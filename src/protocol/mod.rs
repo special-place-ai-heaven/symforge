@@ -2258,7 +2258,18 @@ impl ServerHandler for SymForgeServer {
                         // as success". Reclassify centrally via the ONE shared
                         // error-shape predicate so every tool inherits it without
                         // per-handler signature churn.
-                        if !admitted_raw_measurement_relay && result.is_error != Some(true) {
+                        // The read tools below type their own status from the
+                        // outcome they decided; their bodies can lead with raw
+                        // source, which no text predicate can tell from a status
+                        // line. Re-reading the body would undo that.
+                        let typed_read = matches!(
+                            tool_name.as_ref(),
+                            "get_file_content" | "get_symbol" | "get_symbol_context"
+                        );
+                        if !admitted_raw_measurement_relay
+                            && !typed_read
+                            && result.is_error != Some(true)
+                        {
                             let body = result
                                 .content
                                 .iter()

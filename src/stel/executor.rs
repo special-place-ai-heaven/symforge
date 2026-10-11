@@ -29,6 +29,17 @@ use super::types::{
 pub struct ServedStepResult {
     pub tool: String,
     pub body: String,
+    /// The outcome the step's read decided from typed state, when it recorded
+    /// one. `None` falls back to classifying `body`.
+    pub outcome: Option<OutcomeClass>,
+}
+
+/// A served step's outcome: its typed one, else its body's class. A read body
+/// can lead with raw source (a symbol whose text starts `Error:`), which the
+/// body classifier cannot tell from a status line.
+pub fn served_step_outcome(step: &ServedStepResult) -> OutcomeClass {
+    step.outcome
+        .unwrap_or_else(|| serve_step_outcome(&step.tool, &step.body))
 }
 
 /// Whether L3 should skip legacy tool dispatch (`bypass` or `cache_hit`).
@@ -788,10 +799,12 @@ mod tests {
                 ServedStepResult {
                     tool: "search_symbols".to_string(),
                     body: "symbols".to_string(),
+                    outcome: None,
                 },
                 ServedStepResult {
                     tool: "get_symbol".to_string(),
                     body: "symbol body".to_string(),
+                    outcome: None,
                 },
             ],
         );
@@ -844,10 +857,12 @@ mod tests {
                 ServedStepResult {
                     tool: "search_files".to_string(),
                     body: "path hits".to_string(),
+                    outcome: None,
                 },
                 ServedStepResult {
                     tool: "search_text".to_string(),
                     body: "No matches".to_string(),
+                    outcome: None,
                 },
             ],
             Some(failed.decision_reason.as_str()),

@@ -5,7 +5,7 @@ use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTempla
 
 use super::SymForgeServer;
 use super::tools::{classify_compact_tool_output, is_index_unavailable_output};
-use crate::protocol::result_status::OutcomeClass;
+use crate::protocol::result_status::{OutcomeClass, ReadOutcome, with_read_outcome_scope};
 use crate::protocol::tools::{
     GetFileContentInput, GetFileContextInput, GetRepoMapInput, GetSymbolContextInput,
     GetSymbolInput, WhatChangedInput,
@@ -59,18 +59,6 @@ enum ResourceRequest {
     },
 }
 
-/// The indexed target a templated resource names, re-checked after a read
-/// renders a miss so content that merely LOOKS like a miss stays a success.
-enum ResourceTarget {
-    File(String),
-    Symbol {
-        path: String,
-        name: String,
-    },
-    /// A symbol named without a file, confirmed by the global name lookup.
-    Named(String),
-}
-
 impl ResourceRequest {
     /// The tool whose rendered output answers this request, for the outcome
     /// classifier. `None` for resources that report state rather than read it.
@@ -83,33 +71,6 @@ impl ResourceRequest {
             Self::SymbolDetail { .. } => Some("get_symbol"),
             Self::SymbolContext { .. } => Some("get_symbol_context"),
             Self::RepoHealth | Self::ToolsCatalog | Self::Glossary => None,
-        }
-    }
-
-    /// The target a templated resource names, whose absence a rendered miss
-    /// claims and the index must confirm.
-    fn target(&self) -> Option<ResourceTarget> {
-        match self {
-            Self::FileContext { path, .. } | Self::FileContent { path, .. } => {
-                Some(ResourceTarget::File(path.clone()))
-            }
-            Self::SymbolDetail { path, name, .. } => Some(ResourceTarget::Symbol {
-                path: path.clone(),
-                name: name.clone(),
-            }),
-            Self::SymbolContext { name, file } => Some(match file {
-                Some(path) => ResourceTarget::Symbol {
-                    path: path.clone(),
-                    name: name.clone(),
-                },
-                None => ResourceTarget::Named(name.clone()),
-            }),
-            Self::RepoHealth
-            | Self::RepoOutline
-            | Self::RepoMap
-            | Self::RepoChangesUncommitted
-            | Self::ToolsCatalog
-            | Self::Glossary => None,
         }
     }
 }
@@ -192,46 +153,15 @@ impl SymForgeServer {
         let request =
             parse_resource_uri(uri).map_err(|error| McpError::invalid_params(error, None))?;
         let tool = request.outcome_tool();
-        let target = request.target();
-        let text = self
-            .render_resource_text(request)
-            .await
-            .map_err(|error| McpError::invalid_params(error, None))?;
+        let (text, recorded) = with_read_outcome_scope(self.render_resource_text(request)).await;
+        let text = text.map_err(|error| McpError::invalid_params(error, None))?;
         if let Some(tool) = tool {
-            // The index could not serve, so nothing was read. Same shape the
-            // stdio front gives a resource read while the runtime is starting.
-            if is_index_unavailable_output(&text) {
-                let retryable = text.starts_with("Index is loading")
-                    || text.starts_with("Index refresh interrupted:");
-                return Err(McpError::internal_error(
-                    text,
-                    Some(serde_json::json!({
-                        "uri": uri,
-                        "reason": "index_unavailable",
-                        "retryable": retryable,
-                    })),
-                ));
-            }
-            match classify_compact_tool_output(tool, &text) {
-                OutcomeClass::InvalidRequest => {
-                    return Err(McpError::invalid_params(
-                        text,
-                        Some(serde_json::json!({ "uri": uri })),
-                    ));
-                }
-                // The classifier only reads the rendered text, which a real file
-                // can imitate, so a miss stands only once the index confirms it.
-                OutcomeClass::NotFound => {
-                    if let Some(target) = target
-                        && self.resource_target_absent(target).await
-                    {
-                        return Err(McpError::resource_not_found(
-                            text,
-                            Some(serde_json::json!({ "uri": uri })),
-                        ));
-                    }
-                }
-                _ => {}
+            // The read tools record the outcome they decided from typed state;
+            // the rendered text is consulted only for an answer that decided
+            // nothing typed, which is always generated, never raw content.
+            let outcome = recorded.unwrap_or_else(|| untyped_outcome(tool, &text));
+            if let Some(error) = resource_read_error(outcome, uri, text.clone()) {
+                return Err(error);
             }
         }
 
@@ -243,93 +173,6 @@ impl SymForgeServer {
         ])
         .with_ttl_ms(0)
         .with_cache_scope(rmcp::model::CacheScope::Private))
-    }
-
-    /// Whether the index, after the read's own freshen, holds no such target.
-    /// Asked through the content-free estimate lanes so a daemon-proxied
-    /// session consults the daemon's index rather than its empty local one.
-    /// Both bypass the session cache, so a repeated read is answered afresh.
-    async fn resource_target_absent(&self, target: ResourceTarget) -> bool {
-        let path = match &target {
-            ResourceTarget::File(path) | ResourceTarget::Symbol { path, .. } => path.clone(),
-            // The name-only `get_symbol` lane is the index's global name lookup;
-            // its estimate renders no source, so a found symbol cannot imitate
-            // the miss.
-            ResourceTarget::Named(name) => {
-                let found = self
-                    .get_symbol(Parameters(GetSymbolInput {
-                        project: None,
-                        path: String::new(),
-                        name: name.clone(),
-                        kind: None,
-                        symbol_line: None,
-                        targets: None,
-                        estimate: Some(true),
-                        max_tokens: None,
-                        force_refresh: Some(true),
-                    }))
-                    .await;
-                return classify_compact_tool_output("get_symbol", &found)
-                    == OutcomeClass::NotFound;
-            }
-        };
-        let file = self
-            .get_file_content(Parameters(GetFileContentInput {
-                project: None,
-                path: path.clone(),
-                mode: None,
-                start_line: None,
-                end_line: None,
-                chunk_index: None,
-                max_lines: None,
-                around_line: None,
-                around_match: None,
-                match_occurrence: None,
-                around_symbol: None,
-                symbol_line: None,
-                context_lines: None,
-                show_line_numbers: None,
-                header: None,
-                estimate: Some(true),
-                offset: None,
-                limit: None,
-                max_tokens: None,
-                force_refresh: Some(true),
-            }))
-            .await;
-        if classify_compact_tool_output("get_file_content", &file) == OutcomeClass::NotFound {
-            return true;
-        }
-        let ResourceTarget::Symbol { name, .. } = target else {
-            return false;
-        };
-        // Line numbers prefix every served line, so a found symbol's source can
-        // never begin the answer and imitate the miss text.
-        let symbol = self
-            .get_file_content(Parameters(GetFileContentInput {
-                project: None,
-                path,
-                mode: None,
-                start_line: None,
-                end_line: None,
-                chunk_index: None,
-                max_lines: None,
-                around_line: None,
-                around_match: None,
-                match_occurrence: None,
-                around_symbol: Some(name),
-                symbol_line: None,
-                context_lines: Some(0),
-                show_line_numbers: Some(true),
-                header: None,
-                estimate: None,
-                offset: None,
-                limit: None,
-                max_tokens: None,
-                force_refresh: Some(true),
-            }))
-            .await;
-        classify_compact_tool_output("get_file_content", &symbol) == OutcomeClass::NotFound
     }
 
     async fn render_resource_text(&self, request: ResourceRequest) -> Result<String, String> {
@@ -459,6 +302,51 @@ impl SymForgeServer {
 
         Ok(text)
     }
+}
+
+/// The outcome of an answer that recorded none: a generated refusal or status
+/// line from a lane without typed state, or a daemon that sent no outcome.
+fn untyped_outcome(tool: &str, text: &str) -> ReadOutcome {
+    if is_index_unavailable_output(text) {
+        return ReadOutcome::Unavailable {
+            retryable: text.starts_with("Index is loading")
+                || text.starts_with("Index refresh interrupted:"),
+        };
+    }
+    match classify_compact_tool_output(tool, text) {
+        OutcomeClass::NotFound => ReadOutcome::NotFound,
+        OutcomeClass::Ambiguous => ReadOutcome::Ambiguous,
+        OutcomeClass::InvalidRequest => ReadOutcome::InvalidRequest,
+        OutcomeClass::InternalFailure => ReadOutcome::Unavailable { retryable: false },
+        OutcomeClass::Found | OutcomeClass::EmptyResult => ReadOutcome::Found,
+    }
+}
+
+/// The MCP error for a read that did not succeed; `None` for a successful read.
+/// An unready index keeps the shape the stdio front gives a resource read while
+/// the runtime is starting (`internal_error` with `retryable`).
+fn resource_read_error(outcome: ReadOutcome, uri: &str, text: String) -> Option<McpError> {
+    Some(match outcome {
+        ReadOutcome::Found => return None,
+        ReadOutcome::NotFound => {
+            McpError::resource_not_found(text, Some(serde_json::json!({ "uri": uri })))
+        }
+        ReadOutcome::InvalidRequest => {
+            McpError::invalid_params(text, Some(serde_json::json!({ "uri": uri })))
+        }
+        ReadOutcome::Ambiguous => McpError::invalid_params(
+            text,
+            Some(serde_json::json!({ "uri": uri, "reason": "ambiguous" })),
+        ),
+        ReadOutcome::Unavailable { retryable } => McpError::internal_error(
+            text,
+            Some(serde_json::json!({
+                "uri": uri,
+                "reason": "index_unavailable",
+                "retryable": retryable,
+            })),
+        ),
+    })
 }
 
 pub(crate) fn repo_health_resource() -> Resource {
@@ -1151,5 +1039,300 @@ mod tests {
             other => panic!("expected text resource, got {other:?}"),
         };
         assert!(text.contains("No references found"), "{text}");
+    }
+
+    /// A JSON-RPC client over an in-process duplex transport, so reads go
+    /// through the real `call_tool` and `read_resource` seams.
+    struct WireClient {
+        lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        next_id: u64,
+    }
+
+    impl WireClient {
+        async fn connect(server: SymForgeServer) -> Self {
+            use tokio::io::AsyncBufReadExt;
+            let (client, transport) = tokio::io::duplex(1 << 20);
+            tokio::spawn(async move {
+                let service = rmcp::serve_server(server, tokio::io::split(transport)).await?;
+                service.waiting().await?;
+                anyhow::Ok(())
+            });
+            let (reader, writer) = tokio::io::split(client);
+            let mut wire = Self {
+                lines: tokio::io::BufReader::new(reader).lines(),
+                writer,
+                next_id: 1,
+            };
+            wire.request(
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "read-outcome-table", "version": "0"}
+                }),
+            )
+            .await;
+            wire.send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+                .await;
+            wire
+        }
+
+        async fn send(&mut self, message: serde_json::Value) {
+            use tokio::io::AsyncWriteExt;
+            let mut line = message.to_string();
+            line.push('\n');
+            self.writer.write_all(line.as_bytes()).await.unwrap();
+        }
+
+        async fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.send(
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+            )
+            .await;
+            loop {
+                let line = tokio::time::timeout(Duration::from_secs(30), self.lines.next_line())
+                    .await
+                    .expect("reply within 30s")
+                    .unwrap()
+                    .expect("open transport");
+                let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if message.get("id") == Some(&serde_json::json!(id)) {
+                    return message;
+                }
+            }
+        }
+    }
+
+    /// Sets `SYMFORGE_SURFACE` for one call and restores it on drop.
+    struct SurfaceEnv(Option<std::ffi::OsString>);
+
+    #[allow(unsafe_code)] // test-only env mutation, single-threaded gates.
+    impl SurfaceEnv {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os("SYMFORGE_SURFACE");
+            // SAFETY: test-only; the gates run tests single-threaded.
+            unsafe { std::env::set_var("SYMFORGE_SURFACE", value) };
+            Self(previous)
+        }
+    }
+
+    #[allow(unsafe_code)] // test-only env mutation, single-threaded gates.
+    impl Drop for SurfaceEnv {
+        fn drop(&mut self) {
+            // SAFETY: as in `set`.
+            unsafe {
+                match self.0.take() {
+                    Some(previous) => std::env::set_var("SYMFORGE_SURFACE", previous),
+                    None => std::env::remove_var("SYMFORGE_SURFACE"),
+                }
+            }
+        }
+    }
+
+    fn resource_class(reply: &serde_json::Value, label: &str) -> OutcomeClass {
+        let Some(error) = reply.get("error") else {
+            return OutcomeClass::Found;
+        };
+        let code = error["code"].as_i64().unwrap();
+        match code {
+            -32002 => OutcomeClass::NotFound,
+            -32602 if error["data"]["reason"] == "ambiguous" => OutcomeClass::Ambiguous,
+            -32602 => OutcomeClass::InvalidRequest,
+            -32603 => OutcomeClass::InternalFailure,
+            _ => panic!("{label}: unexpected resource error {reply}"),
+        }
+    }
+
+    fn tool_class(reply: &serde_json::Value, label: &str) -> (OutcomeClass, bool) {
+        let result = &reply["result"];
+        let class = serde_json::from_value::<OutcomeClass>(
+            result["_meta"]["symforge/result_status"]["outcome_class"].clone(),
+        )
+        .unwrap_or_else(|_| panic!("{label}: no typed status on {reply}"));
+        (class, result["isError"].as_bool().unwrap_or(false))
+    }
+
+    /// The shared outcome table, MCP side: each case through `resources/read`
+    /// and through `tools/call` on the wire, so the call-seam status exemption
+    /// is under test, not only the tool handler.
+    #[tokio::test]
+    async fn resource_read_outcomes_match_the_shared_table() {
+        use crate::protocol::result_status::read_outcome_cases::{CASES, FILES, Read};
+
+        let root = tempfile::tempdir().unwrap();
+        for (path, content) in FILES {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let loaded = SymForgeServer::new(
+            LiveIndex::load(root.path()).expect("index"),
+            "read-outcome-table".to_string(),
+            Arc::new(Mutex::new(WatcherInfo::default())),
+            Some(root.path().to_path_buf()),
+            None,
+        );
+        let unready_index = LiveIndex::empty();
+        unready_index.mark_bootstrap_loading();
+        let unready = SymForgeServer::new(
+            unready_index,
+            "read-outcome-table-unready".to_string(),
+            Arc::new(Mutex::new(WatcherInfo::default())),
+            None,
+            None,
+        );
+        let mut wire = WireClient::connect(loaded).await;
+        let mut unready_wire = WireClient::connect(unready).await;
+        for case in CASES {
+            let (uri, tool, arguments) = match &case.read {
+                Read::Content {
+                    path,
+                    raw,
+                    around_match,
+                    match_occurrence,
+                    start_line,
+                } => {
+                    let mut arguments = serde_json::json!({ "path": path });
+                    if let Some(line) = start_line {
+                        arguments["start_line"] = serde_json::json!(line);
+                    }
+                    if let Some(needle) = around_match {
+                        arguments["around_match"] = serde_json::json!(needle);
+                    }
+                    if let Some(count) = match_occurrence {
+                        arguments["match_occurrence"] = serde_json::json!(count);
+                    }
+                    if *raw {
+                        arguments["show_line_numbers"] = serde_json::json!(false);
+                        arguments["header"] = serde_json::json!(false);
+                    }
+                    let uri = build_uri(
+                        "symforge://file/content",
+                        &[
+                            ("path", Some(path.to_string())),
+                            ("start_line", start_line.map(|line| line.to_string())),
+                            ("around_match", around_match.map(str::to_string)),
+                            (
+                                "match_occurrence",
+                                match_occurrence.map(|count| count.to_string()),
+                            ),
+                            ("show_line_numbers", raw.then(|| "false".to_string())),
+                            ("header", raw.then(|| "false".to_string())),
+                        ],
+                    );
+                    (Some(uri), Some("get_file_content"), arguments)
+                }
+                Read::Context { path } => (
+                    Some(build_uri(
+                        "symforge://file/context",
+                        &[("path", Some(path.to_string()))],
+                    )),
+                    None,
+                    serde_json::Value::Null,
+                ),
+                Read::Symbol { path, name, kind } => {
+                    let mut arguments = serde_json::json!({ "path": path, "name": name });
+                    if let Some(kind) = kind {
+                        arguments["kind"] = serde_json::json!(kind);
+                    }
+                    let uri = build_uri(
+                        "symforge://symbol/detail",
+                        &[
+                            ("path", Some(path.to_string())),
+                            ("name", Some(name.to_string())),
+                            ("kind", kind.map(str::to_string)),
+                        ],
+                    );
+                    (Some(uri), Some("get_symbol"), arguments)
+                }
+                Read::SymbolContext { name, file } => {
+                    let mut arguments = serde_json::json!({ "name": name });
+                    if let Some(file) = file {
+                        arguments["file"] = serde_json::json!(file);
+                    }
+                    let uri = build_uri(
+                        "symforge://symbol/context",
+                        &[
+                            ("name", Some(name.to_string())),
+                            ("file", file.map(str::to_string)),
+                        ],
+                    );
+                    (Some(uri), Some("get_symbol_context"), arguments)
+                }
+                Read::Batch { targets } => {
+                    let targets: Vec<_> = targets
+                        .iter()
+                        .map(|(path, name)| serde_json::json!({ "path": path, "name": name }))
+                        .collect();
+                    (
+                        None,
+                        Some("get_symbol"),
+                        serde_json::json!({ "targets": targets }),
+                    )
+                }
+                Read::Bundle { path, name } => (
+                    None,
+                    Some("get_symbol_context"),
+                    serde_json::json!({ "path": path, "name": name, "bundle": true }),
+                ),
+                Read::Facade { path, symbol } => (
+                    None,
+                    Some("symforge"),
+                    serde_json::json!({
+                        "query": "read it",
+                        "intent": "read",
+                        "path": path,
+                        "symbol": symbol,
+                    }),
+                ),
+                Read::Unready => (
+                    Some(build_uri(
+                        "symforge://file/content",
+                        &[("path", Some("src/lib.rs".to_string()))],
+                    )),
+                    Some("get_file_content"),
+                    serde_json::json!({ "path": "src/lib.rs" }),
+                ),
+            };
+            let client = if matches!(case.read, Read::Unready) {
+                &mut unready_wire
+            } else {
+                &mut wire
+            };
+            if let Some(uri) = uri {
+                let reply = client
+                    .request("resources/read", serde_json::json!({ "uri": uri }))
+                    .await;
+                assert_eq!(
+                    resource_class(&reply, case.label),
+                    case.expected,
+                    "resources/read: {}: {reply}",
+                    case.label
+                );
+            }
+            if let Some(tool) = tool {
+                // The facade answers only on the compact surface, which the
+                // server reads from the environment at call time.
+                let _compact =
+                    matches!(case.read, Read::Facade { .. }).then(|| SurfaceEnv::set("compact"));
+                let reply = client
+                    .request(
+                        "tools/call",
+                        serde_json::json!({ "name": tool, "arguments": arguments }),
+                    )
+                    .await;
+                let (class, is_error) = tool_class(&reply, case.label);
+                assert_eq!(class, case.expected, "tools/call: {}: {reply}", case.label);
+                assert_eq!(
+                    is_error,
+                    case.expected.is_error(),
+                    "tools/call isError: {}: {reply}",
+                    case.label
+                );
+            }
+        }
     }
 }

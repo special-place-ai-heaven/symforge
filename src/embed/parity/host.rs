@@ -1659,7 +1659,7 @@ impl HostRoom {
         };
         let session = self.query_session()?;
         let mut admitted = None;
-        let mut missing = false;
+        let mut target_refusal = None;
         self.source
             .query_with_policy_admitted(
                 &request,
@@ -1671,8 +1671,8 @@ impl HostRoom {
                 Some(control),
                 |claim| {
                     // Refused before the session commits, as MCP answers the same miss.
-                    if resource_target_missing(claim.value()) {
-                        missing = true;
+                    target_refusal = resource_target_refusal(claim.value());
+                    if target_refusal.is_some() {
                         return false;
                     }
                     let reply = HostResourceReply {
@@ -1692,13 +1692,21 @@ impl HostRoom {
             .map_err(|refusal| {
                 let rejected = refusal.kind() == QueryRefusalKind::OutputAdmissionRejected;
                 let mut refusal = HostRefusal::from_query(refusal);
-                if missing && rejected {
-                    refusal.kind = HostRefusalKind::SourceUnavailable;
-                    refusal.query_kind = Some(QueryRefusalKind::NotFound);
+                if rejected && let Some(kind) = target_refusal {
+                    refusal.query_kind = Some(kind);
                 }
-                // A missing target can appear later; retry once the source changes.
-                if refusal.query_kind == Some(QueryRefusalKind::NotFound) {
-                    refusal.retry = Some(HostRetryAdvice::OnEvent);
+                match refusal.query_kind {
+                    // A missing target can appear later; retry once the source changes.
+                    Some(QueryRefusalKind::NotFound) => {
+                        refusal.kind = HostRefusalKind::SourceUnavailable;
+                        refusal.retry = Some(HostRetryAdvice::OnEvent);
+                    }
+                    // MCP answers an ambiguous selector with invalid params.
+                    Some(QueryRefusalKind::AmbiguousSymbol) => {
+                        refusal.kind = HostRefusalKind::InvalidRequest;
+                        refusal.retry = Some(HostRetryAdvice::Never);
+                    }
+                    _ => {}
                 }
                 refusal
             })?;
@@ -2714,6 +2722,248 @@ mod resource_contract_tests {
     }
 }
 
+/// The shared outcome table, embedded side: each case through the room's
+/// resource and its query (the room's tool path), held to the class MCP is.
+/// The unready row holds the reload, a `__test-internals` hook.
+#[cfg(all(test, feature = "__test-internals"))]
+mod resource_outcome_table_tests {
+    use super::*;
+    use crate::embed::lifecycle::guidance::outcome::OutcomeClass;
+    use crate::embed::lifecycle::guidance::outcome::read_outcome_cases::{CASES, FILES, Read};
+    use crate::embed::parity::read::FileContentRequest;
+    use crate::embed::parity::read_context::FileContextRequest;
+    use crate::embed::parity::symbol::{SymbolReadRequest, SymbolTarget};
+    use crate::embed::parity::symbol_context::SymbolContextRequest;
+
+    fn refusal_class(refusal: &HostRefusal) -> OutcomeClass {
+        match refusal.query_kind {
+            Some(QueryRefusalKind::NotFound) => OutcomeClass::NotFound,
+            Some(QueryRefusalKind::AmbiguousSymbol) => OutcomeClass::Ambiguous,
+            Some(QueryRefusalKind::InvalidRequest) => OutcomeClass::InvalidRequest,
+            _ => OutcomeClass::InternalFailure,
+        }
+    }
+
+    fn row_class(refusal: Option<QueryRefusalKind>) -> OutcomeClass {
+        match refusal {
+            None => OutcomeClass::Found,
+            Some(QueryRefusalKind::NotFound) => OutcomeClass::NotFound,
+            Some(QueryRefusalKind::AmbiguousSymbol) => OutcomeClass::Ambiguous,
+            Some(_) => OutcomeClass::InvalidRequest,
+        }
+    }
+
+    fn output_class(output: &QueryOutput) -> OutcomeClass {
+        match output {
+            // A batch is found when any target was served (as on MCP).
+            QueryOutput::SymbolRead(value) => {
+                if value.entries.iter().any(|entry| entry.refusal.is_none()) {
+                    OutcomeClass::Found
+                } else {
+                    row_class(value.entries.first().and_then(|entry| entry.refusal))
+                }
+            }
+            QueryOutput::SymbolContext(value) => row_class(value.refusal),
+            QueryOutput::Symforge(answer) => answer.outcome,
+            _ => OutcomeClass::Found,
+        }
+    }
+
+    fn open_room(repository: &std::path::Path, room_id: &str) -> HostRoom {
+        let grant = HostRoomGrant::new(
+            room_id.into(),
+            repository.to_path_buf(),
+            format!("{room_id}-source"),
+            HostRights::read_only(),
+        )
+        .unwrap();
+        HostRoom::open(
+            ProcessIndexRuntime::acquire().unwrap(),
+            grant,
+            HostRoomConfig {
+                room_id: room_id.into(),
+                limits: HostLimits::default(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn fixture() -> tempfile::TempDir {
+        let repository = tempfile::tempdir().unwrap();
+        git2::Repository::init(repository.path()).unwrap();
+        for (path, content) in FILES {
+            let path = repository.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        repository
+    }
+
+    #[test]
+    fn resource_read_outcomes_match_the_shared_table() {
+        let repository = fixture();
+        let room = open_room(repository.path(), "table-room");
+        let control = room.control().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let HostResponse::Status(status) =
+                room.dispatch(&HostRequest::Status, &control).unwrap()
+            else {
+                panic!("status response");
+            };
+            if status.phase == HostPhase::Current {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source did not publish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The unready room: the first reload is held after its parses, so the
+        // source never reaches Current while the case runs.
+        let unready_repository = fixture();
+        let gate = crate::live_index::store::hold_reload_after_parses_for_test(
+            unready_repository.path(),
+            1,
+        );
+        let unready_room = open_room(unready_repository.path(), "table-room-unready");
+        assert!(
+            gate.wait_until_blocked(Duration::from_secs(5)),
+            "reload did not reach the parse hold"
+        );
+        for case in CASES {
+            let (resource, query) = match &case.read {
+                Read::Content {
+                    path,
+                    raw,
+                    around_match,
+                    match_occurrence,
+                    start_line,
+                } => {
+                    let request = FileContentRequest {
+                        path: path.to_string(),
+                        start_line: *start_line,
+                        around_match: around_match.map(str::to_string),
+                        match_occurrence: *match_occurrence,
+                        show_line_numbers: raw.then_some(false),
+                        header: raw.then_some(false),
+                        ..Default::default()
+                    };
+                    (
+                        Some(HostResourceRequest::FileContentOptions(request.clone())),
+                        QueryRequest::FileContent(request),
+                    )
+                }
+                Read::Context { path } => (
+                    Some(HostResourceRequest::FileContext {
+                        path: path.to_string(),
+                        max_tokens: None,
+                    }),
+                    QueryRequest::FileContext(FileContextRequest {
+                        path: path.to_string(),
+                        ..Default::default()
+                    }),
+                ),
+                Read::Symbol { path, name, kind } => {
+                    let request = SymbolReadRequest {
+                        path: path.to_string(),
+                        name: name.to_string(),
+                        kind: kind.map(str::to_string),
+                        ..Default::default()
+                    };
+                    (
+                        Some(HostResourceRequest::SymbolDetailOptions(request.clone())),
+                        QueryRequest::SymbolRead(request),
+                    )
+                }
+                Read::SymbolContext { name, file } => {
+                    let request = SymbolContextRequest {
+                        name: name.to_string(),
+                        file: file.map(str::to_string),
+                        ..Default::default()
+                    };
+                    (
+                        Some(HostResourceRequest::SymbolContextOptions(request.clone())),
+                        QueryRequest::SymbolContext(request),
+                    )
+                }
+                Read::Batch { targets } => (
+                    None,
+                    QueryRequest::SymbolRead(SymbolReadRequest {
+                        targets: Some(
+                            targets
+                                .iter()
+                                .map(|(path, name)| SymbolTarget {
+                                    path: path.to_string(),
+                                    name: Some(name.to_string()),
+                                    kind: None,
+                                    symbol_line: None,
+                                    start_byte: None,
+                                    end_byte: None,
+                                })
+                                .collect(),
+                        ),
+                        ..Default::default()
+                    }),
+                ),
+                Read::Bundle { path, name } => (
+                    None,
+                    QueryRequest::SymbolContext(SymbolContextRequest {
+                        name: name.to_string(),
+                        path: Some(path.to_string()),
+                        bundle: Some(true),
+                        ..Default::default()
+                    }),
+                ),
+                Read::Facade { path, symbol } => (
+                    None,
+                    QueryRequest::Symforge(crate::embed::parity::stel::StelRequest {
+                        query: "read it".to_string(),
+                        intent: Some(crate::embed::parity::stel::IntentBucket::Read),
+                        path: Some(path.to_string()),
+                        symbol: Some(symbol.to_string()),
+                        ..Default::default()
+                    }),
+                ),
+                Read::Unready => {
+                    let request = FileContentRequest {
+                        path: "src/lib.rs".to_string(),
+                        ..Default::default()
+                    };
+                    (
+                        Some(HostResourceRequest::FileContentOptions(request.clone())),
+                        QueryRequest::FileContent(request),
+                    )
+                }
+            };
+            let target = if matches!(case.read, Read::Unready) {
+                &unready_room
+            } else {
+                &room
+            };
+            let control = target.control().unwrap();
+            if let Some(resource) = resource {
+                let class = match target.dispatch(&HostRequest::Resource(resource), &control) {
+                    Ok(_) => OutcomeClass::Found,
+                    Err(refusal) => refusal_class(&refusal),
+                };
+                assert_eq!(class, case.expected, "room resource: {}", case.label);
+            }
+            let class = match target.dispatch(
+                &HostRequest::Query {
+                    request: query,
+                    limits: QueryLimits::default(),
+                },
+                &control,
+            ) {
+                Ok(HostResponse::Query(reply)) => output_class(&reply.output),
+                Ok(_) => panic!("{}: query response", case.label),
+                Err(refusal) => refusal_class(&refusal),
+            };
+            assert_eq!(class, case.expected, "room query: {}", case.label);
+        }
+        drop(gate);
+    }
+}
+
 // The reload hold is a `__test-internals` hook.
 #[cfg(all(test, feature = "__test-internals"))]
 mod resource_loading_tests {
@@ -3174,22 +3424,31 @@ fn render_prompt(
     })
 }
 
-/// MCP `resources/read` fails with resource-not-found only once its index
-/// confirms the target is absent. Here the native lanes already decided that
-/// against the room's index: a missing file is a typed `NotFound` refusal before
-/// any output exists, and a symbol miss is carried as a typed row refusal, so
-/// rendered text is never consulted and content imitating a miss stays a read.
-fn resource_target_missing(output: &QueryOutput) -> bool {
+/// The typed refusal a symbol resource answer carries, if any. MCP decides a
+/// resource read from the outcome its read tool recorded; the room reads the
+/// same decision from the native lanes: a missing file or selector miss is a
+/// typed refusal before any output exists, and a symbol miss or ambiguity is a
+/// typed row refusal. Rendered text is never consulted.
+fn resource_target_refusal(output: &QueryOutput) -> Option<QueryRefusalKind> {
+    let refused = |kind: Option<QueryRefusalKind>| {
+        kind.filter(|kind| {
+            matches!(
+                kind,
+                QueryRefusalKind::NotFound | QueryRefusalKind::AmbiguousSymbol
+            )
+        })
+    };
     match output {
         QueryOutput::SymbolRead(value) => {
-            !value.entries.is_empty()
-                && value
-                    .entries
-                    .iter()
-                    .all(|entry| entry.refusal == Some(QueryRefusalKind::NotFound))
+            let first = refused(value.entries.first()?.refusal)?;
+            value
+                .entries
+                .iter()
+                .all(|entry| entry.refusal == Some(first))
+                .then_some(first)
         }
-        QueryOutput::SymbolContext(value) => value.refusal == Some(QueryRefusalKind::NotFound),
-        _ => false,
+        QueryOutput::SymbolContext(value) => refused(value.refusal),
+        _ => None,
     }
 }
 

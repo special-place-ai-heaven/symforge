@@ -6,6 +6,8 @@ pub const RESULT_STATUS_META_KEY: &str = "symforge/result_status";
 pub const RESULT_STATUS_CONTRACT_VERSION: u8 = 1;
 
 pub use crate::index_lifecycle::guidance::outcome::OutcomeClass;
+#[cfg(test)]
+pub(crate) use crate::index_lifecycle::guidance::outcome::read_outcome_cases;
 
 /// `_meta` key carrying the selected-project trust evidence (Task 7).
 pub const PROJECT_EVIDENCE_META_KEY: &str = "symforge/project_evidence";
@@ -140,6 +142,68 @@ pub fn current_project_evidence() -> Option<ProjectEvidence> {
         .try_with(|cell| cell.borrow().clone())
         .ok()
         .flatten()
+}
+
+/// HTTP response header carrying a proxied read tool's [`ReadOutcome`]
+/// (JSON). Out-of-band so the body stays byte-identical, exactly like
+/// [`PROJECT_EVIDENCE_HEADER`].
+pub const READ_OUTCOME_HEADER: &str = "x-symforge-read-outcome";
+
+/// The outcome a read tool decided while producing its answer, from typed
+/// state (index readiness, file presence, selector resolution) rather than from
+/// the rendered text, which raw file content can imitate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadOutcome {
+    Found,
+    NotFound,
+    Ambiguous,
+    InvalidRequest,
+    /// The index could not serve; `retryable` when a load or refresh is under
+    /// way and the same read can succeed shortly.
+    Unavailable {
+        retryable: bool,
+    },
+}
+
+impl ReadOutcome {
+    pub fn class(self) -> OutcomeClass {
+        match self {
+            Self::Found => OutcomeClass::Found,
+            Self::NotFound => OutcomeClass::NotFound,
+            Self::Ambiguous => OutcomeClass::Ambiguous,
+            Self::InvalidRequest => OutcomeClass::InvalidRequest,
+            Self::Unavailable { .. } => OutcomeClass::InternalFailure,
+        }
+    }
+}
+
+tokio::task_local! {
+    /// The typed outcome of the read currently being answered. Bound per read by
+    /// [`with_read_outcome_scope`]; written by the read tool at the point it
+    /// decides, or by the daemon proxy from [`READ_OUTCOME_HEADER`].
+    static READ_OUTCOME: std::cell::RefCell<Option<ReadOutcome>>;
+}
+
+/// Run one read with an empty outcome slot and return what it recorded.
+/// `None` means the read decided nothing typed (a generated refusal, or a
+/// daemon that sent no outcome header).
+pub async fn with_read_outcome_scope<F>(future: F) -> (F::Output, Option<ReadOutcome>)
+where
+    F: Future,
+{
+    READ_OUTCOME
+        .scope(std::cell::RefCell::new(None), async {
+            let output = future.await;
+            let outcome = READ_OUTCOME.with(|cell| *cell.borrow());
+            (output, outcome)
+        })
+        .await
+}
+
+/// Record the typed outcome of the current read. No-op outside a scope.
+pub fn record_read_outcome(outcome: ReadOutcome) {
+    let _ = READ_OUTCOME.try_with(|cell| *cell.borrow_mut() = Some(outcome));
 }
 
 /// FR-319 (spec 025): central evidence attachment at the trait-boundary seam.

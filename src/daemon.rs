@@ -2797,6 +2797,36 @@ impl DaemonSessionClient {
         } else {
             None
         };
+        let read_outcome = match response
+            .headers()
+            .get(crate::protocol::result_status::READ_OUTCOME_HEADER)
+        {
+            Some(header) => match serde_json::from_slice::<
+                crate::protocol::result_status::ReadOutcome,
+            >(header.as_bytes())
+            {
+                Ok(outcome) => Some(outcome),
+                Err(error) => {
+                    tracing::debug!(
+                        tool = tool_name,
+                        "malformed read-outcome header; status falls back to the body: {error}"
+                    );
+                    None
+                }
+            },
+            None => {
+                if matches!(
+                    tool_name,
+                    "get_file_content" | "get_file_context" | "get_symbol" | "get_symbol_context"
+                ) {
+                    tracing::debug!(
+                        tool = tool_name,
+                        "no read-outcome header; status falls back to the body"
+                    );
+                }
+                None
+            }
+        };
 
         let body = response
             .text()
@@ -2808,6 +2838,9 @@ impl DaemonSessionClient {
         // fallback or a later retry in the same dispatch scope.
         if let Some(evidence) = project_evidence {
             crate::protocol::result_status::record_project_evidence(evidence);
+        }
+        if let Some(outcome) = read_outcome {
+            crate::protocol::result_status::record_read_outcome(outcome);
         }
         Ok(body)
     }
@@ -5674,25 +5707,33 @@ async fn call_tool_handler(
                 handle.block_on(crate::protocol::result_status::with_project_evidence_scope(
                     initial_call_evidence,
                     async move {
-                        let result = crate::protocol::surface_probe::with_connection_surface(
-                            connection_surface,
-                            execute_tool_call(runtime, &tool_name_owned, params),
-                        )
-                        .await;
+                        // A read tool's typed outcome rides back out-of-band
+                        // beside the evidence receipt (`READ_OUTCOME_HEADER`).
+                        let (result, outcome) =
+                            crate::protocol::result_status::with_read_outcome_scope(
+                                crate::protocol::surface_probe::with_connection_surface(
+                                    connection_surface,
+                                    execute_tool_call(runtime, &tool_name_owned, params),
+                                ),
+                            )
+                            .await;
                         let evidence = crate::protocol::result_status::current_project_evidence();
-                        (result, evidence)
+                        (result, (evidence, outcome))
                     },
                 ))
             })
             .await
             {
                 Ok(result) => result,
-                Err(join_err) => (Err(anyhow::anyhow!("tool task panicked: {join_err}")), None),
+                Err(join_err) => (
+                    Err(anyhow::anyhow!("tool task panicked: {join_err}")),
+                    (None, None),
+                ),
             }
         })
         .await
     {
-        Ok((Ok(mut result), mut response_evidence)) => {
+        Ok((Ok(mut result), (mut response_evidence, read_outcome))) => {
             // Task 7: `health`/`health_compact` gain the session's open-project
             // inventory once MORE than one project is open. Single-project
             // sessions stay byte-identical.
@@ -5736,6 +5777,14 @@ async fn call_tool_handler(
                     crate::protocol::result_status::PROJECT_EVIDENCE_HEADER,
                     value,
                 );
+            }
+            if let Some(outcome) = read_outcome
+                && let Ok(json) = serde_json::to_string(&outcome)
+                && let Ok(value) = axum::http::HeaderValue::try_from(json)
+            {
+                response
+                    .headers_mut()
+                    .insert(crate::protocol::result_status::READ_OUTCOME_HEADER, value);
             }
             Ok(response)
         }
@@ -15819,6 +15868,102 @@ mod tests {
                 .is_some_and(|root| root.contains('é')),
             "unicode canonical root must remain byte-exact: {proxied_evidence:?}"
         );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
+    }
+
+    /// The read outcome rides back from the daemon out-of-band, so a proxied
+    /// read keeps its typed status even when the content imitates an error:
+    /// the header is present and parses, and a daemon-proxied server reports
+    /// the read found with `isError` false.
+    #[tokio::test]
+    async fn test_proxied_read_carries_typed_read_outcome() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project = project_dir("symforge-read-outcome");
+        std::fs::create_dir_all(project.path().join("notes")).expect("notes dir");
+        std::fs::write(
+            project.path().join("notes").join("error.txt"),
+            "Error: this file starts like an error\nlet marker = \"x [error: not an error]\";\n",
+        )
+        .expect("write imitation");
+
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let client = authed_client(&handle);
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "read-outcome".to_string(),
+                pid: Some(81),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let raw_read = serde_json::json!({
+            "path": "notes/error.txt",
+            "show_line_numbers": false,
+            "header": false,
+        });
+
+        let response = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/get_file_content",
+                opened.session_id
+            ))
+            .json(&raw_read)
+            .send()
+            .await
+            .expect("tool request")
+            .error_for_status()
+            .expect("tool status");
+        let header = response
+            .headers()
+            .get(crate::protocol::result_status::READ_OUTCOME_HEADER)
+            .expect("read-outcome header must be present");
+        let outcome = serde_json::from_slice::<crate::protocol::result_status::ReadOutcome>(
+            header.as_bytes(),
+        )
+        .expect("read-outcome header must parse");
+        assert_eq!(outcome, crate::protocol::result_status::ReadOutcome::Found);
+        let body = response.text().await.expect("tool body");
+        assert!(body.starts_with("Error: "), "raw content leads: {body}");
+
+        let proxy = DaemonSessionClient::new_for_test_at(
+            base_url,
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+            test_control_state(daemon_home.path()),
+        )
+        .with_project_root(project.path().to_path_buf());
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(proxy);
+        let input: crate::protocol::tools::GetFileContentInput =
+            serde_json::from_value(raw_read).expect("input");
+        let result = server
+            .get_file_content_tool(Parameters(input))
+            .await
+            .expect("statused result");
+        assert_eq!(
+            crate::protocol::result_status::observed_outcome_class(result.meta.as_ref()),
+            Some(crate::protocol::result_status::OutcomeClass::Found),
+            "the daemon's typed outcome must reach the proxied tool status"
+        );
+        assert_eq!(result.is_error, Some(false));
 
         let _ = handle.shutdown_tx.send(());
         wait_for_path_absent(&test_daemon_path(
