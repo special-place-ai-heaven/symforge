@@ -318,9 +318,9 @@ pub(crate) fn compact_tool_output_is_success(tool: &str, text: &str) -> bool {
     classify_compact_tool_output(tool, text) == OutcomeClass::Found
 }
 
-/// One table of resource reads, run through MCP (`resources/read` and the
-/// matching `tools/call`) and through the embedded room (resource and query),
-/// so both surfaces are held to the same expected outcome class.
+/// One table of reads, run through MCP (`resources/read` and the matching
+/// `tools/call`, both over the wire) and through the embedded room (resource and
+/// query), so both surfaces are held to the same expected outcome class.
 #[cfg(test)]
 pub(crate) mod read_outcome_cases {
     use super::OutcomeClass;
@@ -332,6 +332,11 @@ pub(crate) mod read_outcome_cases {
             "pub fn alpha() -> u32 {\n    let marker = \"x [error: not an error]\";\n    1\n}\n\npub fn caller() -> u32 {\n    alpha()\n}\n",
         ),
         ("src/other.rs", "pub fn beta() {}\n"),
+        (
+            "src/dup.rs",
+            "pub struct A;\npub struct B;\nimpl A {\n    pub fn make() {}\n}\nimpl B {\n    pub fn make() {}\n}\n",
+        ),
+        ("config.yaml", "Error: boom\nok: yes\n"),
         (
             "notes/error.txt",
             "Error: this file starts like an error\nsecond line\n",
@@ -365,6 +370,22 @@ pub(crate) mod read_outcome_cases {
             name: &'static str,
             file: Option<&'static str>,
         },
+        /// Tool only: a `get_symbol` batch of `(path, name)` targets.
+        Batch {
+            targets: &'static [(&'static str, &'static str)],
+        },
+        /// Tool only: `get_symbol_context` bundle mode.
+        Bundle {
+            path: &'static str,
+            name: &'static str,
+        },
+        /// Tool only: the compact `symforge` facade planning one symbol read.
+        Facade {
+            path: &'static str,
+            symbol: &'static str,
+        },
+        /// A raw read of `src/lib.rs` while the index has not published.
+        Unready,
     }
 
     pub(crate) struct Case {
@@ -492,6 +513,24 @@ pub(crate) mod read_outcome_cases {
             expected: OutcomeClass::NotFound,
         },
         Case {
+            label: "symbol detail whose body starts Error:",
+            read: Read::Symbol {
+                path: "config.yaml",
+                name: "Error",
+                kind: None,
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "ambiguous symbol detail",
+            read: Read::Symbol {
+                path: "src/dup.rs",
+                name: "make",
+                kind: None,
+            },
+            expected: OutcomeClass::Ambiguous,
+        },
+        Case {
             label: "name-only symbol context of an unreferenced symbol",
             read: Read::SymbolContext {
                 name: "caller",
@@ -522,6 +561,52 @@ pub(crate) mod read_outcome_cases {
                 file: Some("src/other.rs"),
             },
             expected: OutcomeClass::NotFound,
+        },
+        Case {
+            label: "get_symbol batch led by a body starting Error:",
+            read: Read::Batch {
+                targets: &[("config.yaml", "Error"), ("src/lib.rs", "defined_nowhere")],
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "get_symbol batch of misses",
+            read: Read::Batch {
+                targets: &[
+                    ("src/lib.rs", "defined_nowhere"),
+                    ("src/missing.rs", "alpha"),
+                ],
+            },
+            expected: OutcomeClass::NotFound,
+        },
+        Case {
+            label: "bundle mode",
+            read: Read::Bundle {
+                path: "src/lib.rs",
+                name: "alpha",
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "bundle mode of a missing symbol",
+            read: Read::Bundle {
+                path: "src/lib.rs",
+                name: "defined_nowhere",
+            },
+            expected: OutcomeClass::NotFound,
+        },
+        Case {
+            label: "compact symforge read of a body starting Error:",
+            read: Read::Facade {
+                path: "config.yaml",
+                symbol: "Error",
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "read while the index is unready",
+            read: Read::Unready,
+            expected: OutcomeClass::InternalFailure,
         },
     ];
 }

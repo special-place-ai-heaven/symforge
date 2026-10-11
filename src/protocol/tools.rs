@@ -1362,18 +1362,47 @@ fn default_symbol_context_outcome(index: &LiveIndex, input: &GetSymbolContextInp
             SymbolSelectorMatch::Ambiguous(_) => ReadOutcome::Ambiguous,
         };
     }
-    let defined = format::symbol_defined_anywhere(index, &input.name, kind, input.symbol_line);
-    let referenced = || {
-        index
-            .find_references_for_name(&input.name, None, false)
-            .iter()
-            .any(|(file_path, _)| input.file.as_deref().is_none_or(|file| *file_path == file))
-    };
-    if defined || referenced() {
+    // References first: the whole-index definition scan runs only when the
+    // answer is empty, as in the shared engine.
+    let referenced = index
+        .find_references_for_name(&input.name, None, false)
+        .iter()
+        .any(|(file_path, _)| input.file.as_deref().is_none_or(|file| *file_path == file));
+    if referenced || format::symbol_defined_anywhere(index, &input.name, kind, input.symbol_line) {
         ReadOutcome::Found
     } else {
         ReadOutcome::NotFound
     }
+}
+
+/// A `get_symbol` batch: found when any target was served; otherwise the
+/// first typed miss, so a batch of misses is not reported as a success.
+fn batch_symbol_outcome(captured: &[CapturedGetSymbolsEntry]) -> ReadOutcome {
+    use crate::live_index::query::{SymbolSelectorMatch, resolve_symbol_selector};
+    let mut miss = None;
+    for entry in captured {
+        let outcome = match entry {
+            CapturedGetSymbolsEntry::SymbolLookup {
+                file,
+                name,
+                kind,
+                symbol_line,
+            } => {
+                match resolve_symbol_selector(file.as_ref(), name, kind.as_deref(), *symbol_line) {
+                    SymbolSelectorMatch::Selected(..) => ReadOutcome::Found,
+                    SymbolSelectorMatch::NotFound => ReadOutcome::NotFound,
+                    SymbolSelectorMatch::Ambiguous(_) => ReadOutcome::Ambiguous,
+                }
+            }
+            CapturedGetSymbolsEntry::CodeSlice { .. } => ReadOutcome::Found,
+            CapturedGetSymbolsEntry::FileNotFound { .. } => ReadOutcome::NotFound,
+        };
+        if outcome == ReadOutcome::Found {
+            return ReadOutcome::Found;
+        }
+        miss.get_or_insert(outcome);
+    }
+    miss.unwrap_or(ReadOutcome::NotFound)
 }
 
 /// A content selection on an existing file as a typed read outcome.
@@ -1446,6 +1475,7 @@ impl SymForgeServer {
         // Batch mode: targets[] provided
         if let Some(ref targets) = params.0.targets {
             if targets.is_empty() {
+                record_read_outcome(ReadOutcome::InvalidRequest);
                 return "Error: targets array is empty.".to_string();
             }
             // T038 round-1 (D16): one capture records the evidence receipt
@@ -1454,6 +1484,7 @@ impl SymForgeServer {
             // from a later publication.
             let generation = self.capture_local_response_generation();
             if let Some(message) = loading_guard_message_from_published(&generation.health) {
+                record_read_outcome(unavailable_outcome(&generation.health));
                 return message;
             }
             let captured = {
@@ -1514,6 +1545,7 @@ impl SymForgeServer {
                     CapturedGetSymbolsEntry::FileNotFound { .. } => None,
                 })
                 .sum();
+            record_read_outcome(batch_symbol_outcome(&captured));
             let output = captured
                 .into_iter()
                 .map(|entry| match entry {
@@ -2448,7 +2480,10 @@ impl SymForgeServer {
         if params.0.bundle.unwrap_or(false) {
             let path = match params.0.path.as_deref() {
                 Some(p) => p.to_string(),
-                None => return "Error: bundle=true requires the 'path' parameter.".to_string(),
+                None => {
+                    record_read_outcome(ReadOutcome::InvalidRequest);
+                    return "Error: bundle=true requires the 'path' parameter.".to_string();
+                }
             };
             let (view, raw_chars, parse_state) = {
                 let raw = published
@@ -2469,6 +2504,16 @@ impl SymForgeServer {
                 );
                 (view, raw, parse_state)
             };
+            record_read_outcome(match &view {
+                crate::live_index::ContextBundleView::Found(_) => ReadOutcome::Found,
+                crate::live_index::ContextBundleView::AmbiguousSymbol { .. } => {
+                    ReadOutcome::Ambiguous
+                }
+                crate::live_index::ContextBundleView::FileNotFound { .. }
+                | crate::live_index::ContextBundleView::SymbolNotFound { .. } => {
+                    ReadOutcome::NotFound
+                }
+            });
             let verbosity = params.0.verbosity.as_deref().unwrap_or("full");
             let result = format::context_bundle_result_view_with_max_tokens(
                 &view,
@@ -2531,7 +2576,10 @@ impl SymForgeServer {
         if params.0.sections.is_some() {
             let path = match params.0.path.as_deref() {
                 Some(p) => p.to_string(),
-                None => return "Error: sections requires the 'path' parameter.".to_string(),
+                None => {
+                    record_read_outcome(ReadOutcome::InvalidRequest);
+                    return "Error: sections requires the 'path' parameter.".to_string();
+                }
             };
 
             // Convert sections: Some(empty vec) = all sections (like trace_symbol's None)
@@ -2570,6 +2618,12 @@ impl SymForgeServer {
                 )
             });
             if knowledge_only {
+                // Knowledge for a symbol: served when the symbol resolves.
+                record_read_outcome(if target.is_some() {
+                    ReadOutcome::Found
+                } else {
+                    ReadOutcome::NotFound
+                });
                 let output = crate::protocol::knowledge_model::render_budgeted_code_knowledge_only(
                     &published,
                     knowledge.as_deref(),
@@ -2600,6 +2654,16 @@ impl SymForgeServer {
                 &trace_input,
                 trace_sections.as_deref(),
             );
+            record_read_outcome(match &trace_view {
+                crate::live_index::TraceSymbolView::Found(_) => ReadOutcome::Found,
+                crate::live_index::TraceSymbolView::AmbiguousSymbol { .. } => {
+                    ReadOutcome::Ambiguous
+                }
+                crate::live_index::TraceSymbolView::FileNotFound { .. }
+                | crate::live_index::TraceSymbolView::SymbolNotFound { .. } => {
+                    ReadOutcome::NotFound
+                }
+            });
             let trace_verbosity = trace_input.verbosity.as_deref().unwrap_or("full");
             let mut trace_result = format::trace_symbol_result_view(
                 &trace_view,
@@ -6450,7 +6514,7 @@ impl SymForgeServer {
             chain_failure_decision, format_bypass_body, format_cache_hit_body,
             format_multi_step_serve_body, format_partial_multi_step_serve_body,
             format_single_step_serve_body, is_degrade, route_tool_label, serve_chain_outcome_class,
-            serve_step_failed, serve_step_outcome, should_skip_legacy_dispatch, tools_executed,
+            served_step_outcome, should_skip_legacy_dispatch, tools_executed,
         };
         use crate::stel::handler::{self, metrics_for_decision_tuned};
         use crate::stel::planner::{build_plan, plan_summary_line};
@@ -6783,7 +6847,10 @@ impl SymForgeServer {
             if has_daemon_client {
                 super::result_status::clear_project_evidence();
             }
-            let mut tool_body = self.dispatch_tool_for_tests(&step.tool, step_args).await;
+            // The step's typed outcome, when its read recorded one, decides the
+            // chain; its body is consulted only for steps without one.
+            let (mut tool_body, step_typed) =
+                with_read_outcome_scope(self.dispatch_tool_for_tests(&step.tool, step_args)).await;
             if has_daemon_client {
                 let current = super::result_status::current_project_evidence();
                 let current_matches = current.as_ref().is_some_and(|evidence| {
@@ -6815,8 +6882,9 @@ impl SymForgeServer {
             step_results.push(ServedStepResult {
                 tool: step.tool.clone(),
                 body: tool_body.clone(),
+                outcome: step_typed.map(ReadOutcome::class),
             });
-            let step_outcome = serve_step_outcome(&step.tool, &tool_body);
+            let step_outcome = served_step_outcome(&step_results[step_results.len() - 1]);
             if step.tool == "search_knowledge" && step_outcome == OutcomeClass::EmptyResult {
                 // Knowledge no-match classes are typed successful answers. Keep
                 // the EmptyResult metadata without feeding them into the
@@ -6824,7 +6892,7 @@ impl SymForgeServer {
                 outcome_class = OutcomeClass::EmptyResult;
                 continue;
             }
-            if serve_step_failed(&step.tool, &tool_body) {
+            if step_outcome != OutcomeClass::Found {
                 let fatal = !is_fusion_union
                     || matches!(
                         step_outcome,
@@ -6856,7 +6924,7 @@ impl SymForgeServer {
         if is_fusion_union && !chain_failed && !step_results.is_empty() {
             let all_empty = step_results.iter().all(|r| {
                 matches!(
-                    serve_step_outcome(&r.tool, &r.body),
+                    served_step_outcome(r),
                     OutcomeClass::EmptyResult | OutcomeClass::NotFound
                 )
             });
@@ -6869,7 +6937,7 @@ impl SymForgeServer {
         if chain_failed {
             let failed_index = step_results.len().saturating_sub(1);
             let failed_tool = step_results[failed_index].tool.as_str();
-            let failed_outcome = serve_step_outcome(failed_tool, &step_results[failed_index].body);
+            let failed_outcome = served_step_outcome(&step_results[failed_index]);
             effective_decision =
                 chain_failure_decision(&plan, &decision, failed_index, failed_tool, failed_outcome);
         }

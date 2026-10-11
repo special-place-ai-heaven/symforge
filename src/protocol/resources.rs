@@ -1041,8 +1041,123 @@ mod tests {
         assert!(text.contains("No references found"), "{text}");
     }
 
+    /// A JSON-RPC client over an in-process duplex transport, so reads go
+    /// through the real `call_tool` and `read_resource` seams.
+    struct WireClient {
+        lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        next_id: u64,
+    }
+
+    impl WireClient {
+        async fn connect(server: SymForgeServer) -> Self {
+            use tokio::io::AsyncBufReadExt;
+            let (client, transport) = tokio::io::duplex(1 << 20);
+            tokio::spawn(async move {
+                let service = rmcp::serve_server(server, tokio::io::split(transport)).await?;
+                service.waiting().await?;
+                anyhow::Ok(())
+            });
+            let (reader, writer) = tokio::io::split(client);
+            let mut wire = Self {
+                lines: tokio::io::BufReader::new(reader).lines(),
+                writer,
+                next_id: 1,
+            };
+            wire.request(
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "read-outcome-table", "version": "0"}
+                }),
+            )
+            .await;
+            wire.send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+                .await;
+            wire
+        }
+
+        async fn send(&mut self, message: serde_json::Value) {
+            use tokio::io::AsyncWriteExt;
+            let mut line = message.to_string();
+            line.push('\n');
+            self.writer.write_all(line.as_bytes()).await.unwrap();
+        }
+
+        async fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.send(
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+            )
+            .await;
+            loop {
+                let line = tokio::time::timeout(Duration::from_secs(30), self.lines.next_line())
+                    .await
+                    .expect("reply within 30s")
+                    .unwrap()
+                    .expect("open transport");
+                let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if message.get("id") == Some(&serde_json::json!(id)) {
+                    return message;
+                }
+            }
+        }
+    }
+
+    /// Sets `SYMFORGE_SURFACE` for one call and restores it on drop.
+    struct SurfaceEnv(Option<std::ffi::OsString>);
+
+    #[allow(unsafe_code)] // test-only env mutation, single-threaded gates.
+    impl SurfaceEnv {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os("SYMFORGE_SURFACE");
+            // SAFETY: test-only; the gates run tests single-threaded.
+            unsafe { std::env::set_var("SYMFORGE_SURFACE", value) };
+            Self(previous)
+        }
+    }
+
+    #[allow(unsafe_code)] // test-only env mutation, single-threaded gates.
+    impl Drop for SurfaceEnv {
+        fn drop(&mut self) {
+            // SAFETY: as in `set`.
+            unsafe {
+                match self.0.take() {
+                    Some(previous) => std::env::set_var("SYMFORGE_SURFACE", previous),
+                    None => std::env::remove_var("SYMFORGE_SURFACE"),
+                }
+            }
+        }
+    }
+
+    fn resource_class(reply: &serde_json::Value, label: &str) -> OutcomeClass {
+        let Some(error) = reply.get("error") else {
+            return OutcomeClass::Found;
+        };
+        let code = error["code"].as_i64().unwrap();
+        match code {
+            -32002 => OutcomeClass::NotFound,
+            -32602 if error["data"]["reason"] == "ambiguous" => OutcomeClass::Ambiguous,
+            -32602 => OutcomeClass::InvalidRequest,
+            -32603 => OutcomeClass::InternalFailure,
+            _ => panic!("{label}: unexpected resource error {reply}"),
+        }
+    }
+
+    fn tool_class(reply: &serde_json::Value, label: &str) -> (OutcomeClass, bool) {
+        let result = &reply["result"];
+        let class = serde_json::from_value::<OutcomeClass>(
+            result["_meta"]["symforge/result_status"]["outcome_class"].clone(),
+        )
+        .unwrap_or_else(|_| panic!("{label}: no typed status on {reply}"));
+        (class, result["isError"].as_bool().unwrap_or(false))
+    }
+
     /// The shared outcome table, MCP side: each case through `resources/read`
-    /// and through the matching tool, whose `isError` must agree with the class.
+    /// and through `tools/call` on the wire, so the call-seam status exemption
+    /// is under test, not only the tool handler.
     #[tokio::test]
     async fn resource_read_outcomes_match_the_shared_table() {
         use crate::protocol::result_status::read_outcome_cases::{CASES, FILES, Read};
@@ -1053,15 +1168,26 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, content).unwrap();
         }
-        let server = SymForgeServer::new(
+        let loaded = SymForgeServer::new(
             LiveIndex::load(root.path()).expect("index"),
             "read-outcome-table".to_string(),
             Arc::new(Mutex::new(WatcherInfo::default())),
             Some(root.path().to_path_buf()),
             None,
         );
+        let unready_index = LiveIndex::empty();
+        unready_index.mark_bootstrap_loading();
+        let unready = SymForgeServer::new(
+            unready_index,
+            "read-outcome-table-unready".to_string(),
+            Arc::new(Mutex::new(WatcherInfo::default())),
+            None,
+            None,
+        );
+        let mut wire = WireClient::connect(loaded).await;
+        let mut unready_wire = WireClient::connect(unready).await;
         for case in CASES {
-            let (uri, tool) = match &case.read {
+            let (uri, tool, arguments) = match &case.read {
                 Read::Content {
                     path,
                     raw,
@@ -1069,6 +1195,20 @@ mod tests {
                     match_occurrence,
                     start_line,
                 } => {
+                    let mut arguments = serde_json::json!({ "path": path });
+                    if let Some(line) = start_line {
+                        arguments["start_line"] = serde_json::json!(line);
+                    }
+                    if let Some(needle) = around_match {
+                        arguments["around_match"] = serde_json::json!(needle);
+                    }
+                    if let Some(count) = match_occurrence {
+                        arguments["match_occurrence"] = serde_json::json!(count);
+                    }
+                    if *raw {
+                        arguments["show_line_numbers"] = serde_json::json!(false);
+                        arguments["header"] = serde_json::json!(false);
+                    }
                     let uri = build_uri(
                         "symforge://file/content",
                         &[
@@ -1083,26 +1223,21 @@ mod tests {
                             ("header", raw.then(|| "false".to_string())),
                         ],
                     );
-                    let mut input: GetFileContentInput =
-                        serde_json::from_value(serde_json::json!({ "path": path })).unwrap();
-                    input.start_line = *start_line;
-                    input.around_match = around_match.map(str::to_string);
-                    input.match_occurrence = *match_occurrence;
-                    if *raw {
-                        input.show_line_numbers = Some(false);
-                        input.header = Some(false);
-                    }
-                    let tool = server.get_file_content_tool(Parameters(input)).await;
-                    (uri, Some(tool))
+                    (Some(uri), Some("get_file_content"), arguments)
                 }
-                Read::Context { path } => {
-                    let uri = build_uri(
+                Read::Context { path } => (
+                    Some(build_uri(
                         "symforge://file/context",
                         &[("path", Some(path.to_string()))],
-                    );
-                    (uri, None)
-                }
+                    )),
+                    None,
+                    serde_json::Value::Null,
+                ),
                 Read::Symbol { path, name, kind } => {
+                    let mut arguments = serde_json::json!({ "path": path, "name": name });
+                    if let Some(kind) = kind {
+                        arguments["kind"] = serde_json::json!(kind);
+                    }
                     let uri = build_uri(
                         "symforge://symbol/detail",
                         &[
@@ -1111,14 +1246,13 @@ mod tests {
                             ("kind", kind.map(str::to_string)),
                         ],
                     );
-                    let mut input: GetSymbolInput =
-                        serde_json::from_value(serde_json::json!({ "path": path, "name": name }))
-                            .unwrap();
-                    input.kind = kind.map(str::to_string);
-                    let tool = server.get_symbol_tool(Parameters(input)).await;
-                    (uri, Some(tool))
+                    (Some(uri), Some("get_symbol"), arguments)
                 }
                 Read::SymbolContext { name, file } => {
+                    let mut arguments = serde_json::json!({ "name": name });
+                    if let Some(file) = file {
+                        arguments["file"] = serde_json::json!(file);
+                    }
                     let uri = build_uri(
                         "symforge://symbol/context",
                         &[
@@ -1126,45 +1260,76 @@ mod tests {
                             ("file", file.map(str::to_string)),
                         ],
                     );
-                    let mut input: GetSymbolContextInput =
-                        serde_json::from_value(serde_json::json!({ "name": name })).unwrap();
-                    input.file = file.map(str::to_string);
-                    let tool = server.get_symbol_context_tool(Parameters(input)).await;
-                    (uri, Some(tool))
+                    (Some(uri), Some("get_symbol_context"), arguments)
                 }
+                Read::Batch { targets } => {
+                    let targets: Vec<_> = targets
+                        .iter()
+                        .map(|(path, name)| serde_json::json!({ "path": path, "name": name }))
+                        .collect();
+                    (
+                        None,
+                        Some("get_symbol"),
+                        serde_json::json!({ "targets": targets }),
+                    )
+                }
+                Read::Bundle { path, name } => (
+                    None,
+                    Some("get_symbol_context"),
+                    serde_json::json!({ "path": path, "name": name, "bundle": true }),
+                ),
+                Read::Facade { path, symbol } => (
+                    None,
+                    Some("symforge"),
+                    serde_json::json!({
+                        "query": "read it",
+                        "intent": "read",
+                        "path": path,
+                        "symbol": symbol,
+                    }),
+                ),
+                Read::Unready => (
+                    Some(build_uri(
+                        "symforge://file/content",
+                        &[("path", Some("src/lib.rs".to_string()))],
+                    )),
+                    Some("get_file_content"),
+                    serde_json::json!({ "path": "src/lib.rs" }),
+                ),
             };
-            let resource = match server.read_resource_uri(&uri).await {
-                Ok(_) => OutcomeClass::Found,
-                Err(error) if error.code == rmcp::model::ErrorCode::RESOURCE_NOT_FOUND => {
-                    OutcomeClass::NotFound
-                }
-                Err(error) if error.code == rmcp::model::ErrorCode::INVALID_PARAMS => {
-                    let ambiguous = error
-                        .data
-                        .as_ref()
-                        .and_then(|data| data.get("reason"))
-                        .is_some_and(|reason| reason == "ambiguous");
-                    if ambiguous {
-                        OutcomeClass::Ambiguous
-                    } else {
-                        OutcomeClass::InvalidRequest
-                    }
-                }
-                Err(error) => panic!("{}: unexpected resource error {error:?}", case.label),
+            let client = if matches!(case.read, Read::Unready) {
+                &mut unready_wire
+            } else {
+                &mut wire
             };
-            assert_eq!(resource, case.expected, "resources/read: {}", case.label);
-            if let Some(tool) = tool {
-                let tool = tool.expect("statused tool result");
+            if let Some(uri) = uri {
+                let reply = client
+                    .request("resources/read", serde_json::json!({ "uri": uri }))
+                    .await;
                 assert_eq!(
-                    crate::protocol::result_status::observed_outcome_class(tool.meta.as_ref()),
-                    Some(case.expected),
-                    "tools/call outcome: {}",
+                    resource_class(&reply, case.label),
+                    case.expected,
+                    "resources/read: {}: {reply}",
                     case.label
                 );
+            }
+            if let Some(tool) = tool {
+                // The facade answers only on the compact surface, which the
+                // server reads from the environment at call time.
+                let _compact =
+                    matches!(case.read, Read::Facade { .. }).then(|| SurfaceEnv::set("compact"));
+                let reply = client
+                    .request(
+                        "tools/call",
+                        serde_json::json!({ "name": tool, "arguments": arguments }),
+                    )
+                    .await;
+                let (class, is_error) = tool_class(&reply, case.label);
+                assert_eq!(class, case.expected, "tools/call: {}: {reply}", case.label);
                 assert_eq!(
-                    tool.is_error.unwrap_or(false),
+                    is_error,
                     case.expected.is_error(),
-                    "tools/call isError: {}",
+                    "tools/call isError: {}: {reply}",
                     case.label
                 );
             }

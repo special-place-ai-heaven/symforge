@@ -206,11 +206,6 @@ pub fn record_read_outcome(outcome: ReadOutcome) {
     let _ = READ_OUTCOME.try_with(|cell| *cell.borrow_mut() = Some(outcome));
 }
 
-/// The outcome recorded so far in the current scope, if any.
-pub fn current_read_outcome() -> Option<ReadOutcome> {
-    READ_OUTCOME.try_with(|cell| *cell.borrow()).ok().flatten()
-}
-
 /// FR-319 (spec 025): central evidence attachment at the trait-boundary seam.
 ///
 /// Called on every `tools/call` and `resources/read` result AFTER the router /

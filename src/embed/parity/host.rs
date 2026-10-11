@@ -2724,14 +2724,15 @@ mod resource_contract_tests {
 
 /// The shared outcome table, embedded side: each case through the room's
 /// resource and its query (the room's tool path), held to the class MCP is.
-#[cfg(test)]
+/// The unready row holds the reload, a `__test-internals` hook.
+#[cfg(all(test, feature = "__test-internals"))]
 mod resource_outcome_table_tests {
     use super::*;
     use crate::embed::lifecycle::guidance::outcome::OutcomeClass;
     use crate::embed::lifecycle::guidance::outcome::read_outcome_cases::{CASES, FILES, Read};
     use crate::embed::parity::read::FileContentRequest;
     use crate::embed::parity::read_context::FileContextRequest;
-    use crate::embed::parity::symbol::SymbolReadRequest;
+    use crate::embed::parity::symbol::{SymbolReadRequest, SymbolTarget};
     use crate::embed::parity::symbol_context::SymbolContextRequest;
 
     fn refusal_class(refusal: &HostRefusal) -> OutcomeClass {
@@ -2743,13 +2744,8 @@ mod resource_outcome_table_tests {
         }
     }
 
-    fn output_class(output: &QueryOutput) -> OutcomeClass {
-        let refused = match output {
-            QueryOutput::SymbolRead(value) => value.entries.first().and_then(|entry| entry.refusal),
-            QueryOutput::SymbolContext(value) => value.refusal,
-            _ => None,
-        };
-        match refused {
+    fn row_class(refusal: Option<QueryRefusalKind>) -> OutcomeClass {
+        match refusal {
             None => OutcomeClass::Found,
             Some(QueryRefusalKind::NotFound) => OutcomeClass::NotFound,
             Some(QueryRefusalKind::AmbiguousSymbol) => OutcomeClass::Ambiguous,
@@ -2757,8 +2753,42 @@ mod resource_outcome_table_tests {
         }
     }
 
-    #[test]
-    fn resource_read_outcomes_match_the_shared_table() {
+    fn output_class(output: &QueryOutput) -> OutcomeClass {
+        match output {
+            // A batch is found when any target was served (as on MCP).
+            QueryOutput::SymbolRead(value) => {
+                if value.entries.iter().any(|entry| entry.refusal.is_none()) {
+                    OutcomeClass::Found
+                } else {
+                    row_class(value.entries.first().and_then(|entry| entry.refusal))
+                }
+            }
+            QueryOutput::SymbolContext(value) => row_class(value.refusal),
+            QueryOutput::Symforge(answer) => answer.outcome,
+            _ => OutcomeClass::Found,
+        }
+    }
+
+    fn open_room(repository: &std::path::Path, room_id: &str) -> HostRoom {
+        let grant = HostRoomGrant::new(
+            room_id.into(),
+            repository.to_path_buf(),
+            format!("{room_id}-source"),
+            HostRights::read_only(),
+        )
+        .unwrap();
+        HostRoom::open(
+            ProcessIndexRuntime::acquire().unwrap(),
+            grant,
+            HostRoomConfig {
+                room_id: room_id.into(),
+                limits: HostLimits::default(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn fixture() -> tempfile::TempDir {
         let repository = tempfile::tempdir().unwrap();
         git2::Repository::init(repository.path()).unwrap();
         for (path, content) in FILES {
@@ -2766,22 +2796,13 @@ mod resource_outcome_table_tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, content).unwrap();
         }
-        let grant = HostRoomGrant::new(
-            "table-room".into(),
-            repository.path().to_path_buf(),
-            "table-source".into(),
-            HostRights::read_only(),
-        )
-        .unwrap();
-        let room = HostRoom::open(
-            ProcessIndexRuntime::acquire().unwrap(),
-            grant,
-            HostRoomConfig {
-                room_id: "table-room".into(),
-                limits: HostLimits::default(),
-            },
-        )
-        .unwrap();
+        repository
+    }
+
+    #[test]
+    fn resource_read_outcomes_match_the_shared_table() {
+        let repository = fixture();
+        let room = open_room(repository.path(), "table-room");
         let control = room.control().unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -2796,6 +2817,18 @@ mod resource_outcome_table_tests {
             assert!(Instant::now() < deadline, "source did not publish");
             std::thread::sleep(Duration::from_millis(10));
         }
+        // The unready room: the first reload is held after its parses, so the
+        // source never reaches Current while the case runs.
+        let unready_repository = fixture();
+        let gate = crate::live_index::store::hold_reload_after_parses_for_test(
+            unready_repository.path(),
+            1,
+        );
+        let unready_room = open_room(unready_repository.path(), "table-room-unready");
+        assert!(
+            gate.wait_until_blocked(Duration::from_secs(5)),
+            "reload did not reach the parse hold"
+        );
         for case in CASES {
             let (resource, query) = match &case.read {
                 Read::Content {
@@ -2815,15 +2848,15 @@ mod resource_outcome_table_tests {
                         ..Default::default()
                     };
                     (
-                        HostResourceRequest::FileContentOptions(request.clone()),
+                        Some(HostResourceRequest::FileContentOptions(request.clone())),
                         QueryRequest::FileContent(request),
                     )
                 }
                 Read::Context { path } => (
-                    HostResourceRequest::FileContext {
+                    Some(HostResourceRequest::FileContext {
                         path: path.to_string(),
                         max_tokens: None,
-                    },
+                    }),
                     QueryRequest::FileContext(FileContextRequest {
                         path: path.to_string(),
                         ..Default::default()
@@ -2837,7 +2870,7 @@ mod resource_outcome_table_tests {
                         ..Default::default()
                     };
                     (
-                        HostResourceRequest::SymbolDetailOptions(request.clone()),
+                        Some(HostResourceRequest::SymbolDetailOptions(request.clone())),
                         QueryRequest::SymbolRead(request),
                     )
                 }
@@ -2848,17 +2881,73 @@ mod resource_outcome_table_tests {
                         ..Default::default()
                     };
                     (
-                        HostResourceRequest::SymbolContextOptions(request.clone()),
+                        Some(HostResourceRequest::SymbolContextOptions(request.clone())),
                         QueryRequest::SymbolContext(request),
                     )
                 }
+                Read::Batch { targets } => (
+                    None,
+                    QueryRequest::SymbolRead(SymbolReadRequest {
+                        targets: Some(
+                            targets
+                                .iter()
+                                .map(|(path, name)| SymbolTarget {
+                                    path: path.to_string(),
+                                    name: Some(name.to_string()),
+                                    kind: None,
+                                    symbol_line: None,
+                                    start_byte: None,
+                                    end_byte: None,
+                                })
+                                .collect(),
+                        ),
+                        ..Default::default()
+                    }),
+                ),
+                Read::Bundle { path, name } => (
+                    None,
+                    QueryRequest::SymbolContext(SymbolContextRequest {
+                        name: name.to_string(),
+                        path: Some(path.to_string()),
+                        bundle: Some(true),
+                        ..Default::default()
+                    }),
+                ),
+                Read::Facade { path, symbol } => (
+                    None,
+                    QueryRequest::Symforge(crate::embed::parity::stel::StelRequest {
+                        query: "read it".to_string(),
+                        intent: Some(crate::embed::parity::stel::IntentBucket::Read),
+                        path: Some(path.to_string()),
+                        symbol: Some(symbol.to_string()),
+                        ..Default::default()
+                    }),
+                ),
+                Read::Unready => {
+                    let request = FileContentRequest {
+                        path: "src/lib.rs".to_string(),
+                        ..Default::default()
+                    };
+                    (
+                        Some(HostResourceRequest::FileContentOptions(request.clone())),
+                        QueryRequest::FileContent(request),
+                    )
+                }
             };
-            let resource = match room.dispatch(&HostRequest::Resource(resource), &control) {
-                Ok(_) => OutcomeClass::Found,
-                Err(refusal) => refusal_class(&refusal),
+            let target = if matches!(case.read, Read::Unready) {
+                &unready_room
+            } else {
+                &room
             };
-            assert_eq!(resource, case.expected, "room resource: {}", case.label);
-            let query = match room.dispatch(
+            let control = target.control().unwrap();
+            if let Some(resource) = resource {
+                let class = match target.dispatch(&HostRequest::Resource(resource), &control) {
+                    Ok(_) => OutcomeClass::Found,
+                    Err(refusal) => refusal_class(&refusal),
+                };
+                assert_eq!(class, case.expected, "room resource: {}", case.label);
+            }
+            let class = match target.dispatch(
                 &HostRequest::Query {
                     request: query,
                     limits: QueryLimits::default(),
@@ -2869,8 +2958,9 @@ mod resource_outcome_table_tests {
                 Ok(_) => panic!("{}: query response", case.label),
                 Err(refusal) => refusal_class(&refusal),
             };
-            assert_eq!(query, case.expected, "room query: {}", case.label);
+            assert_eq!(class, case.expected, "room query: {}", case.label);
         }
+        drop(gate);
     }
 }
 

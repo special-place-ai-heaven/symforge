@@ -103,6 +103,28 @@ fn refusal(text: impl Into<String>) -> Result<QueryOutput, QueryRefusalKind> {
     ))
 }
 
+/// The typed outcome of a read primitive's native answer: a served file read,
+/// or a symbol read whose rows carry their own refusal. `None` for primitives
+/// whose answer has no typed outcome.
+fn typed_read_outcome(output: &QueryOutput) -> Option<OutcomeClass> {
+    let refused = match output {
+        QueryOutput::FileContent(_) | QueryOutput::FileContext(_) => None,
+        QueryOutput::SymbolRead(value) => {
+            if value.entries.is_empty() {
+                return None;
+            }
+            if value.entries.iter().any(|entry| entry.refusal.is_none()) {
+                None
+            } else {
+                value.entries[0].refusal
+            }
+        }
+        QueryOutput::SymbolContext(value) => value.refusal,
+        _ => return None,
+    };
+    Some(refused.map_or(OutcomeClass::Found, refused_outcome))
+}
+
 /// The outcome MCP's classifier would report for a primitive whose native
 /// lane refused instead of rendering an answer.
 fn refused_outcome(kind: QueryRefusalKind) -> OutcomeClass {
@@ -280,7 +302,10 @@ pub(super) fn project(
                     Some(rendered) => rendered?,
                     None => render_output(session, &nested, &output)?,
                 };
-                let step_outcome = serve_step_outcome(&step.tool, &body);
+                // A read output carries its outcome typed; MCP's facade uses the
+                // same typed outcome its read tool recorded.
+                let step_outcome = typed_read_outcome(&output)
+                    .unwrap_or_else(|| serve_step_outcome(&step.tool, &body));
                 (body, Some(Box::new(output)), step_outcome)
             }
             Err(QueryRefusalKind::Cancelled) => return Err(QueryRefusalKind::Cancelled),
@@ -312,6 +337,7 @@ pub(super) fn project(
         step_results.push(ServedStepResult {
             tool: step.tool.clone(),
             body,
+            outcome: Some(step_outcome),
         });
         steps.push(SymforgeStep {
             tool: step.tool.clone(),
