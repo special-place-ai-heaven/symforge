@@ -26,7 +26,7 @@ use crate::embed::parity::remediation::{
     SecretRemediationRequest, SecretRemediationScope, SecretScanLimits,
 };
 use crate::embed::parity::session::{
-    CacheDisposition, QuerySession, SessionCacheLimits, SessionEvidence,
+    CacheDisposition, QuerySession, SessionCacheLimits, SessionCreationRefusal, SessionEvidence,
 };
 use crate::embed::parity::{
     QueryClaim, QueryLimits, QueryObservation, QueryOperationKind, QueryOutput, QueryPolicy,
@@ -1411,7 +1411,16 @@ impl HostRoom {
                         max_bytes: self.limits.max_session_cache_bytes,
                         max_entries: self.limits.max_session_cache_entries,
                     })
-                    .map_err(|_| HostRefusal::new(HostRefusalKind::SourceUnavailable))?,
+                    .map_err(|refusal| {
+                        let mut host = HostRefusal::new(HostRefusalKind::SourceUnavailable);
+                        // The source has not published yet: the same typed refusal
+                        // a query gives before Current, retried on the publish.
+                        if refusal == SessionCreationRefusal::SourceUnavailable {
+                            host.query_kind = Some(QueryRefusalKind::SourceUnavailable);
+                            host.retry = Some(HostRetryAdvice::OnEvent);
+                        }
+                        host
+                    })?,
             ));
         }
         Ok(Arc::clone(session.as_ref().expect("session initialized")))
@@ -1686,7 +1695,9 @@ impl HostRoom {
                 if missing && rejected {
                     refusal.kind = HostRefusalKind::SourceUnavailable;
                     refusal.query_kind = Some(QueryRefusalKind::NotFound);
-                    // A missing target can appear later; retry once the source changes.
+                }
+                // A missing target can appear later; retry once the source changes.
+                if refusal.query_kind == Some(QueryRefusalKind::NotFound) {
                     refusal.retry = Some(HostRetryAdvice::OnEvent);
                 }
                 refusal
@@ -2509,6 +2520,16 @@ mod resource_contract_tests {
                 ),
             ),
             (
+                "missing symbol context in an existing file",
+                HostResourceRequest::SymbolContextOptions(
+                    crate::embed::parity::symbol_context::SymbolContextRequest {
+                        name: "no_such_symbol".into(),
+                        file: Some("src/a.rs".into()),
+                        ..Default::default()
+                    },
+                ),
+            ),
+            (
                 "missing symbol in an existing file",
                 HostResourceRequest::SymbolDetailOptions(
                     crate::embed::parity::symbol::SymbolReadRequest {
@@ -2528,10 +2549,26 @@ mod resource_contract_tests {
                 Some(QueryRefusalKind::NotFound),
                 "{label}"
             );
-            if label.contains("symbol") {
-                assert_eq!(refusal.retry, Some(HostRetryAdvice::OnEvent), "{label}");
-            }
+            assert_eq!(refusal.retry, Some(HostRetryAdvice::OnEvent), "{label}");
         }
+        // MCP answers an invalid request with invalid params; the room refuses it
+        // with the matching typed invalid-request kind.
+        let refusal = room
+            .dispatch(
+                &HostRequest::Resource(HostResourceRequest::FileContentOptions(
+                    crate::embed::parity::read::FileContentRequest {
+                        path: "src/a.rs".into(),
+                        start_line: Some(5),
+                        end_line: Some(2),
+                        ..Default::default()
+                    },
+                )),
+                &control,
+            )
+            .err()
+            .expect("an invalid request must not read as success");
+        assert_eq!(refusal.kind, HostRefusalKind::InvalidRequest);
+        assert_eq!(refusal.query_kind, Some(QueryRefusalKind::InvalidRequest));
         // An existing file whose content imitates the miss text is still a read.
         let HostResponse::Resource(reply) = room
             .dispatch(
@@ -2556,6 +2593,68 @@ mod resource_contract_tests {
             panic!("file content output");
         };
         assert_eq!(content.rendered, "File not found: decoy");
+    }
+}
+
+// The reload hold is a `__test-internals` hook.
+#[cfg(all(test, feature = "__test-internals"))]
+mod resource_loading_tests {
+    use super::*;
+
+    /// MCP answers a resource read on a loading index with a retryable error;
+    /// the room refuses it as source-unavailable, retried on the publish event.
+    #[test]
+    fn resource_read_before_current_is_a_retryable_refusal() {
+        let repository = tempfile::tempdir().unwrap();
+        git2::Repository::init(repository.path()).unwrap();
+        std::fs::create_dir(repository.path().join("src")).unwrap();
+        for index in 0..8 {
+            std::fs::write(
+                repository.path().join(format!("src/f{index}.rs")),
+                format!("pub fn f{index}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let gate =
+            crate::live_index::store::hold_reload_after_parses_for_test(repository.path(), 1);
+        let grant = HostRoomGrant::new(
+            "loading-room".into(),
+            repository.path().to_path_buf(),
+            "loading-source".into(),
+            HostRights::read_only(),
+        )
+        .unwrap();
+        let room = HostRoom::open(
+            ProcessIndexRuntime::acquire().unwrap(),
+            grant,
+            HostRoomConfig {
+                room_id: "loading-room".into(),
+                limits: HostLimits::default(),
+            },
+        )
+        .unwrap();
+        assert!(
+            gate.wait_until_blocked(Duration::from_secs(5)),
+            "reload did not reach the parse hold"
+        );
+        let refusal = room
+            .dispatch(
+                &HostRequest::Resource(HostResourceRequest::FileContent {
+                    path: "src/f0.rs".into(),
+                    start_line: None,
+                    end_line: None,
+                }),
+                &room.control().unwrap(),
+            )
+            .err()
+            .expect("a read before Current must not succeed");
+        assert_eq!(refusal.kind, HostRefusalKind::SourceUnavailable);
+        assert_eq!(
+            refusal.query_kind,
+            Some(QueryRefusalKind::SourceUnavailable)
+        );
+        assert_eq!(refusal.retry, Some(HostRetryAdvice::OnEvent));
+        drop(gate);
     }
 }
 

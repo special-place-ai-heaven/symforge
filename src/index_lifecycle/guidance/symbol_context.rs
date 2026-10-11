@@ -1229,6 +1229,23 @@ pub(crate) fn symbol_context_references(
         total += 1;
     }
 
+    // A `file` filter naming a file that holds no such symbol and no reference
+    // to it is a miss, not an empty answer: render the same canonical miss the
+    // exact `path` lane returns, so the outcome classifier reads it NotFound.
+    if map.is_empty()
+        && params.path.is_none()
+        && let Some(file) = params.file
+        && let Err(miss) = guard.find_exact_references_for_symbol(
+            file,
+            params.name,
+            params.symbol_kind,
+            params.symbol_line,
+            None,
+        )
+    {
+        return (miss, 0, 0);
+    }
+
     // Compute total bytes for savings (sum of content of all matched files).
     let total_bytes: u64 = map
         .keys()

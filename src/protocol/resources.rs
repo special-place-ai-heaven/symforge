@@ -4,7 +4,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTemplate};
 
 use super::SymForgeServer;
-use super::tools::classify_compact_tool_output;
+use super::tools::{classify_compact_tool_output, is_index_unavailable_output};
 use crate::protocol::result_status::OutcomeClass;
 use crate::protocol::tools::{
     GetFileContentInput, GetFileContextInput, GetRepoMapInput, GetSymbolContextInput,
@@ -67,32 +67,37 @@ enum ResourceTarget {
 }
 
 impl ResourceRequest {
-    /// The tool whose rendered output answers this request and the target it
-    /// names, for templated resources whose target may not exist.
-    fn target(&self) -> Option<(&'static str, ResourceTarget)> {
+    /// The tool whose rendered output answers this request, for the outcome
+    /// classifier. `None` for resources that report state rather than read it.
+    fn outcome_tool(&self) -> Option<&'static str> {
         match self {
-            Self::FileContext { path, .. } => {
-                Some(("get_file_context", ResourceTarget::File(path.clone())))
+            Self::RepoOutline | Self::RepoMap => Some("get_repo_map"),
+            Self::RepoChangesUncommitted => Some("what_changed"),
+            Self::FileContext { .. } => Some("get_file_context"),
+            Self::FileContent { .. } => Some("get_file_content"),
+            Self::SymbolDetail { .. } => Some("get_symbol"),
+            Self::SymbolContext { .. } => Some("get_symbol_context"),
+            Self::RepoHealth | Self::ToolsCatalog | Self::Glossary => None,
+        }
+    }
+
+    /// The target a templated resource names, whose absence a rendered miss
+    /// claims and the index must confirm.
+    fn target(&self) -> Option<ResourceTarget> {
+        match self {
+            Self::FileContext { path, .. } | Self::FileContent { path, .. } => {
+                Some(ResourceTarget::File(path.clone()))
             }
-            Self::FileContent { path, .. } => {
-                Some(("get_file_content", ResourceTarget::File(path.clone())))
-            }
-            Self::SymbolDetail { path, name, .. } => Some((
-                "get_symbol",
-                ResourceTarget::Symbol {
+            Self::SymbolDetail { path, name, .. } => Some(ResourceTarget::Symbol {
+                path: path.clone(),
+                name: name.clone(),
+            }),
+            Self::SymbolContext { name, file } => {
+                file.as_ref().map(|path| ResourceTarget::Symbol {
                     path: path.clone(),
                     name: name.clone(),
-                },
-            )),
-            Self::SymbolContext { name, file } => file.as_ref().map(|path| {
-                (
-                    "get_symbol_context",
-                    ResourceTarget::Symbol {
-                        path: path.clone(),
-                        name: name.clone(),
-                    },
-                )
-            }),
+                })
+            }
             Self::RepoHealth
             | Self::RepoOutline
             | Self::RepoMap
@@ -180,27 +185,48 @@ impl SymForgeServer {
     ) -> Result<ReadResourceResult, McpError> {
         let request =
             parse_resource_uri(uri).map_err(|error| McpError::invalid_params(error, None))?;
+        let tool = request.outcome_tool();
         let target = request.target();
         let text = self
             .render_resource_text(request)
             .await
             .map_err(|error| McpError::invalid_params(error, None))?;
-        // A templated read whose target does not exist must not report success.
-        // The classifier only reads the rendered text, which a real file can
-        // imitate, so the miss stands only once the index confirms absence.
-        let missing = match target {
-            Some((tool, target))
-                if classify_compact_tool_output(tool, &text) == OutcomeClass::NotFound =>
-            {
-                self.resource_target_absent(target).await
+        if let Some(tool) = tool {
+            // The index could not serve, so nothing was read. Same shape the
+            // stdio front gives a resource read while the runtime is starting.
+            if is_index_unavailable_output(&text) {
+                let retryable = text.starts_with("Index is loading")
+                    || text.starts_with("Index refresh interrupted:");
+                return Err(McpError::internal_error(
+                    text,
+                    Some(serde_json::json!({
+                        "uri": uri,
+                        "reason": "index_unavailable",
+                        "retryable": retryable,
+                    })),
+                ));
             }
-            _ => false,
-        };
-        if missing {
-            return Err(McpError::resource_not_found(
-                text,
-                Some(serde_json::json!({ "uri": uri })),
-            ));
+            match classify_compact_tool_output(tool, &text) {
+                OutcomeClass::InvalidRequest => {
+                    return Err(McpError::invalid_params(
+                        text,
+                        Some(serde_json::json!({ "uri": uri })),
+                    ));
+                }
+                // The classifier only reads the rendered text, which a real file
+                // can imitate, so a miss stands only once the index confirms it.
+                OutcomeClass::NotFound => {
+                    if let Some(target) = target
+                        && self.resource_target_absent(target).await
+                    {
+                        return Err(McpError::resource_not_found(
+                            text,
+                            Some(serde_json::json!({ "uri": uri })),
+                        ));
+                    }
+                }
+                _ => {}
+            }
         }
 
         // FR-312 / INV-4 (spec 025): live per-workspace state behind bearer
@@ -216,6 +242,7 @@ impl SymForgeServer {
     /// Whether the index, after the read's own freshen, holds no such target.
     /// Asked through the content-free estimate lanes so a daemon-proxied
     /// session consults the daemon's index rather than its empty local one.
+    /// Both bypass the session cache, so a repeated read is answered afresh.
     async fn resource_target_absent(&self, target: ResourceTarget) -> bool {
         let path = match &target {
             ResourceTarget::File(path) | ResourceTarget::Symbol { path, .. } => path.clone(),
@@ -241,7 +268,7 @@ impl SymForgeServer {
                 offset: None,
                 limit: None,
                 max_tokens: None,
-                force_refresh: None,
+                force_refresh: Some(true),
             }))
             .await;
         if classify_compact_tool_output("get_file_content", &file) == OutcomeClass::NotFound {
@@ -273,7 +300,7 @@ impl SymForgeServer {
                 offset: None,
                 limit: None,
                 max_tokens: None,
-                force_refresh: None,
+                force_refresh: Some(true),
             }))
             .await;
         classify_compact_tool_output("get_file_content", &symbol) == OutcomeClass::NotFound
@@ -598,6 +625,18 @@ mod tests {
     use crate::watcher::WatcherInfo;
 
     fn make_server_with_file(path: &str, content: &[u8]) -> SymForgeServer {
+        make_server_with_file_in_state(
+            path,
+            content,
+            crate::live_index::store::SnapshotVerifyState::NotNeeded,
+        )
+    }
+
+    fn make_server_with_file_in_state(
+        path: &str,
+        content: &[u8],
+        snapshot_verify_state: crate::live_index::store::SnapshotVerifyState,
+    ) -> SymForgeServer {
         let byte_range = (0, 10);
         let symbol = SymbolRecord {
             name: "main".to_string(),
@@ -636,7 +675,7 @@ mod tests {
             cb_state: CircuitBreakerState::new(0.20),
             is_empty: false,
             load_source: crate::live_index::store::IndexLoadSource::FreshLoad,
-            snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
+            snapshot_verify_state,
             reverse_index: HashMap::new(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
@@ -829,6 +868,13 @@ mod tests {
                     ("name", Some("no_such_symbol".to_string())),
                 ],
             ),
+            build_uri(
+                "symforge://symbol/context",
+                &[
+                    ("name", Some("no_such_symbol".to_string())),
+                    ("file", Some("src/main.rs".to_string())),
+                ],
+            ),
         ];
         for uri in uris {
             let error = server
@@ -886,5 +932,71 @@ mod tests {
             other => panic!("expected text resource, got {other:?}"),
         };
         assert!(text.starts_with("No symbol "), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_read_existing_unreferenced_symbol_context_is_success() {
+        let server = make_server();
+        let uri = build_uri(
+            "symforge://symbol/context",
+            &[
+                ("name", Some("main".to_string())),
+                ("file", Some("src/main.rs".to_string())),
+            ],
+        );
+        let result = server
+            .read_resource_uri(&uri)
+            .await
+            .expect("an existing symbol with no references is a successful read");
+        let text = match &result.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text,
+            other => panic!("expected text resource, got {other:?}"),
+        };
+        assert!(text.contains("No references found"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_read_invalid_request_resource_is_invalid_params() {
+        let server = make_server();
+        let uri = build_uri(
+            "symforge://file/content",
+            &[
+                ("path", Some("src/main.rs".to_string())),
+                ("start_line", Some("5".to_string())),
+                ("end_line", Some("2".to_string())),
+            ],
+        );
+        let error = server
+            .read_resource_uri(&uri)
+            .await
+            .expect_err("an invalid request must not read as success");
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(error.data, Some(serde_json::json!({ "uri": uri })));
+    }
+
+    #[tokio::test]
+    async fn test_read_resource_while_index_loads_is_retryable_internal_error() {
+        let server = make_server_with_file_in_state(
+            "src/main.rs",
+            b"fn main() {}",
+            crate::live_index::store::SnapshotVerifyState::Pending,
+        );
+        let uri = build_uri(
+            "symforge://file/content",
+            &[("path", Some("src/main.rs".to_string()))],
+        );
+        let error = server
+            .read_resource_uri(&uri)
+            .await
+            .expect_err("a loading index must not read as success");
+        assert_eq!(error.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({
+                "uri": uri,
+                "reason": "index_unavailable",
+                "retryable": true,
+            }))
+        );
     }
 }
