@@ -4,6 +4,8 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTemplate};
 
 use super::SymForgeServer;
+use super::tools::{classify_compact_tool_output, is_index_unavailable_output};
+use crate::protocol::result_status::OutcomeClass;
 use crate::protocol::tools::{
     GetFileContentInput, GetFileContextInput, GetRepoMapInput, GetSymbolContextInput,
     GetSymbolInput, WhatChangedInput,
@@ -55,6 +57,61 @@ enum ResourceRequest {
         name: String,
         file: Option<String>,
     },
+}
+
+/// The indexed target a templated resource names, re-checked after a read
+/// renders a miss so content that merely LOOKS like a miss stays a success.
+enum ResourceTarget {
+    File(String),
+    Symbol {
+        path: String,
+        name: String,
+    },
+    /// A symbol named without a file, confirmed by the global name lookup.
+    Named(String),
+}
+
+impl ResourceRequest {
+    /// The tool whose rendered output answers this request, for the outcome
+    /// classifier. `None` for resources that report state rather than read it.
+    fn outcome_tool(&self) -> Option<&'static str> {
+        match self {
+            Self::RepoOutline | Self::RepoMap => Some("get_repo_map"),
+            Self::RepoChangesUncommitted => Some("what_changed"),
+            Self::FileContext { .. } => Some("get_file_context"),
+            Self::FileContent { .. } => Some("get_file_content"),
+            Self::SymbolDetail { .. } => Some("get_symbol"),
+            Self::SymbolContext { .. } => Some("get_symbol_context"),
+            Self::RepoHealth | Self::ToolsCatalog | Self::Glossary => None,
+        }
+    }
+
+    /// The target a templated resource names, whose absence a rendered miss
+    /// claims and the index must confirm.
+    fn target(&self) -> Option<ResourceTarget> {
+        match self {
+            Self::FileContext { path, .. } | Self::FileContent { path, .. } => {
+                Some(ResourceTarget::File(path.clone()))
+            }
+            Self::SymbolDetail { path, name, .. } => Some(ResourceTarget::Symbol {
+                path: path.clone(),
+                name: name.clone(),
+            }),
+            Self::SymbolContext { name, file } => Some(match file {
+                Some(path) => ResourceTarget::Symbol {
+                    path: path.clone(),
+                    name: name.clone(),
+                },
+                None => ResourceTarget::Named(name.clone()),
+            }),
+            Self::RepoHealth
+            | Self::RepoOutline
+            | Self::RepoMap
+            | Self::RepoChangesUncommitted
+            | Self::ToolsCatalog
+            | Self::Glossary => None,
+        }
+    }
 }
 
 impl SymForgeServer {
@@ -134,10 +191,49 @@ impl SymForgeServer {
     ) -> Result<ReadResourceResult, McpError> {
         let request =
             parse_resource_uri(uri).map_err(|error| McpError::invalid_params(error, None))?;
+        let tool = request.outcome_tool();
+        let target = request.target();
         let text = self
             .render_resource_text(request)
             .await
             .map_err(|error| McpError::invalid_params(error, None))?;
+        if let Some(tool) = tool {
+            // The index could not serve, so nothing was read. Same shape the
+            // stdio front gives a resource read while the runtime is starting.
+            if is_index_unavailable_output(&text) {
+                let retryable = text.starts_with("Index is loading")
+                    || text.starts_with("Index refresh interrupted:");
+                return Err(McpError::internal_error(
+                    text,
+                    Some(serde_json::json!({
+                        "uri": uri,
+                        "reason": "index_unavailable",
+                        "retryable": retryable,
+                    })),
+                ));
+            }
+            match classify_compact_tool_output(tool, &text) {
+                OutcomeClass::InvalidRequest => {
+                    return Err(McpError::invalid_params(
+                        text,
+                        Some(serde_json::json!({ "uri": uri })),
+                    ));
+                }
+                // The classifier only reads the rendered text, which a real file
+                // can imitate, so a miss stands only once the index confirms it.
+                OutcomeClass::NotFound => {
+                    if let Some(target) = target
+                        && self.resource_target_absent(target).await
+                    {
+                        return Err(McpError::resource_not_found(
+                            text,
+                            Some(serde_json::json!({ "uri": uri })),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
 
         // FR-312 / INV-4 (spec 025): live per-workspace state behind bearer
         // auth — never eligible for a shared cache, and any nonzero TTL would
@@ -147,6 +243,93 @@ impl SymForgeServer {
         ])
         .with_ttl_ms(0)
         .with_cache_scope(rmcp::model::CacheScope::Private))
+    }
+
+    /// Whether the index, after the read's own freshen, holds no such target.
+    /// Asked through the content-free estimate lanes so a daemon-proxied
+    /// session consults the daemon's index rather than its empty local one.
+    /// Both bypass the session cache, so a repeated read is answered afresh.
+    async fn resource_target_absent(&self, target: ResourceTarget) -> bool {
+        let path = match &target {
+            ResourceTarget::File(path) | ResourceTarget::Symbol { path, .. } => path.clone(),
+            // The name-only `get_symbol` lane is the index's global name lookup;
+            // its estimate renders no source, so a found symbol cannot imitate
+            // the miss.
+            ResourceTarget::Named(name) => {
+                let found = self
+                    .get_symbol(Parameters(GetSymbolInput {
+                        project: None,
+                        path: String::new(),
+                        name: name.clone(),
+                        kind: None,
+                        symbol_line: None,
+                        targets: None,
+                        estimate: Some(true),
+                        max_tokens: None,
+                        force_refresh: Some(true),
+                    }))
+                    .await;
+                return classify_compact_tool_output("get_symbol", &found)
+                    == OutcomeClass::NotFound;
+            }
+        };
+        let file = self
+            .get_file_content(Parameters(GetFileContentInput {
+                project: None,
+                path: path.clone(),
+                mode: None,
+                start_line: None,
+                end_line: None,
+                chunk_index: None,
+                max_lines: None,
+                around_line: None,
+                around_match: None,
+                match_occurrence: None,
+                around_symbol: None,
+                symbol_line: None,
+                context_lines: None,
+                show_line_numbers: None,
+                header: None,
+                estimate: Some(true),
+                offset: None,
+                limit: None,
+                max_tokens: None,
+                force_refresh: Some(true),
+            }))
+            .await;
+        if classify_compact_tool_output("get_file_content", &file) == OutcomeClass::NotFound {
+            return true;
+        }
+        let ResourceTarget::Symbol { name, .. } = target else {
+            return false;
+        };
+        // Line numbers prefix every served line, so a found symbol's source can
+        // never begin the answer and imitate the miss text.
+        let symbol = self
+            .get_file_content(Parameters(GetFileContentInput {
+                project: None,
+                path,
+                mode: None,
+                start_line: None,
+                end_line: None,
+                chunk_index: None,
+                max_lines: None,
+                around_line: None,
+                around_match: None,
+                match_occurrence: None,
+                around_symbol: Some(name),
+                symbol_line: None,
+                context_lines: Some(0),
+                show_line_numbers: Some(true),
+                header: None,
+                estimate: None,
+                offset: None,
+                limit: None,
+                max_tokens: None,
+                force_refresh: Some(true),
+            }))
+            .await;
+        classify_compact_tool_output("get_file_content", &symbol) == OutcomeClass::NotFound
     }
 
     async fn render_resource_text(&self, request: ResourceRequest) -> Result<String, String> {
@@ -468,36 +651,59 @@ mod tests {
     use crate::watcher::WatcherInfo;
 
     fn make_server_with_file(path: &str, content: &[u8]) -> SymForgeServer {
-        let byte_range = (0, 10);
-        let symbol = SymbolRecord {
-            name: "main".to_string(),
-            kind: SymbolKind::Function,
-            depth: 0,
-            sort_order: 0,
-            byte_range,
-            item_byte_range: Some(byte_range),
-            line_range: (
-                1,
-                content.iter().filter(|&&byte| byte == b'\n').count() as u32 + 1,
-            ),
-            doc_byte_range: None,
-        };
-        let file = IndexedFile {
-            relative_path: path.to_string(),
-            language: LanguageId::Rust,
-            classification: crate::domain::FileClassification::for_code_path(path),
-            content: content.to_vec(),
-            symbols: vec![symbol],
-            parse_status: ParseStatus::Parsed,
-            parse_diagnostic: None,
-            byte_len: content.len() as u64,
-            content_hash: "test".to_string(),
-            references: vec![],
-            alias_map: HashMap::new(),
-            mtime_secs: 0,
-        };
+        make_server_with_file_in_state(
+            path,
+            content,
+            crate::live_index::store::SnapshotVerifyState::NotNeeded,
+        )
+    }
+
+    fn make_server_with_file_in_state(
+        path: &str,
+        content: &[u8],
+        snapshot_verify_state: crate::live_index::store::SnapshotVerifyState,
+    ) -> SymForgeServer {
+        make_server_with_files(&[(path, content, "main")], snapshot_verify_state)
+    }
+
+    /// One indexed file per `(path, content, symbol)`, each defining one
+    /// function symbol over its first ten bytes.
+    fn make_server_with_files(
+        entries: &[(&str, &[u8], &str)],
+        snapshot_verify_state: crate::live_index::store::SnapshotVerifyState,
+    ) -> SymForgeServer {
         let mut files = HashMap::new();
-        files.insert(path.to_string(), std::sync::Arc::new(file));
+        for (path, content, name) in entries {
+            let byte_range = (0, 10);
+            let symbol = SymbolRecord {
+                name: name.to_string(),
+                kind: SymbolKind::Function,
+                depth: 0,
+                sort_order: 0,
+                byte_range,
+                item_byte_range: Some(byte_range),
+                line_range: (
+                    1,
+                    content.iter().filter(|&&byte| byte == b'\n').count() as u32 + 1,
+                ),
+                doc_byte_range: None,
+            };
+            let file = IndexedFile {
+                relative_path: path.to_string(),
+                language: LanguageId::Rust,
+                classification: crate::domain::FileClassification::for_code_path(path),
+                content: content.to_vec(),
+                symbols: vec![symbol],
+                parse_status: ParseStatus::Parsed,
+                parse_diagnostic: None,
+                byte_len: content.len() as u64,
+                content_hash: "test".to_string(),
+                references: vec![],
+                alias_map: HashMap::new(),
+                mtime_secs: 0,
+            };
+            files.insert(path.to_string(), std::sync::Arc::new(file));
+        }
         let mut index = LiveIndex {
             files,
             loaded_at: Instant::now(),
@@ -506,7 +712,7 @@ mod tests {
             cb_state: CircuitBreakerState::new(0.20),
             is_empty: false,
             load_source: crate::live_index::store::IndexLoadSource::FreshLoad,
-            snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
+            snapshot_verify_state,
             reverse_index: HashMap::new(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
@@ -671,5 +877,279 @@ mod tests {
             other => panic!("expected text resource, got {other:?}"),
         };
         assert_eq!(text, "1: line 1\n2: TODO first\n3: line 3");
+    }
+
+    #[tokio::test]
+    async fn test_read_templated_resource_for_missing_target_is_resource_not_found() {
+        let server = make_server();
+        let uris = [
+            build_uri(
+                "symforge://file/content",
+                &[("path", Some("src/missing.rs".to_string()))],
+            ),
+            build_uri(
+                "symforge://file/context",
+                &[("path", Some("src/missing.rs".to_string()))],
+            ),
+            build_uri(
+                "symforge://symbol/detail",
+                &[
+                    ("path", Some("src/missing.rs".to_string())),
+                    ("name", Some("main".to_string())),
+                ],
+            ),
+            build_uri(
+                "symforge://symbol/detail",
+                &[
+                    ("path", Some("src/main.rs".to_string())),
+                    ("name", Some("no_such_symbol".to_string())),
+                ],
+            ),
+            build_uri(
+                "symforge://symbol/context",
+                &[
+                    ("name", Some("no_such_symbol".to_string())),
+                    ("file", Some("src/main.rs".to_string())),
+                ],
+            ),
+        ];
+        for uri in uris {
+            let error = server
+                .read_resource_uri(&uri)
+                .await
+                .expect_err("missing target must not read as success");
+            assert_eq!(
+                error.code,
+                rmcp::model::ErrorCode::RESOURCE_NOT_FOUND,
+                "{uri}"
+            );
+            assert_eq!(error.data, Some(serde_json::json!({ "uri": uri })));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_existing_file_whose_content_looks_like_a_miss_is_success() {
+        let server = make_server_with_file("src/main.rs", b"File not found: decoy");
+        let uri = build_uri(
+            "symforge://file/content",
+            &[
+                ("path", Some("src/main.rs".to_string())),
+                ("show_line_numbers", Some("false".to_string())),
+                ("header", Some("false".to_string())),
+            ],
+        );
+        let result = server
+            .read_resource_uri(&uri)
+            .await
+            .expect("an existing file is never resource-not-found");
+        let text = match &result.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text,
+            other => panic!("expected text resource, got {other:?}"),
+        };
+        assert_eq!(text, "File not found: decoy");
+    }
+
+    #[tokio::test]
+    async fn test_read_existing_symbol_whose_body_looks_like_a_miss_is_success() {
+        // The fixture symbol `main` spans bytes 0..10, so its body is `No symbol `.
+        let server = make_server_with_file("src/main.rs", b"No symbol here");
+        let uri = build_uri(
+            "symforge://symbol/detail",
+            &[
+                ("path", Some("src/main.rs".to_string())),
+                ("name", Some("main".to_string())),
+            ],
+        );
+        let result = server
+            .read_resource_uri(&uri)
+            .await
+            .expect("an existing symbol is never resource-not-found");
+        let text = match &result.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text,
+            other => panic!("expected text resource, got {other:?}"),
+        };
+        assert!(text.starts_with("No symbol "), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_read_existing_unreferenced_symbol_context_is_success() {
+        let server = make_server();
+        let uri = build_uri(
+            "symforge://symbol/context",
+            &[
+                ("name", Some("main".to_string())),
+                ("file", Some("src/main.rs".to_string())),
+            ],
+        );
+        let result = server
+            .read_resource_uri(&uri)
+            .await
+            .expect("an existing symbol with no references is a successful read");
+        let text = match &result.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text,
+            other => panic!("expected text resource, got {other:?}"),
+        };
+        assert!(text.contains("No references found"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_read_invalid_request_resource_is_invalid_params() {
+        let server = make_server();
+        let uri = build_uri(
+            "symforge://file/content",
+            &[
+                ("path", Some("src/main.rs".to_string())),
+                ("start_line", Some("5".to_string())),
+                ("end_line", Some("2".to_string())),
+            ],
+        );
+        let error = server
+            .read_resource_uri(&uri)
+            .await
+            .expect_err("an invalid request must not read as success");
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(error.data, Some(serde_json::json!({ "uri": uri })));
+    }
+
+    #[tokio::test]
+    async fn test_read_resource_while_index_loads_is_retryable_internal_error() {
+        let server = make_server_with_file_in_state(
+            "src/main.rs",
+            b"fn main() {}",
+            crate::live_index::store::SnapshotVerifyState::Pending,
+        );
+        let uri = build_uri(
+            "symforge://file/content",
+            &[("path", Some("src/main.rs".to_string()))],
+        );
+        let error = server
+            .read_resource_uri(&uri)
+            .await
+            .expect_err("a loading index must not read as success");
+        assert_eq!(error.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({
+                "uri": uri,
+                "reason": "index_unavailable",
+                "retryable": true,
+            }))
+        );
+    }
+
+    /// `file` filters which references are shown; it does not name the
+    /// symbol's location. A symbol defined in another file and unreferenced
+    /// in the filtered one is "No references found", through the tool and the
+    /// resource alike. A name defined nowhere is the miss.
+    #[tokio::test]
+    async fn test_symbol_context_file_filter_misses_only_a_symbol_defined_nowhere() {
+        let server = make_server_with_files(
+            &[
+                ("src/a.rs", b"fn helper() {}", "helper"),
+                ("src/b.rs", b"fn other() {}", "other"),
+            ],
+            crate::live_index::store::SnapshotVerifyState::NotNeeded,
+        );
+        let tool = server
+            .get_symbol_context(Parameters(GetSymbolContextInput {
+                project: None,
+                name: "helper".to_string(),
+                file: Some("src/b.rs".to_string()),
+                path: None,
+                symbol_kind: None,
+                symbol_line: None,
+                verbosity: None,
+                bundle: None,
+                sections: None,
+                max_tokens: None,
+                estimate: None,
+            }))
+            .await;
+        assert!(tool.contains("No references found"), "{tool}");
+        let defined_elsewhere = build_uri(
+            "symforge://symbol/context",
+            &[
+                ("name", Some("helper".to_string())),
+                ("file", Some("src/b.rs".to_string())),
+            ],
+        );
+        let result = server
+            .read_resource_uri(&defined_elsewhere)
+            .await
+            .expect("a symbol defined elsewhere is not a miss");
+        let text = match &result.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text,
+            other => panic!("expected text resource, got {other:?}"),
+        };
+        assert!(text.contains("No references found"), "{text}");
+        let nowhere = build_uri(
+            "symforge://symbol/context",
+            &[
+                ("name", Some("defined_nowhere".to_string())),
+                ("file", Some("src/b.rs".to_string())),
+            ],
+        );
+        let error = server
+            .read_resource_uri(&nowhere)
+            .await
+            .expect_err("a name defined nowhere is a miss");
+        assert_eq!(error.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+    }
+
+    /// A name-only symbol context: a name defined nowhere is a miss through the
+    /// tool outcome and the resource; an existing unreferenced symbol is not.
+    #[tokio::test]
+    async fn test_name_only_symbol_context_misses_only_a_symbol_defined_nowhere() {
+        let server = make_server();
+        let input = |name: &str| GetSymbolContextInput {
+            project: None,
+            name: name.to_string(),
+            file: None,
+            path: None,
+            symbol_kind: None,
+            symbol_line: None,
+            verbosity: None,
+            bundle: None,
+            sections: None,
+            max_tokens: None,
+            estimate: None,
+        };
+        let tool = server
+            .get_symbol_context(Parameters(input("defined_nowhere")))
+            .await;
+        assert_eq!(
+            classify_compact_tool_output("get_symbol_context", &tool),
+            OutcomeClass::NotFound,
+            "{tool}"
+        );
+        let nowhere = build_uri(
+            "symforge://symbol/context",
+            &[("name", Some("defined_nowhere".to_string()))],
+        );
+        let error = server
+            .read_resource_uri(&nowhere)
+            .await
+            .expect_err("a name defined nowhere is a miss");
+        assert_eq!(error.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+
+        let tool = server.get_symbol_context(Parameters(input("main"))).await;
+        assert_eq!(
+            classify_compact_tool_output("get_symbol_context", &tool),
+            OutcomeClass::Found,
+            "{tool}"
+        );
+        let existing = build_uri(
+            "symforge://symbol/context",
+            &[("name", Some("main".to_string()))],
+        );
+        let result = server
+            .read_resource_uri(&existing)
+            .await
+            .expect("an existing unreferenced symbol is a successful read");
+        let text = match &result.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text,
+            other => panic!("expected text resource, got {other:?}"),
+        };
+        assert!(text.contains("No references found"), "{text}");
     }
 }

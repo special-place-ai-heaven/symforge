@@ -1160,6 +1160,24 @@ pub(crate) fn capture_trace_symbol_view(
     trace_view
 }
 
+/// Whether any indexed file defines the selected symbol (name, plus kind and
+/// line when given), by the same selector every exact lane resolves with.
+// ponytail: linear scan over files, only on the empty-answer path; a name index if it grows hot.
+pub(crate) fn symbol_defined_anywhere(
+    index: &crate::live_index::LiveIndex,
+    name: &str,
+    symbol_kind: Option<&str>,
+    symbol_line: Option<u32>,
+) -> bool {
+    use crate::live_index::query::{SymbolSelectorMatch, resolve_symbol_selector};
+    index.all_files().any(|(_, file)| {
+        !matches!(
+            resolve_symbol_selector(file, name, symbol_kind, symbol_line),
+            SymbolSelectorMatch::NotFound
+        )
+    })
+}
+
 pub(crate) struct SymbolContextSelector<'a> {
     pub name: &'a str,
     pub file: Option<&'a str>,
@@ -1227,6 +1245,21 @@ pub(crate) fn symbol_context_references(
             enclosing,
         ));
         total += 1;
+    }
+
+    // Without an exact `path`, an empty answer is a miss only when the selected
+    // symbol exists nowhere in the index. A symbol defined somewhere but not
+    // referenced (in the `file` filter, when given) is "No references found",
+    // and references to an undefined name are still shown.
+    if map.is_empty()
+        && params.path.is_none()
+        && !symbol_defined_anywhere(guard, params.name, params.symbol_kind, params.symbol_line)
+    {
+        return (
+            format!("Symbol \"{}\" not found in index.", params.name),
+            0,
+            0,
+        );
     }
 
     // Compute total bytes for savings (sum of content of all matched files).

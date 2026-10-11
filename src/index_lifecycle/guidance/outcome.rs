@@ -120,7 +120,11 @@ pub(crate) fn classify_get_symbol_context_output(text: &str) -> OutcomeClass {
         OutcomeClass::InvalidRequest
     } else if text.starts_with("Ambiguous symbol selector") || text.starts_with("Ambiguous:") {
         OutcomeClass::Ambiguous
-    } else if text.starts_with("Symbol \"") || text.starts_with("Symbol '") {
+    } else if text.starts_with("Symbol \"")
+        || text.starts_with("Symbol '")
+        || text.starts_with("Symbol not found in ")
+        || text.starts_with("File not found:")
+    {
         OutcomeClass::NotFound
     } else {
         OutcomeClass::Found
