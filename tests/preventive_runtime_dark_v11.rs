@@ -1135,9 +1135,9 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // feature-neutral and delegating to the shared runtime:
 // stel/{controller,executor,planner,runtime}.rs.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "71e8dfeb6c9586c7b10a31a572332b9ce943c57e273834a74359ce7cfe99a49f",
+    "4b4a8db143050e2987b9f6569d4952d953dba01779c26e7b31c55b4384cc5c66",
     89,
-    2_164_970,
+    2_173_953,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1287,9 +1287,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // stel/{controller,executor,planner,runtime}.rs. Trust-mode host option; no new
 // boundary edge.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "fbaaead51afcdac1b5ddc80b839a54ea52c1f8ab0c48d249bf358802001f51e3",
+    "84767eb90fac83a7f52ffc96ddbe7673843fb02f8bb3d5f951600ed9f34265a5",
     312,
-    11_881_016,
+    11_910_586,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

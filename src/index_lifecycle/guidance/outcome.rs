@@ -140,6 +140,17 @@ pub(crate) fn strip_mode_annotation(text: &str) -> &str {
         .map(|(_, body)| body)
         .unwrap_or(text)
 }
+/// The one shape the read renderers emit for a refused selection:
+/// `{path} [error: {reason}]`, alone on a single line (`file_read.rs`,
+/// `guidance/read_gate.rs`, `protocol/read_gate.rs`). Anchored on that whole
+/// shape, not on a bare `[error:` substring, which ordinary source contains.
+/// A one-line raw read whose content has exactly this shape is still
+/// ambiguous here; `get_file_content` carries a typed outcome so its own status
+/// never depends on this.
+fn is_path_error_line(body: &str) -> bool {
+    !body.contains('\n') && body.ends_with(']') && body.find(" [error: ").is_some_and(|at| at > 0)
+}
+
 pub(crate) fn classify_get_file_content_output(text: &str) -> OutcomeClass {
     // Strip an optional `── mode: <name> (explicit) ──` prefix so the renderer's
     // status message is matched at the start of `body` even when an explicit-mode
@@ -151,7 +162,7 @@ pub(crate) fn classify_get_file_content_output(text: &str) -> OutcomeClass {
     } else if is_error_output(text)
         || text.starts_with("Invalid get_file_content request:")
         || text.starts_with("mode=")
-        || text.contains("[error:")
+        || is_path_error_line(body)
         || body.starts_with("Path is outside the repository root:")
         || (body.starts_with("Chunk ") && body.contains(" out of range for "))
     {
@@ -305,4 +316,212 @@ pub(crate) fn classify_compact_tool_output(tool: &str, text: &str) -> OutcomeCla
 /// Whether a legacy tool body represents successful serve output for STEL chain continuation.
 pub(crate) fn compact_tool_output_is_success(tool: &str, text: &str) -> bool {
     classify_compact_tool_output(tool, text) == OutcomeClass::Found
+}
+
+/// One table of resource reads, run through MCP (`resources/read` and the
+/// matching `tools/call`) and through the embedded room (resource and query),
+/// so both surfaces are held to the same expected outcome class.
+#[cfg(test)]
+pub(crate) mod read_outcome_cases {
+    use super::OutcomeClass;
+
+    /// The fixture workspace every case reads.
+    pub(crate) const FILES: &[(&str, &str)] = &[
+        (
+            "src/lib.rs",
+            "pub fn alpha() -> u32 {\n    let marker = \"x [error: not an error]\";\n    1\n}\n\npub fn caller() -> u32 {\n    alpha()\n}\n",
+        ),
+        ("src/other.rs", "pub fn beta() {}\n"),
+        (
+            "notes/error.txt",
+            "Error: this file starts like an error\nsecond line\n",
+        ),
+        ("notes/loading.txt", "Index is loading... not really\n"),
+        (
+            "notes/bracket.txt",
+            "notes/bracket.txt [error: imitation]\n",
+        ),
+        ("notes/miss.txt", "File not found: decoy\nNo symbol here\n"),
+    ];
+
+    pub(crate) enum Read {
+        /// `raw` turns header and line numbers off so the content leads.
+        Content {
+            path: &'static str,
+            raw: bool,
+            around_match: Option<&'static str>,
+            match_occurrence: Option<u32>,
+            start_line: Option<u32>,
+        },
+        Context {
+            path: &'static str,
+        },
+        Symbol {
+            path: &'static str,
+            name: &'static str,
+            kind: Option<&'static str>,
+        },
+        SymbolContext {
+            name: &'static str,
+            file: Option<&'static str>,
+        },
+    }
+
+    pub(crate) struct Case {
+        pub label: &'static str,
+        pub read: Read,
+        pub expected: OutcomeClass,
+    }
+
+    const fn content(path: &'static str, raw: bool) -> Read {
+        Read::Content {
+            path,
+            raw,
+            around_match: None,
+            match_occurrence: None,
+            start_line: None,
+        }
+    }
+
+    pub(crate) const CASES: &[Case] = &[
+        Case {
+            label: "mid-content [error: with header and line numbers",
+            read: content("src/lib.rs", false),
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "mid-content [error: raw",
+            read: content("src/lib.rs", true),
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "leading Error: raw",
+            read: content("notes/error.txt", true),
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "leading Index is loading raw",
+            read: content("notes/loading.txt", true),
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "leading path [error: line raw",
+            read: content("notes/bracket.txt", true),
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "leading File not found: and No symbol raw",
+            read: content("notes/miss.txt", true),
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "missing file",
+            read: content("src/missing.rs", false),
+            expected: OutcomeClass::NotFound,
+        },
+        Case {
+            label: "around_match miss",
+            read: Read::Content {
+                path: "src/lib.rs",
+                raw: false,
+                around_match: Some("zzzz-no-such-text"),
+                match_occurrence: None,
+                start_line: None,
+            },
+            expected: OutcomeClass::NotFound,
+        },
+        Case {
+            label: "match_occurrence past the count",
+            read: Read::Content {
+                path: "src/lib.rs",
+                raw: false,
+                around_match: Some("alpha"),
+                match_occurrence: Some(9),
+                start_line: None,
+            },
+            expected: OutcomeClass::NotFound,
+        },
+        Case {
+            label: "bad line range",
+            read: Read::Content {
+                path: "src/lib.rs",
+                raw: false,
+                around_match: None,
+                match_occurrence: None,
+                start_line: Some(99),
+            },
+            expected: OutcomeClass::InvalidRequest,
+        },
+        Case {
+            label: "file context of an existing file",
+            read: Read::Context { path: "src/lib.rs" },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "file context of a missing file",
+            read: Read::Context {
+                path: "src/missing.rs",
+            },
+            expected: OutcomeClass::NotFound,
+        },
+        Case {
+            label: "symbol detail with the right kind",
+            read: Read::Symbol {
+                path: "src/lib.rs",
+                name: "alpha",
+                kind: Some("fn"),
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "symbol detail with a non-matching kind",
+            read: Read::Symbol {
+                path: "src/lib.rs",
+                name: "alpha",
+                kind: Some("struct"),
+            },
+            expected: OutcomeClass::NotFound,
+        },
+        Case {
+            label: "symbol detail in a missing file",
+            read: Read::Symbol {
+                path: "src/missing.rs",
+                name: "alpha",
+                kind: None,
+            },
+            expected: OutcomeClass::NotFound,
+        },
+        Case {
+            label: "name-only symbol context of an unreferenced symbol",
+            read: Read::SymbolContext {
+                name: "caller",
+                file: None,
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "name-only symbol context of a name defined nowhere",
+            read: Read::SymbolContext {
+                name: "defined_nowhere",
+                file: None,
+            },
+            expected: OutcomeClass::NotFound,
+        },
+        Case {
+            label: "file-filtered symbol context of a symbol defined elsewhere",
+            read: Read::SymbolContext {
+                name: "alpha",
+                file: Some("src/other.rs"),
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "file-filtered symbol context of a name defined nowhere",
+            read: Read::SymbolContext {
+                name: "defined_nowhere",
+                file: Some("src/other.rs"),
+            },
+            expected: OutcomeClass::NotFound,
+        },
+    ];
 }

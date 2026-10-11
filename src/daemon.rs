@@ -2797,6 +2797,15 @@ impl DaemonSessionClient {
         } else {
             None
         };
+        let read_outcome = response
+            .headers()
+            .get(crate::protocol::result_status::READ_OUTCOME_HEADER)
+            .and_then(|header| {
+                serde_json::from_slice::<crate::protocol::result_status::ReadOutcome>(
+                    header.as_bytes(),
+                )
+                .ok()
+            });
 
         let body = response
             .text()
@@ -2808,6 +2817,9 @@ impl DaemonSessionClient {
         // fallback or a later retry in the same dispatch scope.
         if let Some(evidence) = project_evidence {
             crate::protocol::result_status::record_project_evidence(evidence);
+        }
+        if let Some(outcome) = read_outcome {
+            crate::protocol::result_status::record_read_outcome(outcome);
         }
         Ok(body)
     }
@@ -5674,25 +5686,33 @@ async fn call_tool_handler(
                 handle.block_on(crate::protocol::result_status::with_project_evidence_scope(
                     initial_call_evidence,
                     async move {
-                        let result = crate::protocol::surface_probe::with_connection_surface(
-                            connection_surface,
-                            execute_tool_call(runtime, &tool_name_owned, params),
-                        )
-                        .await;
+                        // A read tool's typed outcome rides back out-of-band
+                        // beside the evidence receipt (`READ_OUTCOME_HEADER`).
+                        let (result, outcome) =
+                            crate::protocol::result_status::with_read_outcome_scope(
+                                crate::protocol::surface_probe::with_connection_surface(
+                                    connection_surface,
+                                    execute_tool_call(runtime, &tool_name_owned, params),
+                                ),
+                            )
+                            .await;
                         let evidence = crate::protocol::result_status::current_project_evidence();
-                        (result, evidence)
+                        (result, (evidence, outcome))
                     },
                 ))
             })
             .await
             {
                 Ok(result) => result,
-                Err(join_err) => (Err(anyhow::anyhow!("tool task panicked: {join_err}")), None),
+                Err(join_err) => (
+                    Err(anyhow::anyhow!("tool task panicked: {join_err}")),
+                    (None, None),
+                ),
             }
         })
         .await
     {
-        Ok((Ok(mut result), mut response_evidence)) => {
+        Ok((Ok(mut result), (mut response_evidence, read_outcome))) => {
             // Task 7: `health`/`health_compact` gain the session's open-project
             // inventory once MORE than one project is open. Single-project
             // sessions stay byte-identical.
@@ -5736,6 +5756,14 @@ async fn call_tool_handler(
                     crate::protocol::result_status::PROJECT_EVIDENCE_HEADER,
                     value,
                 );
+            }
+            if let Some(outcome) = read_outcome
+                && let Ok(json) = serde_json::to_string(&outcome)
+                && let Ok(value) = axum::http::HeaderValue::try_from(json)
+            {
+                response
+                    .headers_mut()
+                    .insert(crate::protocol::result_status::READ_OUTCOME_HEADER, value);
             }
             Ok(response)
         }

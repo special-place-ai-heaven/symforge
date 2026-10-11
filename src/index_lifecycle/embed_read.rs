@@ -128,17 +128,11 @@ fn admit_in(
     Ok(())
 }
 fn selected_range(file: &IndexedFile, context: &ContentContext) -> Result<(), QueryRefusalKind> {
-    if let Some(name) = context.around_symbol.as_deref() {
-        file_read::resolve_around_symbol_range(file, name, context.symbol_line).map_err(
-            |error| match error {
-                file_read::AroundSymbolResolutionError::Ambiguous(_) => {
-                    QueryRefusalKind::AmbiguousSymbol
-                }
-                _ => QueryRefusalKind::NotFound,
-            },
-        )?;
-    }
-    selected_content_range(&file.content, context)
+    selection_refusal(file_read::content_selection(
+        Some(file),
+        &file.content,
+        context,
+    ))
 }
 
 /// Check the exact admitted file before reusing indexed source or session output.
@@ -186,30 +180,18 @@ fn selected_content_range(
     content: &[u8],
     context: &ContentContext,
 ) -> Result<(), QueryRefusalKind> {
-    let text = String::from_utf8_lossy(content);
-    let lines: Vec<&str> = text.lines().collect();
-    let count = lines.len() as u32;
-    if context.start_line.is_some_and(|line| line > count)
-        || context.around_line.is_some_and(|line| line > count)
-    {
-        return Err(QueryRefusalKind::InvalidRequest);
-    }
-    if let Some(chunk) = context.chunk_index {
-        let max_lines = context.max_lines.ok_or(QueryRefusalKind::InvalidRequest)?;
-        if max_lines == 0 || chunk == 0 || chunk > count.div_ceil(max_lines) {
-            return Err(QueryRefusalKind::InvalidRequest);
-        }
-    }
-    if let Some(query) = &context.around_match {
-        let matches = file_read::find_case_insensitive_match_lines(&lines, query);
-        if matches
-            .get(context.match_occurrence.unwrap_or(1).saturating_sub(1) as usize)
-            .is_none()
-        {
-            return Err(QueryRefusalKind::NotFound);
-        }
-    }
-    Ok(())
+    selection_refusal(file_read::content_selection(None, content, context))
+}
+
+/// The shared selection outcome as this lane's typed refusal.
+fn selection_refusal(
+    selection: Result<(), file_read::ContentSelectionMiss>,
+) -> Result<(), QueryRefusalKind> {
+    selection.map_err(|miss| match miss {
+        file_read::ContentSelectionMiss::NotFound => QueryRefusalKind::NotFound,
+        file_read::ContentSelectionMiss::Ambiguous => QueryRefusalKind::AmbiguousSymbol,
+        file_read::ContentSelectionMiss::Invalid => QueryRefusalKind::InvalidRequest,
+    })
 }
 /// MCP `validate_file_syntax`'s authoritative disk-parse lane: the file is
 /// unindexed, or its freshen did not publish. The bytes on disk right now are

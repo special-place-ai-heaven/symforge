@@ -359,7 +359,9 @@ pub fn search_files(index: &LiveIndex, query: &str, limit: usize) -> String {
 
 pub use crate::index_lifecycle::guidance::search_render::search_files_result_view;
 
-pub(crate) use crate::index_lifecycle::guidance::file_read::render_file_content_bytes;
+pub(crate) use crate::index_lifecycle::guidance::file_read::{
+    ContentSelectionMiss, content_selection, render_file_content_bytes,
+};
 pub use crate::index_lifecycle::guidance::file_read::{
     GET_FILE_CONTENT_MAX_BYTES, append_nul_byte_warning, cap_file_content_output, file_content,
     file_content_from_indexed_file, file_content_from_indexed_file_with_context, file_content_view,
@@ -516,6 +518,7 @@ pub use crate::index_lifecycle::guidance::reference_read::{
 
 #[cfg(test)]
 use crate::index_lifecycle::guidance::source::extract_signature;
+pub(crate) use crate::index_lifecycle::guidance::symbol_context::symbol_defined_anywhere;
 #[cfg(test)]
 use crate::index_lifecycle::guidance::symbol_context::{
     apply_verbosity, auto_summarize, format_type_dependencies, heuristic_from_name,

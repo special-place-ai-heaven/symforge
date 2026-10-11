@@ -354,6 +354,65 @@ pub(crate) enum AroundSymbolResolutionError {
     Ambiguous(Vec<u32>),
 }
 
+/// Why a content selection selects nothing from a file that exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContentSelectionMiss {
+    /// The selector names something the file does not hold (an
+    /// `around_symbol`, `around_match`, or `match_occurrence` miss).
+    NotFound,
+    /// An `around_symbol` selector matches more than one symbol.
+    Ambiguous,
+    /// The request cannot select from this file (a line past its end, a chunk
+    /// out of range, a chunk read without `max_lines`).
+    Invalid,
+}
+
+/// The typed outcome of applying `context` to an existing file, decided in the
+/// order the renderers apply it. MCP and the embedded host both read their
+/// outcome from here, never from the rendered text. `file` is the indexed
+/// record when there is one; an unindexed file has no symbols to select.
+pub(crate) fn content_selection(
+    file: Option<&IndexedFile>,
+    content: &[u8],
+    context: &search::ContentContext,
+) -> Result<(), ContentSelectionMiss> {
+    if let Some(name) = context.around_symbol.as_deref() {
+        let Some(file) = file else {
+            return Err(ContentSelectionMiss::NotFound);
+        };
+        return match resolve_around_symbol_range(file, name, context.symbol_line) {
+            Ok(_) => Ok(()),
+            Err(AroundSymbolResolutionError::Ambiguous(_)) => Err(ContentSelectionMiss::Ambiguous),
+            Err(_) => Err(ContentSelectionMiss::NotFound),
+        };
+    }
+    let text = String::from_utf8_lossy(content);
+    let lines: Vec<&str> = text.lines().collect();
+    let count = lines.len() as u32;
+    if let Some(chunk) = context.chunk_index {
+        let max_lines = context.max_lines.ok_or(ContentSelectionMiss::Invalid)?;
+        if max_lines == 0 || chunk == 0 || chunk > count.div_ceil(max_lines) {
+            return Err(ContentSelectionMiss::Invalid);
+        }
+        return Ok(());
+    }
+    if let Some(query) = context.around_match.as_deref() {
+        let matches = find_case_insensitive_match_lines(&lines, query);
+        let occurrence = context.match_occurrence.unwrap_or(1).saturating_sub(1) as usize;
+        return if matches.get(occurrence).is_some() {
+            Ok(())
+        } else {
+            Err(ContentSelectionMiss::NotFound)
+        };
+    }
+    if context.start_line.is_some_and(|line| line > count)
+        || context.around_line.is_some_and(|line| line > count)
+    {
+        return Err(ContentSelectionMiss::Invalid);
+    }
+    Ok(())
+}
+
 /// Resolve an `around_symbol` selector to the symbol's full 1-indexed line range
 /// `(start_line, end_line)`.  Both bounds are inclusive.
 pub(crate) fn resolve_around_symbol_range(

@@ -27,7 +27,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::capability::WorktreeRoutingPolicy;
-use crate::protocol::result_status::{OutcomeClass, ResultStatus};
+use crate::protocol::result_status::{
+    OutcomeClass, ReadOutcome, ResultStatus, record_read_outcome, with_read_outcome_scope,
+};
 
 #[cfg(test)]
 use super::edit_tools::{EditError, prepare_batch_paths_for_edit, prepare_exact_path_for_edit};
@@ -1333,6 +1335,58 @@ fn loading_guard_message_from_published(
     }
 }
 
+/// The typed outcome of an index that cannot serve: a load in progress can
+/// answer shortly; an empty or degraded index will not without intervention.
+pub(crate) fn unavailable_outcome(
+    published: &crate::live_index::PublishedIndexState,
+) -> ReadOutcome {
+    ReadOutcome::Unavailable {
+        retryable: published.status == crate::live_index::PublishedIndexStatus::Loading,
+    }
+}
+
+/// Default-mode `get_symbol_context`, decided from the index the answer is
+/// rendered from: an exact `path` resolves the full selector in that file;
+/// otherwise the symbol is missing only when no file defines it and nothing
+/// (in the `file` filter, when given) references the name.
+fn default_symbol_context_outcome(index: &LiveIndex, input: &GetSymbolContextInput) -> ReadOutcome {
+    use crate::live_index::query::{SymbolSelectorMatch, resolve_symbol_selector};
+    let kind = input.symbol_kind.as_deref();
+    if let Some(path) = input.path.as_deref() {
+        let Some(file) = index.get_file(path) else {
+            return ReadOutcome::NotFound;
+        };
+        return match resolve_symbol_selector(file, &input.name, kind, input.symbol_line) {
+            SymbolSelectorMatch::Selected(..) => ReadOutcome::Found,
+            SymbolSelectorMatch::NotFound => ReadOutcome::NotFound,
+            SymbolSelectorMatch::Ambiguous(_) => ReadOutcome::Ambiguous,
+        };
+    }
+    let defined = format::symbol_defined_anywhere(index, &input.name, kind, input.symbol_line);
+    let referenced = || {
+        index
+            .find_references_for_name(&input.name, None, false)
+            .iter()
+            .any(|(file_path, _)| input.file.as_deref().is_none_or(|file| *file_path == file))
+    };
+    if defined || referenced() {
+        ReadOutcome::Found
+    } else {
+        ReadOutcome::NotFound
+    }
+}
+
+/// A content selection on an existing file as a typed read outcome.
+fn selection_outcome(selection: Result<(), format::ContentSelectionMiss>) -> ReadOutcome {
+    use format::ContentSelectionMiss;
+    match selection {
+        Ok(()) => ReadOutcome::Found,
+        Err(ContentSelectionMiss::NotFound) => ReadOutcome::NotFound,
+        Err(ContentSelectionMiss::Ambiguous) => ReadOutcome::Ambiguous,
+        Err(ContentSelectionMiss::Invalid) => ReadOutcome::InvalidRequest,
+    }
+}
+
 use crate::index_lifecycle::guidance::symbol_read::SymbolNameLookup;
 
 #[tool_router(router = core_tool_router, vis = "pub(crate)")]
@@ -1373,8 +1427,10 @@ impl SymForgeServer {
         params: Parameters<GetSymbolInput>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
-        let output = self.get_symbol(params).await;
-        let outcome_class = classify_get_symbol_output(&output);
+        let (output, outcome) = with_read_outcome_scope(self.get_symbol(params)).await;
+        let outcome_class = outcome
+            .map(ReadOutcome::class)
+            .unwrap_or_else(|| classify_get_symbol_output(&output));
         self.record_tool_completion("get_symbol", &output, started.elapsed(), outcome_class);
         statused_tool_result(output, outcome_class)
     }
@@ -1525,9 +1581,11 @@ impl SymForgeServer {
                 }
                 SymbolNameLookup::Ambiguous(message, candidates) => {
                     debug_assert!(candidates.len() > 1);
+                    record_read_outcome(ReadOutcome::Ambiguous);
                     return message;
                 }
                 SymbolNameLookup::NotFound(message) => {
+                    record_read_outcome(ReadOutcome::NotFound);
                     return message;
                 }
             }
@@ -1542,6 +1600,7 @@ impl SymForgeServer {
         // this same bundle.
         let generation = self.capture_local_response_generation();
         if let Some(message) = loading_guard_message_from_published(&generation.health) {
+            record_read_outcome(unavailable_outcome(&generation.health));
             return message;
         }
         let source_id = generation
@@ -1565,6 +1624,8 @@ impl SymForgeServer {
             force_refresh,
         ) && let Some(hit) = self.format_read_cache_hit(&meta, "session_repeat_read")
         {
+            // Only a selected symbol is recorded for repeat hits (below).
+            record_read_outcome(ReadOutcome::Found);
             return hit;
         }
 
@@ -1614,6 +1675,25 @@ impl SymForgeServer {
 
         match file {
             Some(file) => {
+                // The full selector (name, kind, line) decides the outcome, by
+                // the resolver the renderer below uses.
+                let outcome = match crate::live_index::query::resolve_symbol_selector(
+                    file.as_ref(),
+                    &params.0.name,
+                    params.0.kind.as_deref(),
+                    params.0.symbol_line,
+                ) {
+                    crate::live_index::query::SymbolSelectorMatch::Selected(..) => {
+                        ReadOutcome::Found
+                    }
+                    crate::live_index::query::SymbolSelectorMatch::NotFound => {
+                        ReadOutcome::NotFound
+                    }
+                    crate::live_index::query::SymbolSelectorMatch::Ambiguous(_) => {
+                        ReadOutcome::Ambiguous
+                    }
+                };
+                record_read_outcome(outcome);
                 let raw_chars = file.content.len();
                 let body = format::symbol_detail_from_indexed_file(
                     file.as_ref(),
@@ -1660,21 +1740,25 @@ impl SymForgeServer {
                         prior.approx_tokens,
                     );
                 }
-                let handle = self.ccr_store.lock().insert(
-                    "get_symbol",
-                    final_output.clone(),
-                    self.ccr_publication_identity(),
-                );
-                self.session_context.record_symbol_fetch(
-                    &params.0.path,
-                    &params.0.name,
-                    params_hash,
-                    tokens,
-                    &handle,
-                );
+                // A repeat hit replays a recorded read as Found.
+                if outcome == ReadOutcome::Found {
+                    let handle = self.ccr_store.lock().insert(
+                        "get_symbol",
+                        final_output.clone(),
+                        self.ccr_publication_identity(),
+                    );
+                    self.session_context.record_symbol_fetch(
+                        &params.0.path,
+                        &params.0.name,
+                        params_hash,
+                        tokens,
+                        &handle,
+                    );
+                }
                 final_output
             }
             None => {
+                record_read_outcome(ReadOutcome::NotFound);
                 let suggestions = suggest_similar_files(&generation.live, &params.0.path);
                 format::not_found_file_with_suggestions(&params.0.path, &suggestions)
             }
@@ -1923,11 +2007,13 @@ impl SymForgeServer {
             self,
             &search::PathScope::exact(&params.0.path),
         ) {
+            record_read_outcome(ReadOutcome::Unavailable { retryable: true });
             return refusal.message(&params.0.path);
         }
         let published = self.capture_local_response_generation();
         *served = Some(Arc::clone(&published.live));
         if let Some(message) = loading_guard_message_from_published(&published.health) {
+            record_read_outcome(unavailable_outcome(&published.health));
             return message;
         }
         let params_hash = crate::protocol::session::hash_file_context_params(
@@ -1967,6 +2053,15 @@ impl SymForgeServer {
                 return result;
             }
         }
+        // Past the guards the answer is about one path: present in the index
+        // this read renders from, or not.
+        record_read_outcome(
+            if published.live.capture_shared_file(&params.0.path).is_some() {
+                ReadOutcome::Found
+            } else {
+                ReadOutcome::NotFound
+            },
+        );
         if params.0.estimate == Some(true) {
             if let Some(file) = published.live.capture_shared_file(&params.0.path) {
                 let file_tokens = file.content.len() / 4;
@@ -2228,8 +2323,10 @@ impl SymForgeServer {
         params: Parameters<GetSymbolContextInput>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
-        let output = self.get_symbol_context(params).await;
-        let outcome_class = classify_get_symbol_context_output(&output);
+        let (output, outcome) = with_read_outcome_scope(self.get_symbol_context(params)).await;
+        let outcome_class = outcome
+            .map(ReadOutcome::class)
+            .unwrap_or_else(|| classify_get_symbol_context_output(&output));
         self.record_tool_completion(
             "get_symbol_context",
             &output,
@@ -2295,7 +2392,10 @@ impl SymForgeServer {
         let refreshed = if let Some(path) = params.0.path.as_deref().or(params.0.file.as_deref()) {
             match freshen_exact_path_for_targeted_retrieval(self, &search::PathScope::exact(path)) {
                 Ok(refreshed) => refreshed,
-                Err(refusal) => return refusal.message(path),
+                Err(refusal) => {
+                    record_read_outcome(ReadOutcome::Unavailable { retryable: true });
+                    return refusal.message(path);
+                }
             }
         } else {
             false
@@ -2303,6 +2403,7 @@ impl SymForgeServer {
         let published = self.capture_local_response_generation();
         *served = Some(Arc::clone(&published.live));
         if let Some(message) = loading_guard_message_from_published(&published.health) {
+            record_read_outcome(unavailable_outcome(&published.health));
             return message;
         }
         if let Some(path) = params.0.path.as_deref().or(params.0.file.as_deref()) {
@@ -2547,12 +2648,17 @@ impl SymForgeServer {
                 resolved_path = Some(candidates.into_iter().next().unwrap());
                 resolved_path.as_deref()
             } else if candidates.len() > 1 {
+                record_read_outcome(ReadOutcome::Ambiguous);
                 return format_ambiguous_symbol_context(&params.0.name, &candidates);
             } else {
                 resolved_path = None;
                 None
             }
         };
+        record_read_outcome(default_symbol_context_outcome(
+            published.live.as_ref(),
+            &params.0,
+        ));
         let verbosity = params.0.verbosity.as_deref().unwrap_or("full");
         let max_tokens = params.0.max_tokens;
         let knowledge_section = file_path_hint
@@ -5152,8 +5258,13 @@ impl SymForgeServer {
         params: Parameters<GetFileContentInput>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
-        let output = self.get_file_content(params).await;
-        let outcome_class = classify_get_file_content_output(&output);
+        let (output, outcome) = with_read_outcome_scope(self.get_file_content(params)).await;
+        // The renderer's typed outcome; raw content can imitate any status line.
+        // Text classification only for an answer that decided nothing typed (a
+        // generated refusal, or a daemon that sent no outcome header).
+        let outcome_class = outcome
+            .map(ReadOutcome::class)
+            .unwrap_or_else(|| classify_get_file_content_output(&output));
         self.record_tool_completion(
             "get_file_content",
             &output,
@@ -5196,6 +5307,7 @@ impl SymForgeServer {
             if let Some(file) = indexed {
                 let file_tokens = file.content.len() / 4;
                 let line_count = file.content.iter().filter(|&&b| b == b'\n').count();
+                record_read_outcome(ReadOutcome::Found);
                 return format!(
                     "Estimate for get_file_content(path=\"{}\"):\n  ~{} tokens (~{} lines)",
                     input.path, file_tokens, line_count
@@ -5210,6 +5322,7 @@ impl SymForgeServer {
                     Ok(canon_path) if canon_path.is_file() => {
                         if let Ok(metadata) = std::fs::metadata(&canon_path) {
                             let file_tokens = metadata.len() as usize / 4;
+                            record_read_outcome(ReadOutcome::Found);
                             return format!(
                                 "Estimate for get_file_content(path=\"{}\"):\n  ~{} tokens (raw disk read; not indexed)",
                                 input.path, file_tokens
@@ -5226,6 +5339,7 @@ impl SymForgeServer {
                     _ => {}
                 }
             }
+            record_read_outcome(ReadOutcome::NotFound);
             return format::not_found_file(&input.path);
         }
 
@@ -5251,6 +5365,7 @@ impl SymForgeServer {
             Err(message) => return message,
         };
         if let Err(refusal) = freshen_exact_path_for_targeted_retrieval(self, &options.path_scope) {
+            record_read_outcome(ReadOutcome::Unavailable { retryable: true });
             return refusal.message(&input.path);
         }
 
@@ -5260,6 +5375,7 @@ impl SymForgeServer {
         // captured generation rather than a second live-index read.
         let generation = self.capture_local_response_generation();
         if let Some(message) = loading_guard_message_from_published(&generation.health) {
+            record_read_outcome(unavailable_outcome(&generation.health));
             return message;
         }
         let force_refresh = input.force_refresh == Some(true);
@@ -5280,6 +5396,8 @@ impl SymForgeServer {
                 .try_file_content_cache_hit(&input.path, params_hash, force_refresh)
             && let Some(hit) = self.format_read_cache_hit(&meta, "session_repeat_read")
         {
+            // Only successful reads are recorded for repeat hits (below).
+            record_read_outcome(ReadOutcome::Found);
             return hit;
         }
         let mode_annotation = match (
@@ -5294,6 +5412,13 @@ impl SymForgeServer {
             .capture_shared_file_for_scope(&options.path_scope);
         match file {
             Some(file) => {
+                let selection = format::content_selection(
+                    Some(file.as_ref()),
+                    &file.as_ref().content,
+                    &options.content_context,
+                );
+                let found = selection.is_ok();
+                record_read_outcome(selection_outcome(selection));
                 let raw_chars = file.as_ref().content.len();
                 let max_tokens = Some(format::resolve_read_max_tokens(
                     explicit_max_tokens,
@@ -5334,17 +5459,21 @@ impl SymForgeServer {
                         prior.approx_tokens,
                     );
                 }
-                let handle = self.ccr_store.lock().insert(
-                    "get_file_content",
-                    final_output.clone(),
-                    self.ccr_publication_identity(),
-                );
-                self.session_context.record_file_content_fetch(
-                    &input.path,
-                    params_hash,
-                    tokens,
-                    &handle,
-                );
+                // A repeat hit replays a recorded read as Found, so only a
+                // read that selected something is recorded.
+                if found {
+                    let handle = self.ccr_store.lock().insert(
+                        "get_file_content",
+                        final_output.clone(),
+                        self.ccr_publication_identity(),
+                    );
+                    self.session_context.record_file_content_fetch(
+                        &input.path,
+                        params_hash,
+                        tokens,
+                        &handle,
+                    );
+                }
                 final_output
             }
             None => {
@@ -5367,7 +5496,10 @@ impl SymForgeServer {
                         Err(message) if message.starts_with(edit::PATH_SPELLING_DIFFERS) => {
                             return format!("Error: {message}");
                         }
-                        Err(_) => return format::not_found_file(&input.path),
+                        Err(_) => {
+                            record_read_outcome(ReadOutcome::NotFound);
+                            return format::not_found_file(&input.path);
+                        }
                     };
                     if canon_path.is_file() {
                         // The gate owns this read: it classifies the exact buffer
@@ -5388,11 +5520,19 @@ impl SymForgeServer {
                             Ok(content) => content,
                             Err(refusal) => return refusal,
                         };
-                        let body = format::render_file_content_bytes(
-                            &input.path,
-                            &content,
-                            options.content_context,
-                        );
+                        let selection =
+                            format::content_selection(None, &content, &options.content_context);
+                        record_read_outcome(selection_outcome(selection));
+                        // An unindexed file has no symbols: say so rather than
+                        // serving the whole file for an `around_symbol` read.
+                        let body = match options.content_context.around_symbol.as_deref() {
+                            Some(name) => format!("Symbol not found in {}: {name}", input.path),
+                            None => format::render_file_content_bytes(
+                                &input.path,
+                                &content,
+                                options.content_context,
+                            ),
+                        };
                         // Frecency bump — commitment tool. Raw-disk
                         // fallback branch (non-indexed source files);
                         // collection policy is resolved inside bump_frecency.
@@ -5413,6 +5553,7 @@ impl SymForgeServer {
                 // the miss above — a fresh read() here could suggest from a
                 // different generation than the one that said not-found (T046).
                 let suggestions = suggest_similar_files(&generation.live, &input.path);
+                record_read_outcome(ReadOutcome::NotFound);
                 format::not_found_file_with_suggestions(&input.path, &suggestions)
             }
         }
