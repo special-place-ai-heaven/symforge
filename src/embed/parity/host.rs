@@ -1686,6 +1686,8 @@ impl HostRoom {
                 if missing && rejected {
                     refusal.kind = HostRefusalKind::SourceUnavailable;
                     refusal.query_kind = Some(QueryRefusalKind::NotFound);
+                    // A missing target can appear later; retry once the source changes.
+                    refusal.retry = Some(HostRetryAdvice::OnEvent);
                 }
                 refusal
             })?;
@@ -2335,6 +2337,12 @@ mod resource_contract_tests {
         git2::Repository::init(repository.path()).unwrap();
         std::fs::create_dir(repository.path().join("src")).unwrap();
         std::fs::write(repository.path().join("src/a.rs"), b"pub fn a() {}\n").unwrap();
+        std::fs::create_dir(repository.path().join("docs")).unwrap();
+        std::fs::write(
+            repository.path().join("docs/decoy.txt"),
+            b"File not found: decoy",
+        )
+        .unwrap();
         let grant = HostRoomGrant::new(
             "resource-room".into(),
             repository.path().to_path_buf(),
@@ -2500,6 +2508,16 @@ mod resource_contract_tests {
                     },
                 ),
             ),
+            (
+                "missing symbol in an existing file",
+                HostResourceRequest::SymbolDetailOptions(
+                    crate::embed::parity::symbol::SymbolReadRequest {
+                        path: "src/a.rs".into(),
+                        name: "no_such_symbol".into(),
+                        ..Default::default()
+                    },
+                ),
+            ),
         ] {
             let refusal = room
                 .dispatch(&HostRequest::Resource(request), &control)
@@ -2510,7 +2528,34 @@ mod resource_contract_tests {
                 Some(QueryRefusalKind::NotFound),
                 "{label}"
             );
+            if label.contains("symbol") {
+                assert_eq!(refusal.retry, Some(HostRetryAdvice::OnEvent), "{label}");
+            }
         }
+        // An existing file whose content imitates the miss text is still a read.
+        let HostResponse::Resource(reply) = room
+            .dispatch(
+                &HostRequest::Resource(HostResourceRequest::FileContentOptions(
+                    crate::embed::parity::read::FileContentRequest {
+                        path: "docs/decoy.txt".into(),
+                        show_line_numbers: Some(false),
+                        header: Some(false),
+                        ..Default::default()
+                    },
+                )),
+                &control,
+            )
+            .unwrap_or_else(|refusal| panic!("existing decoy file refused: {refusal:?}"))
+        else {
+            panic!("resource response");
+        };
+        let HostResourceContent::Query(query) = reply.content else {
+            panic!("query-backed resource");
+        };
+        let QueryOutput::FileContent(content) = query.output else {
+            panic!("file content output");
+        };
+        assert_eq!(content.rendered, "File not found: decoy");
     }
 }
 
@@ -2912,19 +2957,23 @@ fn render_prompt(
     })
 }
 
-/// MCP `resources/read` fails with resource-not-found when the shared outcome
-/// classifier reads the rendered answer as a miss; the room applies the same
-/// classifier to the same rendered text so both surfaces refuse alike.
+/// MCP `resources/read` fails with resource-not-found only once its index
+/// confirms the target is absent. Here the native lanes already decided that
+/// against the room's index: a missing file is a typed `NotFound` refusal before
+/// any output exists, and a symbol miss is carried as a typed row refusal, so
+/// rendered text is never consulted and content imitating a miss stays a read.
 fn resource_target_missing(output: &QueryOutput) -> bool {
-    use crate::embed::lifecycle::guidance::outcome::{OutcomeClass, classify_compact_tool_output};
-    let (tool, rendered) = match output {
-        QueryOutput::FileContent(value) => ("get_file_content", &value.rendered),
-        QueryOutput::FileContext(value) => ("get_file_context", &value.rendered),
-        QueryOutput::SymbolRead(value) => ("get_symbol", &value.rendered),
-        QueryOutput::SymbolContext(value) => ("get_symbol_context", &value.rendered),
-        _ => return false,
-    };
-    classify_compact_tool_output(tool, rendered) == OutcomeClass::NotFound
+    match output {
+        QueryOutput::SymbolRead(value) => {
+            !value.entries.is_empty()
+                && value
+                    .entries
+                    .iter()
+                    .all(|entry| entry.refusal == Some(QueryRefusalKind::NotFound))
+        }
+        QueryOutput::SymbolContext(value) => value.refusal == Some(QueryRefusalKind::NotFound),
+        _ => false,
+    }
 }
 
 fn encode_uri_value(value: &str) -> String {

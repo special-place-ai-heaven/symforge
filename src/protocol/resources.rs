@@ -59,15 +59,40 @@ enum ResourceRequest {
     },
 }
 
+/// The indexed target a templated resource names, re-checked after a read
+/// renders a miss so content that merely LOOKS like a miss stays a success.
+enum ResourceTarget {
+    File(String),
+    Symbol { path: String, name: String },
+}
+
 impl ResourceRequest {
-    /// The tool whose rendered output answers this request, for templated
-    /// resources that name a target which may not exist.
-    fn target_tool(&self) -> Option<&'static str> {
+    /// The tool whose rendered output answers this request and the target it
+    /// names, for templated resources whose target may not exist.
+    fn target(&self) -> Option<(&'static str, ResourceTarget)> {
         match self {
-            Self::FileContext { .. } => Some("get_file_context"),
-            Self::FileContent { .. } => Some("get_file_content"),
-            Self::SymbolDetail { .. } => Some("get_symbol"),
-            Self::SymbolContext { .. } => Some("get_symbol_context"),
+            Self::FileContext { path, .. } => {
+                Some(("get_file_context", ResourceTarget::File(path.clone())))
+            }
+            Self::FileContent { path, .. } => {
+                Some(("get_file_content", ResourceTarget::File(path.clone())))
+            }
+            Self::SymbolDetail { path, name, .. } => Some((
+                "get_symbol",
+                ResourceTarget::Symbol {
+                    path: path.clone(),
+                    name: name.clone(),
+                },
+            )),
+            Self::SymbolContext { name, file } => file.as_ref().map(|path| {
+                (
+                    "get_symbol_context",
+                    ResourceTarget::Symbol {
+                        path: path.clone(),
+                        name: name.clone(),
+                    },
+                )
+            }),
             Self::RepoHealth
             | Self::RepoOutline
             | Self::RepoMap
@@ -155,16 +180,23 @@ impl SymForgeServer {
     ) -> Result<ReadResourceResult, McpError> {
         let request =
             parse_resource_uri(uri).map_err(|error| McpError::invalid_params(error, None))?;
-        let tool = request.target_tool();
+        let target = request.target();
         let text = self
             .render_resource_text(request)
             .await
             .map_err(|error| McpError::invalid_params(error, None))?;
-        // A templated read whose target does not exist must not report success:
-        // the shared outcome classifier is the one authority on the rendered miss.
-        if tool
-            .is_some_and(|tool| classify_compact_tool_output(tool, &text) == OutcomeClass::NotFound)
-        {
+        // A templated read whose target does not exist must not report success.
+        // The classifier only reads the rendered text, which a real file can
+        // imitate, so the miss stands only once the index confirms absence.
+        let missing = match target {
+            Some((tool, target))
+                if classify_compact_tool_output(tool, &text) == OutcomeClass::NotFound =>
+            {
+                self.resource_target_absent(target).await
+            }
+            _ => false,
+        };
+        if missing {
             return Err(McpError::resource_not_found(
                 text,
                 Some(serde_json::json!({ "uri": uri })),
@@ -179,6 +211,72 @@ impl SymForgeServer {
         ])
         .with_ttl_ms(0)
         .with_cache_scope(rmcp::model::CacheScope::Private))
+    }
+
+    /// Whether the index, after the read's own freshen, holds no such target.
+    /// Asked through the content-free estimate lanes so a daemon-proxied
+    /// session consults the daemon's index rather than its empty local one.
+    async fn resource_target_absent(&self, target: ResourceTarget) -> bool {
+        let path = match &target {
+            ResourceTarget::File(path) | ResourceTarget::Symbol { path, .. } => path.clone(),
+        };
+        let file = self
+            .get_file_content(Parameters(GetFileContentInput {
+                project: None,
+                path: path.clone(),
+                mode: None,
+                start_line: None,
+                end_line: None,
+                chunk_index: None,
+                max_lines: None,
+                around_line: None,
+                around_match: None,
+                match_occurrence: None,
+                around_symbol: None,
+                symbol_line: None,
+                context_lines: None,
+                show_line_numbers: None,
+                header: None,
+                estimate: Some(true),
+                offset: None,
+                limit: None,
+                max_tokens: None,
+                force_refresh: None,
+            }))
+            .await;
+        if classify_compact_tool_output("get_file_content", &file) == OutcomeClass::NotFound {
+            return true;
+        }
+        let ResourceTarget::Symbol { name, .. } = target else {
+            return false;
+        };
+        // Line numbers prefix every served line, so a found symbol's source can
+        // never begin the answer and imitate the miss text.
+        let symbol = self
+            .get_file_content(Parameters(GetFileContentInput {
+                project: None,
+                path,
+                mode: None,
+                start_line: None,
+                end_line: None,
+                chunk_index: None,
+                max_lines: None,
+                around_line: None,
+                around_match: None,
+                match_occurrence: None,
+                around_symbol: Some(name),
+                symbol_line: None,
+                context_lines: Some(0),
+                show_line_numbers: Some(true),
+                header: None,
+                estimate: None,
+                offset: None,
+                limit: None,
+                max_tokens: None,
+                force_refresh: None,
+            }))
+            .await;
+        classify_compact_tool_output("get_file_content", &symbol) == OutcomeClass::NotFound
     }
 
     async fn render_resource_text(&self, request: ResourceRequest) -> Result<String, String> {
@@ -724,6 +822,13 @@ mod tests {
                     ("name", Some("main".to_string())),
                 ],
             ),
+            build_uri(
+                "symforge://symbol/detail",
+                &[
+                    ("path", Some("src/main.rs".to_string())),
+                    ("name", Some("no_such_symbol".to_string())),
+                ],
+            ),
         ];
         for uri in uris {
             let error = server
@@ -737,5 +842,49 @@ mod tests {
             );
             assert_eq!(error.data, Some(serde_json::json!({ "uri": uri })));
         }
+    }
+
+    #[tokio::test]
+    async fn test_read_existing_file_whose_content_looks_like_a_miss_is_success() {
+        let server = make_server_with_file("src/main.rs", b"File not found: decoy");
+        let uri = build_uri(
+            "symforge://file/content",
+            &[
+                ("path", Some("src/main.rs".to_string())),
+                ("show_line_numbers", Some("false".to_string())),
+                ("header", Some("false".to_string())),
+            ],
+        );
+        let result = server
+            .read_resource_uri(&uri)
+            .await
+            .expect("an existing file is never resource-not-found");
+        let text = match &result.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text,
+            other => panic!("expected text resource, got {other:?}"),
+        };
+        assert_eq!(text, "File not found: decoy");
+    }
+
+    #[tokio::test]
+    async fn test_read_existing_symbol_whose_body_looks_like_a_miss_is_success() {
+        // The fixture symbol `main` spans bytes 0..10, so its body is `No symbol `.
+        let server = make_server_with_file("src/main.rs", b"No symbol here");
+        let uri = build_uri(
+            "symforge://symbol/detail",
+            &[
+                ("path", Some("src/main.rs".to_string())),
+                ("name", Some("main".to_string())),
+            ],
+        );
+        let result = server
+            .read_resource_uri(&uri)
+            .await
+            .expect("an existing symbol is never resource-not-found");
+        let text = match &result.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text,
+            other => panic!("expected text resource, got {other:?}"),
+        };
+        assert!(text.starts_with("No symbol "), "{text}");
     }
 }

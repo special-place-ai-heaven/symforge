@@ -1287,9 +1287,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // stel/{controller,executor,planner,runtime}.rs. Trust-mode host option; no new
 // boundary edge.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "82aa373a1fb49060b53b36d4620c6751a5d6255aad0222b5e1069993c565780d",
+    "5ee48e31e69866333a4e62029ba705383c740ccc6735a95edfd1993fcf2e6f21",
     312,
-    11_848_805,
+    11_856_447,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
