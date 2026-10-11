@@ -2886,6 +2886,25 @@ mod resource_outcome_table_tests {
                         ..Default::default()
                     }),
                 ),
+                Read::ByteSlice {
+                    path,
+                    start_byte,
+                    end_byte,
+                    ..
+                } => (
+                    None,
+                    QueryRequest::SymbolRead(SymbolReadRequest {
+                        targets: Some(vec![SymbolTarget {
+                            path: path.to_string(),
+                            name: None,
+                            kind: None,
+                            symbol_line: None,
+                            start_byte: Some(*start_byte),
+                            end_byte: *end_byte,
+                        }]),
+                        ..Default::default()
+                    }),
+                ),
                 Read::Bundle { path, name } => (
                     None,
                     QueryRequest::SymbolContext(SymbolContextRequest {
@@ -2965,6 +2984,22 @@ mod resource_outcome_table_tests {
                 Err(refusal) => refusal_class(refusal),
             };
             assert_eq!(class, case.expected, "room query: {}", case.label);
+            if let Read::ByteSlice {
+                expected_output, ..
+            } = &case.read
+            {
+                let HostResponse::Query(reply) = &reply.as_ref().expect("byte-slice query") else {
+                    panic!("{}: query response", case.label);
+                };
+                let QueryOutput::SymbolRead(read) = &reply.output else {
+                    panic!("{}: symbol-read output", case.label);
+                };
+                assert_eq!(
+                    read.rendered, *expected_output,
+                    "room byte-slice output: {}",
+                    case.label
+                );
+            }
             // The same answer as a compact-facade step on the room.
             if !matches!(case.read, Read::Facade { .. } | Read::FacadeQuery { .. }) {
                 let step = match &reply {

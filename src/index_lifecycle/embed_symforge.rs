@@ -22,6 +22,8 @@ use crate::stel::runtime::{self, FacadeLedgerInput};
 pub(super) fn step_request(tool: &str, args: &Value) -> Result<QueryRequest, QueryRefusalKind> {
     use crate::embed::parity::guidance::ExploreRequest;
 
+    let tool = crate::stel::planner::FacadeStepTool::from_name(tool)
+        .ok_or(QueryRefusalKind::UnsupportedOption)?;
     let mut args = args.clone();
     if let Value::Object(map) = &mut args {
         map.remove("project");
@@ -31,7 +33,7 @@ pub(super) fn step_request(tool: &str, args: &Value) -> Result<QueryRequest, Que
     }
     let text = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_owned);
     let number = |key: &str| args.get(key).and_then(Value::as_u64);
-    Ok(match tool {
+    Ok(match tool.as_str() {
         "search_text" => QueryRequest::TextSearch(decode(args)?),
         "search_symbols" => QueryRequest::SymbolSearch(decode(args)?),
         "search_files" => QueryRequest::FileSearch(decode(args)?),
@@ -666,5 +668,25 @@ mod step_tool_guard_tests {
         // Planned steps the room does not dispatch: refused as a whole facade
         // request with a typed refusal. Pinned so a change is deliberate.
         assert_eq!(not_dispatched, vec!["health_compact".to_string()]);
+
+        let refusal = room
+            .dispatch(
+                &HostRequest::Query {
+                    request: crate::embed::parity::QueryRequest::Symforge(
+                        crate::stel_core::types::StelRequest {
+                            query: "index health".into(),
+                            ..Default::default()
+                        },
+                    ),
+                    limits: QueryLimits::default(),
+                },
+                &control,
+            )
+            .expect_err("health_compact is refused by the embedded facade");
+        assert_eq!(
+            refusal.query_kind,
+            Some(crate::embed::parity::QueryRefusalKind::UnsupportedOption),
+            "health_compact must remain an explicit typed room refusal: {refusal:?}"
+        );
     }
 }

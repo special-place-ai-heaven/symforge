@@ -23,10 +23,6 @@ pub(super) fn validate(request: &SymbolReadRequest) -> Result<(), QueryRefusalKi
                     .as_ref()
                     .is_some_and(|name| name.trim().is_empty())
                 || (target.name.is_none() && target.start_byte.is_none())
-                || target
-                    .start_byte
-                    .zip(target.end_byte)
-                    .is_some_and(|(start, end)| start > end)
             {
                 return Err(QueryRefusalKind::InvalidRequest);
             }
@@ -122,14 +118,11 @@ fn target(
             }
         }
     } else {
-        let start = target.start_byte.ok_or(QueryRefusalKind::InvalidRequest)? as usize;
-        let end = target
-            .end_byte
-            .map_or(file.content.len(), |end| end as usize);
-        let bytes = file
-            .content
-            .get(start..end)
-            .ok_or(QueryRefusalKind::InvalidSpan)?;
+        let start_byte = target.start_byte.ok_or(QueryRefusalKind::InvalidRequest)? as usize;
+        let end_byte = target.end_byte.map(|end| end as usize);
+        let (start, end) =
+            symbol_read::clamp_code_slice_range(file.content.len(), start_byte, end_byte);
+        let bytes = &file.content[start..end];
         (
             start,
             end,

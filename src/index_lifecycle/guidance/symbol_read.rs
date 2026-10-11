@@ -144,16 +144,22 @@ pub fn code_slice_view(path: &str, slice: &[u8]) -> String {
     format!("{path}\n{text}")
 }
 
+pub(crate) fn clamp_code_slice_range(
+    content_len: usize,
+    start_byte: usize,
+    end_byte: Option<usize>,
+) -> (usize, usize) {
+    let end = end_byte.unwrap_or(content_len).min(content_len);
+    (start_byte.min(end), end)
+}
+
 #[cfg(feature = "server")]
 pub fn code_slice_from_indexed_file(
     file: &IndexedFile,
     start_byte: usize,
     end_byte: Option<usize>,
 ) -> String {
-    let end = end_byte
-        .unwrap_or(file.content.len())
-        .min(file.content.len());
-    let start = start_byte.min(end);
+    let (start, end) = clamp_code_slice_range(file.content.len(), start_byte, end_byte);
     // Safety: `file.content` is `Vec<u8>`, so this is a BYTE-slice index (no
     // char-boundary panic), and the clamps above guarantee 0 <= start <= end <=
     // len (no out-of-range panic) even for untrusted caller-supplied byte offsets.

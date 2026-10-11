@@ -4,8 +4,11 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTemplate};
 
 use super::SymForgeServer;
-use super::tools::{classify_compact_tool_output, is_index_unavailable_output};
-use crate::protocol::result_status::{OutcomeClass, ReadOutcome, with_read_outcome_scope};
+#[cfg(test)]
+use super::tools::classify_compact_tool_output;
+#[cfg(test)]
+use crate::protocol::result_status::OutcomeClass;
+use crate::protocol::result_status::{ReadOutcome, with_read_outcome_scope};
 use crate::protocol::tools::{
     GetFileContentInput, GetFileContextInput, GetRepoMapInput, GetSymbolContextInput,
     GetSymbolInput, WhatChangedInput,
@@ -155,11 +158,10 @@ impl SymForgeServer {
         let tool = request.outcome_tool();
         let (text, recorded) = with_read_outcome_scope(self.render_resource_text(request)).await;
         let text = text.map_err(|error| McpError::invalid_params(error, None))?;
-        if let Some(tool) = tool {
-            // The read tools record the outcome they decided from typed state;
-            // the rendered text is consulted only for an answer that decided
-            // nothing typed, which is always generated, never raw content.
-            let outcome = recorded.unwrap_or_else(|| untyped_outcome(tool, &text));
+        if tool.is_some() {
+            // A resource backed by a covered read tool fails closed if that
+            // tool did not record a typed outcome.
+            let outcome = recorded.unwrap_or(ReadOutcome::Unavailable { retryable: false });
             if let Some(error) = resource_read_error(outcome, uri, text.clone()) {
                 return Err(error);
             }
@@ -301,24 +303,6 @@ impl SymForgeServer {
         };
 
         Ok(text)
-    }
-}
-
-/// The outcome of an answer that recorded none: a generated refusal or status
-/// line from a lane without typed state, or a daemon that sent no outcome.
-fn untyped_outcome(tool: &str, text: &str) -> ReadOutcome {
-    if is_index_unavailable_output(text) {
-        return ReadOutcome::Unavailable {
-            retryable: text.starts_with("Index is loading")
-                || text.starts_with("Index refresh interrupted:"),
-        };
-    }
-    match classify_compact_tool_output(tool, text) {
-        OutcomeClass::NotFound => ReadOutcome::NotFound,
-        OutcomeClass::Ambiguous => ReadOutcome::Ambiguous,
-        OutcomeClass::InvalidRequest => ReadOutcome::InvalidRequest,
-        OutcomeClass::InternalFailure => ReadOutcome::Unavailable { retryable: false },
-        OutcomeClass::Found | OutcomeClass::EmptyResult => ReadOutcome::Found,
     }
 }
 
@@ -1273,6 +1257,22 @@ mod tests {
                         serde_json::json!({ "targets": targets }),
                     )
                 }
+                Read::ByteSlice {
+                    path,
+                    start_byte,
+                    end_byte,
+                    ..
+                } => (
+                    None,
+                    Some("get_symbol"),
+                    serde_json::json!({
+                        "targets": [{
+                            "path": path,
+                            "start_byte": start_byte,
+                            "end_byte": end_byte,
+                        }]
+                    }),
+                ),
                 Read::Bundle { path, name } => (
                     None,
                     Some("get_symbol_context"),
@@ -1342,6 +1342,17 @@ mod tests {
                     "tools/call isError: {}: {reply}",
                     case.label
                 );
+                if let Read::ByteSlice {
+                    expected_output, ..
+                } = &case.read
+                {
+                    assert_eq!(
+                        reply["result"]["content"][0]["text"].as_str(),
+                        Some(*expected_output),
+                        "tools/call byte-slice output: {}",
+                        case.label
+                    );
+                }
                 // The same tool as a compact-facade step: the step's own
                 // typed outcome, on the same server.
                 if !matches!(case.read, Read::Facade { .. } | Read::FacadeQuery { .. }) {

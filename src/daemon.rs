@@ -2797,6 +2797,15 @@ impl DaemonSessionClient {
         } else {
             None
         };
+        // Every runnable facade step has a typed read outcome contract. Keep
+        // the proxy membership tied to the planner's generated tool registry.
+        let typed_outcome_tool =
+            crate::stel::planner::FacadeStepTool::from_name(tool_name).is_some();
+        let missing_read_outcome = || {
+            typed_outcome_tool.then_some(crate::protocol::result_status::ReadOutcome::Unavailable {
+                retryable: false,
+            })
+        };
         let read_outcome = match response
             .headers()
             .get(crate::protocol::result_status::READ_OUTCOME_HEADER)
@@ -2809,22 +2818,19 @@ impl DaemonSessionClient {
                 Err(error) => {
                     tracing::debug!(
                         tool = tool_name,
-                        "malformed read-outcome header; status falls back to the body: {error}"
+                        "malformed read-outcome header; refusing to infer status from body: {error}"
                     );
-                    None
+                    missing_read_outcome()
                 }
             },
             None => {
-                if matches!(
-                    tool_name,
-                    "get_file_content" | "get_file_context" | "get_symbol" | "get_symbol_context"
-                ) {
+                if typed_outcome_tool {
                     tracing::debug!(
                         tool = tool_name,
-                        "no read-outcome header; status falls back to the body"
+                        "no read-outcome header; refusing to infer status from body"
                     );
                 }
-                None
+                missing_read_outcome()
             }
         };
 

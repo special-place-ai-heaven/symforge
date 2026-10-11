@@ -74,21 +74,20 @@ fn statused_tool_result(
 // the embedded facade refuses the same `path:` values MCP does.
 use crate::stel::runtime::{facade_path_is_repo_relative, path_is_within_bound_project};
 
-// Moved verbatim to the feature-neutral `guidance::outcome` so the STEL
-// facade and the embedded facade classify a rendered answer exactly as MCP does.
-pub(super) use crate::index_lifecycle::guidance::outcome::{
-    classify_compact_tool_output, is_error_output, is_index_unavailable_output,
-};
+// Moved to the feature-neutral `guidance::outcome` for legacy and untyped paths.
+#[cfg(test)]
+pub(super) use crate::index_lifecycle::guidance::outcome::classify_compact_tool_output;
 use crate::index_lifecycle::guidance::outcome::{
-    classify_find_references_output, classify_get_file_content_output,
-    classify_get_symbol_context_output, classify_get_symbol_output, classify_search_files_output,
-    classify_search_knowledge_output, classify_search_symbols_output, classify_search_text_output,
-    is_admission_refusal,
+    classify_search_knowledge_output, is_admission_refusal,
+};
+pub(super) use crate::index_lifecycle::guidance::outcome::{
+    is_error_output, is_index_unavailable_output,
 };
 // The classifier tests below name these through `super::`.
 #[cfg(test)]
 use crate::index_lifecycle::guidance::outcome::{
-    classify_get_file_context_output, compact_tool_output_is_success,
+    classify_get_file_content_output, classify_get_file_context_output,
+    classify_search_text_output, compact_tool_output_is_success,
 };
 
 use crate::domain::LanguageId;
@@ -1457,13 +1456,17 @@ fn knowledge_search_outcome(
     }
 }
 
-/// A tool's status: the typed outcome its code recorded, else (an answer that
-/// decided nothing typed) its body's class.
-fn typed_class(
-    outcome: Option<ReadOutcome>,
-    fallback: impl FnOnce() -> OutcomeClass,
-) -> OutcomeClass {
-    outcome.map(ReadOutcome::class).unwrap_or_else(fallback)
+/// Use the outcome recorded by the handler. A missing outcome is an internal failure.
+fn typed_class(outcome: Option<ReadOutcome>) -> OutcomeClass {
+    outcome
+        .map(ReadOutcome::class)
+        .unwrap_or(OutcomeClass::InternalFailure)
+}
+
+#[cfg(test)]
+#[test]
+fn typed_class_without_a_recorded_outcome_fails_closed() {
+    assert_eq!(typed_class(None), OutcomeClass::InternalFailure);
 }
 
 /// A `get_symbol` batch: found when any target was served; otherwise the
@@ -1548,9 +1551,7 @@ impl SymForgeServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let (output, outcome) = read_with_outcome(self.get_symbol(params)).await;
-        let outcome_class = outcome
-            .map(ReadOutcome::class)
-            .unwrap_or_else(|| classify_get_symbol_output(&output));
+        let outcome_class = typed_class(outcome);
         self.record_tool_completion("get_symbol", &output, started.elapsed(), outcome_class);
         statused_tool_result(output, outcome_class)
     }
@@ -2454,9 +2455,7 @@ impl SymForgeServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let (output, outcome) = read_with_outcome(self.get_symbol_context(params)).await;
-        let outcome_class = outcome
-            .map(ReadOutcome::class)
-            .unwrap_or_else(|| classify_get_symbol_context_output(&output));
+        let outcome_class = typed_class(outcome);
         self.record_tool_completion(
             "get_symbol_context",
             &output,
@@ -3089,7 +3088,7 @@ impl SymForgeServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let (output, outcome) = read_with_outcome(self.search_symbols(params)).await;
-        let outcome_class = typed_class(outcome, || classify_search_symbols_output(&output));
+        let outcome_class = typed_class(outcome);
         self.record_tool_completion("search_symbols", &output, started.elapsed(), outcome_class);
         statused_tool_result(output, outcome_class)
     }
@@ -3188,7 +3187,7 @@ impl SymForgeServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let (output, outcome) = read_with_outcome(self.search_text(params)).await;
-        let outcome_class = typed_class(outcome, || classify_search_text_output(&output));
+        let outcome_class = typed_class(outcome);
         self.record_tool_completion("search_text", &output, started.elapsed(), outcome_class);
         statused_tool_result(output, outcome_class)
     }
@@ -3216,7 +3215,7 @@ impl SymForgeServer {
         }
         let started = Instant::now();
         let (output, outcome) = read_with_outcome(self.search_knowledge(params)).await;
-        let outcome_class = typed_class(outcome, || classify_search_knowledge_output(&output));
+        let outcome_class = typed_class(outcome);
         self.record_tool_completion(
             "search_knowledge",
             &output,
@@ -3579,7 +3578,7 @@ impl SymForgeServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let (output, outcome) = read_with_outcome(self.search_files(params)).await;
-        let outcome_class = typed_class(outcome, || classify_search_files_output(&output));
+        let outcome_class = typed_class(outcome);
         self.record_tool_completion("search_files", &output, started.elapsed(), outcome_class);
         statused_tool_result(output, outcome_class)
     }
@@ -5504,12 +5503,8 @@ impl SymForgeServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let (output, outcome) = read_with_outcome(self.get_file_content(params)).await;
-        // The renderer's typed outcome; raw content can imitate any status line.
-        // Text classification only for an answer that decided nothing typed (a
-        // generated refusal, or a daemon that sent no outcome header).
-        let outcome_class = outcome
-            .map(ReadOutcome::class)
-            .unwrap_or_else(|| classify_get_file_content_output(&output));
+        // The renderer's typed outcome is required; raw content can imitate status lines.
+        let outcome_class = typed_class(outcome);
         self.record_tool_completion(
             "get_file_content",
             &output,
@@ -5964,7 +5959,7 @@ impl SymForgeServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let (output, outcome) = read_with_outcome(self.find_references(params)).await;
-        let outcome_class = typed_class(outcome, || classify_find_references_output(&output));
+        let outcome_class = typed_class(outcome);
         self.record_tool_completion("find_references", &output, started.elapsed(), outcome_class);
         statused_tool_result(output, outcome_class)
     }
@@ -19574,7 +19569,7 @@ mod tests {
             OutcomeClass::InvalidRequest
         );
         assert_eq!(
-            super::classify_find_references_output(
+            crate::index_lifecycle::guidance::outcome::classify_find_references_output(
                 "Error in find_references: project 'missing' is not open"
             ),
             OutcomeClass::InvalidRequest
@@ -26171,15 +26166,17 @@ mod tests {
     #[tokio::test]
     async fn every_facade_step_tool_records_a_typed_outcome_on_mcp() {
         let (planned, _) = crate::stel::planner::facade_step_tool_sets();
-        assert!(
-            planned.len() >= 15,
-            "step-tool scan found too few tools: {planned:?}"
-        );
+        let registered: std::collections::BTreeSet<_> = crate::stel::planner::FacadeStepTool::ALL
+            .iter()
+            .map(|tool| tool.as_str().to_string())
+            .collect();
+        assert_eq!(planned, registered, "planner coverage registry drifted");
         let (_dir, server) =
             setup_loaded_edit_test(&[("src/lib.rs", "pub fn alpha() -> u32 {\n    1\n}\n")]);
-        // MCP runs exactly the planner's steps; the embedded dispatch set is the
-        // room's (guarded in `embed_symforge`).
-        for tool in &planned {
+        // `planned` accepts only this generated enum, so every constructor
+        // variant is exercised here; the embed guard uses the same registry.
+        for tool in crate::stel::planner::FacadeStepTool::ALL {
+            let tool = tool.as_str();
             let (body, recorded) = crate::protocol::result_status::with_read_outcome_scope(
                 server.dispatch_tool_for_tests(tool, facade_step_guard_args(tool)),
             )

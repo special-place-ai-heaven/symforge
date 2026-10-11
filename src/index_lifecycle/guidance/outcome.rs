@@ -1,6 +1,6 @@
-//! Machine-readable outcome classes and the text classifiers that derive them
-//! from a rendered tool answer. Shared by the MCP handlers, the STEL facade
-//! and the embedded facade, so one rendered answer classifies one way.
+//! Machine-readable outcomes shared by the MCP handlers, the STEL facade and
+//! the embedded facade. Typed outcomes are primary; text classifiers remain
+//! for legacy or untyped paths that have not yet adopted the shared contract.
 
 use serde::{Deserialize, Serialize};
 
@@ -385,6 +385,14 @@ pub(crate) mod read_outcome_cases {
         Batch {
             targets: &'static [(&'static str, &'static str)],
         },
+        /// Tool-only code slices in a get_symbol batch, with the exact output
+        /// expected after the shared byte-range clamping rule.
+        ByteSlice {
+            path: &'static str,
+            start_byte: u32,
+            end_byte: Option<u32>,
+            expected_output: &'static str,
+        },
         /// Tool only: `get_symbol_context` bundle mode.
         Bundle {
             path: &'static str,
@@ -599,6 +607,46 @@ pub(crate) mod read_outcome_cases {
                 ],
             },
             expected: OutcomeClass::NotFound,
+        },
+        Case {
+            label: "get_symbol batch valid byte slice",
+            read: Read::ByteSlice {
+                path: "notes/error.txt",
+                start_byte: 0,
+                end_byte: Some(6),
+                expected_output: "notes/error.txt\nError:",
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "get_symbol batch byte slice past EOF clamps to empty",
+            read: Read::ByteSlice {
+                path: "notes/error.txt",
+                start_byte: 999,
+                end_byte: None,
+                expected_output: "notes/error.txt\n",
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "get_symbol batch reversed byte slice clamps to empty",
+            read: Read::ByteSlice {
+                path: "notes/error.txt",
+                start_byte: 8,
+                end_byte: Some(2),
+                expected_output: "notes/error.txt\n",
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "get_symbol batch byte slice end past EOF clamps",
+            read: Read::ByteSlice {
+                path: "notes/error.txt",
+                start_byte: 0,
+                end_byte: Some(999),
+                expected_output: "notes/error.txt\nError: this file starts like an error\nsecond line\n",
+            },
+            expected: OutcomeClass::Found,
         },
         Case {
             label: "bundle mode",

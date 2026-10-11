@@ -218,11 +218,9 @@ fn is_loading_refusal(response: &CallToolResponse) -> bool {
     let CallToolResponse::Complete(result) = response else {
         return false;
     };
-    result
-        .content
-        .first()
-        .and_then(|block| block.as_text())
-        .is_some_and(|text| text.text.starts_with("Index is loading"))
+    crate::protocol::result_status::observed_outcome_class(result.meta.as_ref())
+        == Some(OutcomeClass::InternalFailure)
+        && reports_loading(result)
 }
 
 /// Whether the runtime's index is still loading, asked through `status`. It
@@ -571,6 +569,40 @@ mod tests {
         server_with(index)
     }
 
+    #[test]
+    fn loading_refusal_requires_typed_failure_and_loading_evidence() {
+        fn response(outcome: OutcomeClass, index_state: Option<&str>) -> CallToolResponse {
+            let mut result =
+                ResultStatus::new(outcome).into_call_tool_result("Index is loading... source text");
+            let mut meta = result.meta.take().expect("typed outcome metadata");
+            if let Some(index_state) = index_state {
+                meta.0.insert(
+                    PROJECT_EVIDENCE_META_KEY.to_string(),
+                    json!({ "index_state": index_state }),
+                );
+            }
+            result.meta = Some(meta);
+            CallToolResponse::Complete(result)
+        }
+
+        assert!(is_loading_refusal(&response(
+            OutcomeClass::InternalFailure,
+            Some("Loading"),
+        )));
+        assert!(!is_loading_refusal(&response(
+            OutcomeClass::InternalFailure,
+            Some("Ready"),
+        )));
+        assert!(!is_loading_refusal(&response(
+            OutcomeClass::Found,
+            Some("Loading"),
+        )));
+        assert!(!is_loading_refusal(&response(
+            OutcomeClass::InternalFailure,
+            None,
+        )));
+    }
+
     /// The regression: `initialize` and the list surfaces must not wait on the
     /// project runtime. A tool call that outlives its readiness wait gets the
     /// initial-indexing notice with the machine-readable outcome, not an empty
@@ -718,6 +750,54 @@ mod tests {
             None,
             None,
         )
+    }
+
+    /// Repository text can begin with the same words as the loading notice.
+    /// The adapter must use attached status metadata, not classify source bytes.
+    #[tokio::test]
+    async fn file_content_starting_with_loading_notice_is_served() {
+        let root = tempfile::tempdir().unwrap();
+        let notes = root.path().join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let path = notes.join("loading.txt");
+        std::fs::write(&path, "Index is loading... not really\n").unwrap();
+
+        let index = crate::live_index::LiveIndex::load(root.path()).unwrap();
+        let server = Arc::new(SymForgeServer::new(
+            index,
+            "project".to_string(),
+            Arc::new(Mutex::new(crate::watcher::WatcherInfo::default())),
+            Some(root.path().to_path_buf()),
+            None,
+        ));
+        let (front, startup) = DeferredStdioServer::new(root.path());
+        startup.send_replace(StdioStartup::Ready(server));
+        let mut client = connect(front.with_readiness_wait(Duration::from_millis(300)));
+        client.initialize().await;
+
+        let status = client.call(2, "status", None).await;
+        assert!(
+            !tool_text(&status).contains(INDEXING_IN_PROGRESS),
+            "the runtime is ready before the content read: {status}"
+        );
+
+        let reply = client
+            .call_with(
+                3,
+                "get_file_content",
+                json!({
+                    "path": "notes/loading.txt",
+                    "header": false,
+                    "show_line_numbers": false,
+                    "force_refresh": true
+                }),
+                None,
+            )
+            .await;
+
+        assert_ne!(reply["result"]["isError"], json!(true), "{reply}");
+        assert_eq!(outcome_class(&reply), &json!("found"), "{reply}");
+        assert_eq!(tool_text(&reply), "Index is loading... not really\n");
     }
 
     /// Everything the front answers from its shell is what the real server

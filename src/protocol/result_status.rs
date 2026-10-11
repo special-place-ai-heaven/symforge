@@ -202,8 +202,8 @@ tokio::task_local! {
 }
 
 /// Run one read with an empty outcome slot and return what it recorded.
-/// `None` means the read decided nothing typed (a generated refusal, or a
-/// daemon that sent no outcome header).
+/// `None` means the handler recorded no typed outcome; covered proxy tools and
+/// their callers must fail closed rather than classify the rendered body.
 pub async fn with_read_outcome_scope<F>(future: F) -> (F::Output, Option<ReadOutcome>)
 where
     F: Future,
