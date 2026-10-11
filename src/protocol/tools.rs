@@ -5019,6 +5019,10 @@ impl SymForgeServer {
         if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
             return refusal;
         }
+        if let Err(error) = parse_language_filter(params.0.language.as_deref()) {
+            record_read_outcome(ReadOutcome::InvalidRequest);
+            return error;
+        }
         if params.0.estimate == Some(true) {
             return crate::index_lifecycle::guidance::changes::what_changed_estimate(
                 params.0.include_symbol_diff.unwrap_or(false),
@@ -5046,6 +5050,7 @@ impl SymForgeServer {
                     "call index_folder(path=...)"
                 }
             };
+            record_read_outcome(ReadOutcome::Unavailable { retryable: false });
             return format!("No repo root attached; {attach} or pass since=...");
         }
         let options = WhatChangedOptions {
@@ -5059,7 +5064,10 @@ impl SymForgeServer {
         };
         let mode = match determine_what_changed_mode(&options, effective_repo_root.is_some()) {
             Ok(mode) => mode,
-            Err(message) => return message,
+            Err(message) => {
+                record_read_outcome(ReadOutcome::Unavailable { retryable: false });
+                return message;
+            }
         };
 
         match &mode {
@@ -5118,6 +5126,7 @@ impl SymForgeServer {
                             result
                         }
                         Err(error) => {
+                            record_read_outcome(ReadOutcome::InvalidRequest);
                             self.session_context.record_summary_output(
                                 "what_changed",
                                 (error.len() / 4).min(u32::MAX as usize) as u32,
@@ -5140,12 +5149,16 @@ impl SymForgeServer {
                 drop(guard);
 
                 let Some(repo_root) = effective_repo_root.as_deref() else {
+                    record_read_outcome(ReadOutcome::Unavailable { retryable: false });
                     return "Git change detection unavailable; pass `since` for timestamp mode."
                         .to_string();
                 };
                 let repo = match crate::git::GitRepo::open(repo_root) {
                     Ok(r) => r,
-                    Err(e) => return format!("Git change detection failed: {e}"),
+                    Err(e) => {
+                        record_read_outcome(ReadOutcome::Unavailable { retryable: false });
+                        return format!("Git change detection failed: {e}");
+                    }
                 };
                 match repo.uncommitted_paths() {
                     Ok(paths) => {
@@ -5222,10 +5235,16 @@ impl SymForgeServer {
                                 );
                                 format::enforce_token_budget(result, params.0.max_tokens)
                             }
-                            Err(e) => e,
+                            Err(e) => {
+                                record_read_outcome(ReadOutcome::InvalidRequest);
+                                e
+                            }
                         }
                     }
-                    Err(e) => format!("Git change detection failed: {e}"),
+                    Err(e) => {
+                        record_read_outcome(ReadOutcome::Unavailable { retryable: false });
+                        format!("Git change detection failed: {e}")
+                    }
                 }
             }
             WhatChangedMode::GitRef(git_ref) => {
@@ -5234,12 +5253,16 @@ impl SymForgeServer {
                 drop(guard);
 
                 let Some(repo_root) = effective_repo_root.as_deref() else {
+                    record_read_outcome(ReadOutcome::Unavailable { retryable: false });
                     return "Git change detection unavailable; pass `since` for timestamp mode."
                         .to_string();
                 };
                 let repo = match crate::git::GitRepo::open(repo_root) {
                     Ok(r) => r,
-                    Err(e) => return format!("Git change detection failed: {e}"),
+                    Err(e) => {
+                        record_read_outcome(ReadOutcome::Unavailable { retryable: false });
+                        return format!("Git change detection failed: {e}");
+                    }
                 };
                 match repo.changed_paths_from_ref(git_ref) {
                     Ok(paths) => {
@@ -5307,10 +5330,16 @@ impl SymForgeServer {
                                 );
                                 result
                             }
-                            Err(e) => e,
+                            Err(e) => {
+                                record_read_outcome(ReadOutcome::InvalidRequest);
+                                e
+                            }
                         }
                     }
-                    Err(e) => format!("Git change detection failed: {e}"),
+                    Err(e) => {
+                        record_read_outcome(ReadOutcome::Unavailable { retryable: false });
+                        format!("Git change detection failed: {e}")
+                    }
                 }
             }
         }
@@ -6408,6 +6437,13 @@ impl SymForgeServer {
         if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
             return refusal;
         }
+        let lang_filter = match parse_language_filter(params.0.language.as_deref()) {
+            Ok(f) => f,
+            Err(e) => {
+                record_read_outcome(ReadOutcome::InvalidRequest);
+                return e;
+            }
+        };
         if params.0.estimate == Some(true) {
             let depth = params.0.depth.unwrap_or(1);
             let est = match depth {
@@ -6417,10 +6453,6 @@ impl SymForgeServer {
             };
             return format!("Estimate for explore: ~{} tokens (depth={})", est, depth);
         }
-        let lang_filter = match parse_language_filter(params.0.language.as_deref()) {
-            Ok(f) => f,
-            Err(e) => return e,
-        };
         let guard = self.index.data_plane().read();
         *served = Some(Arc::clone(&guard));
         loading_guard!(guard);
@@ -8035,7 +8067,7 @@ impl SymForgeServer {
         }
         let q = smart_query::strip_leading_articles(original_q);
         if q.is_empty() {
-            record_read_outcome(ReadOutcome::Found);
+            record_read_outcome(ReadOutcome::InvalidRequest);
             return "query requires a non-empty question.".to_string();
         }
         // `ask` chooses its route from index state, so daemon-backed calls must
@@ -18665,8 +18697,8 @@ mod tests {
         let _cwd_guard = CwdGuard::set(&home);
         let server = make_server(make_live_index_empty());
 
-        let result = server
-            .what_changed(Parameters(super::WhatChangedInput {
+        let (result, outcome) = crate::protocol::result_status::with_read_outcome_scope(
+            server.what_changed(Parameters(super::WhatChangedInput {
                 project: None,
                 since: None,
                 git_ref: None,
@@ -18677,8 +18709,13 @@ mod tests {
                 include_symbol_diff: None,
                 estimate: None,
                 max_tokens: None,
-            }))
-            .await;
+            })),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            Some(crate::protocol::result_status::ReadOutcome::Unavailable { retryable: false })
+        );
         // Surface-aware guidance (TR-02 / FR-012): `since=` is always offered;
         // `index_folder` is named only on the full/meta surface where it is
         // callable, never on the compact surface where it is dispatch-gated.

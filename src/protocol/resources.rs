@@ -1152,6 +1152,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, content).unwrap();
         }
+        git2::Repository::init(root.path()).unwrap();
         let loaded = SymForgeServer::new(
             LiveIndex::load(root.path()).expect("index"),
             "read-outcome-table".to_string(),

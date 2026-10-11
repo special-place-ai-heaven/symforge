@@ -790,6 +790,78 @@ pub(crate) mod read_outcome_cases {
             expected: OutcomeClass::EmptyResult,
         },
         Case {
+            label: "what_changed uncommitted unsupported language",
+            read: Read::Tool {
+                tool: "what_changed",
+                args: r#"{"uncommitted":true,"language":"not-a-language"}"#,
+            },
+            expected: OutcomeClass::InvalidRequest,
+        },
+        Case {
+            label: "what_changed timestamp unsupported language",
+            read: Read::Tool {
+                tool: "what_changed",
+                args: r#"{"since":0,"language":"not-a-language"}"#,
+            },
+            expected: OutcomeClass::InvalidRequest,
+        },
+        Case {
+            label: "what_changed estimate unsupported language",
+            read: Read::Tool {
+                tool: "what_changed",
+                args: r#"{"estimate":true,"language":"not-a-language"}"#,
+            },
+            expected: OutcomeClass::InvalidRequest,
+        },
+        Case {
+            label: "what_changed future timestamp unsupported language",
+            read: Read::Tool {
+                tool: "what_changed",
+                args: r#"{"since":9223372036854775807,"language":"not-a-language"}"#,
+            },
+            expected: OutcomeClass::InvalidRequest,
+        },
+        Case {
+            label: "explore estimate unsupported language",
+            read: Read::Tool {
+                tool: "explore",
+                args: r#"{"query":"alpha","depth":1,"limit":10,"include_noise":false,"include_vendor":false,"include_personal_tooling":false,"language":"not-a-language","estimate":true}"#,
+            },
+            expected: OutcomeClass::InvalidRequest,
+        },
+        Case {
+            label: "what_changed nonexistent git ref",
+            read: Read::Tool {
+                tool: "what_changed",
+                args: r#"{"git_ref":"definitely-no-such-ref"}"#,
+            },
+            expected: OutcomeClass::InternalFailure,
+        },
+        Case {
+            label: "explore unsupported language",
+            read: Read::Tool {
+                tool: "explore",
+                args: r#"{"query":"alpha","depth":1,"limit":10,"include_noise":false,"include_vendor":false,"include_personal_tooling":false,"language":"not-a-language"}"#,
+            },
+            expected: OutcomeClass::InvalidRequest,
+        },
+        Case {
+            label: "ask empty query",
+            read: Read::Tool {
+                tool: "ask",
+                args: r#"{"query":""}"#,
+            },
+            expected: OutcomeClass::InvalidRequest,
+        },
+        Case {
+            label: "ask whitespace query",
+            read: Read::Tool {
+                tool: "ask",
+                args: r#"{"query":"   "}"#,
+            },
+            expected: OutcomeClass::InvalidRequest,
+        },
+        Case {
             label: "read while the index is unready",
             read: Read::Unready,
             expected: OutcomeClass::InternalFailure,

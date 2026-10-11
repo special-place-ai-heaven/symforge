@@ -2739,7 +2739,9 @@ mod resource_outcome_table_tests {
         match refusal.query_kind {
             Some(QueryRefusalKind::NotFound) => OutcomeClass::NotFound,
             Some(QueryRefusalKind::AmbiguousSymbol) => OutcomeClass::Ambiguous,
-            Some(QueryRefusalKind::InvalidRequest) => OutcomeClass::InvalidRequest,
+            Some(QueryRefusalKind::InvalidRequest | QueryRefusalKind::UnsupportedOption) => {
+                OutcomeClass::InvalidRequest
+            }
             _ => OutcomeClass::InternalFailure,
         }
     }
@@ -2931,6 +2933,9 @@ mod resource_outcome_table_tests {
                         "search_files" => "FileSearch",
                         "search_text" => "TextSearch",
                         "search_symbols" => "SymbolSearch",
+                        "what_changed" => "WhatChanged",
+                        "explore" => "Explore",
+                        "ask" => "Ask",
                         other => panic!("no embed query for {other}"),
                     };
                     let args: serde_json::Value = serde_json::from_str(args).unwrap();
