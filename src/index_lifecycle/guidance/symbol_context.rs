@@ -1160,6 +1160,24 @@ pub(crate) fn capture_trace_symbol_view(
     trace_view
 }
 
+/// Whether any indexed file defines the selected symbol (name, plus kind and
+/// line when given), by the same selector every exact lane resolves with.
+// ponytail: linear scan over files, only on the empty-answer path; a name index if it grows hot.
+pub(crate) fn symbol_defined_anywhere(
+    index: &crate::live_index::LiveIndex,
+    name: &str,
+    symbol_kind: Option<&str>,
+    symbol_line: Option<u32>,
+) -> bool {
+    use crate::live_index::query::{SymbolSelectorMatch, resolve_symbol_selector};
+    index.all_files().any(|(_, file)| {
+        !matches!(
+            resolve_symbol_selector(file, name, symbol_kind, symbol_line),
+            SymbolSelectorMatch::NotFound
+        )
+    })
+}
+
 pub(crate) struct SymbolContextSelector<'a> {
     pub name: &'a str,
     pub file: Option<&'a str>,
@@ -1229,21 +1247,19 @@ pub(crate) fn symbol_context_references(
         total += 1;
     }
 
-    // A `file` filter naming a file that holds no such symbol and no reference
-    // to it is a miss, not an empty answer: render the same canonical miss the
-    // exact `path` lane returns, so the outcome classifier reads it NotFound.
+    // `file` only filters which references are shown. An empty answer under it
+    // is a miss only when the selected symbol exists nowhere in the index; a
+    // symbol defined elsewhere and unreferenced here is "No references found".
     if map.is_empty()
         && params.path.is_none()
-        && let Some(file) = params.file
-        && let Err(miss) = guard.find_exact_references_for_symbol(
-            file,
-            params.name,
-            params.symbol_kind,
-            params.symbol_line,
-            None,
-        )
+        && params.file.is_some()
+        && !symbol_defined_anywhere(guard, params.name, params.symbol_kind, params.symbol_line)
     {
-        return (miss, 0, 0);
+        return (
+            format!("Symbol \"{}\" not found in index.", params.name),
+            0,
+            0,
+        );
     }
 
     // Compute total bytes for savings (sum of content of all matched files).

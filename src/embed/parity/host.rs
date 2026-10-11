@@ -2348,6 +2348,7 @@ mod resource_contract_tests {
         git2::Repository::init(repository.path()).unwrap();
         std::fs::create_dir(repository.path().join("src")).unwrap();
         std::fs::write(repository.path().join("src/a.rs"), b"pub fn a() {}\n").unwrap();
+        std::fs::write(repository.path().join("src/b.rs"), b"pub fn b() {}\n").unwrap();
         std::fs::create_dir(repository.path().join("docs")).unwrap();
         std::fs::write(
             repository.path().join("docs/decoy.txt"),
@@ -2569,6 +2570,70 @@ mod resource_contract_tests {
             .expect("an invalid request must not read as success");
         assert_eq!(refusal.kind, HostRefusalKind::InvalidRequest);
         assert_eq!(refusal.query_kind, Some(QueryRefusalKind::InvalidRequest));
+        // `file` filters which references are shown, as on MCP: `a` is defined
+        // in src/a.rs and unreferenced in src/b.rs, which is not a miss through
+        // the query or the resource. A name defined nowhere is the miss.
+        let filtered = crate::embed::parity::symbol_context::SymbolContextRequest {
+            name: "a".into(),
+            file: Some("src/b.rs".into()),
+            ..Default::default()
+        };
+        let HostResponse::Query(query) = room
+            .dispatch(
+                &HostRequest::Query {
+                    request: QueryRequest::SymbolContext(filtered.clone()),
+                    limits: QueryLimits::default(),
+                },
+                &control,
+            )
+            .unwrap_or_else(|refusal| panic!("filtered symbol context refused: {refusal:?}"))
+        else {
+            panic!("query response");
+        };
+        let QueryOutput::SymbolContext(context) = query.output else {
+            panic!("symbol context output");
+        };
+        assert!(
+            context.rendered.contains("No references found"),
+            "{}",
+            context.rendered
+        );
+        let HostResponse::Resource(reply) = room
+            .dispatch(
+                &HostRequest::Resource(HostResourceRequest::SymbolContextOptions(filtered)),
+                &control,
+            )
+            .unwrap_or_else(|refusal| {
+                panic!("filtered symbol context resource refused: {refusal:?}")
+            })
+        else {
+            panic!("resource response");
+        };
+        let HostResourceContent::Query(query) = reply.content else {
+            panic!("query-backed resource");
+        };
+        let QueryOutput::SymbolContext(context) = query.output else {
+            panic!("symbol context output");
+        };
+        assert!(
+            context.rendered.contains("No references found"),
+            "{}",
+            context.rendered
+        );
+        let refusal = room
+            .dispatch(
+                &HostRequest::Resource(HostResourceRequest::SymbolContextOptions(
+                    crate::embed::parity::symbol_context::SymbolContextRequest {
+                        name: "defined_nowhere".into(),
+                        file: Some("src/b.rs".into()),
+                        ..Default::default()
+                    },
+                )),
+                &control,
+            )
+            .err()
+            .expect("a name defined nowhere is a miss");
+        assert_eq!(refusal.query_kind, Some(QueryRefusalKind::NotFound));
         // An existing file whose content imitates the miss text is still a read.
         let HostResponse::Resource(reply) = room
             .dispatch(

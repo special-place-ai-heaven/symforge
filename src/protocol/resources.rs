@@ -637,36 +637,47 @@ mod tests {
         content: &[u8],
         snapshot_verify_state: crate::live_index::store::SnapshotVerifyState,
     ) -> SymForgeServer {
-        let byte_range = (0, 10);
-        let symbol = SymbolRecord {
-            name: "main".to_string(),
-            kind: SymbolKind::Function,
-            depth: 0,
-            sort_order: 0,
-            byte_range,
-            item_byte_range: Some(byte_range),
-            line_range: (
-                1,
-                content.iter().filter(|&&byte| byte == b'\n').count() as u32 + 1,
-            ),
-            doc_byte_range: None,
-        };
-        let file = IndexedFile {
-            relative_path: path.to_string(),
-            language: LanguageId::Rust,
-            classification: crate::domain::FileClassification::for_code_path(path),
-            content: content.to_vec(),
-            symbols: vec![symbol],
-            parse_status: ParseStatus::Parsed,
-            parse_diagnostic: None,
-            byte_len: content.len() as u64,
-            content_hash: "test".to_string(),
-            references: vec![],
-            alias_map: HashMap::new(),
-            mtime_secs: 0,
-        };
+        make_server_with_files(&[(path, content, "main")], snapshot_verify_state)
+    }
+
+    /// One indexed file per `(path, content, symbol)`, each defining one
+    /// function symbol over its first ten bytes.
+    fn make_server_with_files(
+        entries: &[(&str, &[u8], &str)],
+        snapshot_verify_state: crate::live_index::store::SnapshotVerifyState,
+    ) -> SymForgeServer {
         let mut files = HashMap::new();
-        files.insert(path.to_string(), std::sync::Arc::new(file));
+        for (path, content, name) in entries {
+            let byte_range = (0, 10);
+            let symbol = SymbolRecord {
+                name: name.to_string(),
+                kind: SymbolKind::Function,
+                depth: 0,
+                sort_order: 0,
+                byte_range,
+                item_byte_range: Some(byte_range),
+                line_range: (
+                    1,
+                    content.iter().filter(|&&byte| byte == b'\n').count() as u32 + 1,
+                ),
+                doc_byte_range: None,
+            };
+            let file = IndexedFile {
+                relative_path: path.to_string(),
+                language: LanguageId::Rust,
+                classification: crate::domain::FileClassification::for_code_path(path),
+                content: content.to_vec(),
+                symbols: vec![symbol],
+                parse_status: ParseStatus::Parsed,
+                parse_diagnostic: None,
+                byte_len: content.len() as u64,
+                content_hash: "test".to_string(),
+                references: vec![],
+                alias_map: HashMap::new(),
+                mtime_secs: 0,
+            };
+            files.insert(path.to_string(), std::sync::Arc::new(file));
+        }
         let mut index = LiveIndex {
             files,
             loaded_at: Instant::now(),
@@ -998,5 +1009,64 @@ mod tests {
                 "retryable": true,
             }))
         );
+    }
+
+    /// `file` filters which references are shown; it does not name the
+    /// symbol's location. A symbol defined in another file and unreferenced
+    /// in the filtered one is "No references found", through the tool and the
+    /// resource alike. A name defined nowhere is the miss.
+    #[tokio::test]
+    async fn test_symbol_context_file_filter_misses_only_a_symbol_defined_nowhere() {
+        let server = make_server_with_files(
+            &[
+                ("src/a.rs", b"fn helper() {}", "helper"),
+                ("src/b.rs", b"fn other() {}", "other"),
+            ],
+            crate::live_index::store::SnapshotVerifyState::NotNeeded,
+        );
+        let tool = server
+            .get_symbol_context(Parameters(GetSymbolContextInput {
+                project: None,
+                name: "helper".to_string(),
+                file: Some("src/b.rs".to_string()),
+                path: None,
+                symbol_kind: None,
+                symbol_line: None,
+                verbosity: None,
+                bundle: None,
+                sections: None,
+                max_tokens: None,
+                estimate: None,
+            }))
+            .await;
+        assert!(tool.contains("No references found"), "{tool}");
+        let defined_elsewhere = build_uri(
+            "symforge://symbol/context",
+            &[
+                ("name", Some("helper".to_string())),
+                ("file", Some("src/b.rs".to_string())),
+            ],
+        );
+        let result = server
+            .read_resource_uri(&defined_elsewhere)
+            .await
+            .expect("a symbol defined elsewhere is not a miss");
+        let text = match &result.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text,
+            other => panic!("expected text resource, got {other:?}"),
+        };
+        assert!(text.contains("No references found"), "{text}");
+        let nowhere = build_uri(
+            "symforge://symbol/context",
+            &[
+                ("name", Some("defined_nowhere".to_string())),
+                ("file", Some("src/b.rs".to_string())),
+            ],
+        );
+        let error = server
+            .read_resource_uri(&nowhere)
+            .await
+            .expect_err("a name defined nowhere is a miss");
+        assert_eq!(error.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
     }
 }

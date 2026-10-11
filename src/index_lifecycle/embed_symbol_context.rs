@@ -304,6 +304,64 @@ fn candidates(
     Ok(bounded)
 }
 
+/// MCP's default-mode answer when the filtered file does not define the
+/// symbol: no definition header, the filtered references, then the same
+/// footer and output bounds the defined-symbol answer goes through.
+fn filtered_references(
+    published: &crate::live_index::PublishedGeneration,
+    file: &crate::live_index::IndexedFile,
+    path: &str,
+    request: &SymbolContextRequest,
+    mut result: SymbolContextResult,
+    budget: &mut Budget,
+) -> Result<QueryOutput, QueryRefusalKind> {
+    let selector = shared::SymbolContextSelector {
+        name: &request.name,
+        file: request.file.as_deref(),
+        path: None,
+        symbol_kind: request.symbol_kind.as_deref(),
+        symbol_line: request.symbol_line,
+    };
+    let max_references = budget.remaining_rows().saturating_sub(1).min(10);
+    let (references, _, count) = shared::symbol_context_references(
+        published,
+        &selector,
+        4000,
+        max_references,
+        read_context::ContextSourceAuthority::CurrentIndex,
+    );
+    for _ in 0..count {
+        budget.required(0)?;
+    }
+    let footer = read_context::compact_savings_footer(references.len(), file.content.len());
+    let (mut rendered, truncated) = knowledge_model::enforce_budgeted_code_context_with_knowledge(
+        published,
+        format!("{references}{footer}"),
+        None,
+        None,
+        request.max_tokens,
+    );
+    let withheld =
+        read_context::withheld_not_searched_note(published.live.withheld_since_restore(), None);
+    if let Some(withheld) = &withheld {
+        rendered.push_str("\n\n");
+        rendered.push_str(withheld);
+    }
+    let (rendered, bounded) = knowledge_model::bound_final_code_context_output_flagged(
+        rendered,
+        request.max_tokens,
+        &format!("symbol:{path}:{}", request.name),
+        request.sections.as_deref(),
+        true,
+        withheld.is_some(),
+        None,
+    );
+    budget.truncated |= truncated || bounded;
+    result.path = Some(path.to_owned());
+    result.rendered = budget.text(&rendered)?;
+    Ok(QueryOutput::SymbolContext(result))
+}
+
 pub(super) fn project(
     snapshot: &EmbeddedQuerySnapshot,
     request: &SymbolContextRequest,
@@ -394,6 +452,21 @@ pub(super) fn project(
             return Ok(QueryOutput::SymbolContext(result));
         }
         crate::live_index::query::SymbolSelectorMatch::NotFound => {
+            // MCP reads a lone `file` as a reference filter, not the symbol's
+            // location: a symbol defined elsewhere answers with the references
+            // shown for that file, even when there are none.
+            if mode == SymbolContextMode::Default
+                && request.path.is_none()
+                && request.file.is_some()
+                && shared::symbol_defined_anywhere(
+                    &published.live,
+                    &request.name,
+                    request.symbol_kind.as_deref(),
+                    request.symbol_line,
+                )
+            {
+                return filtered_references(published, file, &path, request, result, budget);
+            }
             return Err(QueryRefusalKind::NotFound);
         }
     };
