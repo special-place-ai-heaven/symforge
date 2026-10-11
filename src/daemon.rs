@@ -5361,6 +5361,22 @@ fn take_private_project_route_pin(
     Ok(Some(project))
 }
 
+fn project_routing_response(
+    tool_name: &str,
+    mut response: axum::response::Response,
+) -> axum::response::Response {
+    if crate::stel::planner::FacadeStepTool::from_name(tool_name).is_some() {
+        let outcome = crate::protocol::result_status::ReadOutcome::InvalidRequest;
+        let json =
+            serde_json::to_string(&outcome).expect("read outcome serialization is infallible");
+        let value = axum::http::HeaderValue::from_str(&json)
+            .expect("serialized read outcome is a valid header value");
+        response
+            .headers_mut()
+            .insert(crate::protocol::result_status::READ_OUTCOME_HEADER, value);
+    }
+    response
+}
 async fn call_tool_handler(
     State(state): State<SharedDaemonState>,
     headers: HeaderMap,
@@ -5372,7 +5388,10 @@ async fn call_tool_handler(
     let private_project_route_pin = match take_private_project_route_pin(&tool_name, &mut params) {
         Ok(pin) => pin,
         Err(message) => {
-            return Ok(format!("Error: project_routing: {message}").into_response());
+            return Ok(project_routing_response(
+                &tool_name,
+                format!("Error: project_routing: {message}").into_response(),
+            ));
         }
     };
     if tool_name == "index_folder" {
@@ -5380,11 +5399,12 @@ async fn call_tool_handler(
             .as_object()
             .is_some_and(|object| object.contains_key("project") || object.contains_key("projects"))
         {
-            return Ok(
+            return Ok(project_routing_response(
+                &tool_name,
                 "Error: project_routing: tool 'index_folder' does not accept `project` or \
                  `projects`; `path` is the project selection for this operation."
                     .into_response(),
-            );
+            ));
         }
         let input = decode_params::<IndexFolderInput>(params).map_err(bad_request)?;
         let state_for_index = state.clone();
@@ -5417,7 +5437,10 @@ async fn call_tool_handler(
     let (raw_project, raw_projects) = match strict_daemon_project_selectors(&params) {
         Ok(selectors) => selectors,
         Err(message) => {
-            return Ok(format!("Error: project_routing: {message}").into_response());
+            return Ok(project_routing_response(
+                &tool_name,
+                format!("Error: project_routing: {message}").into_response(),
+            ));
         }
     };
     let cross_project_selector_tool = matches!(
@@ -5433,18 +5456,24 @@ async fn call_tool_handler(
         && !cross_project_selector_tool
         && !single_project_routed_tool(&tool_name)
     {
-        return Ok(format!(
-            "Error: project_routing: tool '{tool_name}' does not accept a public `project` \
+        return Ok(project_routing_response(
+            &tool_name,
+            format!(
+                "Error: project_routing: tool '{tool_name}' does not accept a public `project` \
              selector."
-        )
-        .into_response());
+            )
+            .into_response(),
+        ));
     }
     if raw_projects.is_some() && !cross_project_selector_tool {
-        return Ok(format!(
-            "Error: project_routing: tool '{tool_name}' accepts at most one `project`; \
+        return Ok(project_routing_response(
+            &tool_name,
+            format!(
+                "Error: project_routing: tool '{tool_name}' accepts at most one `project`; \
              `projects` is supported only by the set-valued discovery tools."
-        )
-        .into_response());
+            )
+            .into_response(),
+        ));
     }
     let mut scalar_target_runtime: Option<SessionRuntime> = None;
     let mut has_explicit_project_set = false;
@@ -5482,11 +5511,12 @@ async fn call_tool_handler(
         };
 
         if project.is_some() && projects.is_some() {
-            return Ok(
+            return Ok(project_routing_response(
+                &tool_name,
                 "Error: project_routing: project and projects are mutually exclusive: pass \
                  exactly one (a single id in `project`, or a list/`[\"*\"]` in `projects`)."
                     .into_response(),
-            );
+            ));
         }
         has_explicit_project_set = projects.is_some();
 
@@ -5502,7 +5532,10 @@ async fn call_tool_handler(
                     return Err((StatusCode::NOT_FOUND, message));
                 }
                 Err(message) => {
-                    return Ok(format!("Error: project_routing: {message}").into_response());
+                    return Ok(project_routing_response(
+                        &tool_name,
+                        format!("Error: project_routing: {message}").into_response(),
+                    ));
                 }
             };
             let project_id = target_runtime.project_id.clone();
@@ -5521,7 +5554,10 @@ async fn call_tool_handler(
                         return Err((StatusCode::NOT_FOUND, message));
                     }
                     Err(message) => {
-                        return Ok(format!("Error: project_routing: {message}").into_response());
+                        return Ok(project_routing_response(
+                            &tool_name,
+                            format!("Error: project_routing: {message}").into_response(),
+                        ));
                     }
                 };
                 if !project_ids.contains(&project_id) {
@@ -5575,7 +5611,10 @@ async fn call_tool_handler(
                 return Err((StatusCode::NOT_FOUND, message));
             }
             Err(message) => {
-                return Ok(format!("Error: project_routing: {message}").into_response());
+                return Ok(project_routing_response(
+                    &tool_name,
+                    format!("Error: project_routing: {message}").into_response(),
+                ));
             }
         }
     } else if single_project_routed_tool(&tool_name) {
@@ -5596,11 +5635,12 @@ async fn call_tool_handler(
         // strip below would silently swallow a `project`+`projects` conflict
         // before `resolve_targets` could see it, so reject it here.
         if peek.project.is_some() && peek.projects.is_some() {
-            return Ok(
+            return Ok(project_routing_response(
+                &tool_name,
                 "Error: project_routing: project and projects are mutually exclusive: pass \
                  exactly one (a single id in `project`, or a list/`[\"*\"]` in `projects`)."
                     .into_response(),
-            );
+            ));
         }
         match state.runtime_for_target(&session_id, peek.project.as_deref()) {
             Ok(runtime) => {
@@ -5625,7 +5665,10 @@ async fn call_tool_handler(
             // convention as tool errors below) so the MCP client sees the
             // candidates immediately instead of a transport failure.
             Err(message) => {
-                return Ok(format!("Error: project_routing: {message}").into_response());
+                return Ok(project_routing_response(
+                    &tool_name,
+                    format!("Error: project_routing: {message}").into_response(),
+                ));
             }
         }
     } else {
@@ -17733,12 +17776,53 @@ mod tests {
             unknown["_meta"]["symforge/result_status"]["outcome_class"], "invalid_request",
             "a daemon routing refusal must never look Found: {unknown}"
         );
+        assert_eq!(
+            unknown["isError"], true,
+            "a typed routing refusal must also be marked as an MCP error: {unknown}"
+        );
         assert!(
             unknown["content"][0]["text"]
                 .as_str()
                 .is_some_and(|text| text.starts_with("Error: project_routing:")),
             "daemon routing refusal must use the shared error prefix: {unknown}"
         );
+
+        let get_file_url = format!(
+            "{base_url}/v1/sessions/{}/tools/get_file_content",
+            opened.session_id
+        );
+        for selector in [
+            serde_json::json!("not-an-open-project"),
+            serde_json::json!(7),
+        ] {
+            let response = http
+                .post(&get_file_url)
+                .json(&serde_json::json!({
+                    "path": "src/lib.rs",
+                    "project": selector,
+                }))
+                .send()
+                .await
+                .expect("routing refusal request");
+            assert!(response.status().is_success());
+            let outcome = serde_json::from_slice::<crate::protocol::result_status::ReadOutcome>(
+                response
+                    .headers()
+                    .get(crate::protocol::result_status::READ_OUTCOME_HEADER)
+                    .expect("routing refusal must carry a typed outcome")
+                    .as_bytes(),
+            )
+            .expect("routing outcome header");
+            assert_eq!(
+                outcome,
+                crate::protocol::result_status::ReadOutcome::InvalidRequest
+            );
+            let body = response.text().await.expect("routing refusal body");
+            assert!(
+                body.starts_with("Error: project_routing:"),
+                "project selector refusal should retain its body: {body}"
+            );
+        }
 
         // The daemon HTTP route is independently callable. A structural edit
         // must not drop a malformed/set-valued selector and mutate ACTIVE B.
