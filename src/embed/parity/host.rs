@@ -1650,6 +1650,7 @@ impl HostRoom {
         };
         let session = self.query_session()?;
         let mut admitted = None;
+        let mut missing = false;
         self.source
             .query_with_policy_admitted(
                 &request,
@@ -1660,6 +1661,11 @@ impl HostRoom {
                 Some(&session),
                 Some(control),
                 |claim| {
+                    // Refused before the session commits, as MCP answers the same miss.
+                    if resource_target_missing(claim.value()) {
+                        missing = true;
+                        return false;
+                    }
                     let reply = HostResourceReply {
                         uri: uri.to_owned(),
                         content: HostResourceContent::Query(HostQueryReply::from_claim(
@@ -1674,7 +1680,15 @@ impl HostRoom {
                     fits
                 },
             )
-            .map_err(HostRefusal::from_query)?;
+            .map_err(|refusal| {
+                let rejected = refusal.kind() == QueryRefusalKind::OutputAdmissionRejected;
+                let mut refusal = HostRefusal::from_query(refusal);
+                if missing && rejected {
+                    refusal.kind = HostRefusalKind::SourceUnavailable;
+                    refusal.query_kind = Some(QueryRefusalKind::NotFound);
+                }
+                refusal
+            })?;
         Ok(admitted.expect("admitted resource response was encoded before session commit"))
     }
 
@@ -2458,6 +2472,45 @@ mod resource_contract_tests {
             assert_eq!(query.semantic_operation, operation);
             assert!(!query.publication_identity.is_empty());
         }
+        // MCP `resources/read` answers a missing target with resource-not-found;
+        // the room must refuse with the matching typed not-found outcome.
+        for (label, request) in [
+            (
+                "file content",
+                HostResourceRequest::FileContent {
+                    path: "src/missing.rs".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+            ),
+            (
+                "file context",
+                HostResourceRequest::FileContext {
+                    path: "src/missing.rs".into(),
+                    max_tokens: None,
+                },
+            ),
+            (
+                "symbol detail",
+                HostResourceRequest::SymbolDetailOptions(
+                    crate::embed::parity::symbol::SymbolReadRequest {
+                        path: "src/missing.rs".into(),
+                        name: "a".into(),
+                        ..Default::default()
+                    },
+                ),
+            ),
+        ] {
+            let refusal = room
+                .dispatch(&HostRequest::Resource(request), &control)
+                .err()
+                .unwrap_or_else(|| panic!("{label}: missing target must not read as success"));
+            assert_eq!(
+                refusal.query_kind,
+                Some(QueryRefusalKind::NotFound),
+                "{label}"
+            );
+        }
     }
 }
 
@@ -2857,6 +2910,21 @@ fn render_prompt(
         description: description.into(),
         messages,
     })
+}
+
+/// MCP `resources/read` fails with resource-not-found when the shared outcome
+/// classifier reads the rendered answer as a miss; the room applies the same
+/// classifier to the same rendered text so both surfaces refuse alike.
+fn resource_target_missing(output: &QueryOutput) -> bool {
+    use crate::embed::lifecycle::guidance::outcome::{OutcomeClass, classify_compact_tool_output};
+    let (tool, rendered) = match output {
+        QueryOutput::FileContent(value) => ("get_file_content", &value.rendered),
+        QueryOutput::FileContext(value) => ("get_file_context", &value.rendered),
+        QueryOutput::SymbolRead(value) => ("get_symbol", &value.rendered),
+        QueryOutput::SymbolContext(value) => ("get_symbol_context", &value.rendered),
+        _ => return false,
+    };
+    classify_compact_tool_output(tool, rendered) == OutcomeClass::NotFound
 }
 
 fn encode_uri_value(value: &str) -> String {

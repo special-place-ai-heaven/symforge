@@ -4,6 +4,8 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTemplate};
 
 use super::SymForgeServer;
+use super::tools::classify_compact_tool_output;
+use crate::protocol::result_status::OutcomeClass;
 use crate::protocol::tools::{
     GetFileContentInput, GetFileContextInput, GetRepoMapInput, GetSymbolContextInput,
     GetSymbolInput, WhatChangedInput,
@@ -55,6 +57,25 @@ enum ResourceRequest {
         name: String,
         file: Option<String>,
     },
+}
+
+impl ResourceRequest {
+    /// The tool whose rendered output answers this request, for templated
+    /// resources that name a target which may not exist.
+    fn target_tool(&self) -> Option<&'static str> {
+        match self {
+            Self::FileContext { .. } => Some("get_file_context"),
+            Self::FileContent { .. } => Some("get_file_content"),
+            Self::SymbolDetail { .. } => Some("get_symbol"),
+            Self::SymbolContext { .. } => Some("get_symbol_context"),
+            Self::RepoHealth
+            | Self::RepoOutline
+            | Self::RepoMap
+            | Self::RepoChangesUncommitted
+            | Self::ToolsCatalog
+            | Self::Glossary => None,
+        }
+    }
 }
 
 impl SymForgeServer {
@@ -134,10 +155,21 @@ impl SymForgeServer {
     ) -> Result<ReadResourceResult, McpError> {
         let request =
             parse_resource_uri(uri).map_err(|error| McpError::invalid_params(error, None))?;
+        let tool = request.target_tool();
         let text = self
             .render_resource_text(request)
             .await
             .map_err(|error| McpError::invalid_params(error, None))?;
+        // A templated read whose target does not exist must not report success:
+        // the shared outcome classifier is the one authority on the rendered miss.
+        if tool
+            .is_some_and(|tool| classify_compact_tool_output(tool, &text) == OutcomeClass::NotFound)
+        {
+            return Err(McpError::resource_not_found(
+                text,
+                Some(serde_json::json!({ "uri": uri })),
+            ));
+        }
 
         // FR-312 / INV-4 (spec 025): live per-workspace state behind bearer
         // auth — never eligible for a shared cache, and any nonzero TTL would
@@ -671,5 +703,39 @@ mod tests {
             other => panic!("expected text resource, got {other:?}"),
         };
         assert_eq!(text, "1: line 1\n2: TODO first\n3: line 3");
+    }
+
+    #[tokio::test]
+    async fn test_read_templated_resource_for_missing_target_is_resource_not_found() {
+        let server = make_server();
+        let uris = [
+            build_uri(
+                "symforge://file/content",
+                &[("path", Some("src/missing.rs".to_string()))],
+            ),
+            build_uri(
+                "symforge://file/context",
+                &[("path", Some("src/missing.rs".to_string()))],
+            ),
+            build_uri(
+                "symforge://symbol/detail",
+                &[
+                    ("path", Some("src/missing.rs".to_string())),
+                    ("name", Some("main".to_string())),
+                ],
+            ),
+        ];
+        for uri in uris {
+            let error = server
+                .read_resource_uri(&uri)
+                .await
+                .expect_err("missing target must not read as success");
+            assert_eq!(
+                error.code,
+                rmcp::model::ErrorCode::RESOURCE_NOT_FOUND,
+                "{uri}"
+            );
+            assert_eq!(error.data, Some(serde_json::json!({ "uri": uri })));
+        }
     }
 }
