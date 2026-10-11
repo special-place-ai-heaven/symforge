@@ -4305,12 +4305,14 @@ impl SymForgeServer {
         session_id: String,
         project_root: PathBuf,
     ) -> String {
-        self.health_compact_for_runtime(
+        let result = self.health_compact_for_runtime(
             format::RuntimeMode::DaemonReusedSession,
             Some(project_id),
             Some(session_id),
             Some(project_root),
-        )
+        );
+        record_read_outcome(ReadOutcome::Found);
+        result
     }
 
     /// Diagnostic: index status, file/symbol counts, load time, watcher state, token savings,

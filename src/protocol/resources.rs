@@ -436,6 +436,12 @@ fn parse_resource_uri(uri: &str) -> Result<ResourceRequest, String> {
     }
 
     let query: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+    // Resource templates are scoped to the server's bound project and do not
+    // advertise project selectors. Reject them instead of silently serving the
+    // active project's source for a different or malformed target.
+    if query.contains_key("project") || query.contains_key("projects") {
+        return Err("project selectors are not supported on resource URIs".to_string());
+    }
 
     match (url.host_str(), url.path()) {
         (Some("repo"), "/health") => Ok(ResourceRequest::RepoHealth),
@@ -881,6 +887,47 @@ mod tests {
             .expect_err("an invalid request must not read as success");
         assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert_eq!(error.data, Some(serde_json::json!({ "uri": uri })));
+    }
+
+    #[tokio::test]
+    async fn project_selectors_are_rejected_by_project_bound_resource_templates() {
+        let server = make_server();
+        let invalid_uris = [
+            "symforge://file/context?path=src%2Fmain.rs&project=not-an-open-project",
+            "symforge://file/content?path=src%2Fmain.rs&project=not-an-open-project&force_refresh=true",
+            "symforge://symbol/detail?path=src%2Fmain.rs&name=main&project=not-an-open-project",
+            "symforge://symbol/context?name=main&project=not-an-open-project",
+            "symforge://file/context?path=src%2Fmain.rs&project=test_project",
+            "symforge://file/content?path=src%2Fmain.rs&project=test_project",
+            "symforge://symbol/detail?path=src%2Fmain.rs&name=main&project=test_project",
+            "symforge://symbol/context?name=main&project=test_project",
+            "symforge://file/content?path=src%2Fmain.rs&project=%20%20",
+            "symforge://file/content?path=src%2Fmain.rs&projects=*",
+        ];
+        for uri in invalid_uris {
+            let error = server
+                .read_resource_uri(uri)
+                .await
+                .expect_err("resource templates do not support project selectors");
+            assert_eq!(
+                error.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "unsupported project selector must be an invalid request: {uri}"
+            );
+        }
+
+        let current_project_uris = [
+            "symforge://file/context?path=src%2Fmain.rs",
+            "symforge://file/content?path=src%2Fmain.rs",
+            "symforge://symbol/detail?path=src%2Fmain.rs&name=main",
+            "symforge://symbol/context?name=main",
+        ];
+        for uri in current_project_uris {
+            server
+                .read_resource_uri(uri)
+                .await
+                .expect("resource reads without a selector use the bound project");
+        }
     }
 
     #[tokio::test]

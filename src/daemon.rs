@@ -17512,9 +17512,157 @@ mod tests {
         );
     }
 
+    /// Daemon health_compact must carry its typed success through the MCP proxy.
+    #[tokio::test]
+    async fn daemon_health_compact_proxy_reports_found_on_http_and_mcp_wire() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let _surface_guard = EnvVarGuard::set_str("SYMFORGE_SURFACE", "full");
+
+        let project = project_dir("symforge-health-compact-typed");
+        std::fs::write(
+            project.path().join("src").join("lib.rs"),
+            "pub fn health_fixture() -> u32 { 1 }\n",
+        )
+        .expect("write project source");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let opened = authed_client(&handle)
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "health-compact-typed".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        let client = DaemonSessionClient::new_for_test_at(
+            base_url,
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+            test_control_state(daemon_home.path()),
+        )
+        .with_project_root(project.path().to_path_buf());
+
+        let (body, outcome) = crate::protocol::result_status::with_read_outcome_scope(
+            client.call_tool_value("health_compact", serde_json::json!({})),
+        )
+        .await;
+        let body = body.expect("daemon health_compact HTTP response");
+        assert!(
+            body.contains("Runtime: mode=daemon_reused_session"),
+            "daemon health_compact response should include its daemon runtime, got: {body}"
+        );
+        assert_eq!(
+            outcome.map(|outcome| outcome.class()),
+            Some(crate::protocol::result_status::OutcomeClass::Found),
+            "real daemon response must carry a typed Found outcome"
+        );
+
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+        let server_task = tokio::spawn(async move {
+            let service = rmcp::serve_server(server, tokio::io::split(server_io)).await?;
+            service.waiting().await?;
+            anyhow::Ok(())
+        });
+        let (reader, mut writer) = tokio::io::split(client_io);
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let init_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "health-compact-typed", "version": "0"}
+            }
+        });
+        writer
+            .write_all(format!("{init_request}\n").as_bytes())
+            .await
+            .expect("write initialize request");
+        let init_reply = lines
+            .next_line()
+            .await
+            .expect("read initialize reply")
+            .expect("initialize transport");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&init_reply).expect("initialize JSON")["id"],
+            1
+        );
+        writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .expect("write initialized notification");
+        let call_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "health_compact", "arguments": {}}
+        });
+        writer
+            .write_all(format!("{call_request}\n").as_bytes())
+            .await
+            .expect("write tools/call request");
+
+        let call_reply = loop {
+            let line = lines
+                .next_line()
+                .await
+                .expect("read tools/call reply")
+                .expect("MCP transport");
+            let reply: serde_json::Value = serde_json::from_str(&line).expect("tools/call JSON");
+            if reply.get("id") == Some(&serde_json::json!(2)) {
+                break reply;
+            }
+        };
+        assert!(
+            call_reply.get("error").is_none(),
+            "health_compact tools/call should return a result: {call_reply}"
+        );
+        let result = &call_reply["result"];
+        assert!(
+            !result["isError"].as_bool().unwrap_or(false),
+            "health_compact must not be an MCP error: {result}"
+        );
+        assert_eq!(
+            result["_meta"][crate::protocol::result_status::RESULT_STATUS_META_KEY]["outcome_class"],
+            "found",
+            "MCP result must preserve typed Found status: {result}"
+        );
+
+        drop(writer);
+        drop(lines);
+        server_task
+            .await
+            .expect("MCP server task")
+            .expect("MCP server");
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
+    }
+
     /// Opening another project must not move connection-scoped surfaces away
     /// from the immutable home project.
     #[tokio::test]
+
     async fn test_index_folder_activation_keeps_status_home_but_routes_facade_to_active_project() {
         let _env_lock = env_lock().await;
         let daemon_home = TempDir::new().expect("daemon home");
