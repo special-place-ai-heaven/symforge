@@ -1650,6 +1650,7 @@ impl HostRoom {
         };
         let session = self.query_session()?;
         let mut admitted = None;
+        let mut missing = false;
         self.source
             .query_with_policy_admitted(
                 &request,
@@ -1660,6 +1661,11 @@ impl HostRoom {
                 Some(&session),
                 Some(control),
                 |claim| {
+                    // Refused before the session commits, as MCP answers the same miss.
+                    if resource_target_missing(claim.value()) {
+                        missing = true;
+                        return false;
+                    }
                     let reply = HostResourceReply {
                         uri: uri.to_owned(),
                         content: HostResourceContent::Query(HostQueryReply::from_claim(
@@ -1674,7 +1680,17 @@ impl HostRoom {
                     fits
                 },
             )
-            .map_err(HostRefusal::from_query)?;
+            .map_err(|refusal| {
+                let rejected = refusal.kind() == QueryRefusalKind::OutputAdmissionRejected;
+                let mut refusal = HostRefusal::from_query(refusal);
+                if missing && rejected {
+                    refusal.kind = HostRefusalKind::SourceUnavailable;
+                    refusal.query_kind = Some(QueryRefusalKind::NotFound);
+                    // A missing target can appear later; retry once the source changes.
+                    refusal.retry = Some(HostRetryAdvice::OnEvent);
+                }
+                refusal
+            })?;
         Ok(admitted.expect("admitted resource response was encoded before session commit"))
     }
 
@@ -2321,6 +2337,12 @@ mod resource_contract_tests {
         git2::Repository::init(repository.path()).unwrap();
         std::fs::create_dir(repository.path().join("src")).unwrap();
         std::fs::write(repository.path().join("src/a.rs"), b"pub fn a() {}\n").unwrap();
+        std::fs::create_dir(repository.path().join("docs")).unwrap();
+        std::fs::write(
+            repository.path().join("docs/decoy.txt"),
+            b"File not found: decoy",
+        )
+        .unwrap();
         let grant = HostRoomGrant::new(
             "resource-room".into(),
             repository.path().to_path_buf(),
@@ -2458,6 +2480,82 @@ mod resource_contract_tests {
             assert_eq!(query.semantic_operation, operation);
             assert!(!query.publication_identity.is_empty());
         }
+        // MCP `resources/read` answers a missing target with resource-not-found;
+        // the room must refuse with the matching typed not-found outcome.
+        for (label, request) in [
+            (
+                "file content",
+                HostResourceRequest::FileContent {
+                    path: "src/missing.rs".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+            ),
+            (
+                "file context",
+                HostResourceRequest::FileContext {
+                    path: "src/missing.rs".into(),
+                    max_tokens: None,
+                },
+            ),
+            (
+                "symbol detail",
+                HostResourceRequest::SymbolDetailOptions(
+                    crate::embed::parity::symbol::SymbolReadRequest {
+                        path: "src/missing.rs".into(),
+                        name: "a".into(),
+                        ..Default::default()
+                    },
+                ),
+            ),
+            (
+                "missing symbol in an existing file",
+                HostResourceRequest::SymbolDetailOptions(
+                    crate::embed::parity::symbol::SymbolReadRequest {
+                        path: "src/a.rs".into(),
+                        name: "no_such_symbol".into(),
+                        ..Default::default()
+                    },
+                ),
+            ),
+        ] {
+            let refusal = room
+                .dispatch(&HostRequest::Resource(request), &control)
+                .err()
+                .unwrap_or_else(|| panic!("{label}: missing target must not read as success"));
+            assert_eq!(
+                refusal.query_kind,
+                Some(QueryRefusalKind::NotFound),
+                "{label}"
+            );
+            if label.contains("symbol") {
+                assert_eq!(refusal.retry, Some(HostRetryAdvice::OnEvent), "{label}");
+            }
+        }
+        // An existing file whose content imitates the miss text is still a read.
+        let HostResponse::Resource(reply) = room
+            .dispatch(
+                &HostRequest::Resource(HostResourceRequest::FileContentOptions(
+                    crate::embed::parity::read::FileContentRequest {
+                        path: "docs/decoy.txt".into(),
+                        show_line_numbers: Some(false),
+                        header: Some(false),
+                        ..Default::default()
+                    },
+                )),
+                &control,
+            )
+            .unwrap_or_else(|refusal| panic!("existing decoy file refused: {refusal:?}"))
+        else {
+            panic!("resource response");
+        };
+        let HostResourceContent::Query(query) = reply.content else {
+            panic!("query-backed resource");
+        };
+        let QueryOutput::FileContent(content) = query.output else {
+            panic!("file content output");
+        };
+        assert_eq!(content.rendered, "File not found: decoy");
     }
 }
 
@@ -2857,6 +2955,25 @@ fn render_prompt(
         description: description.into(),
         messages,
     })
+}
+
+/// MCP `resources/read` fails with resource-not-found only once its index
+/// confirms the target is absent. Here the native lanes already decided that
+/// against the room's index: a missing file is a typed `NotFound` refusal before
+/// any output exists, and a symbol miss is carried as a typed row refusal, so
+/// rendered text is never consulted and content imitating a miss stays a read.
+fn resource_target_missing(output: &QueryOutput) -> bool {
+    match output {
+        QueryOutput::SymbolRead(value) => {
+            !value.entries.is_empty()
+                && value
+                    .entries
+                    .iter()
+                    .all(|entry| entry.refusal == Some(QueryRefusalKind::NotFound))
+        }
+        QueryOutput::SymbolContext(value) => value.refusal == Some(QueryRefusalKind::NotFound),
+        _ => false,
+    }
 }
 
 fn encode_uri_value(value: &str) -> String {

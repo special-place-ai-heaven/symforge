@@ -73,19 +73,19 @@ use crate::stel::runtime::{facade_path_is_repo_relative, path_is_within_bound_pr
 
 // Moved verbatim to the feature-neutral `guidance::outcome` so the STEL
 // facade and the embedded facade classify a rendered answer exactly as MCP does.
+pub(super) use crate::index_lifecycle::guidance::outcome::{
+    classify_compact_tool_output, is_error_output, is_index_unavailable_output,
+};
 use crate::index_lifecycle::guidance::outcome::{
     classify_find_references_output, classify_get_file_content_output,
     classify_get_symbol_context_output, classify_get_symbol_output, classify_search_files_output,
     classify_search_knowledge_output, classify_search_symbols_output, classify_search_text_output,
     is_admission_refusal,
 };
-pub(super) use crate::index_lifecycle::guidance::outcome::{
-    is_error_output, is_index_unavailable_output,
-};
 // The classifier tests below name these through `super::`.
 #[cfg(test)]
 use crate::index_lifecycle::guidance::outcome::{
-    classify_compact_tool_output, classify_get_file_context_output, compact_tool_output_is_success,
+    classify_get_file_context_output, compact_tool_output_is_success,
 };
 
 use crate::domain::LanguageId;
