@@ -1247,12 +1247,12 @@ pub(crate) fn symbol_context_references(
         total += 1;
     }
 
-    // `file` only filters which references are shown. An empty answer under it
-    // is a miss only when the selected symbol exists nowhere in the index; a
-    // symbol defined elsewhere and unreferenced here is "No references found".
+    // Without an exact `path`, an empty answer is a miss only when the selected
+    // symbol exists nowhere in the index. A symbol defined somewhere but not
+    // referenced (in the `file` filter, when given) is "No references found",
+    // and references to an undefined name are still shown.
     if map.is_empty()
         && params.path.is_none()
-        && params.file.is_some()
         && !symbol_defined_anywhere(guard, params.name, params.symbol_kind, params.symbol_line)
     {
         return (

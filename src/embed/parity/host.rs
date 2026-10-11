@@ -2634,6 +2634,59 @@ mod resource_contract_tests {
             .err()
             .expect("a name defined nowhere is a miss");
         assert_eq!(refusal.query_kind, Some(QueryRefusalKind::NotFound));
+        // Name-only, as on MCP: a name defined nowhere is the miss through the
+        // query outcome and the resource; an existing unreferenced symbol is not.
+        let name_only = |name: &str| crate::embed::parity::symbol_context::SymbolContextRequest {
+            name: name.into(),
+            ..Default::default()
+        };
+        let HostResponse::Query(query) = room
+            .dispatch(
+                &HostRequest::Query {
+                    request: QueryRequest::SymbolContext(name_only("defined_nowhere")),
+                    limits: QueryLimits::default(),
+                },
+                &control,
+            )
+            .unwrap_or_else(|refusal| panic!("name-only query refused: {refusal:?}"))
+        else {
+            panic!("query response");
+        };
+        let QueryOutput::SymbolContext(context) = query.output else {
+            panic!("symbol context output");
+        };
+        assert_eq!(context.refusal, Some(QueryRefusalKind::NotFound));
+        let refusal = room
+            .dispatch(
+                &HostRequest::Resource(HostResourceRequest::SymbolContextOptions(name_only(
+                    "defined_nowhere",
+                ))),
+                &control,
+            )
+            .err()
+            .expect("a name-only name defined nowhere is a miss");
+        assert_eq!(refusal.query_kind, Some(QueryRefusalKind::NotFound));
+        let HostResponse::Resource(reply) = room
+            .dispatch(
+                &HostRequest::Resource(HostResourceRequest::SymbolContextOptions(name_only("a"))),
+                &control,
+            )
+            .unwrap_or_else(|refusal| panic!("name-only existing symbol refused: {refusal:?}"))
+        else {
+            panic!("resource response");
+        };
+        let HostResourceContent::Query(query) = reply.content else {
+            panic!("query-backed resource");
+        };
+        let QueryOutput::SymbolContext(context) = query.output else {
+            panic!("symbol context output");
+        };
+        assert_eq!(context.refusal, None);
+        assert!(
+            context.rendered.contains("No references found"),
+            "{}",
+            context.rendered
+        );
         // An existing file whose content imitates the miss text is still a read.
         let HostResponse::Resource(reply) = room
             .dispatch(

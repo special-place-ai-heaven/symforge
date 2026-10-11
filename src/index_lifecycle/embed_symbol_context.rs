@@ -309,8 +309,8 @@ fn candidates(
 /// footer and output bounds the defined-symbol answer goes through.
 fn filtered_references(
     published: &crate::live_index::PublishedGeneration,
-    file: &crate::live_index::IndexedFile,
-    path: &str,
+    raw_len: usize,
+    path: Option<&str>,
     request: &SymbolContextRequest,
     mut result: SymbolContextResult,
     budget: &mut Budget,
@@ -333,7 +333,7 @@ fn filtered_references(
     for _ in 0..count {
         budget.required(0)?;
     }
-    let footer = read_context::compact_savings_footer(references.len(), file.content.len());
+    let footer = read_context::compact_savings_footer(references.len(), raw_len);
     let (mut rendered, truncated) = knowledge_model::enforce_budgeted_code_context_with_knowledge(
         published,
         format!("{references}{footer}"),
@@ -350,14 +350,14 @@ fn filtered_references(
     let (rendered, bounded) = knowledge_model::bound_final_code_context_output_flagged(
         rendered,
         request.max_tokens,
-        &format!("symbol:{path}:{}", request.name),
+        &format!("symbol:{}:{}", path.unwrap_or_default(), request.name),
         request.sections.as_deref(),
         true,
         withheld.is_some(),
         None,
     );
     budget.truncated |= truncated || bounded;
-    result.path = Some(path.to_owned());
+    result.path = path.map(str::to_owned);
     result.rendered = budget.text(&rendered)?;
     Ok(QueryOutput::SymbolContext(result))
 }
@@ -415,6 +415,27 @@ pub(super) fn project(
             .map(|(path, _)| path.to_string())
             .collect();
         paths.sort_unstable();
+        // MCP's name-only default answer shows references even to a name no
+        // file defines (an external or dynamic use); only an unreferenced name
+        // defined nowhere is the miss.
+        if paths.is_empty()
+            && mode == SymbolContextMode::Default
+            && request.file.is_none()
+            && !snapshot
+                .generation
+                .live
+                .find_references_for_name(&request.name, None, false)
+                .is_empty()
+        {
+            return filtered_references(
+                snapshot.generation.as_ref(),
+                0,
+                None,
+                request,
+                result,
+                budget,
+            );
+        }
         if paths.len() != 1 {
             result.refusal = Some(if paths.is_empty() {
                 QueryRefusalKind::NotFound
@@ -465,7 +486,14 @@ pub(super) fn project(
                     request.symbol_line,
                 )
             {
-                return filtered_references(published, file, &path, request, result, budget);
+                return filtered_references(
+                    published,
+                    file.content.len(),
+                    Some(&path),
+                    request,
+                    result,
+                    budget,
+                );
             }
             return Err(QueryRefusalKind::NotFound);
         }

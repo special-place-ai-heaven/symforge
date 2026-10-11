@@ -63,7 +63,12 @@ enum ResourceRequest {
 /// renders a miss so content that merely LOOKS like a miss stays a success.
 enum ResourceTarget {
     File(String),
-    Symbol { path: String, name: String },
+    Symbol {
+        path: String,
+        name: String,
+    },
+    /// A symbol named without a file, confirmed by the global name lookup.
+    Named(String),
 }
 
 impl ResourceRequest {
@@ -92,12 +97,13 @@ impl ResourceRequest {
                 path: path.clone(),
                 name: name.clone(),
             }),
-            Self::SymbolContext { name, file } => {
-                file.as_ref().map(|path| ResourceTarget::Symbol {
+            Self::SymbolContext { name, file } => Some(match file {
+                Some(path) => ResourceTarget::Symbol {
                     path: path.clone(),
                     name: name.clone(),
-                })
-            }
+                },
+                None => ResourceTarget::Named(name.clone()),
+            }),
             Self::RepoHealth
             | Self::RepoOutline
             | Self::RepoMap
@@ -246,6 +252,26 @@ impl SymForgeServer {
     async fn resource_target_absent(&self, target: ResourceTarget) -> bool {
         let path = match &target {
             ResourceTarget::File(path) | ResourceTarget::Symbol { path, .. } => path.clone(),
+            // The name-only `get_symbol` lane is the index's global name lookup;
+            // its estimate renders no source, so a found symbol cannot imitate
+            // the miss.
+            ResourceTarget::Named(name) => {
+                let found = self
+                    .get_symbol(Parameters(GetSymbolInput {
+                        project: None,
+                        path: String::new(),
+                        name: name.clone(),
+                        kind: None,
+                        symbol_line: None,
+                        targets: None,
+                        estimate: Some(true),
+                        max_tokens: None,
+                        force_refresh: Some(true),
+                    }))
+                    .await;
+                return classify_compact_tool_output("get_symbol", &found)
+                    == OutcomeClass::NotFound;
+            }
         };
         let file = self
             .get_file_content(Parameters(GetFileContentInput {
@@ -1068,5 +1094,62 @@ mod tests {
             .await
             .expect_err("a name defined nowhere is a miss");
         assert_eq!(error.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+    }
+
+    /// A name-only symbol context: a name defined nowhere is a miss through the
+    /// tool outcome and the resource; an existing unreferenced symbol is not.
+    #[tokio::test]
+    async fn test_name_only_symbol_context_misses_only_a_symbol_defined_nowhere() {
+        let server = make_server();
+        let input = |name: &str| GetSymbolContextInput {
+            project: None,
+            name: name.to_string(),
+            file: None,
+            path: None,
+            symbol_kind: None,
+            symbol_line: None,
+            verbosity: None,
+            bundle: None,
+            sections: None,
+            max_tokens: None,
+            estimate: None,
+        };
+        let tool = server
+            .get_symbol_context(Parameters(input("defined_nowhere")))
+            .await;
+        assert_eq!(
+            classify_compact_tool_output("get_symbol_context", &tool),
+            OutcomeClass::NotFound,
+            "{tool}"
+        );
+        let nowhere = build_uri(
+            "symforge://symbol/context",
+            &[("name", Some("defined_nowhere".to_string()))],
+        );
+        let error = server
+            .read_resource_uri(&nowhere)
+            .await
+            .expect_err("a name defined nowhere is a miss");
+        assert_eq!(error.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+
+        let tool = server.get_symbol_context(Parameters(input("main"))).await;
+        assert_eq!(
+            classify_compact_tool_output("get_symbol_context", &tool),
+            OutcomeClass::Found,
+            "{tool}"
+        );
+        let existing = build_uri(
+            "symforge://symbol/context",
+            &[("name", Some("main".to_string()))],
+        );
+        let result = server
+            .read_resource_uri(&existing)
+            .await
+            .expect("an existing unreferenced symbol is a successful read");
+        let text = match &result.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text,
+            other => panic!("expected text resource, got {other:?}"),
+        };
+        assert!(text.contains("No references found"), "{text}");
     }
 }
