@@ -28,7 +28,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::capability::WorktreeRoutingPolicy;
 use crate::protocol::result_status::{
-    OutcomeClass, ReadOutcome, ResultStatus, record_read_outcome, with_read_outcome_scope,
+    OutcomeClass, ReadOutcome, ResultStatus, read_with_outcome, record_read_outcome,
+    with_read_outcome_scope,
 };
 
 #[cfg(test)]
@@ -73,21 +74,20 @@ fn statused_tool_result(
 // the embedded facade refuses the same `path:` values MCP does.
 use crate::stel::runtime::{facade_path_is_repo_relative, path_is_within_bound_project};
 
-// Moved verbatim to the feature-neutral `guidance::outcome` so the STEL
-// facade and the embedded facade classify a rendered answer exactly as MCP does.
-pub(super) use crate::index_lifecycle::guidance::outcome::{
-    classify_compact_tool_output, is_error_output, is_index_unavailable_output,
-};
+// Moved to the feature-neutral `guidance::outcome` for legacy and untyped paths.
+#[cfg(test)]
+pub(super) use crate::index_lifecycle::guidance::outcome::classify_compact_tool_output;
 use crate::index_lifecycle::guidance::outcome::{
-    classify_find_references_output, classify_get_file_content_output,
-    classify_get_symbol_context_output, classify_get_symbol_output, classify_search_files_output,
-    classify_search_knowledge_output, classify_search_symbols_output, classify_search_text_output,
-    is_admission_refusal,
+    classify_search_knowledge_output, is_admission_refusal,
+};
+pub(super) use crate::index_lifecycle::guidance::outcome::{
+    is_error_output, is_index_unavailable_output,
 };
 // The classifier tests below name these through `super::`.
 #[cfg(test)]
 use crate::index_lifecycle::guidance::outcome::{
-    classify_get_file_context_output, compact_tool_output_is_success,
+    classify_get_file_content_output, classify_get_file_context_output,
+    classify_search_text_output, compact_tool_output_is_success,
 };
 
 use crate::domain::LanguageId;
@@ -811,10 +811,18 @@ fn admission_tier_degradation_for_path(
     symbol_name: &str,
 ) -> Option<String> {
     let view = match admission_degradation_view_for_path(index, repo_root, path) {
-        Err(refusal) => return Some(refusal),
+        Err(refusal) => {
+            // The admission policy refused the path outright.
+            record_read_outcome(ReadOutcome::InvalidRequest);
+            return Some(refusal);
+        }
         Ok(None) => return None,
         Ok(Some(view)) => view,
     };
+    // A non-normal tier answers with a served degraded explanation.
+    if !matches!(view.tier, AdmissionTier::Normal) {
+        record_read_outcome(ReadOutcome::Found);
+    }
     match view.tier {
         AdmissionTier::Normal => None,
         AdmissionTier::MetadataOnly => Some(format!(
@@ -882,10 +890,18 @@ fn admission_tier_file_degradation_for_path(
     path: &str,
 ) -> Option<String> {
     let view = match admission_degradation_view_for_path(index, repo_root, path) {
-        Err(refusal) => return Some(refusal),
+        Err(refusal) => {
+            // The admission policy refused the path outright.
+            record_read_outcome(ReadOutcome::InvalidRequest);
+            return Some(refusal);
+        }
         Ok(None) => return None,
         Ok(Some(view)) => view,
     };
+    // A non-normal tier answers with a served degraded explanation.
+    if !matches!(view.tier, AdmissionTier::Normal) {
+        record_read_outcome(ReadOutcome::Found);
+    }
     if view.tier == AdmissionTier::Normal {
         return None;
     }
@@ -1299,23 +1315,53 @@ macro_rules! loading_guard {
     ($guard:expr) => {
         match $guard.index_state() {
             IndexState::Ready => {}
-            IndexState::Empty => return format::empty_guard_message(),
+            IndexState::Empty => {
+                record_read_outcome(ReadOutcome::Unavailable { retryable: false });
+                return format::empty_guard_message();
+            }
             IndexState::Loading => {
+                record_read_outcome(ReadOutcome::Unavailable { retryable: true });
                 return format::loading_guard_message_for(
                     &$guard.snapshot_verify_state(),
                     $guard.load_source() == crate::live_index::IndexLoadSource::EmptyBootstrap,
                 );
             }
             IndexState::CircuitBreakerTripped { summary } => {
+                record_read_outcome(ReadOutcome::Unavailable { retryable: false });
                 return format!("Index degraded: {summary}");
             }
         }
     };
 }
 
+impl SymForgeServer {
+    /// One compact-facade step: the planned tool's answer and the outcome its
+    /// own code recorded (or a daemon sent in its outcome header). A step with
+    /// no typed outcome (a local tool missing one, which the step-tool guard
+    /// test rejects, or a daemon too old to send the header) reads as an
+    /// internal failure, never as a class guessed from the body.
+    pub(crate) async fn facade_step(
+        &self,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> (String, OutcomeClass) {
+        let (body, recorded) =
+            with_read_outcome_scope(self.dispatch_tool_for_tests(tool, args)).await;
+        let class = recorded
+            .map(ReadOutcome::class)
+            .unwrap_or(OutcomeClass::InternalFailure);
+        (body, class)
+    }
+}
+
 fn loading_guard_message_from_published(
     published: &crate::live_index::PublishedIndexState,
 ) -> Option<String> {
+    // Every caller returns this message as its answer: the typed outcome is
+    // recorded here, once, for all of them.
+    if published.status != crate::live_index::PublishedIndexStatus::Ready {
+        record_read_outcome(unavailable_outcome(published));
+    }
     match published.status {
         crate::live_index::PublishedIndexStatus::Ready => None,
         crate::live_index::PublishedIndexStatus::Empty => Some(format::empty_guard_message()),
@@ -1373,6 +1419,54 @@ fn default_symbol_context_outcome(index: &LiveIndex, input: &GetSymbolContextInp
     } else {
         ReadOutcome::NotFound
     }
+}
+
+/// One exact `path` + selector: the file is missing, the selector misses or
+/// is ambiguous, or it resolves.
+fn exact_symbol_outcome(
+    index: &LiveIndex,
+    path: &str,
+    name: &str,
+    kind: Option<&str>,
+    symbol_line: Option<u32>,
+) -> ReadOutcome {
+    use crate::live_index::query::{SymbolSelectorMatch, resolve_symbol_selector};
+    let Some(file) = index.get_file(path) else {
+        return ReadOutcome::NotFound;
+    };
+    match resolve_symbol_selector(file, name, kind, symbol_line) {
+        SymbolSelectorMatch::Selected(..) => ReadOutcome::Found,
+        SymbolSelectorMatch::NotFound => ReadOutcome::NotFound,
+        SymbolSelectorMatch::Ambiguous(_) => ReadOutcome::Ambiguous,
+    }
+}
+
+/// A knowledge search, from its retrieval: refused input, no source in scope,
+/// a typed absence, or hits.
+fn knowledge_search_outcome(
+    projection: &Result<super::knowledge_search::KnowledgeSearchProjection, String>,
+) -> ReadOutcome {
+    match projection {
+        Err(_) => ReadOutcome::InvalidRequest,
+        Ok(projection) => match &projection.retrieval {
+            None => ReadOutcome::Unavailable { retryable: false },
+            Some(retrieval) if retrieval.absence.is_some() => ReadOutcome::Empty,
+            Some(_) => ReadOutcome::Found,
+        },
+    }
+}
+
+/// Use the outcome recorded by the handler. A missing outcome is an internal failure.
+fn typed_class(outcome: Option<ReadOutcome>) -> OutcomeClass {
+    outcome
+        .map(ReadOutcome::class)
+        .unwrap_or(OutcomeClass::InternalFailure)
+}
+
+#[cfg(test)]
+#[test]
+fn typed_class_without_a_recorded_outcome_fails_closed() {
+    assert_eq!(typed_class(None), OutcomeClass::InternalFailure);
 }
 
 /// A `get_symbol` batch: found when any target was served; otherwise the
@@ -1456,10 +1550,8 @@ impl SymForgeServer {
         params: Parameters<GetSymbolInput>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
-        let (output, outcome) = with_read_outcome_scope(self.get_symbol(params)).await;
-        let outcome_class = outcome
-            .map(ReadOutcome::class)
-            .unwrap_or_else(|| classify_get_symbol_output(&output));
+        let (output, outcome) = read_with_outcome(self.get_symbol(params)).await;
+        let outcome_class = typed_class(outcome);
         self.record_tool_completion("get_symbol", &output, started.elapsed(), outcome_class);
         statused_tool_result(output, outcome_class)
     }
@@ -1593,6 +1685,7 @@ impl SymForgeServer {
         let mut resolved_from_bare_name: Option<String> = None;
         if params.0.path.trim().is_empty() {
             if params.0.name.trim().is_empty() {
+                record_read_outcome(ReadOutcome::InvalidRequest);
                 return "Invalid request: get_symbol needs a `name` (optionally with `path`), \
                         or a `targets` array. Add `path`/`symbol_line` to disambiguate a common \
                         name, or use search_symbols for a fuzzy lookup."
@@ -1696,11 +1789,13 @@ impl SymForgeServer {
                     .find(|s| s.name == params.0.name)
                     .map(|s| (s.byte_range.1 - s.byte_range.0) as usize / 4)
                     .unwrap_or(0);
+                record_read_outcome(ReadOutcome::Found);
                 return format!(
                     "Estimate for get_symbol(path=\"{}\", name=\"{}\"):\n  Symbol body: ~{} tokens\n  Raw file: ~{} tokens",
                     params.0.path, params.0.name, sym_tokens, file_tokens
                 );
             } else {
+                record_read_outcome(ReadOutcome::NotFound);
                 return format::not_found_file(&params.0.path);
             }
         }
@@ -1810,6 +1905,9 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("get_repo_map", &params.0).await {
             return result;
         }
+        // Past routing, the answer is served; guards and refusals below
+        // record their own outcome.
+        record_read_outcome(ReadOutcome::Found);
         if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
             return refusal;
         }
@@ -2066,6 +2164,7 @@ impl SymForgeServer {
         ) && let Some(hit) = self.format_read_cache_hit(&meta, "session_repeat_read")
         {
             *cache_hit_handle = Some(meta.retrieve_handle);
+            record_read_outcome(ReadOutcome::Found);
             return hit;
         }
         // Honest Tier-2/Tier-3 response: the path may EXIST on disk but be
@@ -2355,10 +2454,8 @@ impl SymForgeServer {
         params: Parameters<GetSymbolContextInput>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
-        let (output, outcome) = with_read_outcome_scope(self.get_symbol_context(params)).await;
-        let outcome_class = outcome
-            .map(ReadOutcome::class)
-            .unwrap_or_else(|| classify_get_symbol_context_output(&output));
+        let (output, outcome) = read_with_outcome(self.get_symbol_context(params)).await;
+        let outcome_class = typed_class(outcome);
         self.record_tool_completion(
             "get_symbol_context",
             &output,
@@ -2466,6 +2563,7 @@ impl SymForgeServer {
                     .filter(|r| r.name == params.0.name)
                     .count();
                 let bundle_est = sym_tokens * 3; // rough: body + deps
+                record_read_outcome(ReadOutcome::Found);
                 return format!(
                     "Estimate for get_symbol_context(name=\"{}\"):\n  Symbol body: ~{} tokens\n  Callers: ~{} tokens\n  Bundle: ~{} tokens",
                     params.0.name,
@@ -2474,6 +2572,7 @@ impl SymForgeServer {
                     bundle_est
                 );
             } else {
+                record_read_outcome(ReadOutcome::NotFound);
                 return format!("Symbol '{}' not found in '{}'", params.0.name, path);
             }
         }
@@ -2912,6 +3011,9 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("analyze_file_impact", &params.0).await {
             return result;
         }
+        // Past routing, the answer is served; guards and refusals below
+        // record their own outcome.
+        record_read_outcome(ReadOutcome::Found);
         if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
             return refusal;
         }
@@ -2985,8 +3087,8 @@ impl SymForgeServer {
         params: Parameters<SearchSymbolsInput>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
-        let output = self.search_symbols(params).await;
-        let outcome_class = classify_search_symbols_output(&output);
+        let (output, outcome) = read_with_outcome(self.search_symbols(params)).await;
+        let outcome_class = typed_class(outcome);
         self.record_tool_completion("search_symbols", &output, started.elapsed(), outcome_class);
         statused_tool_result(output, outcome_class)
     }
@@ -2995,6 +3097,7 @@ impl SymForgeServer {
         let query_str = params.0.query.as_deref().unwrap_or("").trim();
         let is_browse = query_str.is_empty();
         if is_browse && params.0.kind.is_none() && params.0.path_prefix.is_none() {
+            record_read_outcome(ReadOutcome::InvalidRequest);
             return "search_symbols requires at least one of: query, kind, or path_prefix"
                 .to_string();
         }
@@ -3018,6 +3121,9 @@ impl SymForgeServer {
                 crate::protocol::read_gate::unverified_notice(&generation.live, path)
             })
         {
+            // A served notice (the class it always had): withheld content is
+            // named, not failed.
+            record_read_outcome(ReadOutcome::Found);
             return notice;
         }
         let execution = {
@@ -3026,9 +3132,17 @@ impl SymForgeServer {
             match crate::index_lifecycle::guidance::search::execute_symbol_search(&guard, &params.0)
             {
                 Ok(execution) => execution,
-                Err(message) => return message,
+                Err(message) => {
+                    record_read_outcome(ReadOutcome::InvalidRequest);
+                    return message;
+                }
             }
         };
+        record_read_outcome(if execution.result.hits.is_empty() {
+            ReadOutcome::Empty
+        } else {
+            ReadOutcome::Found
+        });
         let output = crate::index_lifecycle::guidance::search::render_symbol_search(
             &generation,
             &execution,
@@ -3072,8 +3186,8 @@ impl SymForgeServer {
         params: Parameters<SearchTextInput>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
-        let output = self.search_text(params).await;
-        let outcome_class = classify_search_text_output(&output);
+        let (output, outcome) = read_with_outcome(self.search_text(params)).await;
+        let outcome_class = typed_class(outcome);
         self.record_tool_completion("search_text", &output, started.elapsed(), outcome_class);
         statused_tool_result(output, outcome_class)
     }
@@ -3096,12 +3210,12 @@ impl SymForgeServer {
         params: Parameters<SearchKnowledgeInput>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         if let Err(output) = super::knowledge_search::validate_input(&params.0) {
-            let outcome_class = classify_search_knowledge_output(&output);
-            return statused_tool_result(output, outcome_class);
+            record_read_outcome(ReadOutcome::InvalidRequest);
+            return statused_tool_result(output, OutcomeClass::InvalidRequest);
         }
         let started = Instant::now();
-        let output = self.search_knowledge(params).await;
-        let outcome_class = classify_search_knowledge_output(&output);
+        let (output, outcome) = read_with_outcome(self.search_knowledge(params)).await;
+        let outcome_class = typed_class(outcome);
         self.record_tool_completion(
             "search_knowledge",
             &output,
@@ -3118,6 +3232,7 @@ impl SymForgeServer {
         // Includes the raw-query secret guard and must run before daemon
         // routing, analytics, cache lookup, or CCR creation.
         if let Err(error) = super::knowledge_search::validate_input(&params.0) {
+            record_read_outcome(ReadOutcome::InvalidRequest);
             return error;
         }
         if let Some(result) = self.proxy_tool_call("search_knowledge", &params.0).await {
@@ -3130,7 +3245,14 @@ impl SymForgeServer {
         }
 
         let source_set = self.index.data_plane().published_source_set();
-        let output = super::knowledge_search::search_scoped(&source_set, &params.0);
+        // The retrieval decides: no source in scope, a typed absence, or hits.
+        let projection = super::knowledge_search::search_scoped_projection(&source_set, &params.0);
+        record_read_outcome(knowledge_search_outcome(&projection));
+        let rendered = match projection {
+            Ok(projection) => projection.rendered,
+            Err(error) => error,
+        };
+        let output = super::knowledge_search::budget_summary(&rendered, params.0.max_tokens);
         let output = with_withheld_note(&source_set.current_generation().live, None, output);
         self.apply_ccr_budget("search_knowledge", output, params.0.max_tokens)
     }
@@ -3284,6 +3406,7 @@ impl SymForgeServer {
             let limit = params.0.limit.unwrap_or(50) as usize;
             let per_file = params.0.max_per_file.unwrap_or(5) as usize;
             let est = limit * 20 + 50;
+            record_read_outcome(ReadOutcome::Found);
             return format!(
                 "Estimate for search_text: ~{} tokens (limit={}, max_per_file={})",
                 est, limit, per_file
@@ -3295,6 +3418,9 @@ impl SymForgeServer {
                 crate::protocol::read_gate::unverified_notice(&generation.live, path)
             })
         {
+            // A served notice (the class it always had): withheld content is
+            // named, not failed.
+            record_read_outcome(ReadOutcome::Found);
             return notice;
         }
         let execution = {
@@ -3305,9 +3431,19 @@ impl SymForgeServer {
                 &params.0,
             ) {
                 Ok(execution) => execution,
-                Err(message) => return message,
+                Err(message) => {
+                    record_read_outcome(ReadOutcome::InvalidRequest);
+                    return message;
+                }
             }
         };
+        // The engine's typed result decides: an invalid request, no matching
+        // file, or matches (whatever text the matched lines carry).
+        record_read_outcome(match &execution.result {
+            Err(_) => ReadOutcome::InvalidRequest,
+            Ok(result) if result.files.is_empty() => ReadOutcome::Empty,
+            Ok(_) => ReadOutcome::Found,
+        });
         let mut output = render_search_text_output(
             self,
             &generation,
@@ -3441,8 +3577,8 @@ impl SymForgeServer {
         params: Parameters<SearchFilesInput>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
-        let output = self.search_files(params).await;
-        let outcome_class = classify_search_files_output(&output);
+        let (output, outcome) = read_with_outcome(self.search_files(params)).await;
+        let outcome_class = typed_class(outcome);
         self.record_tool_completion("search_files", &output, started.elapsed(), outcome_class);
         statused_tool_result(output, outcome_class)
     }
@@ -3459,6 +3595,7 @@ impl SymForgeServer {
         if params.0.estimate == Some(true) {
             let limit = params.0.limit.unwrap_or(20) as usize;
             let est = limit * 10 + 30;
+            record_read_outcome(ReadOutcome::Found);
             return format!(
                 "Estimate for search_files: ~{} tokens (limit={})",
                 est, limit
@@ -3472,6 +3609,7 @@ impl SymForgeServer {
         // Resolve mode: exact path resolution
         if params.0.resolve.unwrap_or(false) {
             if params.0.query.is_empty() {
+                record_read_outcome(ReadOutcome::InvalidRequest);
                 return "search_files with resolve=true requires a non-empty `query`.".to_string();
             }
             let (view, hidden_noise_count) = {
@@ -3479,6 +3617,13 @@ impl SymForgeServer {
                 loading_guard!(guard);
                 crate::index_lifecycle::guidance::file_search::resolve_files(&guard, &params.0)
             };
+            record_read_outcome(match &view {
+                SearchFilesResolveView::EmptyHint => ReadOutcome::InvalidRequest,
+                SearchFilesResolveView::Resolved { .. }
+                | SearchFilesResolveView::ResolvedMetadataOnly { .. } => ReadOutcome::Found,
+                SearchFilesResolveView::NotFound { .. } => ReadOutcome::NotFound,
+                SearchFilesResolveView::Ambiguous { .. } => ReadOutcome::Ambiguous,
+            });
             let envelope = match &view {
                 SearchFilesResolveView::Resolved { path } => {
                     let guard = Arc::clone(&generation.live);
@@ -3582,11 +3727,15 @@ impl SymForgeServer {
             match temporal.state {
                 crate::live_index::git_temporal::GitTemporalState::Ready => {}
                 crate::live_index::git_temporal::GitTemporalState::Unavailable(ref reason) => {
+                    // A served status line (the class it always had).
+                    record_read_outcome(ReadOutcome::Found);
                     return append_changed_with_deprecation_warning(format!(
                         "Git temporal data unavailable: {reason}"
                     ));
                 }
                 _ => {
+                    // A served status line (the class it always had).
+                    record_read_outcome(ReadOutcome::Found);
                     return append_changed_with_deprecation_warning(
                         "Git temporal data is still loading. Try again in a few seconds."
                             .to_string(),
@@ -3598,6 +3747,11 @@ impl SymForgeServer {
                 let (hits, weak_hits) =
                     crate::index_lifecycle::guidance::file_search::changed_rows(history);
                 if hits.is_empty() {
+                    record_read_outcome(if weak_hits.is_empty() {
+                        ReadOutcome::Empty
+                    } else {
+                        ReadOutcome::Found
+                    });
                     if !weak_hits.is_empty() {
                         let total = weak_hits.len();
                         let mut result =
@@ -3655,6 +3809,7 @@ impl SymForgeServer {
                     };
                     return append_changed_with_deprecation_warning(result);
                 }
+                record_read_outcome(ReadOutcome::Found);
                 let total = hits.len();
                 let mut result = format::search_files_result_view(&SearchFilesView::Found {
                     query: format!("co-changes with {target_path}"),
@@ -3688,6 +3843,7 @@ impl SymForgeServer {
                 }
                 return append_changed_with_deprecation_warning(result);
             }
+            record_read_outcome(ReadOutcome::NotFound);
             if commit_count < 20 {
                 return append_changed_with_deprecation_warning(format!(
                     "'{target_path}' not found in git history ({commit_count} commit(s) analyzed). Co-change analysis needs more history to produce useful results."
@@ -3699,6 +3855,7 @@ impl SymForgeServer {
         }
 
         if params.0.query.is_empty() {
+            record_read_outcome(ReadOutcome::InvalidRequest);
             return "search_files requires a non-empty `query` (or use `changed_with` to find co-changing files).".to_string();
         }
 
@@ -3713,6 +3870,11 @@ impl SymForgeServer {
                 true,
             )
         };
+        record_read_outcome(match &ranked.view {
+            SearchFilesView::EmptyQuery => ReadOutcome::InvalidRequest,
+            SearchFilesView::NotFound { .. } => ReadOutcome::NotFound,
+            SearchFilesView::Found { .. } => ReadOutcome::Found,
+        });
         let result = crate::index_lifecycle::guidance::file_search::render_ranked_files(
             &generation,
             ranked,
@@ -4143,12 +4305,14 @@ impl SymForgeServer {
         session_id: String,
         project_root: PathBuf,
     ) -> String {
-        self.health_compact_for_runtime(
+        let result = self.health_compact_for_runtime(
             format::RuntimeMode::DaemonReusedSession,
             Some(project_id),
             Some(session_id),
             Some(project_root),
-        )
+        );
+        record_read_outcome(ReadOutcome::Found);
+        result
     }
 
     /// Diagnostic: index status, file/symbol counts, load time, watcher state, token savings,
@@ -4186,6 +4350,9 @@ impl SymForgeServer {
             // we proxied to is serving an OLDER binary than this front-end.
             return append_daemon_staleness_warning(result, env!("CARGO_PKG_VERSION"));
         }
+        // Past routing, the answer is served; guards and refusals below
+        // record their own outcome.
+        record_read_outcome(ReadOutcome::Found);
 
         let result = self.health_compact_for_runtime(self.local_runtime_mode(), None, None, None);
         self.session_context.record_summary_output(
@@ -4444,6 +4611,7 @@ impl SymForgeServer {
             return None;
         }
         super::result_status::clear_project_evidence();
+        record_read_outcome(ReadOutcome::InvalidRequest);
         let bound_root = self.capture_repo_root();
         // `Error:` anchor: routing refusals are semantic ERRORS, and the
         // shared `is_error_output` predicate (analytics, edit classifiers,
@@ -4514,6 +4682,7 @@ impl SymForgeServer {
         }
 
         super::result_status::clear_project_evidence();
+        record_read_outcome(ReadOutcome::InvalidRequest);
 
         Some(
             "Error: project_routing: cross-project queries (project/projects) require the daemon: the \
@@ -4846,8 +5015,15 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("what_changed", &params.0).await {
             return result;
         }
+        // Past routing, the answer is served; guards and refusals below
+        // record their own outcome.
+        record_read_outcome(ReadOutcome::Found);
         if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
             return refusal;
+        }
+        if let Err(error) = parse_language_filter(params.0.language.as_deref()) {
+            record_read_outcome(ReadOutcome::InvalidRequest);
+            return error;
         }
         if params.0.estimate == Some(true) {
             return crate::index_lifecycle::guidance::changes::what_changed_estimate(
@@ -4876,6 +5052,7 @@ impl SymForgeServer {
                     "call index_folder(path=...)"
                 }
             };
+            record_read_outcome(ReadOutcome::Unavailable { retryable: false });
             return format!("No repo root attached; {attach} or pass since=...");
         }
         let options = WhatChangedOptions {
@@ -4889,7 +5066,10 @@ impl SymForgeServer {
         };
         let mode = match determine_what_changed_mode(&options, effective_repo_root.is_some()) {
             Ok(mode) => mode,
-            Err(message) => return message,
+            Err(message) => {
+                record_read_outcome(ReadOutcome::Unavailable { retryable: false });
+                return message;
+            }
         };
 
         match &mode {
@@ -4948,6 +5128,7 @@ impl SymForgeServer {
                             result
                         }
                         Err(error) => {
+                            record_read_outcome(ReadOutcome::InvalidRequest);
                             self.session_context.record_summary_output(
                                 "what_changed",
                                 (error.len() / 4).min(u32::MAX as usize) as u32,
@@ -4970,12 +5151,16 @@ impl SymForgeServer {
                 drop(guard);
 
                 let Some(repo_root) = effective_repo_root.as_deref() else {
+                    record_read_outcome(ReadOutcome::Unavailable { retryable: false });
                     return "Git change detection unavailable; pass `since` for timestamp mode."
                         .to_string();
                 };
                 let repo = match crate::git::GitRepo::open(repo_root) {
                     Ok(r) => r,
-                    Err(e) => return format!("Git change detection failed: {e}"),
+                    Err(e) => {
+                        record_read_outcome(ReadOutcome::Unavailable { retryable: false });
+                        return format!("Git change detection failed: {e}");
+                    }
                 };
                 match repo.uncommitted_paths() {
                     Ok(paths) => {
@@ -5052,10 +5237,16 @@ impl SymForgeServer {
                                 );
                                 format::enforce_token_budget(result, params.0.max_tokens)
                             }
-                            Err(e) => e,
+                            Err(e) => {
+                                record_read_outcome(ReadOutcome::InvalidRequest);
+                                e
+                            }
                         }
                     }
-                    Err(e) => format!("Git change detection failed: {e}"),
+                    Err(e) => {
+                        record_read_outcome(ReadOutcome::Unavailable { retryable: false });
+                        format!("Git change detection failed: {e}")
+                    }
                 }
             }
             WhatChangedMode::GitRef(git_ref) => {
@@ -5064,12 +5255,16 @@ impl SymForgeServer {
                 drop(guard);
 
                 let Some(repo_root) = effective_repo_root.as_deref() else {
+                    record_read_outcome(ReadOutcome::Unavailable { retryable: false });
                     return "Git change detection unavailable; pass `since` for timestamp mode."
                         .to_string();
                 };
                 let repo = match crate::git::GitRepo::open(repo_root) {
                     Ok(r) => r,
-                    Err(e) => return format!("Git change detection failed: {e}"),
+                    Err(e) => {
+                        record_read_outcome(ReadOutcome::Unavailable { retryable: false });
+                        return format!("Git change detection failed: {e}");
+                    }
                 };
                 match repo.changed_paths_from_ref(git_ref) {
                     Ok(paths) => {
@@ -5137,10 +5332,16 @@ impl SymForgeServer {
                                 );
                                 result
                             }
-                            Err(e) => e,
+                            Err(e) => {
+                                record_read_outcome(ReadOutcome::InvalidRequest);
+                                e
+                            }
                         }
                     }
-                    Err(e) => format!("Git change detection failed: {e}"),
+                    Err(e) => {
+                        record_read_outcome(ReadOutcome::Unavailable { retryable: false });
+                        format!("Git change detection failed: {e}")
+                    }
                 }
             }
         }
@@ -5158,6 +5359,9 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("detect_impact", &params.0).await {
             return result;
         }
+        // Past routing, the answer is served; guards and refusals below
+        // record their own outcome.
+        record_read_outcome(ReadOutcome::Found);
 
         // T038 round-1 (D16): one capture — the evidence receipt names the
         // exact publication the blast-radius walk below renders from, not the
@@ -5168,6 +5372,7 @@ impl SymForgeServer {
         }
 
         let Some(repo_root) = self.effective_repo_root_for_git_tools() else {
+            record_read_outcome(ReadOutcome::InvalidRequest);
             return "Error: Git unavailable: not inside a git repository. detect_impact requires \
                     git for change detection; use find_dependents or what_changed(since=...) for \
                     non-git impact/change queries."
@@ -5175,7 +5380,10 @@ impl SymForgeServer {
         };
         let repo = match crate::git::GitRepo::open(&repo_root) {
             Ok(r) => r,
-            Err(e) => return format!("Error: Git unavailable: {e}"),
+            Err(e) => {
+                record_read_outcome(ReadOutcome::InvalidRequest);
+                return format!("Error: Git unavailable: {e}");
+            }
         };
 
         let report = match crate::index_lifecycle::guidance::impact::compute_detect_impact(
@@ -5204,7 +5412,10 @@ impl SymForgeServer {
             },
         ) {
             Ok(report) => report,
-            Err(message) => return message,
+            Err(message) => {
+                record_read_outcome(ReadOutcome::InvalidRequest);
+                return message;
+            }
         };
         let risk_counts = report.risk_counts();
         let crate::index_lifecycle::guidance::impact::ImpactReport {
@@ -5322,13 +5533,9 @@ impl SymForgeServer {
         params: Parameters<GetFileContentInput>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
-        let (output, outcome) = with_read_outcome_scope(self.get_file_content(params)).await;
-        // The renderer's typed outcome; raw content can imitate any status line.
-        // Text classification only for an answer that decided nothing typed (a
-        // generated refusal, or a daemon that sent no outcome header).
-        let outcome_class = outcome
-            .map(ReadOutcome::class)
-            .unwrap_or_else(|| classify_get_file_content_output(&output));
+        let (output, outcome) = read_with_outcome(self.get_file_content(params)).await;
+        // The renderer's typed outcome is required; raw content can imitate status lines.
+        let outcome_class = typed_class(outcome);
         self.record_tool_completion(
             "get_file_content",
             &output,
@@ -5344,6 +5551,7 @@ impl SymForgeServer {
         let explicit_max_tokens = input.max_tokens;
 
         if let Err(e) = normalize_file_content_aliases(&mut input) {
+            record_read_outcome(ReadOutcome::InvalidRequest);
             return e;
         }
 
@@ -5361,6 +5569,7 @@ impl SymForgeServer {
             // Internals are refused before any lookup, so an estimate never
             // discloses whether a `.git` or `.symforge` path exists or its size.
             if let Some(refusal) = read_gate::hard_scope_refusal(&input.path) {
+                record_read_outcome(ReadOutcome::InvalidRequest);
                 return refusal;
             }
             let indexed = {
@@ -5394,10 +5603,15 @@ impl SymForgeServer {
                         }
                     }
                     Err(message) if message.contains("outside the repository") => {
+                        record_read_outcome(ReadOutcome::InvalidRequest);
                         return format::path_outside_repo(&input.path);
                     }
-                    Err(message) if is_admission_refusal(&message) => return message,
+                    Err(message) if is_admission_refusal(&message) => {
+                        record_read_outcome(ReadOutcome::InvalidRequest);
+                        return message;
+                    }
                     Err(message) if message.starts_with(edit::PATH_SPELLING_DIFFERS) => {
+                        record_read_outcome(ReadOutcome::InvalidRequest);
                         return format!("Error: {message}");
                     }
                     _ => {}
@@ -5418,15 +5632,20 @@ impl SymForgeServer {
             crate::protocol::withheld::record_pending_withheld(
                 crate::protocol::withheld::WithheldMeta::path_rule_only(&input.path, rule_id),
             );
+            record_read_outcome(ReadOutcome::InvalidRequest);
             return format::content_withheld_by_path_rule(&input.path, rule_id);
         }
         if let Some(refusal) = read_gate::hard_scope_refusal(&input.path) {
+            record_read_outcome(ReadOutcome::InvalidRequest);
             return refusal;
         }
 
         let options = match file_content_options_from_input(&input) {
             Ok(options) => options,
-            Err(message) => return message,
+            Err(message) => {
+                record_read_outcome(ReadOutcome::InvalidRequest);
+                return message;
+            }
         };
         if let Err(refusal) = freshen_exact_path_for_targeted_retrieval(self, &options.path_scope) {
             record_read_outcome(ReadOutcome::Unavailable { retryable: true });
@@ -5552,12 +5771,17 @@ impl SymForgeServer {
                         // an "outside the repository" message; surface that
                         // explicitly instead of a misleading "File not found".
                         Err(message) if message.contains("outside the repository") => {
+                            record_read_outcome(ReadOutcome::InvalidRequest);
                             return format::path_outside_repo(&input.path);
                         }
                         // An alias of a credential file gets the refusal its
                         // canonical spelling gets, not a false "not found".
-                        Err(message) if is_admission_refusal(&message) => return message,
+                        Err(message) if is_admission_refusal(&message) => {
+                            record_read_outcome(ReadOutcome::InvalidRequest);
+                            return message;
+                        }
                         Err(message) if message.starts_with(edit::PATH_SPELLING_DIFFERS) => {
+                            record_read_outcome(ReadOutcome::InvalidRequest);
                             return format!("Error: {message}");
                         }
                         Err(_) => {
@@ -5582,7 +5806,10 @@ impl SymForgeServer {
                             &input.path,
                         ) {
                             Ok(content) => content,
-                            Err(refusal) => return refusal,
+                            Err(refusal) => {
+                                record_read_outcome(ReadOutcome::InvalidRequest);
+                                return refusal;
+                            }
                         };
                         let selection =
                             format::content_selection(None, &content, &options.content_context);
@@ -5762,8 +5989,8 @@ impl SymForgeServer {
         params: Parameters<FindReferencesInput>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
-        let output = self.find_references(params).await;
-        let outcome_class = classify_find_references_output(&output);
+        let (output, outcome) = read_with_outcome(self.find_references(params)).await;
+        let outcome_class = typed_class(outcome);
         self.record_tool_completion("find_references", &output, started.elapsed(), outcome_class);
         statused_tool_result(output, outcome_class)
     }
@@ -5825,6 +6052,11 @@ impl SymForgeServer {
                 None
             };
             let result = format::implementations_result_view(&view, &input.name, &limits);
+            record_read_outcome(if view.entries.is_empty() {
+                ReadOutcome::Empty
+            } else {
+                ReadOutcome::Found
+            });
             if view.entries.is_empty() {
                 let guard = Arc::clone(&generation.live);
                 let is_concrete = guard.all_files().any(|(_, file)| {
@@ -5853,6 +6085,7 @@ impl SymForgeServer {
                     .any(|(_, file)| file.symbols.iter().any(|s| s.name == input.name));
                 drop(guard);
                 if !exists_in_project {
+                    record_read_outcome(ReadOutcome::NotFound);
                     return format!(
                         "No implementations found for \"{}\" — this symbol is not defined \
                          in the indexed project (likely from an external dependency).\n\
@@ -5923,6 +6156,12 @@ impl SymForgeServer {
                 if collect_qualified_usages {
                     merge_qualified_usages_into_view(&mut view, qualified_usages, indexed_ranges);
                 }
+                // The references found decide, whatever text their lines carry.
+                record_read_outcome(if view.files.is_empty() {
+                    ReadOutcome::Empty
+                } else {
+                    ReadOutcome::Found
+                });
                 // Tier-2 honesty sweep (dogfood #1): compute BEFORE the envelope
                 // so the completeness label can confess the exclusion instead of
                 // claiming "full for current scope" over an unscanned file.
@@ -6066,7 +6305,20 @@ impl SymForgeServer {
                     result
                 }
             }
-            Err(error) => error,
+            Err(error) => {
+                // The exact selector failed: decided by the same resolver.
+                record_read_outcome(match input.path.as_deref() {
+                    Some(path) => exact_symbol_outcome(
+                        &generation.live,
+                        path,
+                        &input.name,
+                        input.symbol_kind.as_deref(),
+                        input.symbol_line,
+                    ),
+                    None => ReadOutcome::InvalidRequest,
+                });
+                error
+            }
         }
     }
 
@@ -6093,6 +6345,8 @@ impl SymForgeServer {
             .map(str::trim)
             .filter(|n| !n.is_empty())
         {
+            // A served redirect, not a failure (the class the body always had).
+            record_read_outcome(ReadOutcome::Found);
             return format!(
                 "find_dependents is file-level only (it lists files that import \"{path}\"). \
                  You supplied name=\"{name}\", which is a symbol-level query. \
@@ -6105,6 +6359,9 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("find_dependents", &params.0).await {
             return result;
         }
+        // Past routing, the answer is served; guards and refusals below
+        // record their own outcome.
+        record_read_outcome(ReadOutcome::Found);
         if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
             return refusal;
         }
@@ -6176,9 +6433,19 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("explore", &params.0).await {
             return result;
         }
+        // Past routing, the answer is served; guards and refusals below
+        // record their own outcome.
+        record_read_outcome(ReadOutcome::Found);
         if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
             return refusal;
         }
+        let lang_filter = match parse_language_filter(params.0.language.as_deref()) {
+            Ok(f) => f,
+            Err(e) => {
+                record_read_outcome(ReadOutcome::InvalidRequest);
+                return e;
+            }
+        };
         if params.0.estimate == Some(true) {
             let depth = params.0.depth.unwrap_or(1);
             let est = match depth {
@@ -6188,10 +6455,6 @@ impl SymForgeServer {
             };
             return format!("Estimate for explore: ~{} tokens (depth={})", est, depth);
         }
-        let lang_filter = match parse_language_filter(params.0.language.as_deref()) {
-            Ok(f) => f,
-            Err(e) => return e,
-        };
         let guard = self.index.data_plane().read();
         *served = Some(Arc::clone(&guard));
         loading_guard!(guard);
@@ -6277,6 +6540,9 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call_without_params("conventions").await {
             return result;
         }
+        // Past routing, the answer is served; guards and refusals below
+        // record their own outcome.
+        record_read_outcome(ReadOutcome::Found);
         let conv = {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
@@ -6363,6 +6629,9 @@ impl SymForgeServer {
         {
             return result;
         }
+        // Past routing, the answer is served; guards and refusals below
+        // record their own outcome.
+        record_read_outcome(ReadOutcome::Found);
         if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
             return refusal;
         }
@@ -6847,10 +7116,8 @@ impl SymForgeServer {
             if has_daemon_client {
                 super::result_status::clear_project_evidence();
             }
-            // The step's typed outcome, when its read recorded one, decides the
-            // chain; its body is consulted only for steps without one.
-            let (mut tool_body, step_typed) =
-                with_read_outcome_scope(self.dispatch_tool_for_tests(&step.tool, step_args)).await;
+            // The step's typed outcome decides the chain; its body never does.
+            let (mut tool_body, step_class) = self.facade_step(&step.tool, step_args).await;
             if has_daemon_client {
                 let current = super::result_status::current_project_evidence();
                 let current_matches = current.as_ref().is_some_and(|evidence| {
@@ -6882,7 +7149,7 @@ impl SymForgeServer {
             step_results.push(ServedStepResult {
                 tool: step.tool.clone(),
                 body: tool_body.clone(),
-                outcome: step_typed.map(ReadOutcome::class),
+                outcome: Some(step_class),
             });
             let step_outcome = served_step_outcome(&step_results[step_results.len() - 1]);
             if step.tool == "search_knowledge" && step_outcome == OutcomeClass::EmptyResult {
@@ -7720,6 +7987,9 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("symforge_retrieve", &params.0).await {
             return result;
         }
+        // Past routing, the answer is served; guards and refusals below
+        // record their own outcome.
+        record_read_outcome(ReadOutcome::Found);
         let hash = params.0.hash.trim().to_lowercase();
         if hash.len() != 12 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
             return "CCR retrieve: invalid hash (expected 12 hex chars)".to_string();
@@ -7777,6 +8047,9 @@ impl SymForgeServer {
         {
             return result;
         }
+        // Past routing, the answer is served; guards and refusals below
+        // record their own outcome.
+        record_read_outcome(ReadOutcome::Found);
         let snap = self.session_context.snapshot();
         let ccr = self.compression_economics();
         crate::protocol::session::format_context_inventory(&snap, ccr)
@@ -7791,10 +8064,12 @@ impl SymForgeServer {
 
         let original_q = params.0.query.trim();
         if crate::knowledge::guard_query(original_q).is_err() {
+            record_read_outcome(ReadOutcome::InvalidRequest);
             return "Error: sensitive query rejected by repository safety policy.".to_string();
         }
         let q = smart_query::strip_leading_articles(original_q);
         if q.is_empty() {
+            record_read_outcome(ReadOutcome::InvalidRequest);
             return "query requires a non-empty question.".to_string();
         }
         // `ask` chooses its route from index state, so daemon-backed calls must
@@ -7822,238 +8097,250 @@ impl SymForgeServer {
         };
         let assessment = smart_query::assess_route(&intent, matched_prefix);
 
-        let result = match &intent {
-            smart_query::QueryIntent::FindCallers { symbol, path } => {
-                let input = FindReferencesInput {
-                    name: symbol.clone(),
-                    kind: None,
-                    path: path.clone(),
-                    symbol_kind: None,
-                    symbol_line: None,
-                    limit: None,
-                    max_per_file: None,
-                    compact: Some(true),
-                    mode: None,
-                    direction: None,
-                    estimate: None,
-                    max_tokens: None,
-                    project: nested_project.clone(),
-                    projects: None,
-                };
-                self.find_references(Parameters(input)).await
+        // The routed tool records its own outcome; isolate it so `ask` types
+        // its answer from it below rather than inheriting it unread.
+        let (result, routed) = with_read_outcome_scope(async {
+            match &intent {
+                smart_query::QueryIntent::FindCallers { symbol, path } => {
+                    let input = FindReferencesInput {
+                        name: symbol.clone(),
+                        kind: None,
+                        path: path.clone(),
+                        symbol_kind: None,
+                        symbol_line: None,
+                        limit: None,
+                        max_per_file: None,
+                        compact: Some(true),
+                        mode: None,
+                        direction: None,
+                        estimate: None,
+                        max_tokens: None,
+                        project: nested_project.clone(),
+                        projects: None,
+                    };
+                    self.find_references(Parameters(input)).await
+                }
+                smart_query::QueryIntent::FindSymbol { name, kind } => {
+                    let input = SearchSymbolsInput {
+                        query: Some(name.clone()),
+                        kind: kind.clone(),
+                        path_prefix: None,
+                        language: None,
+                        limit: None,
+                        include_generated: None,
+                        include_tests: None,
+                        include_vendor: None,
+                        include_personal_tooling: None,
+                        estimate: None,
+                        max_tokens: None,
+                        project: nested_project.clone(),
+                        projects: None,
+                    };
+                    self.search_symbols(Parameters(input)).await
+                }
+                smart_query::QueryIntent::FindFile { hint } => {
+                    let input = SearchFilesInput {
+                        project: nested_project.clone(),
+                        projects: None,
+                        query: hint.clone(),
+                        limit: None,
+                        current_file: None,
+                        changed_with: None,
+                        resolve: None,
+                        estimate: None,
+                        max_tokens: None,
+                        debug_ranking: None,
+                        rank_by: None,
+                        anchor_path: None,
+                        include_vendor: None,
+                        include_personal_tooling: None,
+                        path_prefix: None,
+                    };
+                    self.search_files(Parameters(input)).await
+                }
+                smart_query::QueryIntent::FindChanges => {
+                    let input = WhatChangedInput {
+                        project: nested_project.clone(),
+                        since: None,
+                        git_ref: None,
+                        uncommitted: Some(true),
+                        path_prefix: None,
+                        language: None,
+                        code_only: Some(true),
+                        include_symbol_diff: Some(true),
+                        estimate: None,
+                        max_tokens: None,
+                    };
+                    self.what_changed(Parameters(input)).await
+                }
+                smart_query::QueryIntent::Understand { concept } => {
+                    let input = ExploreInput {
+                        project: nested_project.clone(),
+                        query: concept.clone(),
+                        limit: None,
+                        depth: Some(2),
+                        include_noise: None,
+                        include_vendor: None,
+                        include_personal_tooling: None,
+                        language: None,
+                        path_prefix: None,
+                        estimate: None,
+                        max_tokens: None,
+                    };
+                    self.explore(Parameters(input)).await
+                }
+                smart_query::QueryIntent::UnderstandSymbol { symbol } => {
+                    let input = GetSymbolContextInput {
+                        project: nested_project.clone(),
+                        name: symbol.clone(),
+                        file: None,
+                        path: None,
+                        symbol_kind: None,
+                        symbol_line: None,
+                        verbosity: Some("compact".to_string()),
+                        bundle: None,
+                        sections: None,
+                        max_tokens: None,
+                        estimate: None,
+                    };
+                    self.get_symbol_context(Parameters(input)).await
+                }
+                smart_query::QueryIntent::UnderstandImplementations { name } => {
+                    let input = FindReferencesInput {
+                        name: name.clone(),
+                        kind: None,
+                        path: None,
+                        symbol_kind: None,
+                        symbol_line: None,
+                        limit: None,
+                        max_per_file: None,
+                        compact: None,
+                        mode: Some("implementations".to_string()),
+                        direction: None,
+                        estimate: None,
+                        max_tokens: None,
+                        project: nested_project.clone(),
+                        projects: None,
+                    };
+                    self.find_references(Parameters(input)).await
+                }
+                smart_query::QueryIntent::SearchCode { pattern } => {
+                    let input = SearchTextInput {
+                        query: Some(pattern.clone()),
+                        terms: None,
+                        regex: None,
+                        path_prefix: None,
+                        language: None,
+                        limit: None,
+                        max_per_file: None,
+                        glob: None,
+                        exclude_glob: None,
+                        context: None,
+                        case_sensitive: None,
+                        whole_word: None,
+                        group_by: None,
+                        follow_refs: None,
+                        follow_refs_limit: None,
+                        ranked: None,
+                        include_generated: None,
+                        include_tests: None,
+                        include_vendor: None,
+                        include_personal_tooling: None,
+                        estimate: None,
+                        max_tokens: None,
+                        structural: None,
+                        project: nested_project.clone(),
+                        projects: None,
+                    };
+                    self.search_text(Parameters(input)).await
+                }
+                smart_query::QueryIntent::SearchKnowledge { query } => {
+                    let input = SearchKnowledgeInput {
+                        query: query.clone(),
+                        path_prefix: None,
+                        source_scope: Some(super::search_tools::KnowledgeSourceScope::Current),
+                        authority_scope: Some(
+                            super::search_tools::KnowledgeAuthorityScope::Default,
+                        ),
+                        project: nested_project.clone(),
+                        projects: None,
+                        limit: None,
+                        max_tokens: params.0.max_tokens,
+                    };
+                    self.search_knowledge(Parameters(input)).await
+                }
+                smart_query::QueryIntent::RepositoryOrientation => {
+                    self.get_repo_map(Parameters(GetRepoMapInput {
+                        project: nested_project.clone(),
+                        detail: Some("compact".to_string()),
+                        path: None,
+                        depth: None,
+                        max_files: None,
+                        estimate: None,
+                        max_tokens: params.0.max_tokens,
+                    }))
+                    .await
+                }
+                smart_query::QueryIntent::FindDependents { target } => {
+                    let input = FindDependentsInput {
+                        project: nested_project.clone(),
+                        path: target.clone(),
+                        name: None,
+                        limit: None,
+                        max_per_file: None,
+                        format: None,
+                        compact: Some(true),
+                        estimate: None,
+                        max_tokens: None,
+                    };
+                    self.find_dependents(Parameters(input)).await
+                }
+                smart_query::QueryIntent::FindImplementations { name } => {
+                    let input = FindReferencesInput {
+                        name: name.clone(),
+                        kind: None,
+                        path: None,
+                        symbol_kind: None,
+                        symbol_line: None,
+                        limit: None,
+                        max_per_file: None,
+                        compact: None,
+                        mode: Some("implementations".to_string()),
+                        direction: None,
+                        estimate: None,
+                        max_tokens: None,
+                        project: nested_project.clone(),
+                        projects: None,
+                    };
+                    self.find_references(Parameters(input)).await
+                }
+                smart_query::QueryIntent::ToolHelp { topic } => {
+                    smart_query::render_tool_catalog_for_topic(topic.as_deref())
+                }
+                smart_query::QueryIntent::Explore { query } => {
+                    let input = ExploreInput {
+                        project: nested_project.clone(),
+                        query: query.clone(),
+                        limit: None,
+                        depth: Some(2),
+                        include_noise: None,
+                        include_vendor: None,
+                        include_personal_tooling: None,
+                        language: None,
+                        path_prefix: None,
+                        estimate: None,
+                        max_tokens: None,
+                    };
+                    self.explore(Parameters(input)).await
+                }
             }
-            smart_query::QueryIntent::FindSymbol { name, kind } => {
-                let input = SearchSymbolsInput {
-                    query: Some(name.clone()),
-                    kind: kind.clone(),
-                    path_prefix: None,
-                    language: None,
-                    limit: None,
-                    include_generated: None,
-                    include_tests: None,
-                    include_vendor: None,
-                    include_personal_tooling: None,
-                    estimate: None,
-                    max_tokens: None,
-                    project: nested_project.clone(),
-                    projects: None,
-                };
-                self.search_symbols(Parameters(input)).await
-            }
-            smart_query::QueryIntent::FindFile { hint } => {
-                let input = SearchFilesInput {
-                    project: nested_project.clone(),
-                    projects: None,
-                    query: hint.clone(),
-                    limit: None,
-                    current_file: None,
-                    changed_with: None,
-                    resolve: None,
-                    estimate: None,
-                    max_tokens: None,
-                    debug_ranking: None,
-                    rank_by: None,
-                    anchor_path: None,
-                    include_vendor: None,
-                    include_personal_tooling: None,
-                    path_prefix: None,
-                };
-                self.search_files(Parameters(input)).await
-            }
-            smart_query::QueryIntent::FindChanges => {
-                let input = WhatChangedInput {
-                    project: nested_project.clone(),
-                    since: None,
-                    git_ref: None,
-                    uncommitted: Some(true),
-                    path_prefix: None,
-                    language: None,
-                    code_only: Some(true),
-                    include_symbol_diff: Some(true),
-                    estimate: None,
-                    max_tokens: None,
-                };
-                self.what_changed(Parameters(input)).await
-            }
-            smart_query::QueryIntent::Understand { concept } => {
-                let input = ExploreInput {
-                    project: nested_project.clone(),
-                    query: concept.clone(),
-                    limit: None,
-                    depth: Some(2),
-                    include_noise: None,
-                    include_vendor: None,
-                    include_personal_tooling: None,
-                    language: None,
-                    path_prefix: None,
-                    estimate: None,
-                    max_tokens: None,
-                };
-                self.explore(Parameters(input)).await
-            }
-            smart_query::QueryIntent::UnderstandSymbol { symbol } => {
-                let input = GetSymbolContextInput {
-                    project: nested_project.clone(),
-                    name: symbol.clone(),
-                    file: None,
-                    path: None,
-                    symbol_kind: None,
-                    symbol_line: None,
-                    verbosity: Some("compact".to_string()),
-                    bundle: None,
-                    sections: None,
-                    max_tokens: None,
-                    estimate: None,
-                };
-                self.get_symbol_context(Parameters(input)).await
-            }
-            smart_query::QueryIntent::UnderstandImplementations { name } => {
-                let input = FindReferencesInput {
-                    name: name.clone(),
-                    kind: None,
-                    path: None,
-                    symbol_kind: None,
-                    symbol_line: None,
-                    limit: None,
-                    max_per_file: None,
-                    compact: None,
-                    mode: Some("implementations".to_string()),
-                    direction: None,
-                    estimate: None,
-                    max_tokens: None,
-                    project: nested_project.clone(),
-                    projects: None,
-                };
-                self.find_references(Parameters(input)).await
-            }
-            smart_query::QueryIntent::SearchCode { pattern } => {
-                let input = SearchTextInput {
-                    query: Some(pattern.clone()),
-                    terms: None,
-                    regex: None,
-                    path_prefix: None,
-                    language: None,
-                    limit: None,
-                    max_per_file: None,
-                    glob: None,
-                    exclude_glob: None,
-                    context: None,
-                    case_sensitive: None,
-                    whole_word: None,
-                    group_by: None,
-                    follow_refs: None,
-                    follow_refs_limit: None,
-                    ranked: None,
-                    include_generated: None,
-                    include_tests: None,
-                    include_vendor: None,
-                    include_personal_tooling: None,
-                    estimate: None,
-                    max_tokens: None,
-                    structural: None,
-                    project: nested_project.clone(),
-                    projects: None,
-                };
-                self.search_text(Parameters(input)).await
-            }
-            smart_query::QueryIntent::SearchKnowledge { query } => {
-                let input = SearchKnowledgeInput {
-                    query: query.clone(),
-                    path_prefix: None,
-                    source_scope: Some(super::search_tools::KnowledgeSourceScope::Current),
-                    authority_scope: Some(super::search_tools::KnowledgeAuthorityScope::Default),
-                    project: nested_project.clone(),
-                    projects: None,
-                    limit: None,
-                    max_tokens: params.0.max_tokens,
-                };
-                self.search_knowledge(Parameters(input)).await
-            }
-            smart_query::QueryIntent::RepositoryOrientation => {
-                self.get_repo_map(Parameters(GetRepoMapInput {
-                    project: nested_project.clone(),
-                    detail: Some("compact".to_string()),
-                    path: None,
-                    depth: None,
-                    max_files: None,
-                    estimate: None,
-                    max_tokens: params.0.max_tokens,
-                }))
-                .await
-            }
-            smart_query::QueryIntent::FindDependents { target } => {
-                let input = FindDependentsInput {
-                    project: nested_project.clone(),
-                    path: target.clone(),
-                    name: None,
-                    limit: None,
-                    max_per_file: None,
-                    format: None,
-                    compact: Some(true),
-                    estimate: None,
-                    max_tokens: None,
-                };
-                self.find_dependents(Parameters(input)).await
-            }
-            smart_query::QueryIntent::FindImplementations { name } => {
-                let input = FindReferencesInput {
-                    name: name.clone(),
-                    kind: None,
-                    path: None,
-                    symbol_kind: None,
-                    symbol_line: None,
-                    limit: None,
-                    max_per_file: None,
-                    compact: None,
-                    mode: Some("implementations".to_string()),
-                    direction: None,
-                    estimate: None,
-                    max_tokens: None,
-                    project: nested_project.clone(),
-                    projects: None,
-                };
-                self.find_references(Parameters(input)).await
-            }
-            smart_query::QueryIntent::ToolHelp { topic } => {
-                smart_query::render_tool_catalog_for_topic(topic.as_deref())
-            }
-            smart_query::QueryIntent::Explore { query } => {
-                let input = ExploreInput {
-                    project: nested_project.clone(),
-                    query: query.clone(),
-                    limit: None,
-                    depth: Some(2),
-                    include_noise: None,
-                    include_vendor: None,
-                    include_personal_tooling: None,
-                    language: None,
-                    path_prefix: None,
-                    estimate: None,
-                    max_tokens: None,
-                };
-                self.explore(Parameters(input)).await
-            }
-        };
+        })
+        .await;
+        // `ask` always serves its routing envelope with the routed answer inside
+        // (the class its body has always had); the route's own outcome is
+        // isolated above so it cannot stand for `ask`.
+        let _ = routed;
+        record_read_outcome(ReadOutcome::Found);
 
         let output = smart_query::render_answer(&intent, assessment, original_q, q, &result);
         self.session_context
@@ -8073,6 +8360,9 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("diff_symbols", &params.0).await {
             return result;
         }
+        // Past routing, the answer is served; guards and refusals below
+        // record their own outcome.
+        record_read_outcome(ReadOutcome::Found);
         if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
             return refusal;
         }
@@ -18409,8 +18699,8 @@ mod tests {
         let _cwd_guard = CwdGuard::set(&home);
         let server = make_server(make_live_index_empty());
 
-        let result = server
-            .what_changed(Parameters(super::WhatChangedInput {
+        let (result, outcome) = crate::protocol::result_status::with_read_outcome_scope(
+            server.what_changed(Parameters(super::WhatChangedInput {
                 project: None,
                 since: None,
                 git_ref: None,
@@ -18421,8 +18711,13 @@ mod tests {
                 include_symbol_diff: None,
                 estimate: None,
                 max_tokens: None,
-            }))
-            .await;
+            })),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            Some(crate::protocol::result_status::ReadOutcome::Unavailable { retryable: false })
+        );
         // Surface-aware guidance (TR-02 / FR-012): `since=` is always offered;
         // `index_folder` is named only on the full/meta surface where it is
         // callable, never on the compact surface where it is dispatch-gated.
@@ -19313,7 +19608,7 @@ mod tests {
             OutcomeClass::InvalidRequest
         );
         assert_eq!(
-            super::classify_find_references_output(
+            crate::index_lifecycle::guidance::outcome::classify_find_references_output(
                 "Error in find_references: project 'missing' is not open"
             ),
             OutcomeClass::InvalidRequest
@@ -25872,6 +26167,64 @@ mod tests {
             None,
         );
         (dir, server)
+    }
+
+    /// Minimal arguments for a facade step tool. A step tool missing here
+    /// fails the guard below, so a new one cannot land untested.
+    fn facade_step_guard_args(tool: &str) -> serde_json::Value {
+        match tool {
+            "get_file_content" | "get_file_context" | "find_dependents" | "analyze_file_impact" => {
+                serde_json::json!({ "path": "src/lib.rs" })
+            }
+            "get_symbol" => serde_json::json!({ "path": "src/lib.rs", "name": "alpha" }),
+            "get_symbol_context" | "find_references" => serde_json::json!({ "name": "alpha" }),
+            "search_text" | "search_symbols" | "search_files" | "search_knowledge" | "explore" => {
+                serde_json::json!({ "query": "alpha" })
+            }
+            "ask" => serde_json::json!({ "query": "who calls alpha" }),
+            "symforge_retrieve" => serde_json::json!({ "hash": "000000000000" }),
+            "what_changed"
+            | "diff_symbols"
+            | "detect_impact"
+            | "get_repo_map"
+            | "conventions"
+            | "context_inventory"
+            | "investigation_suggest"
+            | "health_compact" => serde_json::json!({}),
+            other => panic!(
+                "facade step tool `{other}` has no guard arguments: add it here and give it \
+                 a typed outcome"
+            ),
+        }
+    }
+
+    /// Guard: every tool the compact facade can run as a step (the planner's
+    /// emitted steps and the embedded facade's dispatch set, both read from
+    /// code) records a typed outcome on MCP, so a step never falls back to a
+    /// class guessed from its body. A step tool added without one turns this red.
+    #[tokio::test]
+    async fn every_facade_step_tool_records_a_typed_outcome_on_mcp() {
+        let (planned, _) = crate::stel::planner::facade_step_tool_sets();
+        let registered: std::collections::BTreeSet<_> = crate::stel::planner::FacadeStepTool::ALL
+            .iter()
+            .map(|tool| tool.as_str().to_string())
+            .collect();
+        assert_eq!(planned, registered, "planner coverage registry drifted");
+        let (_dir, server) =
+            setup_loaded_edit_test(&[("src/lib.rs", "pub fn alpha() -> u32 {\n    1\n}\n")]);
+        // `planned` accepts only this generated enum, so every constructor
+        // variant is exercised here; the embed guard uses the same registry.
+        for tool in crate::stel::planner::FacadeStepTool::ALL {
+            let tool = tool.as_str();
+            let (body, recorded) = crate::protocol::result_status::with_read_outcome_scope(
+                server.dispatch_tool_for_tests(tool, facade_step_guard_args(tool)),
+            )
+            .await;
+            assert!(
+                recorded.is_some(),
+                "facade step tool `{tool}` decided no typed outcome on MCP: {body}"
+            );
+        }
     }
 
     #[test]

@@ -2797,6 +2797,15 @@ impl DaemonSessionClient {
         } else {
             None
         };
+        // Every runnable facade step has a typed read outcome contract. Keep
+        // the proxy membership tied to the planner's generated tool registry.
+        let typed_outcome_tool =
+            crate::stel::planner::FacadeStepTool::from_name(tool_name).is_some();
+        let missing_read_outcome = || {
+            typed_outcome_tool.then_some(crate::protocol::result_status::ReadOutcome::Unavailable {
+                retryable: false,
+            })
+        };
         let read_outcome = match response
             .headers()
             .get(crate::protocol::result_status::READ_OUTCOME_HEADER)
@@ -2809,22 +2818,19 @@ impl DaemonSessionClient {
                 Err(error) => {
                     tracing::debug!(
                         tool = tool_name,
-                        "malformed read-outcome header; status falls back to the body: {error}"
+                        "malformed read-outcome header; refusing to infer status from body: {error}"
                     );
-                    None
+                    missing_read_outcome()
                 }
             },
             None => {
-                if matches!(
-                    tool_name,
-                    "get_file_content" | "get_file_context" | "get_symbol" | "get_symbol_context"
-                ) {
+                if typed_outcome_tool {
                     tracing::debug!(
                         tool = tool_name,
-                        "no read-outcome header; status falls back to the body"
+                        "no read-outcome header; refusing to infer status from body"
                     );
                 }
-                None
+                missing_read_outcome()
             }
         };
 
@@ -5355,6 +5361,22 @@ fn take_private_project_route_pin(
     Ok(Some(project))
 }
 
+fn project_routing_response(
+    tool_name: &str,
+    mut response: axum::response::Response,
+) -> axum::response::Response {
+    if crate::stel::planner::FacadeStepTool::from_name(tool_name).is_some() {
+        let outcome = crate::protocol::result_status::ReadOutcome::InvalidRequest;
+        let json =
+            serde_json::to_string(&outcome).expect("read outcome serialization is infallible");
+        let value = axum::http::HeaderValue::from_str(&json)
+            .expect("serialized read outcome is a valid header value");
+        response
+            .headers_mut()
+            .insert(crate::protocol::result_status::READ_OUTCOME_HEADER, value);
+    }
+    response
+}
 async fn call_tool_handler(
     State(state): State<SharedDaemonState>,
     headers: HeaderMap,
@@ -5366,7 +5388,10 @@ async fn call_tool_handler(
     let private_project_route_pin = match take_private_project_route_pin(&tool_name, &mut params) {
         Ok(pin) => pin,
         Err(message) => {
-            return Ok(format!("Error: project_routing: {message}").into_response());
+            return Ok(project_routing_response(
+                &tool_name,
+                format!("Error: project_routing: {message}").into_response(),
+            ));
         }
     };
     if tool_name == "index_folder" {
@@ -5374,11 +5399,12 @@ async fn call_tool_handler(
             .as_object()
             .is_some_and(|object| object.contains_key("project") || object.contains_key("projects"))
         {
-            return Ok(
+            return Ok(project_routing_response(
+                &tool_name,
                 "Error: project_routing: tool 'index_folder' does not accept `project` or \
                  `projects`; `path` is the project selection for this operation."
                     .into_response(),
-            );
+            ));
         }
         let input = decode_params::<IndexFolderInput>(params).map_err(bad_request)?;
         let state_for_index = state.clone();
@@ -5411,7 +5437,10 @@ async fn call_tool_handler(
     let (raw_project, raw_projects) = match strict_daemon_project_selectors(&params) {
         Ok(selectors) => selectors,
         Err(message) => {
-            return Ok(format!("Error: project_routing: {message}").into_response());
+            return Ok(project_routing_response(
+                &tool_name,
+                format!("Error: project_routing: {message}").into_response(),
+            ));
         }
     };
     let cross_project_selector_tool = matches!(
@@ -5427,18 +5456,24 @@ async fn call_tool_handler(
         && !cross_project_selector_tool
         && !single_project_routed_tool(&tool_name)
     {
-        return Ok(format!(
-            "Error: project_routing: tool '{tool_name}' does not accept a public `project` \
+        return Ok(project_routing_response(
+            &tool_name,
+            format!(
+                "Error: project_routing: tool '{tool_name}' does not accept a public `project` \
              selector."
-        )
-        .into_response());
+            )
+            .into_response(),
+        ));
     }
     if raw_projects.is_some() && !cross_project_selector_tool {
-        return Ok(format!(
-            "Error: project_routing: tool '{tool_name}' accepts at most one `project`; \
+        return Ok(project_routing_response(
+            &tool_name,
+            format!(
+                "Error: project_routing: tool '{tool_name}' accepts at most one `project`; \
              `projects` is supported only by the set-valued discovery tools."
-        )
-        .into_response());
+            )
+            .into_response(),
+        ));
     }
     let mut scalar_target_runtime: Option<SessionRuntime> = None;
     let mut has_explicit_project_set = false;
@@ -5476,11 +5511,12 @@ async fn call_tool_handler(
         };
 
         if project.is_some() && projects.is_some() {
-            return Ok(
+            return Ok(project_routing_response(
+                &tool_name,
                 "Error: project_routing: project and projects are mutually exclusive: pass \
                  exactly one (a single id in `project`, or a list/`[\"*\"]` in `projects`)."
                     .into_response(),
-            );
+            ));
         }
         has_explicit_project_set = projects.is_some();
 
@@ -5496,7 +5532,10 @@ async fn call_tool_handler(
                     return Err((StatusCode::NOT_FOUND, message));
                 }
                 Err(message) => {
-                    return Ok(format!("Error: project_routing: {message}").into_response());
+                    return Ok(project_routing_response(
+                        &tool_name,
+                        format!("Error: project_routing: {message}").into_response(),
+                    ));
                 }
             };
             let project_id = target_runtime.project_id.clone();
@@ -5515,7 +5554,10 @@ async fn call_tool_handler(
                         return Err((StatusCode::NOT_FOUND, message));
                     }
                     Err(message) => {
-                        return Ok(format!("Error: project_routing: {message}").into_response());
+                        return Ok(project_routing_response(
+                            &tool_name,
+                            format!("Error: project_routing: {message}").into_response(),
+                        ));
                     }
                 };
                 if !project_ids.contains(&project_id) {
@@ -5569,7 +5611,10 @@ async fn call_tool_handler(
                 return Err((StatusCode::NOT_FOUND, message));
             }
             Err(message) => {
-                return Ok(format!("Error: project_routing: {message}").into_response());
+                return Ok(project_routing_response(
+                    &tool_name,
+                    format!("Error: project_routing: {message}").into_response(),
+                ));
             }
         }
     } else if single_project_routed_tool(&tool_name) {
@@ -5590,11 +5635,12 @@ async fn call_tool_handler(
         // strip below would silently swallow a `project`+`projects` conflict
         // before `resolve_targets` could see it, so reject it here.
         if peek.project.is_some() && peek.projects.is_some() {
-            return Ok(
+            return Ok(project_routing_response(
+                &tool_name,
                 "Error: project_routing: project and projects are mutually exclusive: pass \
                  exactly one (a single id in `project`, or a list/`[\"*\"]` in `projects`)."
                     .into_response(),
-            );
+            ));
         }
         match state.runtime_for_target(&session_id, peek.project.as_deref()) {
             Ok(runtime) => {
@@ -5619,7 +5665,10 @@ async fn call_tool_handler(
             // convention as tool errors below) so the MCP client sees the
             // candidates immediately instead of a transport failure.
             Err(message) => {
-                return Ok(format!("Error: project_routing: {message}").into_response());
+                return Ok(project_routing_response(
+                    &tool_name,
+                    format!("Error: project_routing: {message}").into_response(),
+                ));
             }
         }
     } else {
@@ -17463,9 +17512,157 @@ mod tests {
         );
     }
 
+    /// Daemon health_compact must carry its typed success through the MCP proxy.
+    #[tokio::test]
+    async fn daemon_health_compact_proxy_reports_found_on_http_and_mcp_wire() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let _surface_guard = EnvVarGuard::set_str("SYMFORGE_SURFACE", "full");
+
+        let project = project_dir("symforge-health-compact-typed");
+        std::fs::write(
+            project.path().join("src").join("lib.rs"),
+            "pub fn health_fixture() -> u32 { 1 }\n",
+        )
+        .expect("write project source");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let opened = authed_client(&handle)
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "health-compact-typed".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        let client = DaemonSessionClient::new_for_test_at(
+            base_url,
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+            test_control_state(daemon_home.path()),
+        )
+        .with_project_root(project.path().to_path_buf());
+
+        let (body, outcome) = crate::protocol::result_status::with_read_outcome_scope(
+            client.call_tool_value("health_compact", serde_json::json!({})),
+        )
+        .await;
+        let body = body.expect("daemon health_compact HTTP response");
+        assert!(
+            body.contains("Runtime: mode=daemon_reused_session"),
+            "daemon health_compact response should include its daemon runtime, got: {body}"
+        );
+        assert_eq!(
+            outcome.map(|outcome| outcome.class()),
+            Some(crate::protocol::result_status::OutcomeClass::Found),
+            "real daemon response must carry a typed Found outcome"
+        );
+
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+        let server_task = tokio::spawn(async move {
+            let service = rmcp::serve_server(server, tokio::io::split(server_io)).await?;
+            service.waiting().await?;
+            anyhow::Ok(())
+        });
+        let (reader, mut writer) = tokio::io::split(client_io);
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let init_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "health-compact-typed", "version": "0"}
+            }
+        });
+        writer
+            .write_all(format!("{init_request}\n").as_bytes())
+            .await
+            .expect("write initialize request");
+        let init_reply = lines
+            .next_line()
+            .await
+            .expect("read initialize reply")
+            .expect("initialize transport");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&init_reply).expect("initialize JSON")["id"],
+            1
+        );
+        writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .expect("write initialized notification");
+        let call_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "health_compact", "arguments": {}}
+        });
+        writer
+            .write_all(format!("{call_request}\n").as_bytes())
+            .await
+            .expect("write tools/call request");
+
+        let call_reply = loop {
+            let line = lines
+                .next_line()
+                .await
+                .expect("read tools/call reply")
+                .expect("MCP transport");
+            let reply: serde_json::Value = serde_json::from_str(&line).expect("tools/call JSON");
+            if reply.get("id") == Some(&serde_json::json!(2)) {
+                break reply;
+            }
+        };
+        assert!(
+            call_reply.get("error").is_none(),
+            "health_compact tools/call should return a result: {call_reply}"
+        );
+        let result = &call_reply["result"];
+        assert!(
+            !result["isError"].as_bool().unwrap_or(false),
+            "health_compact must not be an MCP error: {result}"
+        );
+        assert_eq!(
+            result["_meta"][crate::protocol::result_status::RESULT_STATUS_META_KEY]["outcome_class"],
+            "found",
+            "MCP result must preserve typed Found status: {result}"
+        );
+
+        drop(writer);
+        drop(lines);
+        server_task
+            .await
+            .expect("MCP server task")
+            .expect("MCP server");
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
+    }
+
     /// Opening another project must not move connection-scoped surfaces away
     /// from the immutable home project.
     #[tokio::test]
+
     async fn test_index_folder_activation_keeps_status_home_but_routes_facade_to_active_project() {
         let _env_lock = env_lock().await;
         let daemon_home = TempDir::new().expect("daemon home");
@@ -17727,12 +17924,53 @@ mod tests {
             unknown["_meta"]["symforge/result_status"]["outcome_class"], "invalid_request",
             "a daemon routing refusal must never look Found: {unknown}"
         );
+        assert_eq!(
+            unknown["isError"], true,
+            "a typed routing refusal must also be marked as an MCP error: {unknown}"
+        );
         assert!(
             unknown["content"][0]["text"]
                 .as_str()
                 .is_some_and(|text| text.starts_with("Error: project_routing:")),
             "daemon routing refusal must use the shared error prefix: {unknown}"
         );
+
+        let get_file_url = format!(
+            "{base_url}/v1/sessions/{}/tools/get_file_content",
+            opened.session_id
+        );
+        for selector in [
+            serde_json::json!("not-an-open-project"),
+            serde_json::json!(7),
+        ] {
+            let response = http
+                .post(&get_file_url)
+                .json(&serde_json::json!({
+                    "path": "src/lib.rs",
+                    "project": selector,
+                }))
+                .send()
+                .await
+                .expect("routing refusal request");
+            assert!(response.status().is_success());
+            let outcome = serde_json::from_slice::<crate::protocol::result_status::ReadOutcome>(
+                response
+                    .headers()
+                    .get(crate::protocol::result_status::READ_OUTCOME_HEADER)
+                    .expect("routing refusal must carry a typed outcome")
+                    .as_bytes(),
+            )
+            .expect("routing outcome header");
+            assert_eq!(
+                outcome,
+                crate::protocol::result_status::ReadOutcome::InvalidRequest
+            );
+            let body = response.text().await.expect("routing refusal body");
+            assert!(
+                body.starts_with("Error: project_routing:"),
+                "project selector refusal should retain its body: {body}"
+            );
+        }
 
         // The daemon HTTP route is independently callable. A structural edit
         // must not drop a malformed/set-valued selector and mutate ACTIVE B.

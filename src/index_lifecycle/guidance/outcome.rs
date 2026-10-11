@@ -1,6 +1,6 @@
-//! Machine-readable outcome classes and the text classifiers that derive them
-//! from a rendered tool answer. Shared by the MCP handlers, the STEL facade
-//! and the embedded facade, so one rendered answer classifies one way.
+//! Machine-readable outcomes shared by the MCP handlers, the STEL facade and
+//! the embedded facade. Typed outcomes are primary; text classifiers remain
+//! for legacy or untyped paths that have not yet adopted the shared contract.
 
 use serde::{Deserialize, Serialize};
 
@@ -338,6 +338,17 @@ pub(crate) mod read_outcome_cases {
         ),
         ("config.yaml", "Error: boom\nok: yes\n"),
         (
+            "src/refs.rs",
+            "pub fn target() {}\n\npub fn user() {\n    target(); // this symbol is not defined in the indexed project\n}\n",
+        ),
+        (
+            "docs/matcher.md",
+            "# Matcher notes\n\nThe matcher reports\nNo match: when nothing fits the pattern.\n",
+        ),
+        ("src/Ambiguous path hint/guide.rs", "pub fn guide() {}\n"),
+        ("src/a/twin.rs", "pub fn twin_a() {}\n"),
+        ("src/b/twin.rs", "pub fn twin_b() {}\n"),
+        (
             "notes/error.txt",
             "Error: this file starts like an error\nsecond line\n",
         ),
@@ -374,6 +385,14 @@ pub(crate) mod read_outcome_cases {
         Batch {
             targets: &'static [(&'static str, &'static str)],
         },
+        /// Tool-only code slices in a get_symbol batch, with the exact output
+        /// expected after the shared byte-range clamping rule.
+        ByteSlice {
+            path: &'static str,
+            start_byte: u32,
+            end_byte: Option<u32>,
+            expected_output: &'static str,
+        },
         /// Tool only: `get_symbol_context` bundle mode.
         Bundle {
             path: &'static str,
@@ -386,6 +405,16 @@ pub(crate) mod read_outcome_cases {
         },
         /// A raw read of `src/lib.rs` while the index has not published.
         Unready,
+        /// Tool only: a search-family tool with JSON arguments.
+        Tool {
+            tool: &'static str,
+            args: &'static str,
+        },
+        /// Tool only: the compact `symforge` facade planning one step from a
+        /// natural-language query.
+        FacadeQuery {
+            query: &'static str,
+        },
     }
 
     pub(crate) struct Case {
@@ -580,6 +609,46 @@ pub(crate) mod read_outcome_cases {
             expected: OutcomeClass::NotFound,
         },
         Case {
+            label: "get_symbol batch valid byte slice",
+            read: Read::ByteSlice {
+                path: "notes/error.txt",
+                start_byte: 0,
+                end_byte: Some(6),
+                expected_output: "notes/error.txt\nError:",
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "get_symbol batch byte slice past EOF clamps to empty",
+            read: Read::ByteSlice {
+                path: "notes/error.txt",
+                start_byte: 999,
+                end_byte: None,
+                expected_output: "notes/error.txt\n",
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "get_symbol batch reversed byte slice clamps to empty",
+            read: Read::ByteSlice {
+                path: "notes/error.txt",
+                start_byte: 8,
+                end_byte: Some(2),
+                expected_output: "notes/error.txt\n",
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "get_symbol batch byte slice end past EOF clamps",
+            read: Read::ByteSlice {
+                path: "notes/error.txt",
+                start_byte: 0,
+                end_byte: Some(999),
+                expected_output: "notes/error.txt\nError: this file starts like an error\nsecond line\n",
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
             label: "bundle mode",
             read: Read::Bundle {
                 path: "src/lib.rs",
@@ -602,6 +671,195 @@ pub(crate) mod read_outcome_cases {
                 symbol: "Error",
             },
             expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "find_references hit whose line carries the not-defined phrase",
+            read: Read::Tool {
+                tool: "find_references",
+                args: r#"{"name": "target"}"#,
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "facade find_references hit whose line carries the not-defined phrase",
+            read: Read::FacadeQuery {
+                query: "who calls target",
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "find_references with no references",
+            read: Read::Tool {
+                tool: "find_references",
+                args: r#"{"name": "caller"}"#,
+            },
+            expected: OutcomeClass::EmptyResult,
+        },
+        Case {
+            label: "find_references in a missing file",
+            read: Read::Tool {
+                tool: "find_references",
+                args: r#"{"name": "target", "path": "src/missing.rs"}"#,
+            },
+            expected: OutcomeClass::NotFound,
+        },
+        Case {
+            label: "knowledge snippet with a line starting No match:",
+            read: Read::Tool {
+                tool: "search_knowledge",
+                args: r#"{"query": "matcher reports"}"#,
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "facade knowledge snippet with a line starting No match:",
+            read: Read::FacadeQuery {
+                query: "search knowledge for matcher reports",
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "knowledge search with no match",
+            read: Read::Tool {
+                tool: "search_knowledge",
+                args: r#"{"query": "zqxjv wkpfh"}"#,
+            },
+            expected: OutcomeClass::EmptyResult,
+        },
+        Case {
+            label: "search_files hit under a path carrying Ambiguous path hint",
+            read: Read::Tool {
+                tool: "search_files",
+                args: r#"{"query": "guide.rs"}"#,
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "facade search_files hit under a path carrying Ambiguous path hint",
+            read: Read::FacadeQuery {
+                query: "files named guide.rs",
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "search_files ambiguous resolution",
+            read: Read::Tool {
+                tool: "search_files",
+                args: r#"{"query": "twin.rs", "resolve": true}"#,
+            },
+            expected: OutcomeClass::Ambiguous,
+        },
+        Case {
+            label: "search_files with no match",
+            read: Read::Tool {
+                tool: "search_files",
+                args: r#"{"query": "zqxjvwkpfh.rs"}"#,
+            },
+            expected: OutcomeClass::NotFound,
+        },
+        Case {
+            label: "search_text hit",
+            read: Read::Tool {
+                tool: "search_text",
+                args: r#"{"query": "not defined in the indexed project"}"#,
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "search_text with no match",
+            read: Read::Tool {
+                tool: "search_text",
+                args: r#"{"query": "zqxjvwkpfh"}"#,
+            },
+            expected: OutcomeClass::EmptyResult,
+        },
+        Case {
+            label: "search_symbols hit",
+            read: Read::Tool {
+                tool: "search_symbols",
+                args: r#"{"query": "target"}"#,
+            },
+            expected: OutcomeClass::Found,
+        },
+        Case {
+            label: "search_symbols with no match",
+            read: Read::Tool {
+                tool: "search_symbols",
+                args: r#"{"query": "zqxjvwkpfh"}"#,
+            },
+            expected: OutcomeClass::EmptyResult,
+        },
+        Case {
+            label: "what_changed uncommitted unsupported language",
+            read: Read::Tool {
+                tool: "what_changed",
+                args: r#"{"uncommitted":true,"language":"not-a-language"}"#,
+            },
+            expected: OutcomeClass::InvalidRequest,
+        },
+        Case {
+            label: "what_changed timestamp unsupported language",
+            read: Read::Tool {
+                tool: "what_changed",
+                args: r#"{"since":0,"language":"not-a-language"}"#,
+            },
+            expected: OutcomeClass::InvalidRequest,
+        },
+        Case {
+            label: "what_changed estimate unsupported language",
+            read: Read::Tool {
+                tool: "what_changed",
+                args: r#"{"estimate":true,"language":"not-a-language"}"#,
+            },
+            expected: OutcomeClass::InvalidRequest,
+        },
+        Case {
+            label: "what_changed future timestamp unsupported language",
+            read: Read::Tool {
+                tool: "what_changed",
+                args: r#"{"since":9223372036854775807,"language":"not-a-language"}"#,
+            },
+            expected: OutcomeClass::InvalidRequest,
+        },
+        Case {
+            label: "explore estimate unsupported language",
+            read: Read::Tool {
+                tool: "explore",
+                args: r#"{"query":"alpha","depth":1,"limit":10,"include_noise":false,"include_vendor":false,"include_personal_tooling":false,"language":"not-a-language","estimate":true}"#,
+            },
+            expected: OutcomeClass::InvalidRequest,
+        },
+        Case {
+            label: "what_changed nonexistent git ref",
+            read: Read::Tool {
+                tool: "what_changed",
+                args: r#"{"git_ref":"definitely-no-such-ref"}"#,
+            },
+            expected: OutcomeClass::InternalFailure,
+        },
+        Case {
+            label: "explore unsupported language",
+            read: Read::Tool {
+                tool: "explore",
+                args: r#"{"query":"alpha","depth":1,"limit":10,"include_noise":false,"include_vendor":false,"include_personal_tooling":false,"language":"not-a-language"}"#,
+            },
+            expected: OutcomeClass::InvalidRequest,
+        },
+        Case {
+            label: "ask empty query",
+            read: Read::Tool {
+                tool: "ask",
+                args: r#"{"query":""}"#,
+            },
+            expected: OutcomeClass::InvalidRequest,
+        },
+        Case {
+            label: "ask whitespace query",
+            read: Read::Tool {
+                tool: "ask",
+                args: r#"{"query":"   "}"#,
+            },
+            expected: OutcomeClass::InvalidRequest,
         },
         Case {
             label: "read while the index is unready",

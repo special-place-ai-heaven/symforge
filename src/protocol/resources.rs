@@ -4,8 +4,11 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTemplate};
 
 use super::SymForgeServer;
-use super::tools::{classify_compact_tool_output, is_index_unavailable_output};
-use crate::protocol::result_status::{OutcomeClass, ReadOutcome, with_read_outcome_scope};
+#[cfg(test)]
+use super::tools::classify_compact_tool_output;
+#[cfg(test)]
+use crate::protocol::result_status::OutcomeClass;
+use crate::protocol::result_status::{ReadOutcome, with_read_outcome_scope};
 use crate::protocol::tools::{
     GetFileContentInput, GetFileContextInput, GetRepoMapInput, GetSymbolContextInput,
     GetSymbolInput, WhatChangedInput,
@@ -155,11 +158,10 @@ impl SymForgeServer {
         let tool = request.outcome_tool();
         let (text, recorded) = with_read_outcome_scope(self.render_resource_text(request)).await;
         let text = text.map_err(|error| McpError::invalid_params(error, None))?;
-        if let Some(tool) = tool {
-            // The read tools record the outcome they decided from typed state;
-            // the rendered text is consulted only for an answer that decided
-            // nothing typed, which is always generated, never raw content.
-            let outcome = recorded.unwrap_or_else(|| untyped_outcome(tool, &text));
+        if tool.is_some() {
+            // A resource backed by a covered read tool fails closed if that
+            // tool did not record a typed outcome.
+            let outcome = recorded.unwrap_or(ReadOutcome::Unavailable { retryable: false });
             if let Some(error) = resource_read_error(outcome, uri, text.clone()) {
                 return Err(error);
             }
@@ -304,30 +306,12 @@ impl SymForgeServer {
     }
 }
 
-/// The outcome of an answer that recorded none: a generated refusal or status
-/// line from a lane without typed state, or a daemon that sent no outcome.
-fn untyped_outcome(tool: &str, text: &str) -> ReadOutcome {
-    if is_index_unavailable_output(text) {
-        return ReadOutcome::Unavailable {
-            retryable: text.starts_with("Index is loading")
-                || text.starts_with("Index refresh interrupted:"),
-        };
-    }
-    match classify_compact_tool_output(tool, text) {
-        OutcomeClass::NotFound => ReadOutcome::NotFound,
-        OutcomeClass::Ambiguous => ReadOutcome::Ambiguous,
-        OutcomeClass::InvalidRequest => ReadOutcome::InvalidRequest,
-        OutcomeClass::InternalFailure => ReadOutcome::Unavailable { retryable: false },
-        OutcomeClass::Found | OutcomeClass::EmptyResult => ReadOutcome::Found,
-    }
-}
-
 /// The MCP error for a read that did not succeed; `None` for a successful read.
 /// An unready index keeps the shape the stdio front gives a resource read while
 /// the runtime is starting (`internal_error` with `retryable`).
 fn resource_read_error(outcome: ReadOutcome, uri: &str, text: String) -> Option<McpError> {
     Some(match outcome {
-        ReadOutcome::Found => return None,
+        ReadOutcome::Found | ReadOutcome::Empty => return None,
         ReadOutcome::NotFound => {
             McpError::resource_not_found(text, Some(serde_json::json!({ "uri": uri })))
         }
@@ -452,6 +436,12 @@ fn parse_resource_uri(uri: &str) -> Result<ResourceRequest, String> {
     }
 
     let query: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+    // Resource templates are scoped to the server's bound project and do not
+    // advertise project selectors. Reject them instead of silently serving the
+    // active project's source for a different or malformed target.
+    if query.contains_key("project") || query.contains_key("projects") {
+        return Err("project selectors are not supported on resource URIs".to_string());
+    }
 
     match (url.host_str(), url.path()) {
         (Some("repo"), "/health") => Ok(ResourceRequest::RepoHealth),
@@ -900,6 +890,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_selectors_are_rejected_by_project_bound_resource_templates() {
+        let server = make_server();
+        let invalid_uris = [
+            "symforge://file/context?path=src%2Fmain.rs&project=not-an-open-project",
+            "symforge://file/content?path=src%2Fmain.rs&project=not-an-open-project&force_refresh=true",
+            "symforge://symbol/detail?path=src%2Fmain.rs&name=main&project=not-an-open-project",
+            "symforge://symbol/context?name=main&project=not-an-open-project",
+            "symforge://file/context?path=src%2Fmain.rs&project=test_project",
+            "symforge://file/content?path=src%2Fmain.rs&project=test_project",
+            "symforge://symbol/detail?path=src%2Fmain.rs&name=main&project=test_project",
+            "symforge://symbol/context?name=main&project=test_project",
+            "symforge://file/content?path=src%2Fmain.rs&project=%20%20",
+            "symforge://file/content?path=src%2Fmain.rs&projects=*",
+        ];
+        for uri in invalid_uris {
+            let error = server
+                .read_resource_uri(uri)
+                .await
+                .expect_err("resource templates do not support project selectors");
+            assert_eq!(
+                error.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "unsupported project selector must be an invalid request: {uri}"
+            );
+        }
+
+        let current_project_uris = [
+            "symforge://file/context?path=src%2Fmain.rs",
+            "symforge://file/content?path=src%2Fmain.rs",
+            "symforge://symbol/detail?path=src%2Fmain.rs&name=main",
+            "symforge://symbol/context?name=main",
+        ];
+        for uri in current_project_uris {
+            server
+                .read_resource_uri(uri)
+                .await
+                .expect("resource reads without a selector use the bound project");
+        }
+    }
+
+    #[tokio::test]
     async fn test_read_resource_while_index_loads_is_retryable_internal_error() {
         let server = make_server_with_file_in_state(
             "src/main.rs",
@@ -1168,6 +1199,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, content).unwrap();
         }
+        git2::Repository::init(root.path()).unwrap();
         let loaded = SymForgeServer::new(
             LiveIndex::load(root.path()).expect("index"),
             "read-outcome-table".to_string(),
@@ -1184,8 +1216,8 @@ mod tests {
             None,
             None,
         );
-        let mut wire = WireClient::connect(loaded).await;
-        let mut unready_wire = WireClient::connect(unready).await;
+        let mut wire = WireClient::connect(loaded.clone()).await;
+        let mut unready_wire = WireClient::connect(unready.clone()).await;
         for case in CASES {
             let (uri, tool, arguments) = match &case.read {
                 Read::Content {
@@ -1230,8 +1262,8 @@ mod tests {
                         "symforge://file/context",
                         &[("path", Some(path.to_string()))],
                     )),
-                    None,
-                    serde_json::Value::Null,
+                    Some("get_file_context"),
+                    serde_json::json!({ "path": path }),
                 ),
                 Read::Symbol { path, name, kind } => {
                     let mut arguments = serde_json::json!({ "path": path, "name": name });
@@ -1273,6 +1305,22 @@ mod tests {
                         serde_json::json!({ "targets": targets }),
                     )
                 }
+                Read::ByteSlice {
+                    path,
+                    start_byte,
+                    end_byte,
+                    ..
+                } => (
+                    None,
+                    Some("get_symbol"),
+                    serde_json::json!({
+                        "targets": [{
+                            "path": path,
+                            "start_byte": start_byte,
+                            "end_byte": end_byte,
+                        }]
+                    }),
+                ),
                 Read::Bundle { path, name } => (
                     None,
                     Some("get_symbol_context"),
@@ -1287,6 +1335,16 @@ mod tests {
                         "path": path,
                         "symbol": symbol,
                     }),
+                ),
+                Read::Tool { tool, args } => (
+                    None,
+                    Some(*tool),
+                    serde_json::from_str::<serde_json::Value>(args).unwrap(),
+                ),
+                Read::FacadeQuery { query } => (
+                    None,
+                    Some("symforge"),
+                    serde_json::json!({ "query": query }),
                 ),
                 Read::Unready => (
                     Some(build_uri(
@@ -1316,8 +1374,8 @@ mod tests {
             if let Some(tool) = tool {
                 // The facade answers only on the compact surface, which the
                 // server reads from the environment at call time.
-                let _compact =
-                    matches!(case.read, Read::Facade { .. }).then(|| SurfaceEnv::set("compact"));
+                let _compact = matches!(case.read, Read::Facade { .. } | Read::FacadeQuery { .. })
+                    .then(|| SurfaceEnv::set("compact"));
                 let reply = client
                     .request(
                         "tools/call",
@@ -1332,6 +1390,28 @@ mod tests {
                     "tools/call isError: {}: {reply}",
                     case.label
                 );
+                if let Read::ByteSlice {
+                    expected_output, ..
+                } = &case.read
+                {
+                    assert_eq!(
+                        reply["result"]["content"][0]["text"].as_str(),
+                        Some(*expected_output),
+                        "tools/call byte-slice output: {}",
+                        case.label
+                    );
+                }
+                // The same tool as a compact-facade step: the step's own
+                // typed outcome, on the same server.
+                if !matches!(case.read, Read::Facade { .. } | Read::FacadeQuery { .. }) {
+                    let server = if matches!(case.read, Read::Unready) {
+                        &unready
+                    } else {
+                        &loaded
+                    };
+                    let (_, step) = server.facade_step(tool, arguments.clone()).await;
+                    assert_eq!(step, case.expected, "facade step: {}", case.label);
+                }
             }
         }
     }

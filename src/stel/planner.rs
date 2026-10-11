@@ -12,11 +12,61 @@ use super::executor::{
 use super::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep, StelRequest};
 
 struct PlannedStep {
-    tool: String,
+    tool: FacadeStepTool,
     args: Value,
     intent: IntentBucket,
     confidence: RouteConfidence,
     rationale: &'static str,
+}
+
+/// Closed list of facade step tools. The enum, iteration list, and wire names
+/// are generated together, so coverage cannot omit a newly added variant.
+macro_rules! facade_step_tools {
+    ($($variant:ident => $name:literal),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+        pub(crate) enum FacadeStepTool {
+            $($variant),+
+        }
+
+        impl FacadeStepTool {
+            #[cfg(test)]
+            pub(crate) const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            pub(crate) fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    $($name => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+
+            pub(crate) const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name),+
+                }
+            }
+        }
+    };
+}
+
+facade_step_tools! {
+    SearchText => "search_text",
+    SearchSymbols => "search_symbols",
+    SearchFiles => "search_files",
+    SearchKnowledge => "search_knowledge",
+    GetFileContext => "get_file_context",
+    GetFileContent => "get_file_content",
+    GetSymbol => "get_symbol",
+    GetSymbolContext => "get_symbol_context",
+    FindReferences => "find_references",
+    FindDependents => "find_dependents",
+    WhatChanged => "what_changed",
+    DetectImpact => "detect_impact",
+    GetRepoMap => "get_repo_map",
+    Ask => "ask",
+    Explore => "explore",
+    ContextInventory => "context_inventory",
+    SymforgeRetrieve => "symforge_retrieve",
+    HealthCompact => "health_compact",
 }
 
 /// What the facade *actually does* with a caller-supplied [`StelRequest`] field,
@@ -314,6 +364,27 @@ pub fn build_plan(request: &StelRequest) -> StelPlan {
     build_plan_from_steps(request, vec![step])
 }
 
+/// The compact facade's closed step-tool registry for guard tests. `planned`
+/// enumerates every typed value accepted by the planner's step constructor;
+/// `embedded` is the embedded room's supported subset. The macro generates the
+/// enum, its iterable registry, and wire names from one list.
+#[cfg(test)]
+pub(crate) fn facade_step_tool_sets() -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    let planned: std::collections::BTreeSet<_> = FacadeStepTool::ALL
+        .iter()
+        .map(|tool| tool.as_str().to_string())
+        .collect();
+    let embedded = planned
+        .iter()
+        .filter(|tool| tool.as_str() != FacadeStepTool::HealthCompact.as_str())
+        .cloned()
+        .collect();
+    (planned, embedded)
+}
+
 fn facade_ccr_retrieval_step(request: &StelRequest) -> Option<PlannedStep> {
     const PREFIX: &str = "retrieve ccr hash ";
     let query = request.query.trim();
@@ -326,7 +397,7 @@ fn facade_ccr_retrieval_step(request: &StelRequest) -> Option<PlannedStep> {
         return None;
     }
     Some(PlannedStep {
-        tool: "symforge_retrieve".to_string(),
+        tool: FacadeStepTool::SymforgeRetrieve,
         intent: IntentBucket::Meta,
         confidence: RouteConfidence::Exact,
         rationale: "explicit compact CCR redemption",
@@ -416,7 +487,7 @@ fn symbol_lookup_step(request: &StelRequest) -> Option<PlannedStep> {
     }
     if let Some(path) = request.path.as_deref().filter(|p| !p.trim().is_empty()) {
         Some(planned(
-            "get_symbol",
+            FacadeStepTool::GetSymbol,
             json!({ "path": path, "name": symbol }),
             IntentBucket::Read,
             RouteConfidence::Exact,
@@ -424,7 +495,7 @@ fn symbol_lookup_step(request: &StelRequest) -> Option<PlannedStep> {
         ))
     } else if bucket == IntentBucket::Read {
         Some(planned(
-            "get_symbol",
+            FacadeStepTool::GetSymbol,
             json!({ "name": symbol }),
             IntentBucket::Read,
             RouteConfidence::Inferred,
@@ -432,7 +503,7 @@ fn symbol_lookup_step(request: &StelRequest) -> Option<PlannedStep> {
         ))
     } else {
         Some(planned(
-            "search_symbols",
+            FacadeStepTool::SearchSymbols,
             json!({ "query": symbol }),
             IntentBucket::Find,
             RouteConfidence::Inferred,
@@ -456,7 +527,7 @@ fn symbol_impact_step(request: &StelRequest) -> Option<PlannedStep> {
     }
     if let Some(path) = request.path.as_deref().filter(|p| !p.trim().is_empty()) {
         return Some(planned(
-            "find_dependents",
+            FacadeStepTool::FindDependents,
             json!({ "path": path, "compact": true }),
             IntentBucket::Impact,
             RouteConfidence::Exact,
@@ -464,7 +535,7 @@ fn symbol_impact_step(request: &StelRequest) -> Option<PlannedStep> {
         ));
     }
     Some(planned(
-        "find_references",
+        FacadeStepTool::FindReferences,
         json!({ "name": symbol, "compact": true }),
         IntentBucket::Impact,
         RouteConfidence::Inferred,
@@ -487,7 +558,7 @@ fn orient_lookup_step(request: &StelRequest) -> Option<PlannedStep> {
         return None;
     }
     Some(planned(
-        "get_repo_map",
+        FacadeStepTool::GetRepoMap,
         json!({}),
         IntentBucket::Orient,
         RouteConfidence::Inferred,
@@ -558,7 +629,7 @@ fn build_plan_from_steps(request: &StelRequest, steps: Vec<PlannedStep>) -> Stel
         .enumerate()
         .map(|(index, step)| StelPlanStep {
             order: (index + 1) as u32,
-            tool: step.tool,
+            tool: step.tool.as_str().to_string(),
             args: step.args,
             est_response_tokens: 400,
             est_manual_tokens: 800,
@@ -686,14 +757,14 @@ fn find_fusion_steps(request: &StelRequest) -> Option<Vec<PlannedStep>> {
 
     Some(vec![
         planned(
-            "search_files",
+            FacadeStepTool::SearchFiles,
             json!({ "query": query, "rank_by": "path+cochange" }),
             IntentBucket::Find,
             RouteConfidence::Inferred,
             FIND_FUSION_PATH_RATIONALE,
         ),
         planned(
-            "search_text",
+            FacadeStepTool::SearchText,
             json!({ "terms": terms, "group_by": "symbol" }),
             IntentBucket::Find,
             RouteConfidence::Inferred,
@@ -824,7 +895,7 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
 
     if let Some(path) = parse_outline_path(query) {
         return Some(planned(
-            "get_file_context",
+            FacadeStepTool::GetFileContext,
             json!({ "path": path }),
             IntentBucket::Read,
             RouteConfidence::Exact,
@@ -834,7 +905,7 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
 
     if let Some((path, name)) = parse_body_of(query) {
         return Some(planned(
-            "get_symbol",
+            FacadeStepTool::GetSymbol,
             json!({ "path": path, "name": name }),
             IntentBucket::Read,
             RouteConfidence::Exact,
@@ -848,7 +919,7 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
             args["path"] = json!(path);
         }
         return Some(planned(
-            "find_references",
+            FacadeStepTool::FindReferences,
             args,
             IntentBucket::Trace,
             RouteConfidence::Exact,
@@ -858,7 +929,7 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
 
     if let Some(name) = parse_bare_references_target(query) {
         return Some(planned(
-            "find_references",
+            FacadeStepTool::FindReferences,
             json!({ "name": name, "compact": true }),
             IntentBucket::Trace,
             RouteConfidence::Inferred,
@@ -868,7 +939,7 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
 
     if lower.contains("repo map") {
         return Some(planned(
-            "get_repo_map",
+            FacadeStepTool::GetRepoMap,
             json!({}),
             IntentBucket::Orient,
             RouteConfidence::Inferred,
@@ -878,7 +949,7 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
 
     if lower == "index health" {
         return Some(planned(
-            "health_compact",
+            FacadeStepTool::HealthCompact,
             json!({}),
             IntentBucket::Meta,
             RouteConfidence::Exact,
@@ -894,7 +965,7 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
             args["end_line"] = json!(max_lines);
         }
         return Some(planned(
-            "get_file_content",
+            FacadeStepTool::GetFileContent,
             args,
             IntentBucket::Read,
             RouteConfidence::Inferred,
@@ -904,7 +975,7 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
 
     if let Some((name, path)) = parse_symbol_in_path(query, &lower) {
         return Some(planned(
-            "get_symbol",
+            FacadeStepTool::GetSymbol,
             json!({ "path": path, "name": name }),
             IntentBucket::Read,
             RouteConfidence::Inferred,
@@ -914,7 +985,7 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
 
     if let Some(name) = parse_symbol_body_phrase(query, &lower) {
         return Some(planned(
-            "get_symbol",
+            FacadeStepTool::GetSymbol,
             json!({ "name": name }),
             IntentBucket::Read,
             RouteConfidence::Inferred,
@@ -924,7 +995,7 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
 
     if let Some(name) = parse_trailing_symbol_phrase(query, &lower) {
         return Some(planned(
-            "search_symbols",
+            FacadeStepTool::SearchSymbols,
             json!({ "query": name }),
             IntentBucket::Find,
             RouteConfidence::Inferred,
@@ -934,7 +1005,7 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
 
     if let Some(hint) = parse_files_named_hint(query, &lower) {
         return Some(planned(
-            "search_files",
+            FacadeStepTool::SearchFiles,
             json!({ "query": hint }),
             IntentBucket::Find,
             RouteConfidence::Inferred,
@@ -944,7 +1015,7 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
 
     if let Some(hint) = parse_files_for_hint(query, &lower) {
         return Some(planned(
-            "search_files",
+            FacadeStepTool::SearchFiles,
             json!({ "query": hint }),
             IntentBucket::Find,
             RouteConfidence::Inferred,
@@ -954,7 +1025,7 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
 
     if let Some(term) = parse_find_entity_search(query, &lower) {
         return Some(planned(
-            "search_text",
+            FacadeStepTool::SearchText,
             json!({ "query": term }),
             IntentBucket::Find,
             RouteConfidence::Inferred,
@@ -971,7 +1042,7 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
             args["path_prefix"] = json!("src");
         }
         return Some(planned(
-            "search_text",
+            FacadeStepTool::SearchText,
             args,
             IntentBucket::Find,
             RouteConfidence::Inferred,
@@ -990,7 +1061,7 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
             .trim()
             .to_string();
         return Some(planned(
-            "search_symbols",
+            FacadeStepTool::SearchSymbols,
             json!({ "query": term }),
             IntentBucket::Find,
             RouteConfidence::Inferred,
@@ -1000,7 +1071,7 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
 
     if lower.starts_with("how does ") || lower.starts_with("how do ") {
         return Some(planned(
-            "explore",
+            FacadeStepTool::Explore,
             json!({ "query": query, "depth": 2 }),
             IntentBucket::Orient,
             RouteConfidence::Inferred,
@@ -1013,16 +1084,33 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
 
 fn route_with_smart_query(request: &StelRequest) -> PlannedStep {
     let intent = smart_query::classify_intent(request.query.trim());
-    let tool = smart_query::route_tool_name(&intent).to_string();
-    let intent_bucket = intent_bucket_for_tool(&tool);
-    let args = default_args_for_tool(&tool, request);
-    PlannedStep {
+    let tool = match &intent {
+        smart_query::QueryIntent::FindCallers { .. }
+        | smart_query::QueryIntent::UnderstandImplementations { .. }
+        | smart_query::QueryIntent::FindImplementations { .. } => FacadeStepTool::FindReferences,
+        smart_query::QueryIntent::FindSymbol { .. } => FacadeStepTool::SearchSymbols,
+        smart_query::QueryIntent::FindFile { .. } => FacadeStepTool::SearchFiles,
+        smart_query::QueryIntent::FindChanges => FacadeStepTool::WhatChanged,
+        smart_query::QueryIntent::Understand { .. } | smart_query::QueryIntent::Explore { .. } => {
+            FacadeStepTool::Explore
+        }
+        smart_query::QueryIntent::UnderstandSymbol { .. } => FacadeStepTool::GetSymbolContext,
+        smart_query::QueryIntent::SearchCode { .. } => FacadeStepTool::SearchText,
+        smart_query::QueryIntent::SearchKnowledge { .. } => FacadeStepTool::SearchKnowledge,
+        smart_query::QueryIntent::RepositoryOrientation => FacadeStepTool::GetRepoMap,
+        smart_query::QueryIntent::FindDependents { .. } => FacadeStepTool::FindDependents,
+        smart_query::QueryIntent::ToolHelp { .. } => FacadeStepTool::Ask,
+    };
+    let tool_name = tool.as_str();
+    let intent_bucket = intent_bucket_for_tool(tool_name);
+    let args = default_args_for_tool(tool_name, request);
+    planned(
         tool,
-        intent: intent_bucket,
-        confidence: RouteConfidence::Inferred,
-        rationale: "smart_query fallback",
         args,
-    }
+        intent_bucket,
+        RouteConfidence::Inferred,
+        "smart_query fallback",
+    )
 }
 
 fn route_find(request: &StelRequest) -> PlannedStep {
@@ -1030,7 +1118,7 @@ fn route_find(request: &StelRequest) -> PlannedStep {
     if lower.contains("symbol") || lower.starts_with("locate ") {
         route_with_query_patterns(request).unwrap_or_else(|| {
             planned(
-                "search_symbols",
+                FacadeStepTool::SearchSymbols,
                 json!({ "query": request.query.trim() }),
                 IntentBucket::Find,
                 RouteConfidence::Inferred,
@@ -1040,7 +1128,7 @@ fn route_find(request: &StelRequest) -> PlannedStep {
     } else {
         route_with_query_patterns(request).unwrap_or_else(|| {
             planned(
-                "search_text",
+                FacadeStepTool::SearchText,
                 json!({ "query": request.query.trim() }),
                 IntentBucket::Find,
                 RouteConfidence::Inferred,
@@ -1054,7 +1142,7 @@ fn route_read(request: &StelRequest) -> PlannedStep {
     route_with_query_patterns(request).unwrap_or_else(|| {
         if let Some(path) = request.path.clone() {
             planned(
-                "get_file_context",
+                FacadeStepTool::GetFileContext,
                 json!({ "path": path }),
                 IntentBucket::Read,
                 RouteConfidence::Exact,
@@ -1062,7 +1150,7 @@ fn route_read(request: &StelRequest) -> PlannedStep {
             )
         } else {
             planned(
-                "get_file_context",
+                FacadeStepTool::GetFileContext,
                 json!({ "path": request.query.trim() }),
                 IntentBucket::Read,
                 RouteConfidence::Fallback,
@@ -1083,7 +1171,7 @@ fn route_trace(request: &StelRequest) -> PlannedStep {
             args["path"] = json!(path);
         }
         planned(
-            "find_references",
+            FacadeStepTool::FindReferences,
             args,
             IntentBucket::Trace,
             RouteConfidence::Inferred,
@@ -1100,7 +1188,7 @@ fn route_trace(request: &StelRequest) -> PlannedStep {
 /// `request.path`/`request.query` are not threaded into this route's args.
 fn route_impact(_request: &StelRequest) -> PlannedStep {
     planned(
-        "detect_impact",
+        FacadeStepTool::DetectImpact,
         json!({ "scope": "files" }),
         IntentBucket::Impact,
         RouteConfidence::Inferred,
@@ -1112,7 +1200,7 @@ fn route_orient(request: &StelRequest) -> PlannedStep {
     let lower = request.query.trim().to_ascii_lowercase();
     if is_orient_query(&lower) {
         planned(
-            "get_repo_map",
+            FacadeStepTool::GetRepoMap,
             json!({}),
             IntentBucket::Orient,
             RouteConfidence::Inferred,
@@ -1120,7 +1208,7 @@ fn route_orient(request: &StelRequest) -> PlannedStep {
         )
     } else if is_guidance_query(&lower) {
         planned(
-            "explore",
+            FacadeStepTool::Explore,
             json!({ "query": request.query.trim(), "depth": 2 }),
             IntentBucket::Orient,
             RouteConfidence::Inferred,
@@ -1128,7 +1216,7 @@ fn route_orient(request: &StelRequest) -> PlannedStep {
         )
     } else {
         planned(
-            "get_repo_map",
+            FacadeStepTool::GetRepoMap,
             json!({}),
             IntentBucket::Orient,
             RouteConfidence::Inferred,
@@ -1139,7 +1227,7 @@ fn route_orient(request: &StelRequest) -> PlannedStep {
 
 fn route_meta(_request: &StelRequest) -> PlannedStep {
     planned(
-        "context_inventory",
+        FacadeStepTool::ContextInventory,
         json!({}),
         IntentBucket::Meta,
         RouteConfidence::Fallback,
@@ -1148,14 +1236,14 @@ fn route_meta(_request: &StelRequest) -> PlannedStep {
 }
 
 fn planned(
-    tool: &str,
+    tool: FacadeStepTool,
     args: Value,
     intent: IntentBucket,
     confidence: RouteConfidence,
     rationale: &'static str,
 ) -> PlannedStep {
     PlannedStep {
-        tool: tool.to_string(),
+        tool,
         args,
         intent,
         confidence,

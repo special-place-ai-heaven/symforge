@@ -156,6 +156,8 @@ pub const READ_OUTCOME_HEADER: &str = "x-symforge-read-outcome";
 #[serde(rename_all = "snake_case")]
 pub enum ReadOutcome {
     Found,
+    /// A search or listing that ran and matched nothing.
+    Empty,
     NotFound,
     Ambiguous,
     InvalidRequest,
@@ -167,9 +169,23 @@ pub enum ReadOutcome {
 }
 
 impl ReadOutcome {
+    /// The outcome of an answer already typed as a class (a facade's own
+    /// status). An internal failure carries no retry evidence here.
+    pub fn from_class(class: OutcomeClass) -> Self {
+        match class {
+            OutcomeClass::Found => Self::Found,
+            OutcomeClass::EmptyResult => Self::Empty,
+            OutcomeClass::NotFound => Self::NotFound,
+            OutcomeClass::Ambiguous => Self::Ambiguous,
+            OutcomeClass::InvalidRequest => Self::InvalidRequest,
+            OutcomeClass::InternalFailure => Self::Unavailable { retryable: false },
+        }
+    }
+
     pub fn class(self) -> OutcomeClass {
         match self {
             Self::Found => OutcomeClass::Found,
+            Self::Empty => OutcomeClass::EmptyResult,
             Self::NotFound => OutcomeClass::NotFound,
             Self::Ambiguous => OutcomeClass::Ambiguous,
             Self::InvalidRequest => OutcomeClass::InvalidRequest,
@@ -186,8 +202,8 @@ tokio::task_local! {
 }
 
 /// Run one read with an empty outcome slot and return what it recorded.
-/// `None` means the read decided nothing typed (a generated refusal, or a
-/// daemon that sent no outcome header).
+/// `None` means the handler recorded no typed outcome; covered proxy tools and
+/// their callers must fail closed rather than classify the rendered body.
 pub async fn with_read_outcome_scope<F>(future: F) -> (F::Output, Option<ReadOutcome>)
 where
     F: Future,
@@ -199,6 +215,19 @@ where
             (output, outcome)
         })
         .await
+}
+
+/// [`with_read_outcome_scope`] that also hands the outcome to the enclosing
+/// scope, so the `call_tool` seam sees the outcome a statused tool decided.
+pub async fn read_with_outcome<F>(future: F) -> (F::Output, Option<ReadOutcome>)
+where
+    F: Future,
+{
+    let (output, outcome) = with_read_outcome_scope(future).await;
+    if let Some(outcome) = outcome {
+        record_read_outcome(outcome);
+    }
+    (output, outcome)
 }
 
 /// Record the typed outcome of the current read. No-op outside a scope.

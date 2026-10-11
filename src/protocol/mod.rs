@@ -1171,7 +1171,10 @@ impl SymForgeServer {
 
         let mut value = match serde_json::to_value(params) {
             Ok(value) => value,
-            Err(error) => return Some(format!("Daemon proxy serialization failed: {error}")),
+            Err(error) => {
+                result_status::record_read_outcome(result_status::ReadOutcome::InvalidRequest);
+                return Some(format!("Daemon proxy serialization failed: {error}"));
+            }
         };
         // A daemon session may target an ACTIVE sibling even when the caller
         // omitted `project`. If transport recovery ultimately fails, executing
@@ -1354,6 +1357,9 @@ impl SymForgeServer {
                 );
                 if let Some(refusal) = local_fallback_refusal.clone() {
                     result_status::clear_project_evidence();
+                    // A routing refusal: the request named a project this lane
+                    // cannot serve.
+                    result_status::record_read_outcome(result_status::ReadOutcome::InvalidRequest);
                     return Some(refusal);
                 }
                 self.ensure_local_index().await;
@@ -1425,6 +1431,9 @@ impl SymForgeServer {
         if !reconnected {
             if let Some(refusal) = local_fallback_refusal.clone() {
                 result_status::clear_project_evidence();
+                // A routing refusal: the request named a project this lane
+                // cannot serve.
+                result_status::record_read_outcome(result_status::ReadOutcome::InvalidRequest);
                 return Some(refusal);
             }
             self.restore_local_project_evidence();
@@ -1456,6 +1465,11 @@ impl SymForgeServer {
                     self.note_daemon_failure(client.base_url(), error.to_string());
                     if let Some(refusal) = local_fallback_refusal.clone() {
                         result_status::clear_project_evidence();
+                        // A routing refusal: the request named a project this lane
+                        // cannot serve.
+                        result_status::record_read_outcome(
+                            result_status::ReadOutcome::InvalidRequest,
+                        );
                         return Some(refusal);
                     }
                     self.ensure_local_index().await;
@@ -1473,6 +1487,11 @@ impl SymForgeServer {
                     );
                     if let Some(refusal) = local_fallback_refusal {
                         result_status::clear_project_evidence();
+                        // A routing refusal: the request named a project this lane
+                        // cannot serve.
+                        result_status::record_read_outcome(
+                            result_status::ReadOutcome::InvalidRequest,
+                        );
                         return Some(refusal);
                     }
                     self.ensure_local_index().await;
@@ -2234,7 +2253,9 @@ impl ServerHandler for SymForgeServer {
         // results attach whatever is current at render time.
         result_status::with_project_evidence_scope(initial_project_evidence, async {
             withheld::with_withheld_scope(async {
-                let response = self.tool_router.call(tcc).await;
+                // The outcome the tool's own code decided, when it recorded one.
+                let (response, recorded) =
+                    result_status::with_read_outcome_scope(self.tool_router.call(tcc)).await;
                 // FR-319 central evidence attachment (plan D1): statused results
                 // already attached evidence inside `into_call_tool_result`
                 // (single-writer wins — this seam never overwrites); plain-String
@@ -2258,16 +2279,32 @@ impl ServerHandler for SymForgeServer {
                         // as success". Reclassify centrally via the ONE shared
                         // error-shape predicate so every tool inherits it without
                         // per-handler signature churn.
-                        // The read tools below type their own status from the
-                        // outcome they decided; their bodies can lead with raw
-                        // source, which no text predicate can tell from a status
-                        // line. Re-reading the body would undo that.
-                        let typed_read = matches!(
-                            tool_name.as_ref(),
-                            "get_file_content" | "get_symbol" | "get_symbol_context"
-                        );
+                        // Covered facade steps type their own status; their
+                        // bodies can contain text that resembles a status line.
+                        let typed_facade_step =
+                            crate::stel::planner::FacadeStepTool::from_name(tool_name.as_ref())
+                                .is_some();
+                        // Typed status is authoritative on covered tools. Missing
+                        // status is an internal failure, never a text-classified answer.
                         if !admitted_raw_measurement_relay
-                            && !typed_read
+                            && (recorded.is_some() || typed_facade_step)
+                            && result_status::observed_outcome_class(result.meta.as_ref()).is_none()
+                        {
+                            let class = recorded
+                                .map(|outcome| outcome.class())
+                                .unwrap_or(OutcomeClass::InternalFailure);
+                            if class.is_error() {
+                                result.is_error = Some(true);
+                            }
+                            result.meta.get_or_insert_with(Default::default).0.insert(
+                                result_status::RESULT_STATUS_META_KEY.to_string(),
+                                serde_json::to_value(result_status::ResultStatus::new(class))
+                                    .expect("ResultStatus must serialize to JSON"),
+                            );
+                        }
+                        let typed_result = typed_facade_step || recorded.is_some();
+                        if !admitted_raw_measurement_relay
+                            && !typed_result
                             && result.is_error != Some(true)
                         {
                             let body = result
@@ -2496,18 +2533,38 @@ mod tests {
     struct FakeToolState {
         calls: Arc<AtomicUsize>,
         body: Arc<String>,
+        read_outcome_header: Option<String>,
     }
 
     async fn fake_tool_handler(
         State(state): State<FakeToolState>,
         _body: axum::body::Bytes,
-    ) -> String {
+    ) -> (HeaderMap, String) {
         state.calls.fetch_add(1, Ordering::Relaxed);
-        state.body.as_ref().clone()
+        let mut headers = HeaderMap::new();
+        if let Some(outcome) = state.read_outcome_header {
+            headers.insert(
+                result_status::READ_OUTCOME_HEADER,
+                HeaderValue::from_str(&outcome).expect("valid fake outcome header"),
+            );
+        }
+        (headers, state.body.as_ref().clone())
     }
 
     async fn spawn_fake_tool_server(
         body: &str,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        spawn_fake_tool_server_with_read_outcome_header(body, None).await
+    }
+
+    async fn spawn_fake_tool_server_with_read_outcome_header(
+        body: &str,
+        read_outcome_header: Option<&str>,
     ) -> (
         String,
         tokio::sync::oneshot::Sender<()>,
@@ -2522,6 +2579,7 @@ mod tests {
         let state = FakeToolState {
             calls: Arc::clone(&calls),
             body: Arc::new(body.to_string()),
+            read_outcome_header: read_outcome_header.map(str::to_string),
         };
         let app = Router::new()
             .route(
@@ -2670,6 +2728,15 @@ mod tests {
                 .expect("fake project evidence is a valid header value"),
             );
         }
+        // A current daemon types every answer it serves.
+        headers.insert(
+            crate::protocol::result_status::READ_OUTCOME_HEADER,
+            HeaderValue::from_str(
+                &serde_json::to_string(&crate::protocol::result_status::ReadOutcome::Found)
+                    .expect("serialize read outcome"),
+            )
+            .expect("read outcome is a valid header value"),
+        );
         let body = if tool_name == "index_folder" {
             "Indexed 0 files, 0 symbols.".to_string()
         } else {
@@ -3380,6 +3447,96 @@ mod tests {
         let _ = shutdown.send(());
         server_task.await.expect("fake tool server task");
         drop((control_home, home_root));
+    }
+
+    #[tokio::test]
+    async fn daemon_proxy_facade_calls_fail_closed_on_missing_or_malformed_outcome_header() {
+        for (header, body) in [
+            (
+                None,
+                "Error: this source file begins with an error-like line",
+            ),
+            (
+                Some("{"),
+                "Index is loading... this is source text, not daemon status",
+            ),
+            (None, "No matches found for query `Error: missing file`"),
+        ] {
+            let control_home = tempfile::TempDir::new().expect("isolated control-state home");
+            let control_state =
+                crate::domain::ControlStateDir::new(control_home.path().to_path_buf());
+            let (base_url, shutdown, calls, server_task) =
+                spawn_fake_tool_server_with_read_outcome_header(body, header).await;
+            let daemon_client = crate::daemon::DaemonSessionClient::new_for_test_at(
+                base_url,
+                "home-project-id".to_string(),
+                "session-id".to_string(),
+                "home-project".to_string(),
+                control_state,
+            );
+            let server = SymForgeServer::new_daemon_proxy(daemon_client);
+
+            let result = server
+                .get_file_content_tool(Parameters(
+                    serde_json::from_value(serde_json::json!({ "path": "notes/error.txt" }))
+                        .expect("file content input"),
+                ))
+                .await
+                .expect("get_file_content tool result");
+            assert_eq!(only_text(&result), body);
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(
+                result_status::observed_outcome_class(result.meta.as_ref()),
+                Some(result_status::OutcomeClass::InternalFailure)
+            );
+
+            let (facade_body, facade_class) = server
+                .facade_step(
+                    "get_file_content",
+                    serde_json::json!({ "path": "notes/error.txt" }),
+                )
+                .await;
+            assert_eq!(facade_body, body);
+            assert_eq!(facade_class, result_status::OutcomeClass::InternalFailure);
+
+            let uri = "symforge://file/content?path=notes%2Ferror.txt";
+            let resource_error = server
+                .read_resource_uri(uri)
+                .await
+                .expect_err("typed read without a valid outcome must fail closed");
+            assert_eq!(resource_error.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+            assert_eq!(resource_error.message, body);
+            assert_eq!(
+                resource_error.data,
+                Some(serde_json::json!({
+                    "uri": uri,
+                    "reason": "index_unavailable",
+                    "retryable": false,
+                }))
+            );
+
+            for tool in crate::stel::planner::FacadeStepTool::ALL {
+                let tool = tool.as_str();
+                let (proxied_body, outcome) = result_status::with_read_outcome_scope(
+                    server.proxy_tool_call(tool, &serde_json::json!({})),
+                )
+                .await;
+                assert_eq!(proxied_body.as_deref(), Some(body), "{tool}");
+                assert_eq!(
+                    outcome.map(result_status::ReadOutcome::class),
+                    Some(result_status::OutcomeClass::InternalFailure),
+                    "{tool} must not classify source text when its typed header is absent or malformed"
+                );
+            }
+
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                3 + crate::stel::planner::FacadeStepTool::ALL.len(),
+            );
+            let _ = shutdown.send(());
+            server_task.await.expect("fake daemon tool server task");
+            drop(control_home);
+        }
     }
 
     #[tokio::test]
