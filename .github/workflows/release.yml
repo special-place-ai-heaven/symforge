@@ -440,7 +440,7 @@ jobs:
 
       - name: Upload code-owned Feature 020 V11 pre-approval evidence
         if: needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: feature-020-v11-preapproval-evidence
           path: target/ci/lifecycle-v11/
@@ -1923,7 +1923,7 @@ jobs:
           node scripts/validate-lifecycle-oracle-traceability.cjs --require-materialized --evidence target/ci/lifecycle-v11/release-evidence.json
 
       - name: Upload closed Feature 020 V11 lifecycle evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: feature-020-v11-closed-release-evidence-${{ steps.gate.outputs.release_ref }}
           path: target/ci/lifecycle-v11/
@@ -2318,7 +2318,7 @@ jobs:
         run: cp "${{ matrix.binary }}" "${{ matrix.artifact }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -2426,7 +2426,7 @@ jobs:
           ls -l dist-npm
 
       - name: Upload npm package artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: npm-package
           path: dist-npm/*.tgz
