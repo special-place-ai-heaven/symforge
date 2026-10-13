@@ -8,8 +8,15 @@
   <link rel="stylesheet" href="/admin/style.css" />
 </head>
 <body>
+  <div class="aurora" aria-hidden="true"></div>
   <header class="topbar">
-    <h1>SymForge Admin</h1>
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">SF</span>
+      <div>
+        <h1>SymForge Admin</h1>
+        <p>Agentic coding control plane</p>
+      </div>
+    </div>
     <span id="project-name" class="project">&hellip;</span>
   </header>
 
@@ -22,6 +29,69 @@
   <main>
     <!-- Dashboard view (US1) -->
     <section id="view-dashboard" class="view active">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Live agent mesh</p>
+          <h2>Fluid code intelligence for autonomous repository work.</h2>
+          <p class="hero-text">Watch the index, tool surface, harness clients, and economics ledger flow through one cockpit.</p>
+          <div class="command-pill">
+            <span class="prompt">&gt;</span>
+            <span id="mission-line">Awaiting telemetry handshake&hellip;</span>
+          </div>
+        </div>
+        <div class="orbital" aria-label="SymForge agent activity visualization">
+          <div class="orbit orbit-one"></div>
+          <div class="orbit orbit-two"></div>
+          <div class="core">
+            <span>forge</span>
+          </div>
+        </div>
+      </section>
+
+      <div class="signal-strip" aria-label="Live system signals">
+        <div class="signal">
+          <span class="signal-label">Project</span>
+          <strong id="signal-project">&hellip;</strong>
+        </div>
+        <div class="signal">
+          <span class="signal-label">Surface</span>
+          <strong id="signal-surface">&hellip;</strong>
+        </div>
+        <div class="signal">
+          <span class="signal-label">Index</span>
+          <strong id="signal-index">&hellip;</strong>
+        </div>
+        <div class="signal">
+          <span class="signal-label">Sessions</span>
+          <strong id="signal-sessions">&hellip;</strong>
+        </div>
+      </div>
+
+      <section class="agent-grid">
+        <article class="agent-panel">
+          <span class="panel-kicker">Planner</span>
+          <h2>Intent graph</h2>
+          <p>Surface schema, symbols, and harness state converge into a fast path for the next tool call.</p>
+          <ul class="flow-list">
+            <li><span></span>Discover repository shape</li>
+            <li><span></span>Route through trusted read gates</li>
+            <li><span></span>Commit only observed outcomes</li>
+          </ul>
+        </article>
+        <article class="agent-panel agent-panel-hot">
+          <span class="panel-kicker">Executor</span>
+          <h2 id="agent-count">Tool surface warming</h2>
+          <p id="agent-caption">Loading available actions from the MCP surface.</p>
+          <div id="agent-tools" class="agent-tools">Stand by.</div>
+        </article>
+        <article class="agent-panel">
+          <span class="panel-kicker">Verifier</span>
+          <h2>Trust loop</h2>
+          <p>Every status banner below is backed by API telemetry or a clear unavailable state.</p>
+          <div class="trust-meter"><span></span></div>
+        </article>
+      </section>
+
       <h2>Economics</h2>
       <div id="economics" class="cards">
         <p class="loading">Loading economics&hellip;</p>

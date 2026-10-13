@@ -41,6 +41,11 @@ function setStatus(msg, isError) {
   el.className = "status-line" + (isError ? " error" : "");
 }
 
+function setText(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+
 function card(label, value, cls) {
   const div = document.createElement("div");
   div.className = "card" + (cls ? " " + cls : "");
@@ -77,15 +82,18 @@ async function loadEconomics() {
     }
     if (data.total_events === 0) {
       note(el, "No economics activity recorded yet.", "empty");
+      setText("mission-line", "Ledger is quiet. Ready for the first autonomous run.");
       return;
     }
     el.appendChild(card("Events", String(data.total_events)));
     el.appendChild(card("Net vs manual (tokens)", String(data.total_net_vs_manual)));
     el.appendChild(card("Accepted", String(data.accepted_count)));
     el.appendChild(card("Sessions", String(data.session_count)));
+    setText("mission-line", data.total_events + " observed events across " + data.session_count + " sessions. Net token delta: " + data.total_net_vs_manual + ".");
     renderRecentRuns(el, data);
   } catch (e) {
     note(el, "Failed to load economics.", "unavailable");
+    setText("mission-line", "Telemetry handshake failed; economics unavailable.");
   }
 }
 
@@ -132,12 +140,20 @@ async function loadSurface() {
     el.innerHTML = "";
     el.appendChild(card("Profile", data.profile));
     el.appendChild(card("Tools", String(data.tool_count)));
+    setText("signal-surface", data.profile + " / " + data.tool_count + " tools");
+    setText("agent-count", data.tool_count + " tools armed");
+    setText("agent-caption", "The active " + data.profile + " surface is ready for agent routing.");
+    setText("agent-tools", data.tools.slice(0, 12).join(" · ") + (data.tools.length > 12 ? " · …" : ""));
     const list = document.createElement("div");
     list.className = "tool-list";
     list.textContent = data.tools.join(", ");
     el.appendChild(list);
   } catch (e) {
     note(el, "Failed to load surface.", "unavailable");
+    setText("signal-surface", "unavailable");
+    setText("agent-count", "Tool surface offline");
+    setText("agent-caption", "The interface is still loaded, but surface telemetry failed.");
+    setText("agent-tools", "No route map available.");
   }
 }
 
@@ -374,10 +390,16 @@ async function loadSystem() {
     el.appendChild(card("Index generation", String(data.index_generation)));
     const projects = data.indexed_projects.length ? data.indexed_projects.join(", ") : "(none)";
     el.appendChild(card("Indexed projects", projects));
-    document.getElementById("project-name").textContent =
-      data.indexed_projects[0] || "(no project)";
+    const project = data.indexed_projects[0] || "(no project)";
+    setText("project-name", project);
+    setText("signal-project", project);
+    setText("signal-index", data.indexed_file_count + " files / " + data.indexed_symbol_count + " symbols");
+    setText("signal-sessions", String(data.active_sessions));
   } catch (e) {
     note(el, "Failed to load system telemetry.", "unavailable");
+    setText("signal-project", "unavailable");
+    setText("signal-index", "unavailable");
+    setText("signal-sessions", "unavailable");
   }
 }
 
