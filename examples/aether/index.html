@@ -1,0 +1,1029 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AETHER — Fluid Agentic Coding</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Syne:wght@500;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --void: #06080b;
+      --ink: #0c1016;
+      --panel: rgba(14, 18, 26, 0.72);
+      --stroke: rgba(200, 214, 230, 0.12);
+      --mercury: #c8d4e0;
+      --mute: rgba(200, 212, 224, 0.55);
+      --teal: #3dffe8;
+      --teal-dim: rgba(61, 255, 232, 0.18);
+      --amber: #ffc14a;
+      --amber-dim: rgba(255, 193, 74, 0.16);
+      --coral: #ff6b4a;
+      --font-display: "Syne", sans-serif;
+      --font-mono: "JetBrains Mono", ui-monospace, monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      background: var(--void);
+      color: var(--mercury);
+      font-family: var(--font-display);
+      overflow: hidden;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background:
+        radial-gradient(ellipse 80% 50% at 50% -10%, rgba(61, 255, 232, 0.08), transparent 55%),
+        radial-gradient(ellipse 50% 40% at 90% 80%, rgba(255, 193, 74, 0.05), transparent 50%),
+        linear-gradient(180deg, #080b10 0%, #06080b 40%, #05070a 100%);
+      z-index: 0;
+    }
+
+    #fluid {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 1;
+      opacity: 0.85;
+    }
+
+    .shell {
+      position: relative;
+      z-index: 2;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      height: 100%;
+      padding: 20px 24px 18px;
+      gap: 14px;
+      max-width: 1440px;
+      margin: 0 auto;
+    }
+
+    /* —— Top bar —— */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      animation: rise 0.8s cubic-bezier(0.22, 1, 0.36, 1) both;
+    }
+
+    .brand {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+    }
+
+    .brand h1 {
+      font-size: clamp(28px, 4vw, 40px);
+      font-weight: 800;
+      letter-spacing: -0.04em;
+      line-height: 1;
+      background: linear-gradient(120deg, #f2f7fb 20%, var(--teal) 55%, var(--amber) 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    .brand .tag {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--mute);
+    }
+
+    .status-pills {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .pill {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: 0.06em;
+      padding: 6px 10px;
+      border: 1px solid var(--stroke);
+      background: var(--panel);
+      backdrop-filter: blur(12px);
+      color: var(--mute);
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .pill .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--teal);
+      box-shadow: 0 0 0 0 rgba(61, 255, 232, 0.5);
+      animation: pulse 2.2s ease-out infinite;
+    }
+
+    .pill.warn .dot { background: var(--amber); animation: none; }
+    .pill .val { color: var(--mercury); }
+
+    /* —— Main stage —— */
+    .stage {
+      display: grid;
+      grid-template-columns: 240px 1fr 280px;
+      gap: 14px;
+      min-height: 0;
+      animation: rise 1s 0.1s cubic-bezier(0.22, 1, 0.36, 1) both;
+    }
+
+    @media (max-width: 980px) {
+      .stage {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto 1fr auto;
+        overflow: auto;
+      }
+      .rail, .swarm { max-height: 180px; }
+      body { overflow: auto; }
+      .shell { overflow: auto; height: auto; min-height: 100%; }
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--stroke);
+      backdrop-filter: blur(18px);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--stroke);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--mute);
+    }
+
+    .panel-head .accent {
+      color: var(--teal);
+      letter-spacing: 0.08em;
+    }
+
+    /* Agent rail */
+    .agents {
+      list-style: none;
+      padding: 8px;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      flex: 1;
+    }
+
+    .agent {
+      display: grid;
+      grid-template-columns: 10px 1fr auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 10px;
+      border: 1px solid transparent;
+      cursor: pointer;
+      transition: border-color 0.25s, background 0.25s, transform 0.25s;
+    }
+
+    .agent:hover, .agent.active {
+      border-color: var(--stroke);
+      background: rgba(61, 255, 232, 0.04);
+    }
+
+    .agent.active { transform: translateX(2px); }
+
+    .agent .orb {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--mute);
+    }
+
+    .agent[data-state="thinking"] .orb {
+      background: var(--amber);
+      animation: blink 1s ease-in-out infinite;
+    }
+    .agent[data-state="writing"] .orb {
+      background: var(--teal);
+      animation: blink 0.55s ease-in-out infinite;
+    }
+    .agent[data-state="idle"] .orb { background: rgba(200, 212, 224, 0.35); }
+    .agent[data-state="done"] .orb { background: var(--teal); }
+
+    .agent .meta { min-width: 0; }
+    .agent .name {
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .agent .role {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--mute);
+      letter-spacing: 0.04em;
+      margin-top: 2px;
+    }
+    .agent .pct {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--mute);
+    }
+
+    /* Center: constellation + editor */
+    .core {
+      display: grid;
+      grid-template-rows: 160px 1fr;
+      gap: 14px;
+      min-height: 0;
+    }
+
+    .constellation {
+      position: relative;
+      border: 1px solid var(--stroke);
+      background: linear-gradient(160deg, rgba(14, 18, 26, 0.6), rgba(8, 12, 18, 0.4));
+      overflow: hidden;
+    }
+
+    .constellation svg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    .constellation .legend {
+      position: absolute;
+      left: 14px;
+      bottom: 12px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--mute);
+      z-index: 2;
+    }
+
+    .constellation .intent-echo {
+      position: absolute;
+      top: 14px;
+      left: 14px;
+      right: 14px;
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      color: rgba(242, 247, 251, 0.92);
+      z-index: 2;
+      opacity: 0;
+      transform: translateY(6px);
+      transition: opacity 0.4s, transform 0.4s;
+    }
+
+    .constellation .intent-echo.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .editor {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    .editor-body {
+      flex: 1;
+      overflow: auto;
+      padding: 14px 0 14px 0;
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      line-height: 1.65;
+      color: rgba(200, 214, 226, 0.88);
+    }
+
+    .code-line {
+      display: grid;
+      grid-template-columns: 48px 1fr;
+      gap: 0;
+      padding: 0 16px 0 0;
+      min-height: 21px;
+    }
+
+    .code-line .ln {
+      text-align: right;
+      padding-right: 14px;
+      color: rgba(200, 212, 224, 0.28);
+      user-select: none;
+    }
+
+    .code-line .src { white-space: pre; overflow-x: hidden; }
+
+    .code-line.added {
+      background: rgba(61, 255, 232, 0.07);
+    }
+    .code-line.added .ln { color: var(--teal); }
+    .code-line.focus {
+      background: rgba(255, 193, 74, 0.08);
+    }
+
+    .tok-kw { color: #7ad4ff; }
+    .tok-fn { color: var(--teal); }
+    .tok-str { color: #ffc14a; }
+    .tok-cm { color: rgba(200, 212, 224, 0.38); font-style: italic; }
+    .tok-ty { color: #9ad4c4; }
+    .tok-num { color: #ff8f6b; }
+
+    .cursor-bar {
+      display: inline-block;
+      width: 7px;
+      height: 1.05em;
+      background: var(--teal);
+      vertical-align: text-bottom;
+      margin-left: 1px;
+      animation: caret 0.9s steps(1) infinite;
+    }
+
+    /* Swarm / activity */
+    .feed {
+      list-style: none;
+      padding: 10px 12px;
+      overflow: auto;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .feed li {
+      font-size: 12px;
+      line-height: 1.45;
+      padding-left: 12px;
+      border-left: 2px solid var(--stroke);
+      color: var(--mute);
+      animation: fadeIn 0.35s ease both;
+    }
+
+    .feed li.hot { border-left-color: var(--teal); color: var(--mercury); }
+    .feed li.warm { border-left-color: var(--amber); }
+
+    .feed .who {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--teal);
+      margin-bottom: 3px;
+    }
+
+    .feed li.warm .who { color: var(--amber); }
+
+    /* —— Intent bar —— */
+    footer {
+      animation: rise 1.1s 0.15s cubic-bezier(0.22, 1, 0.36, 1) both;
+    }
+
+    .intent {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 12px;
+      align-items: center;
+      padding: 10px 12px 10px 16px;
+      border: 1px solid rgba(61, 255, 232, 0.28);
+      background: rgba(10, 14, 20, 0.82);
+      backdrop-filter: blur(20px);
+      box-shadow: 0 0 0 1px rgba(61, 255, 232, 0.05), 0 20px 60px rgba(0, 0, 0, 0.45);
+    }
+
+    .intent .glyph {
+      width: 28px;
+      height: 28px;
+      display: grid;
+      place-items: center;
+    }
+
+    .intent .glyph svg { width: 22px; height: 22px; }
+
+    .intent input {
+      width: 100%;
+      background: transparent;
+      border: 0;
+      outline: none;
+      color: var(--mercury);
+      font-family: var(--font-display);
+      font-size: 16px;
+      font-weight: 500;
+      letter-spacing: -0.02em;
+    }
+
+    .intent input::placeholder { color: rgba(200, 212, 224, 0.35); }
+
+    .intent .go {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      padding: 10px 14px;
+      border: 1px solid rgba(61, 255, 232, 0.45);
+      background: var(--teal-dim);
+      color: var(--teal);
+      cursor: pointer;
+      transition: background 0.2s, color 0.2s, border-color 0.2s;
+    }
+
+    .intent .go:hover {
+      background: rgba(61, 255, 232, 0.28);
+      color: #061014;
+      border-color: var(--teal);
+      background: var(--teal);
+    }
+
+    .hints {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+
+    .hint {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      padding: 6px 10px;
+      border: 1px solid var(--stroke);
+      background: rgba(12, 16, 22, 0.5);
+      color: var(--mute);
+      cursor: pointer;
+      transition: border-color 0.2s, color 0.2s, background 0.2s;
+    }
+
+    .hint:hover {
+      border-color: rgba(255, 193, 74, 0.4);
+      color: var(--amber);
+      background: var(--amber-dim);
+    }
+
+    /* —— Motion —— */
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(16px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(61, 255, 232, 0.45); }
+      70% { box-shadow: 0 0 0 8px rgba(61, 255, 232, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(61, 255, 232, 0); }
+    }
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
+    @keyframes caret {
+      0%, 50% { opacity: 1; }
+      51%, 100% { opacity: 0; }
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .busy .constellation {
+      border-color: rgba(61, 255, 232, 0.35);
+    }
+  </style>
+</head>
+<body>
+  <canvas id="fluid" aria-hidden="true"></canvas>
+
+  <div class="shell" id="app">
+    <header>
+      <div class="brand">
+        <h1>AETHER</h1>
+        <span class="tag">fluid agentic coding</span>
+      </div>
+      <div class="status-pills">
+        <div class="pill"><span class="dot"></span> swarm <span class="val" id="swarmCount">5</span></div>
+        <div class="pill warn"><span class="dot"></span> latency <span class="val" id="latency">42ms</span></div>
+        <div class="pill"><span class="dot"></span> index <span class="val">live</span></div>
+      </div>
+    </header>
+
+    <div class="stage">
+      <aside class="panel rail">
+        <div class="panel-head">Agents <span class="accent" id="agentPhase">idle</span></div>
+        <ul class="agents" id="agentList"></ul>
+      </aside>
+
+      <section class="core">
+        <div class="constellation" id="constellation">
+          <div class="intent-echo" id="intentEcho"></div>
+          <svg id="swarmSvg" viewBox="0 0 800 160" preserveAspectRatio="xMidYMid slice"></svg>
+          <div class="legend">constellation · click an agent to focus</div>
+        </div>
+
+        <div class="panel editor">
+          <div class="panel-head">
+            <span>src/protocol/<span class="accent" id="fileName">admit.rs</span></span>
+            <span id="editBadge">ready</span>
+          </div>
+          <div class="editor-body" id="editor" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <aside class="panel swarm">
+        <div class="panel-head">Stream <span class="accent">now</span></div>
+        <ul class="feed" id="feed"></ul>
+      </aside>
+    </div>
+
+    <footer>
+      <form class="intent" id="intentForm">
+        <div class="glyph" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M4 12c4-8 12-8 16 0-4 8-12 8-16 0Z" stroke="#3dffe8" stroke-width="1.4"/>
+            <circle cx="12" cy="12" r="2.2" fill="#ffc14a"/>
+          </svg>
+        </div>
+        <input id="intentInput" autocomplete="off" spellcheck="false"
+          placeholder="Describe the change — agents will fan out and write…" />
+        <button class="go" type="submit">Dispatch</button>
+      </form>
+      <div class="hints" id="hints"></div>
+    </footer>
+  </div>
+
+  <script>
+    /* ═══════════════════════════════════════════════
+       AETHER — fluid field + agentic coding shell
+       ═══════════════════════════════════════════════ */
+
+    const AGENTS = [
+      { id: "oracle", name: "Oracle", role: "intent · plan", hue: "#3dffe8" },
+      { id: "weaver", name: "Weaver", role: "symbols · graph", hue: "#7ad4ff" },
+      { id: "scribe", name: "Scribe", role: "edit · stream", hue: "#ffc14a" },
+      { id: "sentinel", name: "Sentinel", role: "verify · gate", hue: "#ff8f6b" },
+      { id: "echo", name: "Echo", role: "diff · narrate", hue: "#b8d4c8" },
+    ];
+
+    const HINTS = [
+      "Tighten admit_disk_read so skipped files never claim success",
+      "Add a repeat-call breaker notice without prescribing a remedy",
+      "Fan out agents to refactor the constellation into a DAG",
+      "Stream a glassmorphic status strip that reports observed latency",
+    ];
+
+    const BASE_CODE = [
+      { t: "cm", s: "// Single admission gate for raw-disk content reads." },
+      { t: "", s: "" },
+      { t: "kw", s: "pub fn ", f: "admit_disk_read", rest: "(" },
+      { t: "", s: "    path: &Path," },
+      { t: "", s: "    policy: &ReadPolicy," },
+      { t: "", s: ") -> Result<AdmitPermit, AdmitError> {" },
+      { t: "cm", s: "    // Observe the verdict — never report what we did not see." },
+      { t: "", s: "    let verdict = policy.evaluate(path)?;" },
+      { t: "", s: "    match verdict {" },
+      { t: "", s: "        Verdict::Permit(buf) => Ok(AdmitPermit::from(buf))," },
+      { t: "", s: "        Verdict::Skip(reason) => Err(AdmitError::Skipped(reason))," },
+      { t: "", s: "        Verdict::Deny => Err(AdmitError::Denied)," },
+      { t: "", s: "    }" },
+      { t: "", s: "}" },
+    ];
+
+    const PATCH_LINES = [
+      { after: 6, line: { t: "kw", s: "    let observed = ", f: "observe", rest: "(path, policy);" } },
+      { after: 7, line: { t: "", s: "    let verdict = observed.verdict()?;" } },
+    ];
+
+    /* —— State —— */
+    const state = {
+      agents: AGENTS.map((a) => ({ ...a, state: "idle", pct: 0 })),
+      busy: false,
+      focus: null,
+      lines: BASE_CODE.map((l) => ({ ...l })),
+      feed: [],
+    };
+
+    /* —— DOM —— */
+    const $ = (id) => document.getElementById(id);
+    const agentList = $("agentList");
+    const editor = $("editor");
+    const feed = $("feed");
+    const hints = $("hints");
+    const intentInput = $("intentInput");
+    const intentEcho = $("intentEcho");
+    const app = $("app");
+
+    HINTS.forEach((h) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "hint";
+      b.textContent = h;
+      b.addEventListener("click", () => {
+        intentInput.value = h;
+        intentInput.focus();
+      });
+      hints.appendChild(b);
+    });
+
+    function renderAgents() {
+      agentList.innerHTML = "";
+      state.agents.forEach((a) => {
+        const li = document.createElement("li");
+        li.className = "agent" + (state.focus === a.id ? " active" : "");
+        li.dataset.state = a.state;
+        li.innerHTML = `
+          <span class="orb" style="${a.state !== "idle" ? `background:${a.hue}` : ""}"></span>
+          <div class="meta">
+            <div class="name">${a.name}</div>
+            <div class="role">${a.role}</div>
+          </div>
+          <span class="pct">${a.state === "idle" ? "—" : a.pct + "%"}</span>`;
+        li.addEventListener("click", () => {
+          state.focus = a.id;
+          renderAgents();
+          pushFeed(a.name, `Focused · ${a.role}`, "warm");
+        });
+        agentList.appendChild(li);
+      });
+    }
+
+    function colorize(line) {
+      if (line.t === "cm") return `<span class="tok-cm">${esc(line.s)}</span>`;
+      if (line.t === "kw") {
+        return `<span class="tok-kw">${esc(line.s)}</span><span class="tok-fn">${esc(line.f || "")}</span>${esc(line.rest || "")}`;
+      }
+      let s = esc(line.s);
+      s = s.replace(/\b(Result|AdmitPermit|AdmitError|Path|ReadPolicy|Verdict|Ok|Err)\b/g, '<span class="tok-ty">$1</span>');
+      s = s.replace(/"([^"]*)"/g, '<span class="tok-str">"$1"</span>');
+      return s;
+    }
+
+    function esc(s) {
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
+    function renderEditor(opts = {}) {
+      const { cursorAt = -1, added = new Set() } = opts;
+      editor.innerHTML = state.lines
+        .map((line, i) => {
+          const cls = [
+            "code-line",
+            added.has(i) ? "added" : "",
+            state.focus === "scribe" && added.has(i) ? "focus" : "",
+          ].join(" ");
+          const caret = cursorAt === i ? '<span class="cursor-bar"></span>' : "";
+          return `<div class="${cls}"><span class="ln">${i + 1}</span><span class="src">${colorize(line)}${caret}</span></div>`;
+        })
+        .join("");
+      if (cursorAt >= 0) {
+        const el = editor.querySelectorAll(".code-line")[cursorAt];
+        el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }
+    }
+
+    function pushFeed(who, text, tone = "hot") {
+      state.feed.unshift({ who, text, tone, t: Date.now() });
+      state.feed = state.feed.slice(0, 12);
+      feed.innerHTML = state.feed
+        .map(
+          (f) =>
+            `<li class="${f.tone}"><div class="who">${esc(f.who)}</div>${esc(f.text)}</li>`
+        )
+        .join("");
+    }
+
+    /* —— Constellation SVG —— */
+    const svg = $("swarmSvg");
+    const NS = "http://www.w3.org/2000/svg";
+
+    function mk(tag, attrs = {}) {
+      const el = document.createElementNS(NS, tag);
+      Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
+      return el;
+    }
+
+    const nodes = AGENTS.map((a, i) => {
+      const angle = (i / AGENTS.length) * Math.PI * 2 - Math.PI / 2;
+      return {
+        ...a,
+        baseAngle: angle,
+        r: 52 + (i % 2) * 10,
+        cx: 400,
+        cy: 88,
+      };
+    });
+
+    const links = mk("g", { opacity: "0.55" });
+    const nodeLayer = mk("g");
+    svg.appendChild(links);
+    svg.appendChild(nodeLayer);
+
+    const hub = mk("circle", {
+      cx: 400, cy: 88, r: 6,
+      fill: "#ffc14a",
+      opacity: "0.95",
+    });
+    nodeLayer.appendChild(hub);
+
+    const hubRing = mk("circle", {
+      cx: 400, cy: 88, r: 14,
+      fill: "none",
+      stroke: "#ffc14a",
+      "stroke-opacity": "0.35",
+      "stroke-width": "1",
+    });
+    nodeLayer.appendChild(hubRing);
+
+    const nodeEls = nodes.map((n) => {
+      const g = mk("g", { style: "cursor:pointer" });
+      const line = mk("line", {
+        x1: 400, y1: 88, x2: 400, y2: 88,
+        stroke: n.hue, "stroke-opacity": "0.35", "stroke-width": "1",
+      });
+      links.appendChild(line);
+      const c = mk("circle", { r: 5.5, fill: n.hue });
+      const ring = mk("circle", {
+        r: 11, fill: "none", stroke: n.hue,
+        "stroke-opacity": "0.25", "stroke-width": "1",
+      });
+      const label = mk("text", {
+        fill: "#c8d4e0", "font-size": "10", "font-family": "JetBrains Mono, monospace",
+        "text-anchor": "middle", y: 22, opacity: "0.7",
+      });
+      label.textContent = n.name;
+      g.appendChild(c);
+      g.appendChild(ring);
+      g.appendChild(label);
+      g.addEventListener("click", () => {
+        state.focus = n.id;
+        renderAgents();
+      });
+      nodeLayer.appendChild(g);
+      return { g, c, ring, line, label, n };
+    });
+
+    let t0 = performance.now();
+    function tickConstellation(now) {
+      const t = (now - t0) / 1000;
+      const energy = state.busy ? 1.6 : 0.55;
+      nodeEls.forEach((el, i) => {
+        const n = el.n;
+        const ang = n.baseAngle + t * 0.35 * energy + Math.sin(t * 0.8 + i) * 0.08;
+        const rr = n.r + Math.sin(t * 1.4 + i * 1.7) * (state.busy ? 8 : 3);
+        const x = 400 + Math.cos(ang) * rr * 2.4;
+        const y = 88 + Math.sin(ang) * rr * 0.72;
+        el.g.setAttribute("transform", `translate(${x},${y})`);
+        el.line.setAttribute("x2", x);
+        el.line.setAttribute("y2", y);
+        const agent = state.agents[i];
+        const active = agent.state === "writing" || agent.state === "thinking";
+        el.ring.setAttribute("r", active ? 14 + Math.sin(t * 6) * 2 : 11);
+        el.ring.setAttribute("stroke-opacity", active ? "0.7" : "0.25");
+        el.line.setAttribute("stroke-opacity", active ? "0.7" : "0.28");
+      });
+      hubRing.setAttribute("r", 14 + Math.sin(t * 2) * (state.busy ? 4 : 1.5));
+      requestAnimationFrame(tickConstellation);
+    }
+    requestAnimationFrame(tickConstellation);
+
+    /* —— Fluid canvas —— */
+    const canvas = $("fluid");
+    const ctx = canvas.getContext("2d");
+    let W, H, mouse = { x: 0.5, y: 0.5 };
+    const blobs = Array.from({ length: 7 }, (_, i) => ({
+      x: Math.random(),
+      y: Math.random(),
+      r: 0.12 + Math.random() * 0.18,
+      vx: (Math.random() - 0.5) * 0.00035,
+      vy: (Math.random() - 0.5) * 0.00035,
+      hue: i % 2 === 0 ? "61,255,232" : "255,193,74",
+      a: 0.045 + Math.random() * 0.04,
+    }));
+
+    function resize() {
+      W = canvas.width = window.innerWidth * devicePixelRatio;
+      H = canvas.height = window.innerHeight * devicePixelRatio;
+      canvas.style.width = window.innerWidth + "px";
+      canvas.style.height = window.innerHeight + "px";
+      ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+    }
+    window.addEventListener("resize", resize);
+    resize();
+
+    window.addEventListener("pointermove", (e) => {
+      mouse.x = e.clientX / window.innerWidth;
+      mouse.y = e.clientY / window.innerHeight;
+    });
+
+    function tickFluid() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      ctx.clearRect(0, 0, w, h);
+      ctx.globalCompositeOperation = "lighter";
+
+      blobs.forEach((b, i) => {
+        b.x += b.vx + (mouse.x - 0.5) * 0.00008 * (i + 1);
+        b.y += b.vy + (mouse.y - 0.5) * 0.00006 * (i + 1);
+        if (b.x < -0.2 || b.x > 1.2) b.vx *= -1;
+        if (b.y < -0.2 || b.y > 1.2) b.vy *= -1;
+        b.x = (b.x + 1.4) % 1.4 - 0.2;
+        b.y = (b.y + 1.4) % 1.4 - 0.2;
+
+        const px = b.x * w;
+        const py = b.y * h;
+        const rad = Math.min(w, h) * b.r * (state.busy ? 1.25 : 1);
+        const g = ctx.createRadialGradient(px, py, 0, px, py, rad);
+        const alpha = state.busy ? b.a * 1.8 : b.a;
+        g.addColorStop(0, `rgba(${b.hue},${alpha})`);
+        g.addColorStop(0.45, `rgba(${b.hue},${alpha * 0.35})`);
+        g.addColorStop(1, `rgba(${b.hue},0)`);
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(px, py, rad, 0, Math.PI * 2);
+        ctx.fill();
+      });
+
+      ctx.globalCompositeOperation = "source-over";
+      requestAnimationFrame(tickFluid);
+    }
+    requestAnimationFrame(tickFluid);
+
+    /* —— Dispatch simulation —— */
+    function sleep(ms) {
+      return new Promise((r) => setTimeout(r, ms));
+    }
+
+    async function dispatch(intent) {
+      if (state.busy || !intent.trim()) return;
+      state.busy = true;
+      app.classList.add("busy");
+      $("agentPhase").textContent = "dispatch";
+      $("editBadge").textContent = "streaming";
+      $("fileName").textContent = "admit.rs";
+
+      intentEcho.textContent = intent.trim();
+      intentEcho.classList.add("show");
+
+      pushFeed("Oracle", "Parsed intent · splitting into agent lanes", "hot");
+      state.agents.forEach((a) => { a.state = "thinking"; a.pct = 8; });
+      renderAgents();
+
+      await sleep(500);
+      state.agents[0].state = "writing";
+      state.agents[0].pct = 40;
+      pushFeed("Oracle", "Plan: observe before report · gate skipped paths", "hot");
+      renderAgents();
+
+      await sleep(450);
+      state.agents[1].state = "writing";
+      state.agents[1].pct = 35;
+      pushFeed("Weaver", "Bound admit_disk_read · 3 call sites in protocol", "hot");
+      renderAgents();
+
+      await sleep(400);
+      state.agents[2].state = "writing";
+      state.agents[2].pct = 20;
+      pushFeed("Scribe", "Opening edit stream on src/protocol/admit.rs", "warm");
+      renderAgents();
+
+      // Reset to base then stream patch
+      state.lines = BASE_CODE.map((l) => ({ ...l }));
+      renderEditor({ cursorAt: 6 });
+      await sleep(350);
+
+      const added = new Set();
+      // Insert first new line after index 6
+      const insertAt = 7;
+      const newLine = {
+        t: "kw",
+        s: "    let observed = ",
+        f: "observe",
+        rest: "(path, policy);",
+      };
+      // Type it character by character into a growing line
+      const full = "    let observed = observe(path, policy);";
+      state.lines.splice(insertAt, 0, { t: "", s: "" });
+      added.add(insertAt);
+
+      for (let i = 1; i <= full.length; i++) {
+        const partial = full.slice(0, i);
+        // crude highlight while typing
+        if (partial.includes("observe") && partial.length >= "    let observed = observe".length) {
+          state.lines[insertAt] = {
+            t: "kw",
+            s: "    let observed = ",
+            f: "observe",
+            rest: partial.slice("    let observed = observe".length),
+          };
+        } else {
+          state.lines[insertAt] = { t: "", s: partial };
+        }
+        state.agents[2].pct = Math.min(95, 20 + Math.floor((i / full.length) * 70));
+        renderEditor({ cursorAt: insertAt, added });
+        renderAgents();
+        await sleep(18 + Math.random() * 22);
+      }
+
+      await sleep(280);
+      // Replace the old evaluate line
+      const replaceIdx = insertAt + 1;
+      state.lines[replaceIdx] = { t: "", s: "    let verdict = observed.verdict()?;" };
+      added.add(replaceIdx);
+      pushFeed("Scribe", "Replaced evaluate() with observed.verdict()", "warm");
+      state.agents[2].pct = 100;
+      state.agents[2].state = "done";
+      renderEditor({ added });
+      renderAgents();
+
+      await sleep(400);
+      state.agents[3].state = "writing";
+      state.agents[3].pct = 55;
+      pushFeed("Sentinel", "Invariant check: skipped paths cannot report success", "hot");
+      renderAgents();
+      await sleep(500);
+      state.agents[3].pct = 100;
+      state.agents[3].state = "done";
+      $("latency").textContent = 28 + Math.floor(Math.random() * 30) + "ms";
+      renderAgents();
+
+      await sleep(300);
+      state.agents[4].state = "writing";
+      state.agents[4].pct = 70;
+      pushFeed("Echo", "+2 lines · observe-before-report seam sealed", "warm");
+      renderAgents();
+      await sleep(400);
+
+      state.agents.forEach((a) => {
+        a.state = "done";
+        a.pct = 100;
+      });
+      renderAgents();
+      $("agentPhase").textContent = "settled";
+      $("editBadge").textContent = "applied";
+      pushFeed("AETHER", "Dispatch complete · constellation idle", "hot");
+
+      await sleep(1200);
+      state.agents.forEach((a) => {
+        a.state = "idle";
+        a.pct = 0;
+      });
+      state.busy = false;
+      app.classList.remove("busy");
+      $("agentPhase").textContent = "idle";
+      renderAgents();
+      // keep echo visible a bit longer then soft-hide on next intent
+    }
+
+    $("intentForm").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const v = intentInput.value.trim();
+      if (!v) return;
+      dispatch(v);
+      intentInput.value = "";
+    });
+
+    // Latency jitter
+    setInterval(() => {
+      if (!state.busy) {
+        $("latency").textContent = 36 + Math.floor(Math.random() * 28) + "ms";
+      }
+    }, 2400);
+
+    // Boot
+    renderAgents();
+    renderEditor();
+    pushFeed("AETHER", "Swarm online · fluid field coupled to pointer", "hot");
+    pushFeed("Oracle", "Awaiting intent — try a hint below", "warm");
+
+    // Auto-demo after brief pause so first paint impresses
+    setTimeout(() => {
+      if (!state.busy) {
+        intentInput.value = HINTS[0];
+        dispatch(HINTS[0]);
+        intentInput.value = "";
+      }
+    }, 1400);
+  </script>
+</body>
+</html>
