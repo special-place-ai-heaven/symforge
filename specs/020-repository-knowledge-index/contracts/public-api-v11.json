@@ -4071,21 +4071,5 @@
     "decision": "remove_from_public_rust_api",
     "future_rule": "A public telemetry API requires a separately reviewed and attested manifest amendment.",
     "runtime_placement": "crate_private_server_owned"
-  },
-  "additive_embed_atoms": {
-    "breaks": [],
-    "note": "Added beside the frozen introduced_v11_atoms list. That list stays at its pinned count. parity API_VERSION stays 1 because no QueryRequest or QueryOutput variant changed. ReserveOutcome did not gain a variant: takeover is Acquired and OwnerLease::took_over reports it.",
-    "atoms": [
-      "symforge::embed::CensusParseStatus",
-      "symforge::embed::CensusVerifyPhase",
-      "symforge::embed::CensusFile::reference_count",
-      "symforge::embed::CensusFile::parse_status",
-      "symforge::embed::IndexCensus::snapshot_verify",
-      "symforge::embed::parity::replay::ReplayStore::reserve_with_lease",
-      "symforge::embed::parity::replay::ReplayStore::lease_remaining",
-      "symforge::embed::parity::replay::OwnerLease::took_over",
-      "symforge::embed::parity::replay::ReplayOutcome::response_digest",
-      "symforge::embed::parity::replay::ReplayRecord::uncertain_since"
-    ]
   }
 }

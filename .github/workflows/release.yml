@@ -2272,7 +2272,7 @@ jobs:
     needs:
       - prepare-release
       - gate-release-ref
-    if: ${{ !cancelled() && needs.gate-release-ref.result == 'success' && needs.prepare-release.result == 'success' && needs.prepare-release.outputs.release_created == 'true' && matrix.os == 'ubuntu-latest' }}
+    if: ${{ !cancelled() && needs.gate-release-ref.result == 'success' && needs.prepare-release.result == 'success' && needs.prepare-release.outputs.release_created == 'true' }}
     strategy:
       matrix:
         include:
