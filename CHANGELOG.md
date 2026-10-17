@@ -32,6 +32,12 @@ publication generation; infallible `index_progress` returns `IndexProgress`
 (`files_discovered`, `files_parsed`, `symbols_found`); `search_knowledge`
 accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
+`ReplayStore::reserve_with_lease` stores an expiry on a `not_started` row and lets one later caller take that row over after the expiry. `reserve` still stores no expiry, so those rows stay put. Takeover is `ReserveOutcome::Acquired` with `OwnerLease::took_over` true. `lease_remaining` is the time left on a live `not_started` or `started` lease. An expired `started` row is reported as `Uncertain` through `ReplayRecord::uncertain_since` and is not taken over. `parity::API_VERSION` stays 1; no query variant changed.
+
+Embedders keep their own response bytes and check them with `ReplayOutcome::response_digest`. SymForge stores the digest only.
+
+`CensusFile` gains `reference_count` and `parse_status` (`CensusParseStatus`). `IndexCensus` gains `snapshot_verify` (`CensusVerifyPhase`). Both structs were already `non_exhaustive`.
+
 ## [11.7.2](https://github.com/special-place-ai-heaven/symforge/compare/v11.7.1...v11.7.2) (2026-10-11)
 
 

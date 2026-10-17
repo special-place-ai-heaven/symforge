@@ -40,6 +40,12 @@ impl IdempotencyKey {
         frame.extend_from_slice(self.0.as_bytes());
         hash::digest_hex(&frame)
     }
+
+    /// The v10 key hash. Visible to this repository's replay migration test.
+    #[cfg(feature = "__test-internals")]
+    pub fn hash_hex(&self) -> String {
+        self.key_hash()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

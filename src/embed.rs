@@ -77,15 +77,15 @@ pub fn engine_info() -> EngineInfo {
 pub use crate::index_lifecycle::embedded::SourceCloseReceipt;
 pub use crate::index_lifecycle::embedded::{EmbeddedSourceHandle, ReceiptWaitError};
 pub use crate::index_lifecycle::public_api::{
-    CensusFile, EmbedAtomicAuthority as AtomicAuthority, EmbedClaim as Claim,
-    EmbedClaimProvenance as ClaimProvenance, EmbedEvaluationProvenance as EvaluationProvenance,
-    EmbedOperationReceipt as OperationReceipt, EmbedRefreshTicket as RefreshTicket,
-    EmbedShutdownReceipt as ShutdownReceipt, EmbedSourceRefusal as SourceRefusal,
-    EmbeddedSourceSpec, IndexCensus, IndexProgress, KnowledgeMatch, KnowledgeSearchRequest,
-    KnowledgeSearchResult, OperationKind, ProcessRuntimeApi as ProcessIndexRuntime, RetryAdvice,
-    ShutdownReport, SourceCloseReport, SourceRefusalKind, SourceRuntimePhase, SourceRuntimeView,
-    SymbolMatch, SymbolSearchRequest, SymbolSearchResult, TextMatch, TextSearchRequest,
-    TextSearchResult,
+    CensusFile, CensusParseStatus, CensusVerifyPhase, EmbedAtomicAuthority as AtomicAuthority,
+    EmbedClaim as Claim, EmbedClaimProvenance as ClaimProvenance,
+    EmbedEvaluationProvenance as EvaluationProvenance, EmbedOperationReceipt as OperationReceipt,
+    EmbedRefreshTicket as RefreshTicket, EmbedShutdownReceipt as ShutdownReceipt,
+    EmbedSourceRefusal as SourceRefusal, EmbeddedSourceSpec, IndexCensus, IndexProgress,
+    KnowledgeMatch, KnowledgeSearchRequest, KnowledgeSearchResult, OperationKind,
+    ProcessRuntimeApi as ProcessIndexRuntime, RetryAdvice, ShutdownReport, SourceCloseReport,
+    SourceRefusalKind, SourceRuntimePhase, SourceRuntimeView, SymbolMatch, SymbolSearchRequest,
+    SymbolSearchResult, TextMatch, TextSearchRequest, TextSearchResult,
 };
 
 /// Crate-internal door to the lifecycle modules the parity children consume,
@@ -110,13 +110,14 @@ mod contract {
     //! in the activation-cut oracles (`tests/activation_cut_v11.rs`).
     #[allow(unused_imports)]
     use crate::embed::{
-        AtomicAuthority, CensusFile, Claim, ClaimProvenance, EmbeddedSourceHandle,
-        EmbeddedSourceSpec, EngineInfo, EvaluationProvenance, IndexCensus, IndexProgress,
-        KnowledgeMatch, KnowledgeSearchRequest, KnowledgeSearchResult, OperationKind,
-        OperationReceipt, ProcessIndexRuntime, ReceiptWaitError, RefreshTicket, RetryAdvice,
-        ShutdownReceipt, ShutdownReport, SourceCloseReceipt, SourceCloseReport, SourceRefusal,
-        SourceRefusalKind, SourceRuntimePhase, SourceRuntimeView, SymbolMatch, SymbolSearchRequest,
-        SymbolSearchResult, TextMatch, TextSearchRequest, TextSearchResult, engine_info,
+        AtomicAuthority, CensusFile, CensusParseStatus, CensusVerifyPhase, Claim, ClaimProvenance,
+        EmbeddedSourceHandle, EmbeddedSourceSpec, EngineInfo, EvaluationProvenance, IndexCensus,
+        IndexProgress, KnowledgeMatch, KnowledgeSearchRequest, KnowledgeSearchResult,
+        OperationKind, OperationReceipt, ProcessIndexRuntime, ReceiptWaitError, RefreshTicket,
+        RetryAdvice, ShutdownReceipt, ShutdownReport, SourceCloseReceipt, SourceCloseReport,
+        SourceRefusal, SourceRefusalKind, SourceRuntimePhase, SourceRuntimeView, SymbolMatch,
+        SymbolSearchRequest, SymbolSearchResult, TextMatch, TextSearchRequest, TextSearchResult,
+        engine_info,
     };
 
     #[test]
@@ -124,6 +125,46 @@ mod contract {
         fn _assert_named<T>() {}
         _assert_named::<AtomicAuthority>();
         _assert_named::<CensusFile>();
+        _assert_named::<CensusParseStatus>();
+        _assert_named::<CensusVerifyPhase>();
+        let _reference_count: fn(&CensusFile) -> u32 = |file| file.reference_count;
+        let _parse_status: fn(&CensusFile) -> CensusParseStatus = |file| file.parse_status;
+        let _snapshot_verify: fn(&IndexCensus) -> CensusVerifyPhase =
+            |census| census.snapshot_verify;
+        let _reserve_with_lease: fn(
+            &crate::embed::parity::replay::ReplayStore,
+            &crate::embed::parity::replay::ReplayKey,
+            &crate::embed::parity::replay::RequestFingerprint,
+            std::time::Duration,
+        ) -> Result<
+            crate::embed::parity::replay::ReserveOutcome,
+            crate::embed::parity::replay::ReplayError,
+        > = crate::embed::parity::replay::ReplayStore::reserve_with_lease;
+        let _lease_remaining: fn(
+            &crate::embed::parity::replay::ReplayStore,
+            &crate::embed::parity::replay::ReplayKey,
+        ) -> Result<
+            Option<std::time::Duration>,
+            crate::embed::parity::replay::ReplayError,
+        > = crate::embed::parity::replay::ReplayStore::lease_remaining;
+        let _took_over: fn(&crate::embed::parity::replay::OwnerLease) -> bool =
+            crate::embed::parity::replay::OwnerLease::took_over;
+        let _response_digest: fn(&crate::embed::parity::replay::ReplayOutcome) -> &str =
+            crate::embed::parity::replay::ReplayOutcome::response_digest;
+        let _uncertain_since: fn(
+            &crate::embed::parity::replay::ReplayRecord,
+        ) -> Option<std::time::SystemTime> =
+            crate::embed::parity::replay::ReplayRecord::uncertain_since;
+        let _ = (
+            _reference_count,
+            _parse_status,
+            _snapshot_verify,
+            _reserve_with_lease,
+            _lease_remaining,
+            _took_over,
+            _response_digest,
+            _uncertain_since,
+        );
         _assert_named::<Claim<u64>>();
         _assert_named::<ClaimProvenance>();
         _assert_named::<EmbeddedSourceHandle>();
