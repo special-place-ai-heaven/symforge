@@ -1420,8 +1420,8 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "9553334c288b6575:15999"),
-    ("release.yml", "60715201b01e0b43:112609"),
+    ("ci.yml", "6ff2a3b7865a7122:16471"),
+    ("release.yml", "cccce537e4a54734:113026"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an
@@ -1488,6 +1488,7 @@ const CARGO_LINES: &[(&str, usize)] = &[
         1,
     ),
     ("- name: Run cargo check", 1),
+    ("CARGO_BUILD_JOBS: \"2\"", 2),
     (
         "CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}",
         1,
@@ -2424,8 +2425,8 @@ fn no_gate_builds_doctests() {
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(
         (seen.len(), distinct.len(), files),
-        (39, 32, 2),
-        "the CI workflows hold thirty-nine cargo-mentioning lines, thirty-two \
+        (41, 33, 2),
+        "the CI workflows hold forty-one cargo-mentioning lines, thirty-three \
          of them distinct, across two workflow files; this walk saw {:?}. A gate \
          added, removed, reworded, or a workflow file added — reconcile \
          CARGO_LINES with the workflows deliberately, never by loosening this \

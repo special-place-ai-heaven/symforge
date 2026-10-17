@@ -11,6 +11,7 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CARGO_BUILD_JOBS: "2"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -18,7 +19,7 @@ concurrency:
 
 jobs:
   conventional-commits:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, fresh]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,7 +45,7 @@ jobs:
 
   release-version:
     needs: conventional-commits
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, fresh]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -93,11 +94,13 @@ jobs:
 
   rust:
     needs: release-version
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, fresh]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # hosted disk cleanup deletes docker images; skip it on the shared self-hosted pool
       - name: Free disk space for Rust builds
+        if: runner.environment == 'github-hosted'
         run: bash execution/free_runner_disk.sh
 
       # rust-toolchain.toml is the single source of truth for the toolchain
@@ -194,7 +197,7 @@ jobs:
 
   embed-build:
     needs: release-version
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, fresh]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -222,7 +225,7 @@ jobs:
 
   embed-musl:
     needs: release-version
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, fresh]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -265,7 +268,9 @@ jobs:
 
   darwin-serve-port:
     needs: release-version
-    runs-on: macos-latest
+    # hosted minutes are exhausted and there is no macOS self-hosted runner
+    if: false
+    runs-on: [self-hosted, linux, fresh]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -293,7 +298,7 @@ jobs:
   performance-smoke:
     needs: release-version
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, fresh]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -311,7 +316,7 @@ jobs:
 
   npm:
     needs: release-version
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, fresh]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -325,7 +330,9 @@ jobs:
 
   windows-native:
     needs: release-version
-    runs-on: windows-latest
+    # hosted minutes are exhausted and there is no Windows self-hosted runner
+    if: false
+    runs-on: [self-hosted, linux, fresh]
     steps:
       # Keep test runs off the runner's real control-state home; live daemons
       # and other processes must never share coordination state with them
