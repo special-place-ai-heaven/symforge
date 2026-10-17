@@ -37,6 +37,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
       - id: lifecycle-requirements
         name: Validate committed Feature 020 lifecycle release requirements
         shell: bash
@@ -346,7 +350,7 @@ jobs:
       # Node set up above and the release binary built at "Build release binary
       # on main pushes". ripgrep backs the harness grep oracle (not on ubuntu).
       - name: Install ripgrep (harness grep oracle)
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        run: bash execution/ensure_ripgrep.sh
 
       - name: Verify tool correctness (both fixtures)
         run: |
