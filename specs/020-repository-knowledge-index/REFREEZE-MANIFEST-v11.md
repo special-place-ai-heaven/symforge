@@ -1118,7 +1118,7 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
       "hash_policy": "raw_bytes",
       "path": "specs/020-repository-knowledge-index/contracts/public-api-v11.json",
       "scope": "feature",
-      "sha256": "a3d2fb4fabe932e988a195ec9c8736876a891f09f01ed580e4eee4e42793b0a2",
+      "sha256": "f6c1fc51682faf0635c795e296e6fb3c8c165feb3c1c73e5109e2671231b0903",
       "superseded_by": []
     },
     {
@@ -1472,9 +1472,9 @@ This machine-verifiable manifest binds the complete Feature 020 corpus, its V11 
   ],
   "kind": "symforge-feature-020-refreeze",
   "public_api": {
-    "canonical_sha256": "e97d5131d24794e789e324a49026dec718bb9f93500023cbfeccb3af2dd4ae9b",
+    "canonical_sha256": "602b5c9e363f8784c23a88aa2b804eaa3dce98e5be74cd6c65654b76054fb1a3",
     "path": "specs/020-repository-knowledge-index/contracts/public-api-v11.json",
-    "raw_sha256": "a3d2fb4fabe932e988a195ec9c8736876a891f09f01ed580e4eee4e42793b0a2"
+    "raw_sha256": "f6c1fc51682faf0635c795e296e6fb3c8c165feb3c1c73e5109e2671231b0903"
   },
   "required_normative_paths": [
     "CONTEXT.md",

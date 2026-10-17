@@ -572,6 +572,8 @@
           },
           "subjects": [
             "symforge::embed::CensusFile",
+            "symforge::embed::CensusParseStatus",
+            "symforge::embed::CensusVerifyPhase",
             "symforge::embed::EngineInfo",
             "symforge::embed::IndexCensus",
             "symforge::embed::IndexProgress",
@@ -662,6 +664,18 @@
         "item": "type:embed:CensusFile",
         "namespace": "type",
         "path": "symforge::embed::CensusFile"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:CensusParseStatus",
+        "namespace": "type",
+        "path": "symforge::embed::CensusParseStatus"
+      },
+      {
+        "availability": "feature=embed",
+        "item": "type:embed:CensusVerifyPhase",
+        "namespace": "type",
+        "path": "symforge::embed::CensusVerifyPhase"
       },
       {
         "availability": "feature=embed",
@@ -2236,10 +2250,26 @@
               "visibility": "public"
             },
             {
+              "name": "parse_status",
+              "type": {
+                "id": "type:embed:CensusParseStatus",
+                "kind": "api"
+              },
+              "visibility": "public"
+            },
+            {
               "name": "path",
               "type": {
                 "kind": "path",
                 "path": "std::string::String"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "reference_count",
+              "type": {
+                "kind": "primitive",
+                "name": "u32"
               },
               "visibility": "public"
             },
@@ -2258,6 +2288,34 @@
         "generics": [],
         "id": "type:embed:CensusFile",
         "kind": "struct"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "variants": [
+            "Parsed",
+            "PartialParse",
+            "Failed"
+          ]
+        },
+        "generics": [],
+        "id": "type:embed:CensusParseStatus",
+        "kind": "enum"
+      },
+      {
+        "availability": "feature=embed",
+        "definition": {
+          "variants": [
+            "NotNeeded",
+            "Pending",
+            "Running",
+            "Completed",
+            "Failed"
+          ]
+        },
+        "generics": [],
+        "id": "type:embed:CensusVerifyPhase",
+        "kind": "enum"
       },
       {
         "availability": "feature=embed",
@@ -2399,6 +2457,14 @@
                 ],
                 "kind": "generic",
                 "path": "std::vec::Vec"
+              },
+              "visibility": "public"
+            },
+            {
+              "name": "snapshot_verify",
+              "type": {
+                "id": "type:embed:CensusVerifyPhase",
+                "kind": "api"
               },
               "visibility": "public"
             },
@@ -3797,6 +3863,8 @@
       "symforge::embed::AtomicAuthority::identity",
       "symforge::embed::AtomicAuthority::kind_name",
       "symforge::embed::CensusFile",
+      "symforge::embed::CensusParseStatus",
+      "symforge::embed::CensusVerifyPhase",
       "symforge::embed::Claim",
       "symforge::embed::Claim::evaluation",
       "symforge::embed::Claim::operation",

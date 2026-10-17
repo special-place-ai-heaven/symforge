@@ -43,7 +43,7 @@ ATTESTATION_END = "<!-- SYMFORGE FEATURE020 ATTESTATION V11 JSON END -->"
 
 AMENDMENT_DOMAIN = b"symforge.feature-020.amendment-set.v11\0"
 API_SCHEMA_SHAPE_DOMAIN = b"symforge.public-api-v11.schema-shape.v1\0"
-API_SCHEMA_SHAPE_SHA256 = "545af931dceb0f95183e50476a8341847d2ccd46f91972c4701934220cd982fe"
+API_SCHEMA_SHAPE_SHA256 = "ef5529c7e62f93751ce704f6f05d5495b804f8a812cfed65565837b4303bad68"
 SIGNATURE_NAMESPACE = "symforge-feature-020-refreeze-v11"
 APPROVAL_PURPOSE = "implementation_start"
 CANONICAL_REPOSITORY = "special-place-ai-heaven/symforge"
@@ -281,6 +281,8 @@ EXPECTED_AUTO_TRAITS = {
             },
             "subjects": (
                 "symforge::embed::CensusFile",
+                "symforge::embed::CensusParseStatus",
+                "symforge::embed::CensusVerifyPhase",
                 "symforge::embed::EngineInfo",
                 "symforge::embed::IndexCensus",
                 "symforge::embed::IndexProgress",

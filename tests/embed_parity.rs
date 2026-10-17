@@ -3,9 +3,16 @@
 use std::fs;
 use std::time::{Duration, Instant};
 
+use symforge::embed::parity::changes::DiffSymbolsRequest;
+use symforge::embed::parity::detect_impact::DetectImpactRequest;
+use symforge::embed::parity::file_impact::FileImpactRequest;
+use symforge::embed::parity::knowledge::KnowledgeSourceScope;
+use symforge::embed::parity::knowledge::search::SearchKnowledgeRequest;
+use symforge::embed::parity::read_context::{FileContextRequest, RepoMapRequest};
 use symforge::embed::parity::{
     QueryLimits, QueryOutput, QueryRefusalKind, QueryRequest, QuerySymbolSelector,
 };
+use symforge::embed::{CensusParseStatus, CensusVerifyPhase};
 use symforge::embed::{
     EmbeddedSourceHandle, EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase,
 };
@@ -968,4 +975,429 @@ fn parity_request_deserialization_refuses_unknown_options() {
         )
         .is_err()
     );
+}
+
+fn commit_all(root: &std::path::Path, message: &str) -> String {
+    let repo = git2::Repository::open(root).unwrap();
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["."], git2::IndexAddOption::DEFAULT, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+    let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+    let parents: Vec<&git2::Commit> = parent.iter().collect();
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        message,
+        &tree,
+        &parents,
+    )
+    .unwrap()
+    .to_string()
+}
+
+fn caller_selector() -> QuerySymbolSelector {
+    QuerySymbolSelector {
+        path: "src/lib.rs".into(),
+        name: "caller".into(),
+        kind: Some("function".into()),
+        line: None,
+    }
+}
+
+#[test]
+fn parity_audit_outline() {
+    let root = fixture();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let claim = handle
+        .query(
+            &QueryRequest::File {
+                path: "src/lib.rs".into(),
+                start_line: None,
+                end_line: None,
+            },
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::File { symbols, .. } = claim.value() else {
+        panic!("file outline");
+    };
+    let target = symbols
+        .iter()
+        .find(|symbol| symbol.name == "target")
+        .unwrap();
+    assert_eq!(target.kind, "function");
+    assert!(target.start_line >= 1);
+    assert!(target.end_line >= target.start_line);
+}
+
+#[test]
+fn parity_audit_file_context() {
+    let root = fixture();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let claim = handle
+        .query(
+            &QueryRequest::FileContext(FileContextRequest {
+                project: None,
+                path: "src/lib.rs".into(),
+                max_tokens: None,
+                sections: None,
+                include_tests: false,
+                estimate: false,
+                force_refresh: false,
+            }),
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::FileContext(context) = claim.value() else {
+        panic!("file context");
+    };
+    assert!(context.rendered.contains("target"));
+    assert_eq!(context.path, "src/lib.rs");
+}
+
+#[test]
+fn parity_audit_callers_callees() {
+    let root = fixture();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let callers = handle
+        .query(
+            &QueryRequest::Context { selector: target() },
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::Context(context) = callers.value() else {
+        panic!("callers");
+    };
+    assert!(
+        context
+            .callers
+            .iter()
+            .any(|reference| reference.path == "src/lib.rs"),
+        "callers: {:?}",
+        context.callers
+    );
+    let callees = handle
+        .query(
+            &QueryRequest::Context {
+                selector: caller_selector(),
+            },
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::Context(context) = callees.value() else {
+        panic!("callees");
+    };
+    assert!(
+        context
+            .callees
+            .iter()
+            .any(|reference| reference.name == "target"),
+        "callees: {:?}",
+        context.callees
+    );
+}
+
+#[test]
+fn parity_audit_dependents() {
+    let root = fixture();
+    fs::write(
+        root.path().join("src/main.rs"),
+        "use crate::target;\nfn main() { let _ = target(); }\n",
+    )
+    .unwrap();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let claim = handle
+        .query(
+            &QueryRequest::Dependents {
+                path: "src/lib.rs".into(),
+            },
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::Dependents(rows) = claim.value() else {
+        panic!("dependents");
+    };
+    assert!(
+        rows.iter()
+            .any(|row| row.path.replace('\\', "/").ends_with("src/main.rs")),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn parity_audit_impact_changed_set() {
+    let root = fixture();
+    commit_all(root.path(), "base");
+    fs::write(
+        root.path().join("src/other.rs"),
+        "pub fn target() -> u32 { 9 }\n",
+    )
+    .unwrap();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let claim = handle
+        .query(
+            &QueryRequest::DetectImpact(DetectImpactRequest {
+                base_branch: Some("HEAD".into()),
+                ..DetectImpactRequest::default()
+            }),
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::DetectImpact(impact) = claim.value() else {
+        panic!("impact set");
+    };
+    assert!(
+        impact
+            .changed_files
+            .iter()
+            .any(|path| path.replace('\\', "/").ends_with("src/other.rs"))
+    );
+}
+
+#[test]
+fn parity_audit_symbol_diff_ref_to_ref() {
+    let root = fixture();
+    let base = commit_all(root.path(), "base");
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "pub struct Widget;\npub fn target() -> u32 { 4 }\npub fn caller() -> u32 { target() }\n",
+    )
+    .unwrap();
+    let edited = commit_all(root.path(), "edit");
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let claim = handle
+        .query(
+            &QueryRequest::Diff {
+                path: "src/lib.rs".into(),
+                from_ref: base.clone(),
+                to_ref: Some(edited.clone()),
+            },
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::Diff(diff) = claim.value() else {
+        panic!("ref diff");
+    };
+    assert_eq!(diff.from_commit, base);
+    assert_eq!(diff.to_commit.as_deref(), Some(edited.as_str()));
+    assert!(diff.changes.iter().any(|change| change.name == "target"));
+    let wide = handle
+        .query(
+            &QueryRequest::DiffSymbols(DiffSymbolsRequest {
+                base: Some(base),
+                target: Some(edited),
+                ..DiffSymbolsRequest::default()
+            }),
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::DiffSymbols(diff) = wide.value() else {
+        panic!("symbol diff");
+    };
+    assert!(diff.total_changed_files >= 1);
+}
+
+#[test]
+fn parity_audit_syntax() {
+    let root = fixture();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let claim = handle
+        .query(
+            &QueryRequest::Syntax {
+                path: "src/lib.rs".into(),
+            },
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::Syntax(syntax) = claim.value() else {
+        panic!("syntax");
+    };
+    assert!(syntax.valid);
+    assert_eq!(syntax.path, "src/lib.rs");
+}
+
+#[test]
+fn parity_audit_repo_map() {
+    let root = fixture();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let claim = handle
+        .query(
+            &QueryRequest::RepoMap(RepoMapRequest::default()),
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::RepoMap(map) = claim.value() else {
+        panic!("repo map");
+    };
+    assert!(map.total_files >= 1);
+    assert!(map.rendered.contains("src"));
+}
+
+#[test]
+fn parity_audit_search_symbols() {
+    let root = fixture();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let claim = handle
+        .query(
+            &QueryRequest::SearchSymbols {
+                query: None,
+                path_prefix: Some("src".into()),
+                kind: Some("function".into()),
+                include_tests: false,
+            },
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::Symbols(symbols) = claim.value() else {
+        panic!("symbols");
+    };
+    let names: Vec<&str> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
+    assert!(names.contains(&"target"));
+    assert!(names.contains(&"caller"));
+    assert!(!names.contains(&"inline_test"));
+}
+
+#[test]
+fn parity_audit_search_text() {
+    let root = fixture();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let claim = handle
+        .query(
+            &QueryRequest::SearchText {
+                query: "fn target".into(),
+                path_prefix: Some("src".into()),
+                regex: false,
+                case_sensitive: true,
+                include_tests: false,
+            },
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::Text(rows) = claim.value() else {
+        panic!("text");
+    };
+    assert!(rows.iter().any(|row| row.path.ends_with("lib.rs")));
+}
+
+#[test]
+fn parity_audit_knowledge() {
+    let root = fixture();
+    fs::create_dir(root.path().join("docs")).unwrap();
+    fs::write(
+        root.path().join("docs/architecture.md"),
+        "# Persistence boundary\nThe replay store is local.\n",
+    )
+    .unwrap();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let claim = handle
+        .query(
+            &QueryRequest::SearchKnowledge(SearchKnowledgeRequest {
+                query: "persistence boundary".into(),
+                path_prefix: Some("docs/architecture.md".into()),
+                source_scope: Some(KnowledgeSourceScope::Current),
+                authority_scope: None,
+                project: None,
+                projects: None,
+                limit: Some(10),
+                max_tokens: None,
+            }),
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::SearchKnowledge(result) = claim.value() else {
+        panic!("knowledge");
+    };
+    assert!(result.hit_count > 0 || result.withheld_count > 0 || !result.rendered.is_empty());
+}
+
+#[test]
+fn parity_audit_refresh_one_file() {
+    let root = fixture();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "pub struct Widget;\npub fn target() -> u32 { 7 }\npub fn caller() -> u32 { target() }\n",
+    )
+    .unwrap();
+    let claim = handle
+        .query(
+            &QueryRequest::FileImpact(FileImpactRequest {
+                path: "src/lib.rs".into(),
+                new_file: None,
+                include_co_changes: None,
+                co_changes_limit: None,
+                estimate: Some(false),
+            }),
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::FileImpact(report) = claim.value() else {
+        panic!("file impact");
+    };
+    assert!(!report.rendered.is_empty());
+}
+
+#[test]
+fn parity_audit_census_per_file() {
+    let root = fixture();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let view = handle.runtime_view();
+    assert_eq!(view.phase, SourceRuntimePhase::Current);
+    assert!(view.current_publication_identity.is_some());
+    let census = handle.index_census().unwrap();
+    let file = census
+        .value()
+        .files
+        .iter()
+        .find(|file| file.path.replace('\\', "/") == "src/lib.rs")
+        .unwrap();
+    assert!(file.symbol_count >= 2);
+    assert!(file.reference_count >= 1);
+    assert_eq!(file.parse_status, CensusParseStatus::Parsed);
+    assert!(matches!(
+        census.value().snapshot_verify,
+        CensusVerifyPhase::NotNeeded
+            | CensusVerifyPhase::Pending
+            | CensusVerifyPhase::Running
+            | CensusVerifyPhase::Completed
+            | CensusVerifyPhase::Failed
+    ));
+    let graph = handle
+        .query(
+            &QueryRequest::Graph {
+                path_prefix: Some("src/lib.rs".into()),
+                offset: 0,
+                expected_publication: None,
+            },
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::Graph(graph) = graph.value() else {
+        panic!("graph");
+    };
+    let row = graph
+        .files
+        .iter()
+        .find(|file| file.path.replace('\\', "/") == "src/lib.rs")
+        .unwrap();
+    assert!(row.reference_count >= 1);
+    assert_eq!(row.parse_status, "parsed");
 }

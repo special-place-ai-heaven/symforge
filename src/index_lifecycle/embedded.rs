@@ -2271,10 +2271,34 @@ impl EmbeddedSourceHandle {
             .files
             .iter()
             .filter(|file| parsed.contains(&file.relative_path))
-            .map(|file| super::public_api::CensusFile {
-                path: file.relative_path.clone(),
-                language: file.language.name().to_string(),
-                symbol_count: u32::try_from(file.symbol_count).unwrap_or(u32::MAX),
+            .map(|file| {
+                let (reference_count, parse_status) = generation
+                    .live
+                    .get_file(&file.relative_path)
+                    .map(|indexed| {
+                        (
+                            u32::try_from(indexed.references.len()).unwrap_or(u32::MAX),
+                            match &indexed.parse_status {
+                                crate::live_index::store::ParseStatus::Parsed => {
+                                    super::public_api::CensusParseStatus::Parsed
+                                }
+                                crate::live_index::store::ParseStatus::PartialParse { .. } => {
+                                    super::public_api::CensusParseStatus::PartialParse
+                                }
+                                crate::live_index::store::ParseStatus::Failed { .. } => {
+                                    super::public_api::CensusParseStatus::Failed
+                                }
+                            },
+                        )
+                    })
+                    .unwrap_or((0, super::public_api::CensusParseStatus::Parsed));
+                super::public_api::CensusFile {
+                    path: file.relative_path.clone(),
+                    language: file.language.name().to_string(),
+                    symbol_count: u32::try_from(file.symbol_count).unwrap_or(u32::MAX),
+                    reference_count,
+                    parse_status,
+                }
             })
             .collect();
         let total_files = files.len() as u64;
@@ -2284,6 +2308,23 @@ impl EmbeddedSourceHandle {
                 total_files,
                 total_symbols,
                 files,
+                snapshot_verify: match &generation.health.snapshot_verify_state {
+                    crate::live_index::store::SnapshotVerifyState::NotNeeded => {
+                        super::public_api::CensusVerifyPhase::NotNeeded
+                    }
+                    crate::live_index::store::SnapshotVerifyState::Pending => {
+                        super::public_api::CensusVerifyPhase::Pending
+                    }
+                    crate::live_index::store::SnapshotVerifyState::Running(_) => {
+                        super::public_api::CensusVerifyPhase::Running
+                    }
+                    crate::live_index::store::SnapshotVerifyState::Completed(_) => {
+                        super::public_api::CensusVerifyPhase::Completed
+                    }
+                    crate::live_index::store::SnapshotVerifyState::Failed(_) => {
+                        super::public_api::CensusVerifyPhase::Failed
+                    }
+                },
             },
             crate::lifecycle_identity::OperationKind::IndexCensus,
             normalized,

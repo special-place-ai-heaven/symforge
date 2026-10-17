@@ -218,6 +218,29 @@ pub struct IndexCensus {
     pub total_files: u64,
     pub total_symbols: u64,
     pub files: Vec<CensusFile>,
+    /// Snapshot verification phase of this publication. `NotNeeded` when the
+    /// publication was not restored from a snapshot.
+    pub snapshot_verify: CensusVerifyPhase,
+}
+
+/// Parse outcome for one census file. Diagnostics stay off this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CensusParseStatus {
+    Parsed,
+    PartialParse,
+    Failed,
+}
+
+/// Snapshot verification phase, without the internal report payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CensusVerifyPhase {
+    NotNeeded,
+    Pending,
+    Running,
+    Completed,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +249,8 @@ pub struct CensusFile {
     pub path: String,
     pub language: String,
     pub symbol_count: u32,
+    pub reference_count: u32,
+    pub parse_status: CensusParseStatus,
 }
 
 /// Monotonic counters for the in-flight or last completed reload.
@@ -699,6 +724,14 @@ pub fn wrap_table() -> &'static [WrapEntry] {
         },
         WrapEntry {
             atom: "symforge::embed::CensusFile",
+            obligation: "wrapped-here",
+        },
+        WrapEntry {
+            atom: "symforge::embed::CensusParseStatus",
+            obligation: "wrapped-here",
+        },
+        WrapEntry {
+            atom: "symforge::embed::CensusVerifyPhase",
             obligation: "wrapped-here",
         },
         WrapEntry {

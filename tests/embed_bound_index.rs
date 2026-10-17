@@ -1300,3 +1300,76 @@ fn embedded_search_knowledge_reports_withheld_evidence() {
         result.value().withheld_reasons
     );
 }
+
+#[test]
+fn embed_only_handle_returns_real_data_not_unbound() {
+    let repository = tempfile::tempdir().expect("temporary repository");
+    git2::Repository::init(repository.path()).expect("initialize git repository");
+    fs::create_dir_all(repository.path().join("src")).expect("create source directory");
+    fs::write(
+        repository.path().join("src/lib.rs"),
+        b"pub struct Alpha;\npub fn beta() -> u32 { 1 }\n",
+    )
+    .expect("write source");
+    let runtime = ProcessIndexRuntime::acquire().expect("acquire embedded runtime");
+    let handle = runtime
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+            repository.path().to_path_buf(),
+        ))
+        .expect("open embedded source");
+    let view = wait_for_view(&handle, Instant::now() + Duration::from_secs(15), |view| {
+        view.phase == SourceRuntimePhase::Current
+    });
+    assert!(view.current_publication_identity.is_some());
+
+    let symbols = handle
+        .search_symbols(&SymbolSearchRequest {
+            query: None,
+            path_prefix: None,
+            limit: 50,
+        })
+        .expect("search symbols");
+    assert!(
+        symbols
+            .value()
+            .matches
+            .iter()
+            .any(|item| item.name == "Alpha")
+    );
+    assert!(
+        symbols
+            .value()
+            .matches
+            .iter()
+            .any(|item| item.name == "beta")
+    );
+
+    let text = handle
+        .search_text(&TextSearchRequest {
+            query: "Alpha".to_string(),
+            path_prefix: Some("src".to_string()),
+            limit: 20,
+            case_sensitive: true,
+        })
+        .expect("search text");
+    assert!(!text.value().matches.is_empty());
+
+    let census = handle.index_census().expect("census");
+    assert!(!census.value().files.is_empty());
+
+    let map = handle
+        .query(
+            &symforge::embed::parity::QueryRequest::RepoMap(
+                symforge::embed::parity::read_context::RepoMapRequest::default(),
+            ),
+            symforge::embed::parity::QueryLimits::default(),
+        )
+        .expect("repo map");
+    match map.value() {
+        symforge::embed::parity::QueryOutput::RepoMap(repo) => {
+            assert!(!repo.rendered.is_empty());
+            assert!(repo.total_files >= 1);
+        }
+        _ => panic!("repo map result"),
+    }
+}

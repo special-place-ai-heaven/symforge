@@ -3,11 +3,26 @@
 //! The old `FileReplayStore` is deliberately not exposed through this API. A
 //! host must call `mark_started` before performing an external effect. After a
 //! crash, `Started` and `Uncertain` never become executable by age or retry.
+//!
+//! `reserve` writes no expiry. That row stays until its owner releases it or
+//! moves it forward. `reserve_with_lease` stores `lease_expires_at` and can
+//! replace one expired `not_started` row. Takeover is `Acquired` with
+//! `OwnerLease::took_over` set, so `ReserveOutcome` keeps its existing variants.
+//! The host wall clock is read once inside the immediate transaction and bound
+//! into the compare-and-swap. A backward step only delays takeover.
+//!
+//! An expired `started` row is never taken over. Reads report it as
+//! `Uncertain`, with `uncertain_since` equal to the lease end, and a
+//! compare-and-swap rewrites that row. `reconcile` is still the only way back
+//! to a terminal outcome.
+//!
+//! The embedder keeps its own response bytes and checks them with
+//! `ReplayOutcome::response_digest`. Raw responses are never written here.
 
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
@@ -36,6 +51,8 @@ const SCHEMA: &str = "
         outcome_digest TEXT,
         post_image_digest TEXT,
         evidence_digest TEXT,
+        lease_expires_at INTEGER,
+        uncertain_since INTEGER,
         CHECK ((state IN ('not_started', 'started')) = (owner_token IS NOT NULL))
     );
     CREATE TABLE IF NOT EXISTS replay_binding (
@@ -73,8 +90,31 @@ impl std::fmt::Debug for ReplayKey {
 }
 
 /// The old canonical JSON framing is retained so migration cannot rebind a key.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RequestFingerprint(String);
+///
+/// The second field is uncertain_since in epoch millis. It rides here so
+/// ReplayRecord can stay a fully public struct: a new field there would
+/// reject existing struct literals. Equality is the hash alone.
+/// ponytail: move onto ReplayRecord when default field values stabilize
+/// (rust-lang/rust#132162) or on a major bump.
+#[derive(Clone)]
+pub struct RequestFingerprint(String, Option<i64>);
+
+impl PartialEq for RequestFingerprint {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for RequestFingerprint {}
+
+impl std::fmt::Debug for RequestFingerprint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("RequestFingerprint")
+            .field(&self.0)
+            .finish()
+    }
+}
 
 impl RequestFingerprint {
     pub fn for_json(operation: &str, arguments: &Value) -> Result<Self, ReplayError> {
@@ -89,11 +129,15 @@ impl RequestFingerprint {
         }
         let old = crate::idempotency::RequestHash::for_tool_request(operation, arguments)
             .map_err(|_| ReplayError::InvalidRequest)?;
-        Ok(Self(old.as_str().to_owned()))
+        Ok(Self(old.as_str().to_owned(), None))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    fn uncertain_since(&self) -> Option<SystemTime> {
+        self.1.and_then(system_time_from_ms)
     }
 }
 
@@ -192,6 +236,12 @@ impl ReplayOutcome {
     pub fn matches_post_image(&self, bytes: &[u8]) -> bool {
         self.post_image_digest == crate::hash::digest_hex(bytes)
     }
+
+    /// Digest of the response bytes. The embedder stores those bytes itself
+    /// and checks them against this value.
+    pub fn response_digest(&self) -> &str {
+        &self.response_digest
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,6 +255,12 @@ pub struct ReplayRecord {
 }
 
 impl ReplayRecord {
+    /// When the outcome became unknown: `mark_uncertain`'s clock, or the
+    /// lease end of an expired `started` row.
+    pub fn uncertain_since(&self) -> Option<SystemTime> {
+        self.request.uncertain_since()
+    }
+
     pub fn matches_post_image(&self, bytes: &[u8]) -> bool {
         self.state == ReplayState::Completed
             && self
@@ -221,6 +277,14 @@ pub struct OwnerLease {
     request_hash: String,
     token: Vec<u8>,
     generation: i64,
+    took_over: bool,
+}
+
+impl OwnerLease {
+    /// `true` when this lease replaced an expired `not_started` reservation.
+    pub fn took_over(&self) -> bool {
+        self.took_over
+    }
 }
 
 pub enum ReserveOutcome {
@@ -469,6 +533,7 @@ impl ReplayStore {
         };
         let mut conn = store.connect()?;
         conn.execute_batch(SCHEMA)?;
+        ensure_lease_columns(&conn)?;
         let project_hash = crate::hash::digest_hex(root.as_os_str().as_encoded_bytes());
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
@@ -601,13 +666,8 @@ impl ReplayStore {
     /// After cutover, remove or archive that directory outside this API; old
     /// bytes are never modified here. Existing per-key old records still block
     /// if the directory is retained.
-    pub fn reserve(
-        &self,
-        key: &ReplayKey,
-        request: &RequestFingerprint,
-    ) -> Result<ReserveOutcome, ReplayError> {
-        let key_hash = key.hash();
-        if self.legacy_guard(&key_hash)? {
+    fn ensure_legacy_admits(&self, key_hash: &str) -> Result<(), ReplayError> {
+        if self.legacy_guard(key_hash)? {
             let cutover: Option<String> = self.connect()?.query_row(
                 "SELECT legacy_cutover_digest FROM replay_meta WHERE singleton = 1",
                 [],
@@ -617,26 +677,122 @@ impl ReplayStore {
                 return Err(ReplayError::LegacyCutoverRequired);
             }
         }
+        Ok(())
+    }
+
+    pub fn reserve(
+        &self,
+        key: &ReplayKey,
+        request: &RequestFingerprint,
+    ) -> Result<ReserveOutcome, ReplayError> {
+        self.reserve_inner(key, request, None, None)
+    }
+
+    /// As `reserve`, but the `not_started` row expires. An expired `not_started`
+    /// row of the same request is taken over by one caller. A live row, and
+    /// every `started` or `uncertain` row, returns `Existing`.
+    pub fn reserve_with_lease(
+        &self,
+        key: &ReplayKey,
+        request: &RequestFingerprint,
+        lease: Duration,
+    ) -> Result<ReserveOutcome, ReplayError> {
+        self.reserve_inner(key, request, Some(lease), None)
+    }
+
+    /// Same admission as `reserve_with_lease`, using one caller-supplied clock
+    /// reading for the compare-and-swap. Test builds only.
+    #[cfg(feature = "__test-internals")]
+    pub fn reserve_with_lease_at(
+        &self,
+        key: &ReplayKey,
+        request: &RequestFingerprint,
+        lease: Duration,
+        now: SystemTime,
+    ) -> Result<ReserveOutcome, ReplayError> {
+        self.reserve_inner(key, request, Some(lease), Some(time_to_ms(now)))
+    }
+
+    fn reserve_inner(
+        &self,
+        key: &ReplayKey,
+        request: &RequestFingerprint,
+        lease: Option<Duration>,
+        now_ms: Option<i64>,
+    ) -> Result<ReserveOutcome, ReplayError> {
+        let key_hash = key.hash();
+        self.ensure_legacy_admits(&key_hash)?;
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO replay_entries(key_hash, request_hash, state, generation, owner_token)
-             VALUES (?1, ?2, 'not_started', 1, randomblob(32))",
-            params![key_hash, request.as_str()],
-        )?;
+        let now = now_ms.unwrap_or_else(wall_now_ms);
+        fold_expired_started(&tx, &key_hash, now)?;
+        let inserted = match lease {
+            Some(lease) => tx.execute(
+                "INSERT OR IGNORE INTO replay_entries(
+                    key_hash, request_hash, state, generation, owner_token, lease_expires_at)
+                 VALUES (?1, ?2, 'not_started', 1, randomblob(32), ?3)",
+                params![
+                    key_hash,
+                    request.as_str(),
+                    now.saturating_add(lease_to_ms(lease))
+                ],
+            )?,
+            None => tx.execute(
+                "INSERT OR IGNORE INTO replay_entries(
+                    key_hash, request_hash, state, generation, owner_token)
+                 VALUES (?1, ?2, 'not_started', 1, randomblob(32))",
+                params![key_hash, request.as_str()],
+            )?,
+        };
         if inserted == 1 {
-            let token = tx.query_row(
-                "SELECT owner_token FROM replay_entries WHERE key_hash = ?1",
-                params![key_hash],
-                |row| row.get(0),
-            )?;
+            let token = owner_token(&tx, &key_hash)?;
             tx.commit()?;
             return Ok(ReserveOutcome::Acquired(OwnerLease {
                 key_hash,
                 request_hash: request.as_str().to_owned(),
                 token,
                 generation: 1,
+                took_over: false,
             }));
+        }
+        if let Some(lease) = lease {
+            let head = read_head(&tx, &key_hash)?;
+            if head.request_hash != request.as_str() {
+                tx.commit()?;
+                return Err(ReplayError::Conflict);
+            }
+            let expired = head.state == "not_started"
+                && head.lease_expires_at.is_some_and(|expires| expires <= now);
+            if expired && let Some(token) = head.token.clone() {
+                let changed = tx.execute(
+                    "UPDATE replay_entries
+                         SET owner_token = randomblob(32),
+                             generation = generation + 1,
+                             lease_expires_at = ?1
+                         WHERE key_hash = ?2 AND request_hash = ?3 AND state = 'not_started'
+                           AND generation = ?4 AND owner_token = ?5
+                           AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?6",
+                    params![
+                        now.saturating_add(lease_to_ms(lease)),
+                        key_hash,
+                        request.as_str(),
+                        head.generation,
+                        token,
+                        now,
+                    ],
+                )?;
+                if changed == 1 {
+                    let token = owner_token(&tx, &key_hash)?;
+                    tx.commit()?;
+                    return Ok(ReserveOutcome::Acquired(OwnerLease {
+                        key_hash,
+                        request_hash: request.as_str().to_owned(),
+                        token,
+                        generation: head.generation + 1,
+                        took_over: true,
+                    }));
+                }
+            }
         }
         let record = read_record(&tx, &key_hash)?.ok_or(ReplayError::StaleOwner)?;
         tx.commit()?;
@@ -647,9 +803,67 @@ impl ReplayStore {
     }
 
     pub fn inspect(&self, key: &ReplayKey) -> Result<Option<ReplayRecord>, ReplayError> {
+        self.inspect_with_now(key, None)
+    }
+
+    /// `inspect` at one caller-supplied clock reading. Test builds only.
+    #[cfg(feature = "__test-internals")]
+    pub fn inspect_at(
+        &self,
+        key: &ReplayKey,
+        now: SystemTime,
+    ) -> Result<Option<ReplayRecord>, ReplayError> {
+        self.inspect_with_now(key, Some(time_to_ms(now)))
+    }
+
+    fn inspect_with_now(
+        &self,
+        key: &ReplayKey,
+        now_ms: Option<i64>,
+    ) -> Result<Option<ReplayRecord>, ReplayError> {
         let key_hash = key.hash();
         self.legacy_guard(&key_hash)?;
-        read_record(&*self.connect()?, &key_hash)
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        fold_expired_started(&tx, &key_hash, now_ms.unwrap_or_else(wall_now_ms))?;
+        let record = read_record(&tx, &key_hash)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    /// Remaining lifetime of a live `not_started` or `started` lease.
+    /// `None` when the row has no lease, is expired, or is not in those states.
+    pub fn lease_remaining(&self, key: &ReplayKey) -> Result<Option<Duration>, ReplayError> {
+        self.lease_remaining_at_ms(key, None)
+    }
+
+    /// `lease_remaining` at one caller-supplied clock reading. Test builds only.
+    #[cfg(feature = "__test-internals")]
+    pub fn lease_remaining_at(
+        &self,
+        key: &ReplayKey,
+        now: SystemTime,
+    ) -> Result<Option<Duration>, ReplayError> {
+        self.lease_remaining_at_ms(key, Some(time_to_ms(now)))
+    }
+
+    fn lease_remaining_at_ms(
+        &self,
+        key: &ReplayKey,
+        now_ms: Option<i64>,
+    ) -> Result<Option<Duration>, ReplayError> {
+        let key_hash = key.hash();
+        self.legacy_guard(&key_hash)?;
+        let now = now_ms.unwrap_or_else(wall_now_ms);
+        let row = self
+            .connect()?
+            .query_row(
+                "SELECT state, lease_expires_at FROM replay_entries WHERE key_hash = ?1",
+                params![key_hash],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?;
+        Ok(remaining_lease(row, now))
     }
 
     pub fn mark_started(&self, lease: &OwnerLease) -> Result<ReplayRecord, ReplayError> {
@@ -729,7 +943,8 @@ impl ReplayStore {
         let changed = tx.execute(
             "UPDATE replay_entries SET state = ?1, generation = ?2,
                  owner_token = CASE WHEN ?1 = 'started' THEN owner_token ELSE NULL END,
-                 outcome_kind = ?3, outcome_digest = ?4, post_image_digest = ?5
+                 outcome_kind = ?3, outcome_digest = ?4, post_image_digest = ?5,
+                 uncertain_since = CASE WHEN ?1 = 'uncertain' THEN ?11 ELSE uncertain_since END
              WHERE key_hash = ?6 AND request_hash = ?7 AND state = ?8
                  AND generation = ?9 AND owner_token = ?10",
             params![
@@ -748,6 +963,7 @@ impl ReplayStore {
                         1
                     },
                 lease.token,
+                wall_now_ms(),
             ],
         )?;
         if changed != 1 {
@@ -793,7 +1009,7 @@ impl ReplayStore {
         let changed = tx.execute(
             "UPDATE replay_entries SET state = ?1, generation = generation + 1,
                 owner_token = NULL, outcome_kind = ?2, outcome_digest = ?3,
-                post_image_digest = ?4, evidence_digest = ?5
+                post_image_digest = ?4, evidence_digest = ?5, uncertain_since = NULL
              WHERE key_hash = ?6 AND request_hash = ?7 AND generation = ?8
                 AND state IN ('started', 'uncertain')",
             params![
@@ -816,9 +1032,121 @@ impl ReplayStore {
     }
 }
 
+fn wall_now_ms() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+        // Before the epoch the lease only lasts longer. That delays takeover.
+        Err(_) => 0,
+    }
+}
+
+fn time_to_ms(now: SystemTime) -> i64 {
+    match now.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
+fn system_time_from_ms(ms: i64) -> Option<SystemTime> {
+    if ms < 0 {
+        return None;
+    }
+    UNIX_EPOCH.checked_add(Duration::from_millis(u64::try_from(ms).ok()?))
+}
+
+fn lease_to_ms(lease: Duration) -> i64 {
+    i64::try_from(lease.as_millis()).unwrap_or(i64::MAX)
+}
+
+fn ensure_lease_columns(conn: &Connection) -> Result<(), ReplayError> {
+    for name in ["lease_expires_at", "uncertain_since"] {
+        let mut info = conn.prepare("PRAGMA table_info(replay_entries)")?;
+        let present = info
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == name);
+        drop(info);
+        if present {
+            continue;
+        }
+        let sql = format!("ALTER TABLE replay_entries ADD COLUMN {name} INTEGER");
+        match conn.execute(&sql, []) {
+            Ok(_) => {}
+            Err(error) if error.to_string().contains("duplicate column") => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+struct EntryHead {
+    request_hash: String,
+    state: String,
+    generation: i64,
+    token: Option<Vec<u8>>,
+    lease_expires_at: Option<i64>,
+}
+
+fn read_head(conn: &Connection, key_hash: &str) -> Result<EntryHead, ReplayError> {
+    conn.query_row(
+        "SELECT request_hash, state, generation, owner_token, lease_expires_at
+         FROM replay_entries WHERE key_hash = ?1",
+        params![key_hash],
+        |row| {
+            Ok(EntryHead {
+                request_hash: row.get(0)?,
+                state: row.get(1)?,
+                generation: row.get(2)?,
+                token: row.get(3)?,
+                lease_expires_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()?
+    .ok_or(ReplayError::StaleOwner)
+}
+
+fn owner_token(conn: &Connection, key_hash: &str) -> Result<Vec<u8>, ReplayError> {
+    conn.query_row(
+        "SELECT owner_token FROM replay_entries WHERE key_hash = ?1",
+        params![key_hash],
+        |row| row.get(0),
+    )
+    .map_err(ReplayError::from)
+}
+
+fn fold_expired_started(conn: &Connection, key_hash: &str, now: i64) -> Result<(), ReplayError> {
+    conn.execute(
+        "UPDATE replay_entries
+         SET state = 'uncertain',
+             generation = generation + 1,
+             owner_token = NULL,
+             uncertain_since = lease_expires_at
+         WHERE key_hash = ?1 AND state = 'started'
+           AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?2",
+        params![key_hash, now],
+    )?;
+    Ok(())
+}
+
+fn remaining_lease(row: Option<(String, Option<i64>)>, now: i64) -> Option<Duration> {
+    let (state, expires) = row?;
+    if state != "not_started" && state != "started" {
+        return None;
+    }
+    let expires = expires?;
+    if expires <= now {
+        return None;
+    }
+    Some(Duration::from_millis(
+        u64::try_from(expires - now).unwrap_or(u64::MAX),
+    ))
+}
+
 fn read_record(conn: &Connection, key_hash: &str) -> Result<Option<ReplayRecord>, ReplayError> {
     conn.query_row(
-        "SELECT key_hash, request_hash, state, generation, outcome_kind, outcome_digest, post_image_digest, evidence_digest
+        "SELECT key_hash, request_hash, state, generation, outcome_kind, outcome_digest, post_image_digest, evidence_digest, uncertain_since
          FROM replay_entries WHERE key_hash = ?1",
         params![key_hash],
         |row| {
@@ -828,7 +1156,7 @@ fn read_record(conn: &Connection, key_hash: &str) -> Result<Option<ReplayRecord>
             let post_image: Option<String> = row.get(6)?;
             Ok(ReplayRecord {
                 key_hash: row.get(0)?,
-                request: RequestFingerprint(row.get(1)?),
+                request: RequestFingerprint(row.get(1)?, row.get(8)?),
                 state: ReplayState::parse(&state)?,
                 generation: row.get(3)?,
                 outcome: match (kind, digest, post_image) {
