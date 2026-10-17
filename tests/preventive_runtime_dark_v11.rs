@@ -1420,8 +1420,8 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "6ff2a3b7865a7122:16471"),
-    ("release.yml", "c0b569a2321f26ac:112994"),
+    ("ci.yml", "d544c23aa7b3c0cf:16503"),
+    ("release.yml", "cd5b87fca5eb7e88:113005"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an

@@ -301,7 +301,7 @@ jobs:
       # rust-toolchain.toml is the single source of truth for the toolchain
       # version; rustup resolves it natively (channel + components).
       - name: Install Rust toolchain (rust-toolchain.toml)
-        run: rustup toolchain install
+        run: bash execution/ensure_rustup.sh
 
       - name: Run cargo check
         run: cargo check
@@ -2312,7 +2312,7 @@ jobs:
       # version; rustup resolves it natively (channel + components).
       - name: Install Rust toolchain (rust-toolchain.toml)
         shell: bash
-        run: rustup toolchain install && rustup target add ${{ matrix.target }}
+        run: bash execution/ensure_rustup.sh target add ${{ matrix.target }}
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -2490,7 +2490,7 @@ jobs:
       # rust-toolchain.toml is the single source of truth for the toolchain
       # version; rustup resolves it natively (channel + components).
       - name: Install Rust toolchain (rust-toolchain.toml)
-        run: rustup toolchain install
+        run: bash execution/ensure_rustup.sh
 
       - name: Publish to crates.io
         run: >
