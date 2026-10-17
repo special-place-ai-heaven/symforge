@@ -1134,10 +1134,14 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // protocol/{edit_format,edit_plan,result_status}.rs. STEL modules made
 // feature-neutral and delegating to the shared runtime:
 // stel/{controller,executor,planner,runtime}.rs.
+// Refreshed for the replay lease and census file status. Same 89 paths.
+// The new fields and enums stay in embedded.rs and public_api.rs. embed.rs
+// re-exports those two enums through the existing pub use. No new caller
+// file and no new edge into server_api.rs.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "a1cb52c1c8bb5a52f220adcb238818c5bcb334c0e8306b01c612bc28336134c1",
+    "8d16161d7e3d1c7bd7c92ffb283cf1fab5afad3c1ef48330dbdd7d0d90e549f7",
     89,
-    2_198_843,
+    2_202_015,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1286,10 +1290,14 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // feature-neutral and delegating to the shared runtime:
 // stel/{controller,executor,planner,runtime}.rs. Trust-mode host option; no new
 // boundary edge.
+// Refreshed for the replay lease and census file status. Same 312 files.
+// The src diff is embed.rs, embed/parity/replay.rs, idempotency.rs,
+// index_lifecycle/embedded.rs, and index_lifecycle/public_api.rs. No new
+// caller file and no new edge into server_api.rs.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "4dd700c7ac6832d17bd7dbbed633487d9fc62d5ae30811c33fe03f3210fa2129",
+    "df6f8f6543c11885662c67ec99fb62b1a85c07492868f183296d5e36642dfdc5",
     312,
-    12_003_262,
+    12_020_356,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
