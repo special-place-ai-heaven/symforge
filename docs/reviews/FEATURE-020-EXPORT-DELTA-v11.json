@@ -1,6 +1,6 @@
 {
   "computed_as": "introduced_v11_atoms listed verbatim; introduced_minus_live is that list with every atom that already appears verbatim in the live pub-mod census of src/lib.rs subtracted",
-  "contract_sha256": "a3d2fb4fabe932e988a195ec9c8736876a891f09f01ed580e4eee4e42793b0a2",
+  "contract_sha256": "f6c1fc51682faf0635c795e296e6fb3c8c165feb3c1c73e5109e2671231b0903",
   "forbidden_at_activation": [
     {
       "citizen": "symforge::protocol::format::claim_provenance",
@@ -16,6 +16,8 @@
     "symforge::embed::AtomicAuthority::identity",
     "symforge::embed::AtomicAuthority::kind_name",
     "symforge::embed::CensusFile",
+    "symforge::embed::CensusParseStatus",
+    "symforge::embed::CensusVerifyPhase",
     "symforge::embed::Claim",
     "symforge::embed::Claim::evaluation",
     "symforge::embed::Claim::operation",
@@ -91,6 +93,8 @@
     "symforge::embed::AtomicAuthority::identity",
     "symforge::embed::AtomicAuthority::kind_name",
     "symforge::embed::CensusFile",
+    "symforge::embed::CensusParseStatus",
+    "symforge::embed::CensusVerifyPhase",
     "symforge::embed::Claim",
     "symforge::embed::Claim::evaluation",
     "symforge::embed::Claim::operation",
@@ -172,6 +176,14 @@
     },
     {
       "atom": "symforge::embed::CensusFile",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::CensusParseStatus",
+      "obligation": "wrapped-here"
+    },
+    {
+      "atom": "symforge::embed::CensusVerifyPhase",
       "obligation": "wrapped-here"
     },
     {

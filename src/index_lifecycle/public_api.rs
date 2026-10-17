@@ -727,6 +727,14 @@ pub fn wrap_table() -> &'static [WrapEntry] {
             obligation: "wrapped-here",
         },
         WrapEntry {
+            atom: "symforge::embed::CensusParseStatus",
+            obligation: "wrapped-here",
+        },
+        WrapEntry {
+            atom: "symforge::embed::CensusVerifyPhase",
+            obligation: "wrapped-here",
+        },
+        WrapEntry {
             atom: "symforge::embed::Claim",
             obligation: "wrapped-here",
         },
