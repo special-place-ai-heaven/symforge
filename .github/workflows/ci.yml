@@ -188,7 +188,7 @@ jobs:
       # silently degrades to REVIEW on every case — a disabled tripwire on a
       # non-interactive runner is worthless. Install it so the oracle runs.
       - name: Install ripgrep (harness grep oracle)
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        run: bash execution/ensure_ripgrep.sh
 
       - name: Verify tool correctness (both fixtures)
         run: |
@@ -254,7 +254,7 @@ jobs:
       # CXX_x86_64_unknown_linux_musl (e.g. to a musl g++), since CC_<target>
       # does not redirect the C++ compiler.
       - name: Install musl C toolchain
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: bash execution/ensure_musl_tools.sh
 
       - name: Build engine-only embed feature for musl
         env:
