@@ -254,6 +254,9 @@ jobs:
         if: runner.environment == 'github-hosted'
         run: bash execution/free_runner_disk.sh
 
+      - name: Install GitHub CLI
+        run: bash execution/ensure_gh.sh
+
       - name: Validate commit subjects since last successful Release
         if: github.event_name == 'push'
         env:
@@ -2017,6 +2020,9 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install GitHub CLI
+        run: bash execution/ensure_gh.sh
+
       - name: Run version sync tests
         env:
           SYMFORGE_REQUIRE_SSHSIG: '1'
@@ -2464,6 +2470,13 @@ jobs:
         with:
           name: npm-package
           path: artifacts
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install GitHub CLI
+        run: bash execution/ensure_gh.sh
 
       - name: Upload assets to GitHub release
         env:
