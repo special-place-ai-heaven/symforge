@@ -1062,9 +1062,16 @@ fn lock_contention_surfaces_as_busy() {
 fn from_embedder_digest_accepts_oversized_and_secret_looking_response() {
     let response = vec![b'a'; 1024 * 1024];
     let digest = sha256_hex(&response);
-    let secretish = b"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/FL+/oEaL\n-----END RSA PRIVATE KEY-----\n";
+    // Assembled at runtime so the source file does not contain a contiguous
+    // private-key envelope (repository_source_is_clean_under_its_own_detector).
+    let secretish = [
+        b"-----BEGIN RSA ".as_slice(),
+        b"PRIVATE KEY-----\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/FL+/oEaL\n-----END RSA ",
+        b"PRIVATE KEY-----\n",
+    ]
+    .concat();
     assert!(matches!(
-        ReplayOutcome::from_response_and_post_image(OutcomeKind::Applied, secretish, b"post"),
+        ReplayOutcome::from_response_and_post_image(OutcomeKind::Applied, &secretish, b"post"),
         Err(ReplayError::UnsafeOutcome)
     ));
     let outcome = ReplayOutcome::from_embedder_digest(
@@ -1075,7 +1082,7 @@ fn from_embedder_digest_accepts_oversized_and_secret_looking_response() {
     )
     .unwrap();
     assert_eq!(outcome.response_digest(), digest);
-    let secret_digest = sha256_hex(secretish);
+    let secret_digest = sha256_hex(&secretish);
     let secret_outcome = ReplayOutcome::from_embedder_digest(
         OutcomeKind::Applied,
         secretish.len(),
