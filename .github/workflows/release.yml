@@ -2286,22 +2286,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: symforge-windows-x64.exe
-            binary: target/x86_64-pc-windows-msvc/release/symforge.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: symforge-linux-x64
             binary: target/x86_64-unknown-linux-gnu/release/symforge
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact: symforge-macos-arm64
-            binary: target/aarch64-apple-darwin/release/symforge
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact: symforge-macos-x64
-            binary: target/x86_64-apple-darwin/release/symforge
 
     # hosted minutes are exhausted and there is no macOS/Windows self-hosted runner
     runs-on: [self-hosted, linux, fresh]
@@ -2409,19 +2397,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p npm/platforms/windows-x64/bin
-          mkdir -p npm/platforms/linux-x64/bin
-          mkdir -p npm/platforms/macos-x64/bin
-          mkdir -p npm/platforms/macos-arm64/bin
-
-          cp dist-binaries/symforge-windows-x64.exe npm/platforms/windows-x64/bin/symforge.exe
-          cp dist-binaries/symforge-linux-x64 npm/platforms/linux-x64/bin/symforge
-          cp dist-binaries/symforge-macos-x64 npm/platforms/macos-x64/bin/symforge
-          cp dist-binaries/symforge-macos-arm64 npm/platforms/macos-arm64/bin/symforge
-
-          chmod 755 npm/platforms/linux-x64/bin/symforge
-          chmod 755 npm/platforms/macos-x64/bin/symforge
-          chmod 755 npm/platforms/macos-arm64/bin/symforge
+          copy_bin() {
+            local src="$1" dest="$2"
+            if [ -f "$src" ]; then
+              mkdir -p "$(dirname "$dest")"
+              cp "$src" "$dest"
+              chmod 755 "$dest" || true
+            fi
+          }
+          copy_bin dist-binaries/symforge-windows-x64.exe npm/platforms/windows-x64/bin/symforge.exe
+          copy_bin dist-binaries/symforge-linux-x64 npm/platforms/linux-x64/bin/symforge
+          copy_bin dist-binaries/symforge-macos-x64 npm/platforms/macos-x64/bin/symforge
+          copy_bin dist-binaries/symforge-macos-arm64 npm/platforms/macos-arm64/bin/symforge
 
           for dir in npm/platforms/*; do
             cp LICENSE "$dir/LICENSE"
@@ -2435,7 +2422,9 @@ jobs:
           mkdir -p dist-npm
           npm pack ./npm --pack-destination dist-npm
           for dir in npm/platforms/*; do
-            npm pack "$dir" --pack-destination dist-npm
+            if compgen -G "$dir/bin/*" > /dev/null; then
+              npm pack "$dir" --pack-destination dist-npm
+            fi
           done
           ls -l dist-npm
 
