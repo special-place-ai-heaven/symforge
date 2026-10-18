@@ -574,7 +574,7 @@ impl EmbeddedSourceHandle {
             return Err(refusal(SecretRemediationRefusalKind::SourceUnavailable));
         }
         let lease = match replay
-            .reserve(&key, &fingerprint)
+            .reserve_with_lease(&key, &fingerprint, std::time::Duration::from_secs(3600))
             .map_err(|_| refusal(SecretRemediationRefusalKind::ReplayConflict))?
         {
             ReserveOutcome::Acquired(lease) => lease,

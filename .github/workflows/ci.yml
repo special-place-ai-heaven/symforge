@@ -228,6 +228,17 @@ jobs:
       - name: Run embed-feature integration contract
         run: cargo test --no-default-features --features embed --test embed_bound_index -- --test-threads=1
 
+      - name: Run embed parity and replay contracts
+        run: |
+          set -euo pipefail
+          cargo test --no-default-features --features embed,__test-internals --test embed_parity --test embed_replay_v1 -- --test-threads=1 2>&1 | tee /tmp/embed-parity-replay.log
+          if grep -E 'running 0 tests' /tmp/embed-parity-replay.log; then
+            echo 'embed_parity or embed_replay_v1 executed zero tests' >&2
+            exit 1
+          fi
+          matches=$(grep -cE 'test result: ok\. [1-9][0-9]* passed' /tmp/embed-parity-replay.log || true)
+          test "$matches" -ge 2
+
   embed-musl:
     needs: release-version
     runs-on: [self-hosted, linux, fresh]
