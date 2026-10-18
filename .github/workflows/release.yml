@@ -2290,8 +2290,15 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: symforge-linux-x64
             binary: target/x86_64-unknown-linux-gnu/release/symforge
+            builder: cargo
+          - os: ubuntu-latest
+            target: x86_64-pc-windows-msvc
+            artifact: symforge-windows-x64.exe
+            binary: target/x86_64-pc-windows-msvc/release/symforge.exe
+            builder: xwin
 
-    # hosted minutes are exhausted and there is no macOS/Windows self-hosted runner
+    # hosted minutes are exhausted. Both binaries build on the Linux runners.
+    # Windows is x86_64-pc-windows-msvc via cargo-xwin. macOS is not built.
     runs-on: [self-hosted, linux, fresh]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2313,7 +2320,7 @@ jobs:
         run: bash execution/ensure_rustup.sh target add ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: bash execution/build_release_binary.sh "${{ matrix.builder }}" "${{ matrix.target }}"
 
       - name: Rename artifact
         shell: bash
@@ -2359,8 +2366,6 @@ jobs:
           const version = process.env.VERSION;
           const platformPackages = {
             'linux-x64': 'symforge-linux-x64',
-            'macos-arm64': 'symforge-macos-arm64',
-            'macos-x64': 'symforge-macos-x64',
             'windows-x64': 'symforge-windows-x64',
           };
 
@@ -2407,8 +2412,6 @@ jobs:
           }
           copy_bin dist-binaries/symforge-windows-x64.exe npm/platforms/windows-x64/bin/symforge.exe
           copy_bin dist-binaries/symforge-linux-x64 npm/platforms/linux-x64/bin/symforge
-          copy_bin dist-binaries/symforge-macos-x64 npm/platforms/macos-x64/bin/symforge
-          copy_bin dist-binaries/symforge-macos-arm64 npm/platforms/macos-arm64/bin/symforge
 
           for dir in npm/platforms/*; do
             cp LICENSE "$dir/LICENSE"
@@ -2545,8 +2548,6 @@ jobs:
           for package in \
             symforge-windows-x64 \
             symforge-linux-x64 \
-            symforge-macos-x64 \
-            symforge-macos-arm64 \
             symforge
           do
             test -f "./dist/${package}-${VERSION}.tgz"
@@ -2563,8 +2564,6 @@ jobs:
           for package in \
             symforge-windows-x64 \
             symforge-linux-x64 \
-            symforge-macos-x64 \
-            symforge-macos-arm64
           do
             python execution/release_ops.py publish-npm \
               --tarball "./dist/${package}-${VERSION}.tgz" \

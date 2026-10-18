@@ -14,8 +14,6 @@ test("root npm package is passive and uses platform optional dependencies", () =
   assert.equal(scripts.postinstall, undefined);
   assert.deepEqual(pkg.optionalDependencies, {
     "symforge-linux-x64": pkg.version,
-    "symforge-macos-arm64": pkg.version,
-    "symforge-macos-x64": pkg.version,
     "symforge-windows-x64": pkg.version,
   });
   assert.ok(pkg.files.includes("lib/"));
