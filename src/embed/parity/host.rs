@@ -413,6 +413,27 @@ pub struct HostProgress {
     pub symbols_found: u64,
 }
 
+/// Closed cause for a failed or blocked indexing observation on host status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum HostIndexFailureCause {
+    ParseFailed,
+    PartialParse,
+    PublicationBlocked,
+    StateUnavailable,
+}
+
+/// Typed index-failure evidence on [`HostStatus`]. Prefer this over free-text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct HostIndexFailure {
+    pub cause: HostIndexFailureCause,
+    /// Repository-relative path when the failure is file-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostStatusReport {
     pub status: HostStatus,
@@ -431,6 +452,9 @@ pub struct HostStatus {
     pub source_version: u64,
     pub observer_epoch: u64,
     pub progress: HostProgress,
+    /// Present when status observed a blocked publication or a failed census file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_failure: Option<HostIndexFailure>,
 }
 
 /// Diagnostic build/runtime identity; the build version is not a release attestation.

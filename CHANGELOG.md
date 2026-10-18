@@ -38,6 +38,8 @@ Embedders keep their own response bytes and check them with `ReplayOutcome::resp
 
 `ReplayOutcome::from_embedder_digest` records an embedder-supplied response length and SHA-256 without reading the response body; the embedder owns that secret scan and may complete responses larger than 64 KiB. `from_response_and_post_image` still scans and caps at 64 KiB. `reserve` is deprecated in favour of `reserve_with_lease` (unleased `not_started` rows never expire). `mark_started` refuses an already-expired leased reservation; `mark_started_with_lease` arms a fresh started lease. Lock contention past the busy wait is `ReplayError::Busy`. `tokio` `test-util` is a dev-dependency only. `AtomicU64::try_update` replaces deprecated `fetch_update` on the staged handoff path.
 
+`QuerySymbol` exposes attached doc-comment byte ranges (`doc_byte_start` / `doc_byte_end`). `QuerySymbolChange` exposes `before_signature` / `after_signature` for old-side and new-side first-line signatures. `HostStatus` gains optional typed `index_failure` (`HostIndexFailureCause` + path) when status observes a blocked publication or a failed/partial census file.
+
 `CensusFile` gains `reference_count` and `parse_status` (`CensusParseStatus`). `IndexCensus` gains `snapshot_verify` (`CensusVerifyPhase`). Both structs were already `non_exhaustive`.
 
 ## [11.8.4](https://github.com/special-place-ai-heaven/symforge/compare/v11.8.3...v11.8.4) (2026-10-18)
