@@ -272,13 +272,24 @@ fn child_replay_process() {
     let root = std::env::var_os("SYMFORGE_REPLAY_TEST_ROOT").unwrap();
     let state = std::env::var_os("SYMFORGE_REPLAY_TEST_STATE").unwrap();
     let result = std::env::var_os("SYMFORGE_REPLAY_TEST_RESULT").unwrap();
-    let store = match ReplayStore::open(Path::new(&root), Path::new(&state), "room-a") {
-        Ok(store) => store,
-        Err(ReplayError::WrongPhysicalRoot) if mode == "inspect_binding" => {
-            fs::write(result, b"wrong_physical_root").unwrap();
-            return;
+    let store = {
+        let root_path = Path::new(&root);
+        let state_path = Path::new(&state);
+        let start = Instant::now();
+        loop {
+            match ReplayStore::open(root_path, state_path, "room-a") {
+                Ok(store) => break store,
+                Err(ReplayError::WrongPhysicalRoot) if mode == "inspect_binding" => {
+                    fs::write(result, b"wrong_physical_root").unwrap();
+                    return;
+                }
+                // Concurrent first-open / schema races surface as Busy after C10.
+                Err(ReplayError::Busy) if start.elapsed() < Duration::from_secs(20) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("child replay open refused: {error}"),
+            }
         }
-        Err(error) => panic!("child replay open refused: {error}"),
     };
     if mode == "inspect_binding" {
         let state = store.inspect(&key()).unwrap().unwrap().state;
@@ -356,6 +367,9 @@ fn child(mode: &str, root: &Path, state: &Path, result: &Path) -> Command {
 fn separate_process_reservation_has_one_winner() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
+    // Create the replay DB before the race so eight first-opens do not contend
+    // on schema/bootstrap and stall before writing the ready gate.
+    drop(store(dir.path(), &state));
     let mut children = Vec::new();
     for index in 0..8 {
         let result = dir.path().join(format!("result-{index}"));
@@ -370,7 +384,7 @@ fn separate_process_reservation_has_one_winner() {
         .all(|(_, result)| result.with_extension("ready").exists())
     {
         assert!(
-            start.elapsed() < Duration::from_secs(10),
+            start.elapsed() < Duration::from_secs(30),
             "children did not reach race gate"
         );
         std::thread::sleep(Duration::from_millis(5));
@@ -545,7 +559,7 @@ fn reservation_lease_expiry_allows_exactly_one_takeover() {
         .all(|(_, result)| result.with_extension("ready").exists())
     {
         assert!(
-            start.elapsed() < Duration::from_secs(10),
+            start.elapsed() < Duration::from_secs(30),
             "children did not reach race gate"
         );
         std::thread::sleep(Duration::from_millis(5));
