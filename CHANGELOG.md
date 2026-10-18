@@ -40,6 +40,13 @@ Embedders keep their own response bytes and check them with `ReplayOutcome::resp
 
 `CensusFile` gains `reference_count` and `parse_status` (`CensusParseStatus`). `IndexCensus` gains `snapshot_verify` (`CensusVerifyPhase`). Both structs were already `non_exhaustive`.
 
+## [11.8.3](https://github.com/special-place-ai-heaven/symforge/compare/v11.8.2...v11.8.3) (2026-10-18)
+
+
+### Bug Fixes
+
+* **embed:** land AAP 11.8.2 replay delta (C1-C2, C6-C12) ([#802](https://github.com/special-place-ai-heaven/symforge/issues/802)) ([4b170b3](https://github.com/special-place-ai-heaven/symforge/commit/4b170b37942895c5dbe339b92133c0149ddf90cd))
+
 ## [11.8.2](https://github.com/special-place-ai-heaven/symforge/compare/v11.8.1...v11.8.2) (2026-10-18)
 
 
