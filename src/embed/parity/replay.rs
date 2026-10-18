@@ -4,12 +4,17 @@
 //! host must call `mark_started` before performing an external effect. After a
 //! crash, `Started` and `Uncertain` never become executable by age or retry.
 //!
-//! `reserve` writes no expiry. That row stays until its owner releases it or
-//! moves it forward. `reserve_with_lease` stores `lease_expires_at` and can
-//! replace one expired `not_started` row. Takeover is `Acquired` with
-//! `OwnerLease::took_over` set, so `ReserveOutcome` keeps its existing variants.
-//! The host wall clock is read once inside the immediate transaction and bound
-//! into the compare-and-swap. A backward step only delays takeover.
+//! `reserve` is deprecated: it writes no expiry, so a crashed owner's
+//! `not_started` row stays forever. Prefer `reserve_with_lease`. That path
+//! stores `lease_expires_at` and can replace one expired `not_started` row.
+//! Takeover is `Acquired` with `OwnerLease::took_over` set, so
+//! `ReserveOutcome` keeps its existing variants. The host wall clock is read
+//! once inside the immediate transaction and bound into the compare-and-swap.
+//! A backward step only delays takeover.
+//!
+//! `mark_started` refuses when a leased reservation has already expired; the
+//! row stays `not_started` for takeover. `mark_started_with_lease` arms a fresh
+//! execution lease on the `started` row.
 //!
 //! An expired `started` row is never taken over. Reads report it as
 //! `Uncertain`, with `uncertain_since` equal to the lease end, and a
@@ -18,13 +23,17 @@
 //!
 //! The embedder keeps its own response bytes and checks them with
 //! `ReplayOutcome::response_digest`. Raw responses are never written here.
+//! Large or secret-looking responses use
+//! `ReplayOutcome::from_embedder_digest`: the embedder supplies length and
+//! SHA-256, and owns the response secret scan. SymForge still scans the
+//! post-image bytes passed into either constructor.
 
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 
 const KEY_FRAME: &[u8] = b"symforge-idempotency-key-v1\0";
@@ -33,6 +42,7 @@ const MAX_SCOPE_BYTES: usize = 256;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_EVIDENCE_BYTES: usize = 64 * 1024;
+const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS replay_meta (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -209,6 +219,10 @@ pub struct ReplayOutcome {
 }
 
 impl ReplayOutcome {
+    /// Build an outcome from response and post-image bytes. Response length is
+    /// capped at 64 KiB; both buffers are secret-scanned here. Prefer
+    /// [`Self::from_embedder_digest`] when the response may exceed that cap or
+    /// may contain secret-looking tokens the embedder has already handled.
     pub fn from_response_and_post_image(
         kind: OutcomeKind,
         response: &[u8],
@@ -229,6 +243,39 @@ impl ReplayOutcome {
         Ok(Self {
             kind,
             response_digest: crate::hash::digest_hex(response),
+            post_image_digest: crate::hash::digest_hex(post_image),
+        })
+    }
+
+    /// Digest-only constructor for embedder-owned response bytes.
+    ///
+    /// `response_len` and `response_digest_hex` (lowercase SHA-256) are recorded
+    /// without reading the response body. The embedder owns secret scanning of
+    /// those bytes. SymForge still secret-scans and size-caps `post_image`.
+    /// There is no store-side response size cap on this path: only the digest
+    /// is persisted.
+    pub fn from_embedder_digest(
+        kind: OutcomeKind,
+        response_len: usize,
+        response_digest_hex: &str,
+        post_image: &[u8],
+    ) -> Result<Self, ReplayError> {
+        if response_len == 0
+            || response_digest_hex.len() != 64
+            || !response_digest_hex
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            || post_image.len() > MAX_RESPONSE_BYTES
+            || !matches!(
+                crate::knowledge::scan_secret_bytes("replay-post-image", post_image),
+                crate::knowledge::SecretScan::Clean
+            )
+        {
+            return Err(ReplayError::UnsafeOutcome);
+        }
+        Ok(Self {
+            kind,
+            response_digest: response_digest_hex.to_owned(),
             post_image_digest: crate::hash::digest_hex(post_image),
         })
     }
@@ -381,10 +428,21 @@ pub enum ReplayError {
     InvalidStatePath,
     #[error("replay state path is a symlink")]
     SymlinkStatePath,
+    #[error("replay database is busy; retry the admission")]
+    Busy,
     #[error("replay state I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("replay database: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(rusqlite::Error),
+}
+
+impl From<rusqlite::Error> for ReplayError {
+    fn from(error: rusqlite::Error) -> Self {
+        match error.sqlite_error_code() {
+            Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => Self::Busy,
+            _ => Self::Database(error),
+        }
+    }
 }
 
 /// One durable replay database within a caller-supplied project state directory.
@@ -397,6 +455,22 @@ pub struct ReplayStore {
     state_dir: PathBuf,
     root_anchor_key: [u8; 16],
     state_anchor_key: [u8; 16],
+    busy_timeout: Duration,
+}
+
+/// Test-only guard that keeps a `BEGIN IMMEDIATE` transaction open.
+#[cfg(feature = "__test-internals")]
+pub struct ImmediateHold {
+    conn: Option<AnchoredConnection>,
+}
+
+#[cfg(feature = "__test-internals")]
+impl Drop for ImmediateHold {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+    }
 }
 
 struct AnchoredConnection {
@@ -425,7 +499,33 @@ impl ReplayStore {
         project_state_dir: &Path,
         scope: &str,
     ) -> Result<Self, ReplayError> {
-        Self::open_with_anchor(project_root, project_state_dir, scope, None)
+        Self::open_with_anchor(
+            project_root,
+            project_state_dir,
+            scope,
+            None,
+            DEFAULT_BUSY_TIMEOUT,
+        )
+    }
+
+    /// Hold an IMMEDIATE transaction until drop. Test builds only.
+    #[cfg(feature = "__test-internals")]
+    pub fn begin_immediate_hold(&self) -> Result<ImmediateHold, ReplayError> {
+        let conn = self.connect()?;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(ImmediateHold { conn: Some(conn) })
+    }
+
+    /// Test-only open with a shorter SQLite busy wait so contention surfaces
+    /// as [`ReplayError::Busy`] without a five-second sleep.
+    #[cfg(feature = "__test-internals")]
+    pub fn open_with_busy_timeout(
+        project_root: &Path,
+        project_state_dir: &Path,
+        scope: &str,
+        busy_timeout: Duration,
+    ) -> Result<Self, ReplayError> {
+        Self::open_with_anchor(project_root, project_state_dir, scope, None, busy_timeout)
     }
 
     pub(crate) fn open_bound(
@@ -439,6 +539,7 @@ impl ReplayStore {
             project_state_dir,
             scope,
             Some(expected_anchor),
+            DEFAULT_BUSY_TIMEOUT,
         )
     }
 
@@ -447,6 +548,7 @@ impl ReplayStore {
         project_state_dir: &Path,
         scope: &str,
         expected_anchor: Option<[u8; 16]>,
+        busy_timeout: Duration,
     ) -> Result<Self, ReplayError> {
         if scope.is_empty() || scope.len() > MAX_SCOPE_BYTES {
             return Err(ReplayError::InvalidScope);
@@ -530,6 +632,7 @@ impl ReplayStore {
             state_dir: state,
             root_anchor_key,
             state_anchor_key,
+            busy_timeout,
         };
         let mut conn = store.connect()?;
         conn.execute_batch(SCHEMA)?;
@@ -635,7 +738,7 @@ impl ReplayStore {
             return Err(ReplayError::WrongStateDirectory);
         }
         let conn = Connection::open(&self.db_path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(self.busy_timeout)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
         self.ensure_current_anchors()?;
         Ok(AnchoredConnection {
@@ -680,6 +783,10 @@ impl ReplayStore {
         Ok(())
     }
 
+    /// Unleased reservation. Prefer [`Self::reserve_with_lease`]: a row written
+    /// here has no `lease_expires_at`, so a crash leaves `not_started` forever
+    /// and neither takeover nor `fold_expired_started` can recover it.
+    #[deprecated(note = "use reserve_with_lease; unleased not_started rows never expire")]
     pub fn reserve(
         &self,
         key: &ReplayKey,
@@ -867,7 +974,37 @@ impl ReplayStore {
     }
 
     pub fn mark_started(&self, lease: &OwnerLease) -> Result<ReplayRecord, ReplayError> {
-        self.advance_owned(lease, ReplayState::NotStarted, ReplayState::Started, None)
+        self.advance_to_started(lease, None, None)
+    }
+
+    /// Commit `not_started` -> `started` and arm a fresh execution lease.
+    pub fn mark_started_with_lease(
+        &self,
+        lease: &OwnerLease,
+        started_lease: Duration,
+    ) -> Result<ReplayRecord, ReplayError> {
+        self.advance_to_started(lease, Some(started_lease), None)
+    }
+
+    /// `mark_started_with_lease` at one caller-supplied clock reading. Test builds only.
+    #[cfg(feature = "__test-internals")]
+    pub fn mark_started_with_lease_at(
+        &self,
+        lease: &OwnerLease,
+        started_lease: Duration,
+        now: SystemTime,
+    ) -> Result<ReplayRecord, ReplayError> {
+        self.advance_to_started(lease, Some(started_lease), Some(time_to_ms(now)))
+    }
+
+    /// `mark_started` at one caller-supplied clock reading. Test builds only.
+    #[cfg(feature = "__test-internals")]
+    pub fn mark_started_at(
+        &self,
+        lease: &OwnerLease,
+        now: SystemTime,
+    ) -> Result<ReplayRecord, ReplayError> {
+        self.advance_to_started(lease, None, Some(time_to_ms(now)))
     }
 
     /// Release is valid only before the host has begun the external effect.
@@ -922,6 +1059,43 @@ impl ReplayStore {
 
     pub fn mark_uncertain(&self, lease: &OwnerLease) -> Result<ReplayRecord, ReplayError> {
         self.advance_owned(lease, ReplayState::Started, ReplayState::Uncertain, None)
+    }
+
+    fn advance_to_started(
+        &self,
+        lease: &OwnerLease,
+        started_lease: Option<Duration>,
+        now_ms: Option<i64>,
+    ) -> Result<ReplayRecord, ReplayError> {
+        self.legacy_guard(&lease.key_hash)?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_ms.unwrap_or_else(wall_now_ms);
+        let next_generation = lease.generation + 1;
+        let fresh_expiry = started_lease.map(|lease| now.saturating_add(lease_to_ms(lease)));
+        let changed = tx.execute(
+            "UPDATE replay_entries SET state = 'started', generation = ?1,
+                 owner_token = owner_token,
+                 lease_expires_at = COALESCE(?2, lease_expires_at)
+             WHERE key_hash = ?3 AND request_hash = ?4 AND state = 'not_started'
+                 AND generation = ?5 AND owner_token = ?6
+                 AND (lease_expires_at IS NULL OR lease_expires_at > ?7)",
+            params![
+                next_generation,
+                fresh_expiry,
+                lease.key_hash,
+                lease.request_hash,
+                lease.generation,
+                lease.token,
+                now,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ReplayError::StaleOwner);
+        }
+        let record = read_record(&tx, &lease.key_hash)?.ok_or(ReplayError::StaleOwner)?;
+        tx.commit()?;
+        Ok(record)
     }
 
     fn advance_owned(

@@ -461,7 +461,7 @@ impl EmbeddedSourceHandle {
             .ok()?;
             Some(
                 store
-                    .reserve(&key, &fingerprint)
+                    .reserve_with_lease(&key, &fingerprint, std::time::Duration::from_secs(3600))
                     .map(|outcome| (store, outcome)),
             )
         })();

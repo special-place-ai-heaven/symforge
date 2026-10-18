@@ -1,4 +1,5 @@
 #![cfg(feature = "embed")]
+#![allow(deprecated)]
 
 use std::fs;
 use std::path::Path;
@@ -26,6 +27,13 @@ fn key() -> ReplayKey {
 
 fn request() -> RequestFingerprint {
     RequestFingerprint::for_json("write", &json!({"a": 1, "b": 2})).unwrap()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn acquired(result: ReserveOutcome) -> symforge::embed::parity::replay::OwnerLease {
@@ -898,7 +906,7 @@ fn expired_started_reads_as_uncertain_with_since() {
             .reserve_with_lease_at(&key, &request, lease_for, t0)
             .unwrap(),
     );
-    store.mark_started(&lease).unwrap();
+    store.mark_started_at(&lease, t0).unwrap();
     let midway = store
         .inspect_at(&key, t0 + Duration::from_secs(10))
         .unwrap()
@@ -981,6 +989,114 @@ fn response_digest_accessor_verifies_embedder_bytes() {
     assert_eq!(
         stored.outcome.as_ref().unwrap().response_digest(),
         digest(response)
+    );
+}
+
+#[cfg(feature = "__test-internals")]
+#[test]
+fn expired_reservation_cannot_mark_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path(), &dir.path().join("state"));
+    let key = key();
+    let request = request();
+    let lease_for = Duration::from_millis(100);
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let lease = acquired(
+        store
+            .reserve_with_lease_at(&key, &request, lease_for, t0)
+            .unwrap(),
+    );
+    assert!(matches!(
+        store.mark_started_at(&lease, t0 + Duration::from_millis(200)),
+        Err(ReplayError::StaleOwner)
+    ));
+    let record = store.inspect(&key).unwrap().unwrap();
+    assert_eq!(record.state, ReplayState::NotStarted);
+}
+
+#[cfg(feature = "__test-internals")]
+#[test]
+fn mark_started_with_lease_sets_started_remaining() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path(), &dir.path().join("state"));
+    let key = key();
+    let request = request();
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+    let lease = acquired(
+        store
+            .reserve_with_lease_at(&key, &request, Duration::from_secs(30), t0)
+            .unwrap(),
+    );
+    let started_for = Duration::from_secs(5);
+    store
+        .mark_started_with_lease_at(&lease, started_for, t0)
+        .unwrap();
+    let remaining = store
+        .lease_remaining_at(&key, t0)
+        .unwrap()
+        .expect("started lease");
+    assert_eq!(remaining, started_for);
+}
+
+#[cfg(feature = "__test-internals")]
+#[test]
+fn lock_contention_surfaces_as_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let state = root.join("state");
+    let holder =
+        ReplayStore::open_with_busy_timeout(root, &state, "room-a", Duration::from_millis(50))
+            .unwrap();
+    let contender =
+        ReplayStore::open_with_busy_timeout(root, &state, "room-a", Duration::from_millis(50))
+            .unwrap();
+    let _hold = holder.begin_immediate_hold().unwrap();
+    let err = match contender.reserve_with_lease(&key(), &request(), Duration::from_secs(30)) {
+        Err(err) => err,
+        Ok(_) => panic!("expected Busy, got Ok"),
+    };
+    assert!(matches!(err, ReplayError::Busy), "got {err:?}");
+}
+
+#[test]
+fn from_embedder_digest_accepts_oversized_and_secret_looking_response() {
+    let response = vec![b'a'; 1024 * 1024];
+    let digest = sha256_hex(&response);
+    let secretish = b"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/FL+/oEaL\n-----END RSA PRIVATE KEY-----\n";
+    assert!(matches!(
+        ReplayOutcome::from_response_and_post_image(OutcomeKind::Applied, secretish, b"post"),
+        Err(ReplayError::UnsafeOutcome)
+    ));
+    let outcome = ReplayOutcome::from_embedder_digest(
+        OutcomeKind::Applied,
+        response.len(),
+        &digest,
+        b"post image",
+    )
+    .unwrap();
+    assert_eq!(outcome.response_digest(), digest);
+    let secret_digest = sha256_hex(secretish);
+    let secret_outcome = ReplayOutcome::from_embedder_digest(
+        OutcomeKind::Applied,
+        secretish.len(),
+        &secret_digest,
+        b"post image",
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path(), &dir.path().join("state"));
+    let lease = acquired(
+        store
+            .reserve_with_lease(&key(), &request(), Duration::from_secs(30))
+            .unwrap(),
+    );
+    store
+        .mark_started_with_lease(&lease, Duration::from_secs(30))
+        .unwrap();
+    let stored = store.complete(&lease, &secret_outcome).unwrap();
+    assert_eq!(
+        stored.outcome.as_ref().unwrap().response_digest(),
+        secret_digest
     );
 }
 
