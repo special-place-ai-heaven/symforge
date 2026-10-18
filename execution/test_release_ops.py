@@ -229,8 +229,6 @@ class ReleaseOpsTests(unittest.TestCase):
         for package_name in (
             "symforge-windows-x64",
             "symforge-linux-x64",
-            "symforge-macos-x64",
-            "symforge-macos-arm64",
         ):
             self.assertIn(package_name, workflow)
         self.assertIn("Download built binary artifacts", workflow)

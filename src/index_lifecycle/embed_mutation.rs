@@ -855,7 +855,7 @@ impl EmbeddedSourceHandle {
         let replay = ReplayStore::open_bound(&snapshot.root, state_dir, &authority.scope, anchor)
             .map_err(|_| EditError::Edit(EditErrorKind::ReplayUnavailable))?;
         let lease = match replay
-            .reserve(&key, &fingerprint)
+            .reserve_with_lease(&key, &fingerprint, std::time::Duration::from_secs(3600))
             .map_err(|_| EditError::Edit(EditErrorKind::ReplayConflict))?
         {
             ReserveOutcome::Acquired(lease) => lease,

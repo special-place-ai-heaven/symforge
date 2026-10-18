@@ -700,7 +700,7 @@ impl StagedContentAccounting {
     fn handoff(&self, bytes: u64, permit: Option<InflightPermit>) -> bool {
         let reserved = self
             .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|next| *next <= self.ceiling)
             })
             .is_ok();
@@ -8575,6 +8575,15 @@ mod tests {
         assert!(staged.handoff(4, Some(second)));
         assert_eq!(staged.used_bytes(), 8);
         assert_eq!(inflight.available_bytes(), 4);
+    }
+
+    #[test]
+    fn staged_handoff_reserves_under_ceiling_and_refuses_over_it() {
+        let staged = StagedContentAccounting::new(8);
+        assert!(staged.handoff(8, None));
+        assert_eq!(staged.used_bytes(), 8);
+        assert!(!staged.handoff(1, None));
+        assert_eq!(staged.used_bytes(), 8);
     }
 
     #[test]

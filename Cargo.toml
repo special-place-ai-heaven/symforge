@@ -1,6 +1,6 @@
 [package]
 name = "symforge"
-version = "11.8.2"
+version = "11.8.3"
 edition = "2024"
 description = "SymForge — in-memory code intelligence MCP server for Claude Code, Codex, and Gemini CLI"
 license-file = "LICENSE"
@@ -135,7 +135,7 @@ toml_edit = "0.25"
 thiserror = "2.0"
 # `net` and `io-util` are NOT here: they are server-only and are declared on the
 # `server` feature so the engine-only `embed` build does not compile them in.
-tokio = { version = "1.48", features = ["io-std", "macros", "rt-multi-thread", "time", "sync", "signal", "test-util"] }
+tokio = { version = "1.48", features = ["io-std", "macros", "rt-multi-thread", "time", "sync", "signal"] }
 postcard = { version = "1.1", features = ["use-std"] }
 axum = { version = "0.8", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
@@ -211,12 +211,16 @@ windows = { version = "0.62", features = ["Win32_System_Pipes", "Win32_Security"
 # repo-internal test door open (feature unification applies dev-dep
 # features to test targets only; `cargo build`/`--release` never sees it).
 symforge = { path = ".", default-features = false, features = ["__test-internals"] }
+# `test-util` is test-only. Keeping it off the normal dependency means an
+# embedder build does not compile paused time into production binaries.
+tokio = { version = "1.48", features = ["test-util"] }
 tempfile = "3"
 once_cell = "1"
 postcard = { version = "1.1", features = ["use-std"] }
 # Cross-platform mtime backdating for tee retention age-pruning tests.
 filetime = "0.2"
 criterion = "0.8.2"
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [patch.crates-io]
 # Upstream build.rs uses `-Wno-unused-parameter` which MSVC rejects.

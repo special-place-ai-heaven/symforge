@@ -36,7 +36,16 @@ accepts `KnowledgeSearchRequest` and returns `KnowledgeSearchResult`.
 
 Embedders keep their own response bytes and check them with `ReplayOutcome::response_digest`. SymForge stores the digest only.
 
+`ReplayOutcome::from_embedder_digest` records an embedder-supplied response length and SHA-256 without reading the response body; the embedder owns that secret scan and may complete responses larger than 64 KiB. `from_response_and_post_image` still scans and caps at 64 KiB. `reserve` is deprecated in favour of `reserve_with_lease` (unleased `not_started` rows never expire). `mark_started` refuses an already-expired leased reservation; `mark_started_with_lease` arms a fresh started lease. Lock contention past the busy wait is `ReplayError::Busy`. `tokio` `test-util` is a dev-dependency only. `AtomicU64::try_update` replaces deprecated `fetch_update` on the staged handoff path.
+
 `CensusFile` gains `reference_count` and `parse_status` (`CensusParseStatus`). `IndexCensus` gains `snapshot_verify` (`CensusVerifyPhase`). Both structs were already `non_exhaustive`.
+
+## [11.8.3](https://github.com/special-place-ai-heaven/symforge/compare/v11.8.2...v11.8.3) (2026-10-18)
+
+
+### Bug Fixes
+
+* **embed:** land AAP 11.8.2 replay delta (C1-C2, C6-C12) ([#802](https://github.com/special-place-ai-heaven/symforge/issues/802)) ([4b170b3](https://github.com/special-place-ai-heaven/symforge/commit/4b170b37942895c5dbe339b92133c0149ddf90cd))
 
 ## [11.8.2](https://github.com/special-place-ai-heaven/symforge/compare/v11.8.1...v11.8.2) (2026-10-18)
 

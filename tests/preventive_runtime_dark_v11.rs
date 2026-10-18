@@ -1139,9 +1139,9 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // re-exports those two enums through the existing pub use. No new caller
 // file and no new edge into server_api.rs.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "8d16161d7e3d1c7bd7c92ffb283cf1fab5afad3c1ef48330dbdd7d0d90e549f7",
+    "375632c65e35b3a68dae25422bb6b6cef9e17f2be485fc01d8a623fae6a233f8",
     89,
-    2_202_015,
+    2202260,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1290,14 +1290,15 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // feature-neutral and delegating to the shared runtime:
 // stel/{controller,executor,planner,runtime}.rs. Trust-mode host option; no new
 // boundary edge.
-// Refreshed for the replay lease and census file status. Same 312 files.
-// The src diff is embed.rs, embed/parity/replay.rs, idempotency.rs,
-// index_lifecycle/embedded.rs, and index_lifecycle/public_api.rs. No new
+// Refreshed for the AAP 11.8.2 embed replay delta. Same 312 files.
+// Src diff: embed.rs, embed/parity/replay.rs, live_index/store.rs, and
+// index_lifecycle/embed_{batch,mutation,remediation,symforge_edit}.rs
+// (reserve_with_lease call sites). Additive replay API only; no new
 // caller file and no new edge into server_api.rs.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "df6f8f6543c11885662c67ec99fb62b1a85c07492868f183296d5e36642dfdc5",
+    "4dd1ded17b60345e80e6c570da863e486927d3671b1bae77a4bab7b471485cee",
     312,
-    12_020_356,
+    12028435,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
@@ -1428,8 +1429,8 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "6c39ef1e0041f9f8:16638"),
-    ("release.yml", "53d4cb3ae1228b8f:112833"),
+    ("ci.yml", "8a1b989684769413:17233"),
+    ("release.yml", "addb84653ead805c:113428"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an
@@ -1495,6 +1496,10 @@ const CARGO_LINES: &[(&str, usize)] = &[
         "# types. `cargo tree -d` cannot distinguish this (it lists any",
         1,
     ),
+    (
+        "# Windows is x86_64-pc-windows-msvc via cargo-xwin. macOS is not built.",
+        1,
+    ),
     ("- name: Run cargo check", 1),
     ("CARGO_BUILD_JOBS: \"2\"", 2),
     (
@@ -1505,6 +1510,7 @@ const CARGO_LINES: &[(&str, usize)] = &[
         "SYMFORGE_LIFECYCLE_CARGO_EXECUTABLE: ${{ steps.trusted-tools.outputs.cargo }}",
         1,
     ),
+    ("builder: cargo", 1),
     ("cargo-publish:", 1),
     ("environment: cargo-publish", 1),
     // Commands that invoke no test harness at all.
@@ -1520,10 +1526,6 @@ const CARGO_LINES: &[(&str, usize)] = &[
         1,
     ),
     ("run: cargo build --release", 2),
-    (
-        "run: cargo build --release --target ${{ matrix.target }}",
-        1,
-    ),
     ("run: cargo check", 1),
     ("run: cargo clippy --all-targets -- -D warnings", 2),
     (
@@ -1562,6 +1564,10 @@ const CARGO_LINES: &[(&str, usize)] = &[
     (
         "run: cargo test --no-default-features --features embed --test embed_bound_index -- --test-threads=1",
         1,
+    ),
+    (
+        "cargo test --no-default-features --features embed,__test-internals --test embed_parity --test embed_replay_v1 -- --test-threads=1 2>&1 | tee /tmp/embed-parity-replay.log",
+        2,
     ),
     (
         "run: cargo test --release --test coupling_calibration calibrate_current_repo_smoke -- --ignored --test-threads=1 --nocapture",
@@ -2433,8 +2439,8 @@ fn no_gate_builds_doctests() {
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(
         (seen.len(), distinct.len(), files),
-        (41, 33, 2),
-        "the CI workflows hold forty-one cargo-mentioning lines, thirty-three \
+        (44, 35, 2),
+        "the CI workflows hold forty-four cargo-mentioning lines, thirty-five \
          of them distinct, across two workflow files; this walk saw {:?}. A gate \
          added, removed, reworded, or a workflow file added — reconcile \
          CARGO_LINES with the workflows deliberately, never by loosening this \

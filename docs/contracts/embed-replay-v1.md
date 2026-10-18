@@ -18,12 +18,16 @@ putting source bytes in the request. Raw keys are never logged or stored. The
 key hash and request hash use the prior MCP framing, so an old reservation
 cannot be silently rebound under a different hash. Debug output redacts keys.
 
-`reserve` performs one SQLite `BEGIN IMMEDIATE` transaction. Its unique key row
-and random owner token are visible together or not at all. `Acquired` returns
-the sole `OwnerLease`; `Existing` returns the current typed record. A different
-request fingerprint for the same key is a conflict. The database uses a five
-second lock wait and full synchronous writes. Busy or I/O errors fail the
-operation; the host must not execute on failure.
+`reserve_with_lease` is the supported admission path. It performs one SQLite
+`BEGIN IMMEDIATE` transaction. Its unique key row and random owner token are
+visible together or not at all. `Acquired` returns the sole `OwnerLease`;
+`Existing` returns the current typed record. A different request fingerprint
+for the same key is a conflict. The deprecated `reserve` path still exists but
+writes no `lease_expires_at`; those `not_started` rows never expire and need
+operator action after a crash. The database uses a five second lock wait and
+full synchronous writes. Lock contention past that wait is `ReplayError::Busy`
+(retryable); other I/O or database errors fail the operation. The host must
+not execute on failure.
 
 The state machine is:
 
@@ -34,8 +38,12 @@ absent -> NotStarted -> Started -> Completed
 NotStarted -> absent (same owner only)
 ```
 
-The host calls `mark_started` immediately before the external effect. Only the
-lease owner can release `NotStarted`, and only while it is still `NotStarted`.
+The host calls `mark_started` (or `mark_started_with_lease`) immediately before
+the external effect. A leased reservation that has already expired cannot
+commit `mark_started` (`StaleOwner`); the row stays `not_started` for takeover.
+`mark_started_with_lease` arms a fresh execution lease on the `started` row.
+Only the lease owner can release `NotStarted`, and only while it is still
+`NotStarted`.
 Once started, a crash leaves `Started`, even after process restart or any amount
 of time. An ambiguous effect becomes `Uncertain`. Neither state permits a new
 execution. `reconcile` accepts only `Started` or `Uncertain` and records a digest
@@ -49,9 +57,12 @@ a known terminal failure, never an ambiguous write.
 
 `ReplayOutcome` stores only a fixed outcome kind, a response digest, and a
 post-image digest. It never stores a response body, source text, error message,
-or unrestricted path. Outcome and evidence construction checks the existing
-secret detector and refuses sensitive or indeterminate payloads; request,
-response, and evidence sizes are bounded. A completed mutation is safe to answer as replayed only
+or unrestricted path. `from_response_and_post_image` secret-scans both buffers
+and caps the response at 64 KiB. `from_embedder_digest` records an embedder-
+supplied length and lowercase SHA-256 without reading response bytes: the
+embedder owns the response secret scan, and there is no store-side response
+size cap on that path. SymForge still secret-scans and size-caps the post-image
+and evidence payloads. A completed mutation is safe to answer as replayed only
 after the host rereads the target and calls `matches_post_image` with the
 current bytes. A mismatch is a refusal requiring investigation, never an
 automatic retry. This database is an execution guard, not a response cache.

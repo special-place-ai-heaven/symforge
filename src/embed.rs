@@ -151,6 +151,23 @@ mod contract {
             crate::embed::parity::replay::OwnerLease::took_over;
         let _response_digest: fn(&crate::embed::parity::replay::ReplayOutcome) -> &str =
             crate::embed::parity::replay::ReplayOutcome::response_digest;
+        let _from_embedder_digest: fn(
+            crate::embed::parity::replay::OutcomeKind,
+            usize,
+            &str,
+            &[u8],
+        ) -> Result<
+            crate::embed::parity::replay::ReplayOutcome,
+            crate::embed::parity::replay::ReplayError,
+        > = crate::embed::parity::replay::ReplayOutcome::from_embedder_digest;
+        let _mark_started_with_lease: fn(
+            &crate::embed::parity::replay::ReplayStore,
+            &crate::embed::parity::replay::OwnerLease,
+            std::time::Duration,
+        ) -> Result<
+            crate::embed::parity::replay::ReplayRecord,
+            crate::embed::parity::replay::ReplayError,
+        > = crate::embed::parity::replay::ReplayStore::mark_started_with_lease;
         let _uncertain_since: fn(
             &crate::embed::parity::replay::ReplayRecord,
         ) -> Option<std::time::SystemTime> =
@@ -163,6 +180,8 @@ mod contract {
             _lease_remaining,
             _took_over,
             _response_digest,
+            _from_embedder_digest,
+            _mark_started_with_lease,
             _uncertain_since,
         );
         _assert_named::<Claim<u64>>();
