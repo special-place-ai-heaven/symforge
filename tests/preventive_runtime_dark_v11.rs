@@ -1290,14 +1290,15 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // feature-neutral and delegating to the shared runtime:
 // stel/{controller,executor,planner,runtime}.rs. Trust-mode host option; no new
 // boundary edge.
-// Refreshed for the replay lease and census file status. Same 312 files.
-// The src diff is embed.rs, embed/parity/replay.rs, idempotency.rs,
-// index_lifecycle/embedded.rs, and index_lifecycle/public_api.rs. No new
+// Refreshed for the AAP 11.8.2 embed replay delta. Same 312 files.
+// Src diff: embed.rs, embed/parity/replay.rs, live_index/store.rs, and
+// index_lifecycle/embed_{batch,mutation,remediation,symforge_edit}.rs
+// (reserve_with_lease call sites). Additive replay API only; no new
 // caller file and no new edge into server_api.rs.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "012e62eb5aa7c1a5ae3fdfd38e4bfa64cb8f5fc9a5653bd8433fc40c0da88ce1",
+    "4dd1ded17b60345e80e6c570da863e486927d3671b1bae77a4bab7b471485cee",
     312,
-    12028507,
+    12028435,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
