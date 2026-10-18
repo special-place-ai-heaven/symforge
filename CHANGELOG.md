@@ -40,6 +40,13 @@ Embedders keep their own response bytes and check them with `ReplayOutcome::resp
 
 `CensusFile` gains `reference_count` and `parse_status` (`CensusParseStatus`). `IndexCensus` gains `snapshot_verify` (`CensusVerifyPhase`). Both structs were already `non_exhaustive`.
 
+## [11.8.6](https://github.com/special-place-ai-heaven/symforge/compare/v11.8.5...v11.8.6) (2026-10-18)
+
+
+### Bug Fixes
+
+* **ci:** use apt clang for Windows xwin builds ([#809](https://github.com/special-place-ai-heaven/symforge/issues/809)) ([a2c0d8b](https://github.com/special-place-ai-heaven/symforge/commit/a2c0d8b3b29fd6ef2710645146d4fe7af90eefd9))
+
 ## [11.8.5](https://github.com/special-place-ai-heaven/symforge/compare/v11.8.4...v11.8.5) (2026-10-18)
 
 
