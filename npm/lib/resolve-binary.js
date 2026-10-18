@@ -12,20 +12,6 @@ const SUPPORTED_TARGETS = Object.freeze([
     binaryName: "symforge",
   }),
   Object.freeze({
-    platform: "darwin",
-    arch: "arm64",
-    pkg: "symforge-macos-arm64",
-    monorepoDir: "macos-arm64",
-    binaryName: "symforge",
-  }),
-  Object.freeze({
-    platform: "darwin",
-    arch: "x64",
-    pkg: "symforge-macos-x64",
-    monorepoDir: "macos-x64",
-    binaryName: "symforge",
-  }),
-  Object.freeze({
     platform: "win32",
     arch: "x64",
     pkg: "symforge-windows-x64",
