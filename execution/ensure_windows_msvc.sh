@@ -24,6 +24,25 @@ if [ -n "${GITHUB_PATH:-}" ] && [ -d "${prefix}/bin" ]; then
   echo "${prefix}/bin" >> "${GITHUB_PATH}"
 fi
 
+# aws-lc-sys under cargo-xwin invokes clang-cl (MSVC-flavored clang).
+# Host packages often ship only `clang`; put a user-local clang-cl on PATH.
+user_bin="${HOME}/.local/bin"
+mkdir -p "${user_bin}"
+clang_bin="$(command -v clang)"
+if [ -z "${clang_bin}" ]; then
+  echo "clang is required for Windows xwin builds" >&2
+  exit 1
+fi
+ln -sfn "${clang_bin}" "${user_bin}/clang-cl"
+export PATH="${user_bin}:${PATH}"
+if [ -n "${GITHUB_PATH:-}" ]; then
+  echo "${user_bin}" >> "${GITHUB_PATH}"
+fi
+if ! command -v clang-cl >/dev/null 2>&1; then
+  echo "clang-cl is not on PATH after ensure_windows_msvc" >&2
+  exit 1
+fi
+
 if ! command -v cargo-xwin >/dev/null 2>&1; then
   cargo install --locked cargo-xwin --version 0.23.1
 fi
