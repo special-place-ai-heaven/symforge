@@ -1430,7 +1430,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
     ("ci.yml", "8a1b989684769413:17233"),
-    ("release.yml", "160e4ea4b94b47cc:113494"),
+    ("release.yml", "addb84653ead805c:113428"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an
@@ -1496,6 +1496,10 @@ const CARGO_LINES: &[(&str, usize)] = &[
         "# types. `cargo tree -d` cannot distinguish this (it lists any",
         1,
     ),
+    (
+        "# Windows is x86_64-pc-windows-msvc via cargo-xwin. macOS is not built.",
+        1,
+    ),
     ("- name: Run cargo check", 1),
     ("CARGO_BUILD_JOBS: \"2\"", 2),
     (
@@ -1506,6 +1510,7 @@ const CARGO_LINES: &[(&str, usize)] = &[
         "SYMFORGE_LIFECYCLE_CARGO_EXECUTABLE: ${{ steps.trusted-tools.outputs.cargo }}",
         1,
     ),
+    ("builder: cargo", 1),
     ("cargo-publish:", 1),
     ("environment: cargo-publish", 1),
     // Commands that invoke no test harness at all.
@@ -1521,10 +1526,6 @@ const CARGO_LINES: &[(&str, usize)] = &[
         1,
     ),
     ("run: cargo build --release", 2),
-    (
-        "run: cargo build --release --target ${{ matrix.target }}",
-        1,
-    ),
     ("run: cargo check", 1),
     ("run: cargo clippy --all-targets -- -D warnings", 2),
     (
@@ -2438,8 +2439,8 @@ fn no_gate_builds_doctests() {
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(
         (seen.len(), distinct.len(), files),
-        (43, 34, 2),
-        "the CI workflows hold forty-three cargo-mentioning lines, thirty-four \
+        (44, 35, 2),
+        "the CI workflows hold forty-four cargo-mentioning lines, thirty-five \
          of them distinct, across two workflow files; this walk saw {:?}. A gate \
          added, removed, reworded, or a workflow file added — reconcile \
          CARGO_LINES with the workflows deliberately, never by loosening this \

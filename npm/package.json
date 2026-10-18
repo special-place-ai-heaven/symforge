@@ -15,8 +15,6 @@
   },
   "optionalDependencies": {
     "symforge-linux-x64": "11.8.3",
-    "symforge-macos-arm64": "11.8.3",
-    "symforge-macos-x64": "11.8.3",
     "symforge-windows-x64": "11.8.3"
   },
   "files": [
