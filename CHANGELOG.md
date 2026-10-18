@@ -38,6 +38,19 @@ Embedders keep their own response bytes and check them with `ReplayOutcome::resp
 
 `CensusFile` gains `reference_count` and `parse_status` (`CensusParseStatus`). `IndexCensus` gains `snapshot_verify` (`CensusVerifyPhase`). Both structs were already `non_exhaustive`.
 
+## [11.8.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.7.2...v11.8.0) (2026-10-18)
+
+
+### Features
+
+* **embed:** expire unstarted replay leases and report census file status ([#793](https://github.com/special-place-ai-heaven/symforge/issues/793)) ([42d2299](https://github.com/special-place-ai-heaven/symforge/commit/42d2299f7c9adfe664d5cdb0baacc1be224743ba))
+
+
+### Bug Fixes
+
+* **ci:** install Python before the release ref check ([#794](https://github.com/special-place-ai-heaven/symforge/issues/794)) ([0ea7745](https://github.com/special-place-ai-heaven/symforge/commit/0ea7745d4f9f81ecc6abcfc2225263fc98ce3ebc))
+* **ci:** install the GitHub CLI on fresh release runners ([#795](https://github.com/special-place-ai-heaven/symforge/issues/795)) ([9883884](https://github.com/special-place-ai-heaven/symforge/commit/98838841c50d47a66374977c56f096fe15296160))
+
 ## [11.7.2](https://github.com/special-place-ai-heaven/symforge/compare/v11.7.1...v11.7.2) (2026-10-11)
 
 
