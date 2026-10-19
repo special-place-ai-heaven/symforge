@@ -755,6 +755,7 @@ impl FilesystemStableReadAccess {
         use sha2::{Digest, Sha256};
         use std::io::Read;
 
+        crate::paths::path_must_be_regular_non_link(path)?;
         let mut file = std::fs::File::open(path)?;
         let handle_before = file_stamp_from_metadata(&file.metadata()?);
         if usize::try_from(handle_before.size).map_or(true, |size| size > max_bytes) {
@@ -794,7 +795,7 @@ impl FilesystemStableReadAccess {
         }
 
         let handle_after = file_stamp_from_metadata(&file.metadata()?);
-        let path_after = file_stamp_from_metadata(&std::fs::metadata(path)?);
+        let path_after = file_stamp_from_metadata(&std::fs::symlink_metadata(path)?);
         Ok(StableReadPass {
             bytes,
             length,
@@ -8537,6 +8538,56 @@ mod tests {
             StableReadOutcome::Accepted { bytes, hash }
                 if bytes == expected && hash == crate::hash::digest(expected)
         ));
+    }
+
+    #[test]
+    fn outbound_link_read_pass_refuses_link_and_reads_regular_file() {
+        const SECRET: &str = "OUTBOUND_LINK_SECRET_7f3a9c2e";
+        const PLAIN: &str = "OUTBOUND_LINK_PLAIN_ok";
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("plain.rs");
+        std::fs::write(&regular, format!("fn plain() {{ let _ = \"{PLAIN}\"; }}\n")).unwrap();
+        let stamp = file_stamp_from_metadata(&std::fs::symlink_metadata(&regular).unwrap());
+        let accepted =
+            FilesystemStableReadAccess::read_pass(&regular, 4096, true).expect("regular");
+        assert!(
+            accepted
+                .bytes
+                .as_deref()
+                .is_some_and(|bytes| String::from_utf8_lossy(bytes).contains(PLAIN)),
+            "ordinary file must still be readable"
+        );
+        let _ = stamp;
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), format!("{SECRET}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("outbound_link.txt");
+            std::os::unix::fs::symlink(outside.path().join("secret.txt"), &link).unwrap();
+            let err = FilesystemStableReadAccess::read_pass(&link, 4096, true)
+                .expect_err("leaf symlink must be refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(!err.to_string().contains(SECRET));
+        }
+        #[cfg(windows)]
+        {
+            let junction = dir.path().join("junc");
+            let status = crate::process_util::hidden_command("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&junction)
+                .arg(outside.path())
+                .output()
+                .expect("mklink runs");
+            assert!(
+                status.status.success(),
+                "mklink /J failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+            let err = FilesystemStableReadAccess::read_pass(&junction, 4096, true)
+                .expect_err("a junction is not a regular file");
+            assert!(!err.to_string().contains(SECRET));
+        }
     }
 
     #[test]

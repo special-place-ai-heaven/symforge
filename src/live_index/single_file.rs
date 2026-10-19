@@ -580,6 +580,12 @@ where
         // the latter while retaining this same live-index base.
         let expected_index_state_generation = base.health.generation;
 
+        // Nested junction/symlink: leaf metadata looks regular; canonicalize
+        // must still refuse ingest under the in-repo name.
+        if !crate::paths::canonical_abs_stays_under_relative_root(abs_path, relative_path) {
+            return ReindexReceipt::observed(ReindexOutcome::Skipped, observed_at);
+        }
+
         // Run the same metadata-first scout as cold load before any whole-file read.
         let mut scouted = match scout_single_path(relative_path, abs_path) {
             Ok(scouted) => scouted,
@@ -1072,13 +1078,26 @@ pub(crate) fn freshen_file_if_stale(
         return FreshenResult::GenerationMismatch;
     }
 
-    // 1. Stat the file on disk
-    let disk_mtime = std::fs::metadata(abs_path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    if let Some(root) = abs_path
+        .ancestors()
+        .nth(std::path::Path::new(relative_path).components().count())
+        && crate::index_lifecycle::guidance::read_gate::resolve_repo_path(root, relative_path)
+            .is_err_and(|message| message.contains("outside the repository"))
+    {
+        return FreshenResult::Fresh;
+    }
+
+    // 1. Stat the file on disk without following a symlink or reparse point.
+    let disk_mtime = match crate::paths::path_must_be_regular_non_link(abs_path) {
+        Ok(meta) => meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(_) => return FreshenResult::Fresh,
+    };
 
     // 2. Compare against indexed mtime (read lock, released immediately)
     let indexed_mtime = {
@@ -1209,6 +1228,63 @@ mod tests {
         assert!(
             matches!(outcome, ReindexResult::NotFound),
             "missing file must be NotFound, got {outcome:?}"
+        );
+    }
+
+    const OUTBOUND_LINK_SECRET: &str = "OUTBOUND_LINK_SECRET_7f3a9c2e";
+
+    fn plant_outbound_secret(repo: &Path) -> (tempfile::TempDir, &'static str) {
+        let outside = tempfile::TempDir::new().expect("outside");
+        std::fs::write(
+            outside.path().join("secret.txt"),
+            format!("{OUTBOUND_LINK_SECRET}\n"),
+        )
+        .expect("secret");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), repo.join("junc")).expect("dir symlink");
+            (outside, "junc/secret.txt")
+        }
+        #[cfg(windows)]
+        {
+            let junction = repo.join("junc");
+            let status = crate::process_util::hidden_command("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&junction)
+                .arg(outside.path())
+                .output()
+                .expect("mklink");
+            assert!(
+                status.status.success(),
+                "mklink /J failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+            (outside, "junc/secret.txt")
+        }
+    }
+
+    #[test]
+    fn outbound_link_single_path_ingest_skips_nested_secret() {
+        let dir = tempfile::TempDir::new().expect("repo");
+        std::fs::write(dir.path().join("plain.rs"), "pub fn plain() {}\n").expect("plain");
+        let (_outside, link_path) = plant_outbound_secret(dir.path());
+        let shared = LiveIndex::load(dir.path()).expect("load");
+        let outcome = update_file_from_disk(&shared, dir.path(), link_path);
+        assert!(
+            matches!(outcome, ReindexResult::Skipped),
+            "nested outbound ingest must skip, got {outcome:?}"
+        );
+        assert!(
+            shared.read().get_file(link_path).is_none()
+                || shared.read().get_file(link_path).is_some_and(|file| {
+                    !String::from_utf8_lossy(&file.content).contains(OUTBOUND_LINK_SECRET)
+                }),
+            "ingest must not publish the outside secret"
+        );
+        let plain = update_file_from_disk(&shared, dir.path(), "plain.rs");
+        assert!(
+            matches!(plain, ReindexResult::HashSkip | ReindexResult::Reindexed),
+            "ordinary file must still ingest, got {plain:?}"
         );
     }
 
@@ -1701,5 +1777,56 @@ mod tests {
         assert_eq!(excluded.outcome, ReindexOutcome::PublicationRejected);
         assert_eq!(shared.publication_fence(), publication_before);
         assert!(shared.read().get_file("lib.rs").is_some());
+    }
+
+    #[test]
+    fn outbound_link_freshen_skips_and_does_not_index_secret() {
+        let dir = tempfile::TempDir::new().expect("repo");
+        let plain_marker = "OUTBOUND_LINK_PLAIN_ok";
+        std::fs::write(
+            dir.path().join("plain.rs"),
+            format!("fn plain() {{ let _ = \"{plain_marker}\"; }}\n"),
+        )
+        .expect("plain");
+        let (_outside, link_path) = plant_outbound_secret(dir.path());
+        let shared = LiveIndex::load(dir.path()).expect("load");
+        let expected_gen = shared.current_project_generation();
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(dir.path());
+        let outcome = freshen_file_if_stale(
+            link_path,
+            &dir.path().join(link_path),
+            &shared,
+            expected_gen,
+            &authority,
+            authority.active_observer(),
+        );
+        assert!(
+            matches!(outcome, FreshenResult::Fresh),
+            "outbound path must skip reindex"
+        );
+        assert!(
+            shared.read().get_file(link_path).is_none()
+                || shared.read().get_file(link_path).is_some_and(|file| {
+                    !String::from_utf8_lossy(&file.content).contains(OUTBOUND_LINK_SECRET)
+                }),
+            "freshen must not index the outside secret"
+        );
+
+        let plain_abs = dir.path().join("plain.rs");
+        let _ = freshen_file_if_stale(
+            "plain.rs",
+            &plain_abs,
+            &shared,
+            expected_gen,
+            &authority,
+            authority.active_observer(),
+        );
+        let guard = shared.read();
+        let plain = guard.get_file("plain.rs").expect("plain indexed");
+        assert!(
+            String::from_utf8_lossy(&plain.content).contains(plain_marker),
+            "ordinary file must remain readable"
+        );
     }
 }

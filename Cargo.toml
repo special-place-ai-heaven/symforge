@@ -143,7 +143,7 @@ chrono = "0.4"
 dirs = "7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
-tree-sitter = "=0.26.13"
+tree-sitter = "0.26"
 streaming-iterator = "0.1"
 tree-sitter-rust = "=0.24.2"
 tree-sitter-python = "0.25"
@@ -195,7 +195,9 @@ windows = { version = "0.62", features = [
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_Threading",
 ] }

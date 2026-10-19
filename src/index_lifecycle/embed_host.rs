@@ -6,8 +6,9 @@ use crate::domain::{CapabilityStatus, SourceAccessMode, StatePlacement};
 use crate::embed::parity::host::{
     HostArtifactOutcome, HostCheckpointOutcome, HostCheckpointReceipt, HostEngineIdentity,
     HostHealth, HostHealthNotApplicable, HostHealthProjection, HostHealthReport, HostHealthRequest,
-    HostLimits, HostPhase, HostProgress, HostPublishedHealth, HostRefusal, HostRefusalKind,
-    HostSourceProof, HostStateLocation, HostStatus, HostVerifyPhase, OperationControl, map_stop,
+    HostIndexFailure, HostIndexFailureCause, HostLimits, HostPhase, HostProgress,
+    HostPublishedHealth, HostRefusal, HostRefusalKind, HostSourceProof, HostStateLocation,
+    HostStatus, HostVerifyPhase, OperationControl, map_stop,
 };
 use crate::live_index::store::SnapshotVerifyState;
 
@@ -21,17 +22,19 @@ pub(crate) fn status(
 ) -> HostStatus {
     let view = source.runtime_view();
     let progress = source.index_progress();
+    let phase = match view.phase {
+        SourceRuntimePhase::Blocked => HostPhase::Blocked,
+        SourceRuntimePhase::Current => HostPhase::Current,
+        SourceRuntimePhase::Loading => HostPhase::Loading,
+        SourceRuntimePhase::Refreshing => HostPhase::Refreshing,
+        SourceRuntimePhase::Stopped => HostPhase::Stopped,
+        SourceRuntimePhase::Stopping => HostPhase::Stopping,
+    };
+    let index_failure = observed_index_failure(source, &phase);
     HostStatus {
         room_id: room_id.to_owned(),
         engine: engine.clone(),
-        phase: match view.phase {
-            SourceRuntimePhase::Blocked => HostPhase::Blocked,
-            SourceRuntimePhase::Current => HostPhase::Current,
-            SourceRuntimePhase::Loading => HostPhase::Loading,
-            SourceRuntimePhase::Refreshing => HostPhase::Refreshing,
-            SourceRuntimePhase::Stopped => HostPhase::Stopped,
-            SourceRuntimePhase::Stopping => HostPhase::Stopping,
-        },
+        phase,
         binding_identity: view.binding_identity,
         source_capture_publication_identity: view.current_publication_identity,
         source_version: view.source_version,
@@ -41,7 +44,36 @@ pub(crate) fn status(
             files_parsed: progress.files_parsed,
             symbols_found: progress.symbols_found,
         },
+        index_failure,
     }
+}
+
+fn observed_index_failure(
+    source: &EmbeddedSourceHandle,
+    phase: &HostPhase,
+) -> Option<HostIndexFailure> {
+    if *phase == HostPhase::Blocked {
+        return Some(HostIndexFailure {
+            cause: HostIndexFailureCause::PublicationBlocked,
+            path: None,
+        });
+    }
+    let Ok(census) = source.index_census() else {
+        return None;
+    };
+    census.value().files.iter().find_map(|file| {
+        let cause = match file.parse_status {
+            super::public_api::CensusParseStatus::Failed => HostIndexFailureCause::ParseFailed,
+            super::public_api::CensusParseStatus::PartialParse => {
+                HostIndexFailureCause::PartialParse
+            }
+            super::public_api::CensusParseStatus::Parsed => return None,
+        };
+        Some(HostIndexFailure {
+            cause,
+            path: Some(file.path.clone()),
+        })
+    })
 }
 
 pub(crate) fn health(

@@ -3,7 +3,6 @@
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -75,7 +74,8 @@ fn daemon_start_lock_file_name() -> String {
 /// route. It is the connection-info channel the legit MCP front-end and hook
 /// read when the operator has NOT pinned a token via env — closing the prior
 /// "no token ⇒ open daemon" ambient-authority hole without breaking the
-/// handshake. On Unix it is created `0o600` (owner read/write only).
+/// handshake. On Unix it is created `0o600` (owner read/write only); on Windows
+/// the DACL is owner+SYSTEM with no Everyone/Users read ACE.
 fn daemon_token_file_name() -> String {
     crate::paths::os_tagged_runtime_file_name("daemon", "token")
 }
@@ -535,9 +535,10 @@ fn resolve_daemon_auth_token_at(control_state_dir: &ControlStateDir) -> Option<S
 /// reproduce: high-resolution timestamps, the process id, a heap-allocation
 /// address (ASLR), the current thread id, and a per-call atomic counter.
 ///
-/// The token's real confidentiality barrier is the `0o600` token FILE; the
-/// token only needs to be non-guessable by a local process that cannot read
-/// that file. Both paths satisfy that.
+/// The token's real confidentiality barrier is the owner-only token FILE
+/// Unix `0o600`, Windows owner+SYSTEM DACL. The token only needs to be
+/// non-guessable by a local process that cannot read that file. Both paths
+/// satisfy that.
 fn generate_daemon_auth_token() -> String {
     #[cfg(unix)]
     {
@@ -583,8 +584,11 @@ fn establish_daemon_auth_token() -> String {
 }
 
 /// Persist the daemon auth token to its OS-tagged file with owner-only
-/// permissions on Unix. The token is written before the daemon starts serving
-/// so a client that observes the port file can also read a valid token.
+/// permissions. Unix creates `0o600`. Windows creates the file with an
+/// owner+SYSTEM DACL (no inherited Everyone/Users window) and re-applies
+/// that DACL after every write, including replace of an existing file.
+/// The token is written before the daemon starts serving so a client that
+/// observes the port file can also read a valid token.
 fn write_daemon_token_file_at(control_state_dir: &ControlStateDir, token: &str) -> io::Result<()> {
     let path = daemon_dir_for(control_state_dir)?.join(daemon_token_file_name());
 
@@ -619,7 +623,16 @@ fn write_daemon_token_file_at(control_state_dir: &ControlStateDir, token: &str) 
         Ok(())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        if let Err(error) = write_daemon_token_file_windows(&path, token) {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         std::fs::write(&path, token.as_bytes()).map_err(|e| {
             io::Error::new(
@@ -628,6 +641,218 @@ fn write_daemon_token_file_at(control_state_dir: &ControlStateDir, token: &str) 
             )
         })
     }
+}
+
+/// Create (or truncate) the token file with an owner+SYSTEM DACL already
+/// attached, then re-assert that DACL. `CREATE_ALWAYS` ignores the descriptor
+/// when the file already exists, so the post-write restrict still covers replace.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn write_daemon_token_file_windows(path: &Path, token: &str) -> io::Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+
+    use windows::Win32::Foundation::{GENERIC_WRITE, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows::Win32::Storage::FileSystem::{
+        CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE,
+    };
+    use windows::core::PCWSTR;
+
+    fn token_error(path: &Path, what: &str, err: impl std::fmt::Display) -> io::Error {
+        io::Error::other(format!("{what} at {}: {err}", path.display()))
+    }
+
+    let sddl: Vec<u16> = "D:PAI(A;;FA;;;OW)(A;;FA;;;SY)"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `sddl` is NUL-terminated SDDL; on success `sd` is LocalAlloc.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &raw mut sd,
+            None,
+        )
+        .map_err(|e| token_error(path, "building owner-only token security descriptor", e))?;
+    }
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let attrs = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: false.into(),
+    };
+    // SAFETY: `wide` is NUL-terminated; `attrs` borrows `sd` for this call.
+    let created = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            GENERIC_WRITE.0,
+            FILE_SHARE_NONE,
+            Some(&raw const attrs),
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    };
+    // SAFETY: paired LocalFree for ConvertStringSecurityDescriptorToSecurityDescriptorW.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    }
+    let handle = created.map_err(|e| token_error(path, "creating daemon token file", e))?;
+    // SAFETY: CreateFileW returned an owned handle; File takes close responsibility.
+    let mut file = unsafe { File::from_raw_handle(handle.0 as RawHandle) };
+    file.write_all(token.as_bytes())
+        .map_err(|e| token_error(path, "writing daemon token file", e))?;
+    drop(file);
+    restrict_daemon_token_dacl(path)
+}
+
+/// Replace `path`'s DACL with owner+SYSTEM and mark it protected so parent
+/// Everyone/Users ACEs cannot reappear by inheritance. `unsafe` is FFI-only;
+/// the crate-level `unsafe_code = "deny"` is opted out per-item, matching
+/// `cli/update.rs`.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn restrict_daemon_token_dacl(path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE};
+    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, CreateWellKnownSid,
+        DACL_SECURITY_INFORMATION, GetLengthSid, GetTokenInformation, InitializeAcl,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER,
+        TokenUser, WinLocalSystemSid,
+    };
+    use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::core::PCWSTR;
+
+    fn dacl_error(path: &Path, what: &str, err: impl std::fmt::Display) -> io::Error {
+        io::Error::other(format!("{what} at {}: {err}", path.display()))
+    }
+
+    let mut token = HANDLE::default();
+    // SAFETY: GetCurrentProcess returns a pseudo-handle that must not be closed.
+    // OpenProcessToken writes a real handle into `token` on success.
+    unsafe {
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token)
+            .map_err(|e| dacl_error(path, "opening process token for daemon token DACL", e))?;
+    }
+
+    let mut needed = 0u32;
+    // SAFETY: `token` is the live handle just opened. A null information
+    // buffer is the documented way to learn the TOKEN_USER size.
+    unsafe {
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &raw mut needed);
+    }
+    if needed == 0 {
+        // SAFETY: `token` is the handle we opened above and have not closed.
+        unsafe {
+            let _ = CloseHandle(token);
+        }
+        return Err(dacl_error(
+            path,
+            "querying token user SID size for daemon token DACL",
+            "empty size",
+        ));
+    }
+
+    let mut user_info = vec![0u64; (needed as usize).div_ceil(8)];
+    // SAFETY: `user_info` is large enough for `needed` bytes and lives across
+    // the call; `token` is still the open process token.
+    let queried = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(user_info.as_mut_ptr().cast()),
+            needed,
+            &raw mut needed,
+        )
+    };
+    // SAFETY: paired close for the OpenProcessToken handle above.
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    queried.map_err(|e| dacl_error(path, "querying token user SID for daemon token DACL", e))?;
+
+    // SAFETY: GetTokenInformation wrote a TOKEN_USER into `user_info`; the
+    // embedded SID pointer stays inside this buffer until AddAccessAllowedAce
+    // copies it into the ACL.
+    let user_sid = unsafe { (*user_info.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+
+    #[repr(C, align(4))]
+    struct SidBuf([u8; SECURITY_MAX_SID_SIZE as usize]);
+    let mut system_sid_buf = SidBuf([0; SECURITY_MAX_SID_SIZE as usize]);
+    let mut system_sid_len = SECURITY_MAX_SID_SIZE;
+    // SAFETY: `system_sid_buf` is DWORD-aligned and at least SECURITY_MAX_SID_SIZE.
+    unsafe {
+        CreateWellKnownSid(
+            WinLocalSystemSid,
+            None,
+            Some(PSID(system_sid_buf.0.as_mut_ptr().cast())),
+            &raw mut system_sid_len,
+        )
+        .map_err(|e| dacl_error(path, "creating SYSTEM SID for daemon token DACL", e))?;
+    }
+    let system_sid = PSID(system_sid_buf.0.as_mut_ptr().cast());
+
+    // SAFETY: both SIDs were just produced by documented Win32 calls.
+    let user_len = unsafe { GetLengthSid(user_sid) } as usize;
+    let system_len = unsafe { GetLengthSid(system_sid) } as usize;
+    let acl_bytes = std::mem::size_of::<ACL>()
+        + 2 * (std::mem::size_of::<ACCESS_ALLOWED_ACE>().saturating_sub(4))
+        + user_len
+        + system_len
+        + 32;
+    let mut acl_storage = vec![0u32; acl_bytes.div_ceil(4)];
+    let acl = acl_storage.as_mut_ptr().cast::<ACL>();
+    let acl_len = u32::try_from(acl_storage.len() * 4).expect("ACL buffer fits in u32");
+    // SAFETY: `acl` points at DWORD-aligned `acl_storage` of `acl_len` bytes.
+    // AddAccessAllowedAce copies each SID into that ACL.
+    unsafe {
+        InitializeAcl(acl, acl_len, ACL_REVISION)
+            .map_err(|e| dacl_error(path, "initializing daemon token DACL", e))?;
+        AddAccessAllowedAce(acl, ACL_REVISION, FILE_ALL_ACCESS.0, user_sid)
+            .map_err(|e| dacl_error(path, "adding owner ACE to daemon token DACL", e))?;
+        AddAccessAllowedAce(acl, ACL_REVISION, FILE_ALL_ACCESS.0, system_sid)
+            .map_err(|e| dacl_error(path, "adding SYSTEM ACE to daemon token DACL", e))?;
+    }
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path; `acl` is the initialized
+    // DACL. PROTECTED_DACL_SECURITY_INFORMATION stops parent Everyone/Users
+    // ACEs from merging back onto the file.
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(acl.cast_const()),
+            None,
+        )
+    };
+    if err != ERROR_SUCCESS {
+        return Err(dacl_error(path, "setting daemon token DACL", err.0));
+    }
+    Ok(())
 }
 
 fn env_var_truthy(name: &str) -> bool {
@@ -643,12 +868,7 @@ fn env_var_truthy(name: &str) -> bool {
 }
 
 fn is_loopback_bind_host(host: &str) -> bool {
-    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
-    trimmed.eq_ignore_ascii_case("localhost")
-        || trimmed
-            .parse::<IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false)
+    crate::paths::is_loopback_bind_host(host)
 }
 
 fn resolve_daemon_bind_host(default_host: &str) -> anyhow::Result<String> {
@@ -7630,6 +7850,277 @@ mod tests {
         daemon_dir_for(&test_control_state(home))
             .expect("create test daemon control-state directory")
             .join(file_name)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_token_acl_is_owner_only_mode_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = TempDir::new().expect("daemon home");
+        let control_state_dir = test_control_state(home.path());
+        write_daemon_token_file_at(&control_state_dir, "unix-token").expect("write token");
+        let path = test_daemon_path(home.path(), daemon_token_file_name());
+        let mode = std::fs::metadata(&path)
+            .expect("token metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "Unix daemon token file must stay 0o600");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn daemon_token_acl_excludes_everyone_and_users_read() {
+        let home = TempDir::new().expect("daemon home");
+        let control_state_dir = test_control_state(home.path());
+        write_daemon_token_file_at(&control_state_dir, "first").expect("first write");
+        let path = test_daemon_path(home.path(), daemon_token_file_name());
+        grant_everyone_read_for_test(&path);
+        assert!(
+            token_dacl_grants_content_read_to_well_known(
+                &path,
+                windows::Win32::Security::WinWorldSid
+            ),
+            "oracle must observe an Everyone read ACE before the rewrite"
+        );
+        write_daemon_token_file_at(&control_state_dir, "second").expect("rewrite token");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("owner can still read token"),
+            "second"
+        );
+        assert!(
+            !token_dacl_grants_content_read_to_well_known(
+                &path,
+                windows::Win32::Security::WinWorldSid
+            ),
+            "rewritten token DACL must not grant Everyone read"
+        );
+        assert!(
+            !token_dacl_grants_content_read_to_well_known(
+                &path,
+                windows::Win32::Security::WinBuiltinUsersSid
+            ),
+            "rewritten token DACL must not grant Users read"
+        );
+    }
+
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    fn grant_everyone_read_for_test(path: &Path) {
+        use std::os::windows::ffi::OsStrExt;
+
+        use windows::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
+        use windows::Win32::Security::Authorization::{
+            EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SetEntriesInAclW,
+            SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
+        };
+        use windows::Win32::Security::{
+            ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, NO_INHERITANCE, PSID,
+            SECURITY_MAX_SID_SIZE, WinWorldSid,
+        };
+        use windows::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+        use windows::core::{PCWSTR, PWSTR};
+
+        #[repr(C, align(4))]
+        struct SidBuf([u8; SECURITY_MAX_SID_SIZE as usize]);
+        let mut world = SidBuf([0; SECURITY_MAX_SID_SIZE as usize]);
+        let mut world_len = SECURITY_MAX_SID_SIZE;
+        // SAFETY: `world` is DWORD-aligned and large enough for a well-known SID.
+        unsafe {
+            CreateWellKnownSid(
+                WinWorldSid,
+                None,
+                Some(PSID(world.0.as_mut_ptr().cast())),
+                &raw mut world_len,
+            )
+            .expect("CreateWellKnownSid Everyone");
+        }
+
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut sd = windows::Win32::Security::PSECURITY_DESCRIPTOR::default();
+        let mut old_dacl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated; out-pointers receive a LocalAlloc SD
+        // whose DACL alias we must not free separately.
+        let get_err = unsafe {
+            windows::Win32::Security::Authorization::GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&raw mut old_dacl),
+                None,
+                &raw mut sd,
+            )
+        };
+        assert_eq!(get_err, ERROR_SUCCESS, "GetNamedSecurityInfoW for grant");
+
+        let entry = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_GENERIC_READ.0,
+            grfAccessMode: GRANT_ACCESS,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+                ptstrName: PWSTR(world.0.as_mut_ptr().cast()),
+            },
+        };
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        let old = if old_dacl.is_null() {
+            None
+        } else {
+            Some(old_dacl.cast_const())
+        };
+        // SAFETY: `entry.Trustee` points at `world` for this call; `old` is
+        // either null or the DACL inside `sd`.
+        let merge_err = unsafe { SetEntriesInAclW(Some(&[entry]), old, &raw mut new_dacl) };
+        assert_eq!(merge_err, ERROR_SUCCESS, "SetEntriesInAclW Everyone read");
+        // SAFETY: `new_dacl` is the LocalAlloc ACL from SetEntriesInAclW.
+        let set_err = unsafe {
+            SetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(new_dacl.cast_const()),
+                None,
+            )
+        };
+        assert_eq!(
+            set_err, ERROR_SUCCESS,
+            "SetNamedSecurityInfoW Everyone read"
+        );
+        unsafe {
+            if !new_dacl.is_null() {
+                let _ = LocalFree(Some(HLOCAL(new_dacl.cast())));
+            }
+            if !sd.0.is_null() {
+                let _ = LocalFree(Some(HLOCAL(sd.0)));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    fn token_dacl_grants_content_read_to_well_known(
+        path: &Path,
+        sid_type: windows::Win32::Security::WELL_KNOWN_SID_TYPE,
+    ) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+
+        use windows::Win32::Foundation::{
+            ERROR_SUCCESS, GENERIC_ALL, GENERIC_READ, HLOCAL, LocalFree,
+        };
+        use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows::Win32::Security::{
+            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CreateWellKnownSid,
+            DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, PSID,
+            SECURITY_MAX_SID_SIZE,
+        };
+        use windows::Win32::Storage::FileSystem::FILE_READ_DATA;
+        use windows::core::PCWSTR;
+
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut sd = windows::Win32::Security::PSECURITY_DESCRIPTOR::default();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated; on success `sd` owns a LocalAlloc
+        // descriptor and `dacl` aliases memory inside it.
+        let get_err = unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&raw mut dacl),
+                None,
+                &raw mut sd,
+            )
+        };
+        assert_eq!(get_err, ERROR_SUCCESS, "GetNamedSecurityInfoW inspect DACL");
+        // NULL DACL is world-readable.
+        if dacl.is_null() {
+            unsafe {
+                if !sd.0.is_null() {
+                    let _ = LocalFree(Some(HLOCAL(sd.0)));
+                }
+            }
+            return true;
+        }
+
+        #[repr(C, align(4))]
+        struct SidBuf([u8; SECURITY_MAX_SID_SIZE as usize]);
+        let mut sid_buf = SidBuf([0; SECURITY_MAX_SID_SIZE as usize]);
+        let mut sid_len = SECURITY_MAX_SID_SIZE;
+        // SAFETY: `sid_buf` is DWORD-aligned and large enough for the well-known SID.
+        unsafe {
+            CreateWellKnownSid(
+                sid_type,
+                None,
+                Some(PSID(sid_buf.0.as_mut_ptr().cast())),
+                &raw mut sid_len,
+            )
+            .expect("CreateWellKnownSid for DACL inspect");
+        }
+        let wanted = PSID(sid_buf.0.as_mut_ptr().cast());
+
+        let mut info = ACL_SIZE_INFORMATION::default();
+        // SAFETY: `dacl` aliases the LocalAlloc descriptor; `info` is the out-buffer.
+        unsafe {
+            GetAclInformation(
+                dacl,
+                (&raw mut info).cast(),
+                u32::try_from(std::mem::size_of::<ACL_SIZE_INFORMATION>()).expect("ACL info size"),
+                AclSizeInformation,
+            )
+            .expect("GetAclInformation");
+        }
+
+        let content_read = FILE_READ_DATA.0 | GENERIC_READ.0 | GENERIC_ALL.0;
+        let mut grants = false;
+        for index in 0..info.AceCount {
+            let mut ace_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            unsafe {
+                GetAce(dacl, index, &raw mut ace_ptr).expect("GetAce");
+            }
+            if ace_ptr.is_null() {
+                continue;
+            }
+            // SAFETY: GetAce returned an ACE from `dacl`; ACCESS_ALLOWED_ACE
+            // SidStart is the first DWORD of the SID for AceType 0.
+            let ace = unsafe { &*ace_ptr.cast::<ACCESS_ALLOWED_ACE>() };
+            if ace.Header.AceType != 0 || ace.Mask & content_read == 0 {
+                continue;
+            }
+            let ace_sid = PSID(
+                std::ptr::from_ref(&ace.SidStart)
+                    .cast::<std::ffi::c_void>()
+                    .cast_mut(),
+            );
+            if unsafe { EqualSid(ace_sid, wanted) }.is_ok() {
+                grants = true;
+                break;
+            }
+        }
+
+        unsafe {
+            if !sd.0.is_null() {
+                let _ = LocalFree(Some(HLOCAL(sd.0)));
+            }
+        }
+        grants
     }
 
     async fn spawn_test_daemon(bind_host: &str, home: &Path) -> anyhow::Result<DaemonHandle> {

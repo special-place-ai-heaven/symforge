@@ -9,8 +9,9 @@
 //! Dark payload simplifications, in the `runtime.rs` idiom: observations
 //! are (source, stamp) pairs and stamp derivation is an injected closure so
 //! oracles can drive unwinds; the live `src/watcher/` event vocabulary is
-//! adapted at the cut (T064), not here — the darkness sweep forbids this
-//! module's name in live files. The authority SEMANTICS — strictly
+//! adapted at the cut (T064), not here. Production already names
+//! `ObserverId` from that watcher and from `src/live_index/persist.rs`.
+//! The authority SEMANTICS — strictly
 //! monotonic cut tokens, coalescing with a hard bound,
 //! predecessor-drain-before-successor with a bound successor and
 //! producer-fenced queueing, and unwind retention — are exact. Two deltas
@@ -25,9 +26,9 @@
 //! `authority.rs::ObserverPhase`/`ObserverToken` (the per-source
 //! authority-side projection); unifying the two identities is T064 work.
 //!
-//! **Nothing in production calls this module.** Only the Slice 4 oracle
-//! suites and this directory do; activation (T064/T066) is the only planned
-//! production caller.
+//! Production names `ObserverId` from `src/watcher/mod.rs` and
+//! `src/live_index/persist.rs`. The accumulator, cuts, and handoff stay
+//! in-directory and oracle-suite only.
 
 use std::collections::BTreeMap;
 

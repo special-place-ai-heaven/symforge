@@ -339,6 +339,12 @@ pub struct QuerySymbol {
     pub source: Option<Vec<u8>>,
     pub source_byte_start: u64,
     pub source_byte_end: u64,
+    /// Leading doc-comment byte range when the parser attached one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_byte_start: Option<u64>,
+    /// Exclusive end of the attached doc-comment range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_byte_end: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -442,6 +448,12 @@ pub struct QuerySymbolChange {
     pub after_hash: Option<String>,
     pub before_line: Option<u32>,
     pub after_line: Option<u32>,
+    /// First-line signature on the old side when the symbol existed before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_signature: Option<String>,
+    /// First-line signature on the new side when the symbol exists after.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

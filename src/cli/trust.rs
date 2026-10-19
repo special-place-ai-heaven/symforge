@@ -162,7 +162,7 @@ fn write_cli_store(path: &Path, store: &CliTrustStore) -> anyhow::Result<()> {
     }
     let json =
         serde_json::to_string_pretty(store).context("ProjectConfigTrustStoreSerializeFailed")?;
-    fs::write(path, json)
+    crate::idempotency::write_bytes_atomic(path, json.as_bytes())
         .with_context(|| format!("ProjectConfigTrustStoreWriteFailed: {}", path.display()))?;
     Ok(())
 }
@@ -195,4 +195,128 @@ fn trust_status_label(status: &TrustStatus) -> &'static str {
 
 fn one_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct BlockNewFilesInParent {
+        parent: PathBuf,
+        #[cfg(unix)]
+        previous_mode: u32,
+        #[cfg(windows)]
+        user: String,
+    }
+
+    impl BlockNewFilesInParent {
+        fn engage(parent: &Path) -> Self {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let metadata = fs::metadata(parent).expect("parent metadata");
+                let previous_mode = metadata.permissions().mode();
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(0o555);
+                fs::set_permissions(parent, permissions).expect("block new files");
+                Self {
+                    parent: parent.to_path_buf(),
+                    previous_mode,
+                }
+            }
+            #[cfg(windows)]
+            {
+                let user = whoami_user();
+                let status = crate::process_util::hidden_command("icacls")
+                    .arg(parent)
+                    .arg("/deny")
+                    .arg(format!("{user}:(WD,AD)"))
+                    .output()
+                    .expect("icacls deny");
+                assert!(
+                    status.status.success(),
+                    "icacls deny failed: {}",
+                    String::from_utf8_lossy(&status.stderr)
+                );
+                Self {
+                    parent: parent.to_path_buf(),
+                    user,
+                }
+            }
+        }
+    }
+
+    impl Drop for BlockNewFilesInParent {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(metadata) = fs::metadata(&self.parent) {
+                    let mut permissions = metadata.permissions();
+                    permissions.set_mode(self.previous_mode);
+                    let _ = fs::set_permissions(&self.parent, permissions);
+                }
+            }
+            #[cfg(windows)]
+            {
+                let _ = crate::process_util::hidden_command("icacls")
+                    .arg(&self.parent)
+                    .arg("/remove:d")
+                    .arg(&self.user)
+                    .output();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn whoami_user() -> String {
+        let output = crate::process_util::hidden_command("whoami")
+            .output()
+            .expect("whoami");
+        assert!(output.status.success(), "whoami failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn trust_store_atomic() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("edit-safety").join("trust.json");
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, r#"{"schema_version":1,"records":{}}"#).expect("seed previous");
+
+        let record = TrustRecord {
+            project_key: "proj-key".to_string(),
+            trusted_hash: "cd".repeat(32),
+            trusted_at: "2026-09-18T00:00:00Z".to_string(),
+            writer: "symforge/test".to_string(),
+        };
+        let mut store = CliTrustStore::default();
+        store
+            .records
+            .insert(record.project_key.clone(), record.clone());
+
+        {
+            let parent = path.parent().expect("parent");
+            let _fence = BlockNewFilesInParent::engage(parent);
+            write_cli_store(&path, &store)
+                .expect_err("replace must not run while new files are blocked");
+            let kept = fs::read_to_string(&path).expect("read previous");
+            let loaded: CliTrustStore =
+                serde_json::from_str(&kept).expect("previous JSON parseable");
+            assert!(
+                loaded.records.is_empty(),
+                "crash before replace must keep the previous store"
+            );
+            assert_eq!(loaded.schema_version, 1);
+        }
+
+        write_cli_store(&path, &store).expect("completed persist");
+        let loaded: CliTrustStore =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(
+            loaded.records.get("proj-key").map(|row| &row.trusted_hash),
+            Some(&record.trusted_hash),
+            "completed persist is the new store"
+        );
+    }
 }

@@ -245,7 +245,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
@@ -350,7 +350,7 @@ jobs:
           matches=$(grep -cE 'test result: ok\. [1-9][0-9]* passed' /tmp/embed-parity-replay.log || true)
           test "$matches" -ge 2
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 20
 
@@ -461,7 +461,7 @@ jobs:
 
       - name: Upload code-owned Feature 020 V11 pre-approval evidence
         if: needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: feature-020-v11-preapproval-evidence
           path: target/ci/lifecycle-v11/
@@ -491,7 +491,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
@@ -558,7 +558,7 @@ jobs:
           echo "safe_path=$safe_path" >> "$GITHUB_OUTPUT"
 
       - name: Download code-owned Feature 020 V11 pre-approval evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: feature-020-v11-preapproval-evidence
           path: target/ci/lifecycle-v11
@@ -1944,7 +1944,7 @@ jobs:
           node scripts/validate-lifecycle-oracle-traceability.cjs --require-materialized --evidence target/ci/lifecycle-v11/release-evidence.json
 
       - name: Upload closed Feature 020 V11 lifecycle evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: feature-020-v11-closed-release-evidence-${{ steps.gate.outputs.release_ref }}
           path: target/ci/lifecycle-v11/
@@ -2338,7 +2338,7 @@ jobs:
         run: cp "${{ matrix.binary }}" "${{ matrix.artifact }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -2364,7 +2364,7 @@ jobs:
       - name: Verify release versions
         run: python execution/version_sync.py check --tag "${{ needs.prepare-release.outputs.tag_name }}"
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 20
 
@@ -2402,7 +2402,7 @@ jobs:
         run: npm test
 
       - name: Download built binary artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: symforge-*
           path: dist-binaries
@@ -2443,7 +2443,7 @@ jobs:
           ls -l dist-npm
 
       - name: Upload npm package artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: npm-package
           path: dist-npm/*.tgz
@@ -2469,14 +2469,14 @@ jobs:
         run: bash execution/ensure_gh.sh
 
       - name: Download release binary artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: symforge-*
           path: artifacts
           merge-multiple: true
 
       - name: Download npm package artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: npm-package
           path: artifacts
@@ -2539,13 +2539,13 @@ jobs:
         with:
           python-version: '3.12'
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
       - name: Download npm package artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: npm-package
           path: dist

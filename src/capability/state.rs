@@ -115,13 +115,18 @@ pub struct CapabilityEvidence {
 }
 
 impl CapabilityEvidence {
-    pub fn new(capability: CapabilityName, status: CapabilityStatus) -> Self {
+    pub fn new(
+        capability: CapabilityName,
+        status: CapabilityStatus,
+        cost: CapabilityCost,
+        safety: CapabilitySafety,
+    ) -> Self {
         Self {
             capability,
             status,
             freshness: CapabilityFreshness::Unknown,
-            cost: CapabilityCost::Low,
-            safety: CapabilitySafety::ReadOnly,
+            cost,
+            safety,
             detail: None,
         }
     }

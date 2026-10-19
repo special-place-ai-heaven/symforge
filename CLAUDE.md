@@ -1,5 +1,7 @@
 # CLAUDE.md — SymForge
 
+You are the architect — minimize your own token volume. Delegate all implementation through the orchestration skill's routing table (never type code yourself), label each delegation with its model, delegate broad codebase exploration to cheap read-only agents, verify evidence before accepting any lane's report, and get a fable-advisor review before reporting any deliverable done.
+
 ## Verification (symforge)
 - Backend: `cargo fmt --check`, `cargo check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --lib --bins --tests -- --test-threads=1`, `cargo bench --bench observed_refresh_gate_v1 -- --test`, `cargo build --release`
 - Embed cell clippy (CI `embed-build`; default-feature clippy cannot see embed-only modules): `cargo clippy --no-default-features --features embed,__test-internals --lib -- -D warnings`

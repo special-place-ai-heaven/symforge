@@ -1330,6 +1330,8 @@ pub(super) fn symbol_row(
         source: None,
         source_byte_start: 0,
         source_byte_end: 0,
+        doc_byte_start: symbol.doc_byte_range.map(|(start, _)| start as u64),
+        doc_byte_end: symbol.doc_byte_range.map(|(_, end)| end as u64),
     })
 }
 
@@ -2119,7 +2121,7 @@ fn git_blob(
     Ok((commit_id, Some(blob.content().to_vec())))
 }
 
-type DiffSymbols = BTreeMap<(String, String, u32), (String, u32)>;
+type DiffSymbols = BTreeMap<(String, String, u32), (String, u32, String)>;
 
 fn diff_symbols(path: &str, bytes: Option<&[u8]>) -> Result<(DiffSymbols, bool), QueryRefusalKind> {
     let Some(bytes) = bytes else {
@@ -2139,9 +2141,14 @@ fn diff_symbols(path: &str, bytes: Option<&[u8]>) -> Result<(DiffSymbols, bool),
         let body = bytes
             .get(symbol.byte_range.0 as usize..symbol.byte_range.1 as usize)
             .ok_or(QueryRefusalKind::InvalidSpan)?;
+        let signature = super::guidance::edit_body::extract_signature(bytes, symbol.byte_range);
         symbols.insert(
             (kind, symbol.name, *occurrence),
-            (crate::hash::digest_hex(body), symbol.line_range.0 + 1),
+            (
+                crate::hash::digest_hex(body),
+                symbol.line_range.0 + 1,
+                signature,
+            ),
         );
         *occurrence += 1;
     }
@@ -2189,11 +2196,15 @@ fn diff(
         };
         let before_hash = before.map(|entry| entry.0.clone());
         let after_hash = after.map(|entry| entry.0.clone());
+        let before_signature = before.map(|entry| entry.2.clone());
+        let after_signature = after.map(|entry| entry.2.clone());
         let size = kind.len()
             + name.len()
             + change.len()
             + before_hash.as_ref().map_or(0, String::len)
-            + after_hash.as_ref().map_or(0, String::len);
+            + after_hash.as_ref().map_or(0, String::len)
+            + before_signature.as_ref().map_or(0, String::len)
+            + after_signature.as_ref().map_or(0, String::len);
         if !budget.row(size) {
             break;
         }
@@ -2206,6 +2217,8 @@ fn diff(
             after_hash,
             before_line: before.map(|entry| entry.1),
             after_line: after.map(|entry| entry.1),
+            before_signature,
+            after_signature,
         });
     }
     Ok(QuerySymbolDiff {

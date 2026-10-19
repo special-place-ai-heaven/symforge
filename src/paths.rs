@@ -1,4 +1,5 @@
 use std::io;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use crate::domain::{AccessErrorKind, ControlStateDir, ControlStatePlacement, ProjectStateDir};
@@ -34,6 +35,67 @@ pub(crate) fn state_directory_metadata_is_unsafe(metadata: &std::fs::Metadata) -
         metadata.file_type().is_symlink(),
         metadata_is_reparse_point(metadata),
     )
+}
+
+/// True when `symlink_metadata` describes a symlink or a Windows reparse point
+/// (including junctions that `file_type().is_symlink()` does not report).
+#[must_use]
+pub(crate) fn metadata_is_symlink_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink() || metadata_is_reparse_point(metadata)
+}
+
+/// `symlink_metadata` then refuse to treat a link/reparse as a regular file.
+///
+/// Callers that would otherwise `fs::read` / `File::open` / `Path::is_file()`
+/// (those follow) must use this first. Missing paths stay `Err(NotFound)`.
+pub(crate) fn path_must_be_regular_non_link(path: &Path) -> io::Result<std::fs::Metadata> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata_is_symlink_or_reparse(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to follow a symlink or reparse point at {}",
+                path.display()
+            ),
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("not a regular file: {}", path.display()),
+        ));
+    }
+    Ok(metadata)
+}
+
+/// Whether `abs_path` resolves inside the repo root implied by stripping
+/// `relative_path` from it. Used by single-path ingest so a nested junction
+/// (`junc/secret.txt`) cannot be indexed when the leaf itself is a regular
+/// file. Unresolvable paths (missing leaf) return true so NotFound still
+/// surfaces from scout.
+pub(crate) fn canonical_abs_stays_under_relative_root(
+    abs_path: &Path,
+    relative_path: &str,
+) -> bool {
+    let component_count = Path::new(relative_path).components().count();
+    let Some(root) = abs_path.ancestors().nth(component_count) else {
+        return false;
+    };
+    match (root.canonicalize(), abs_path.canonicalize()) {
+        (Ok(canon_root), Ok(canon_path)) => canon_path.starts_with(&canon_root),
+        _ => true,
+    }
+}
+
+/// Same loopback names the daemon already accepts (`localhost`, loopback IPs).
+#[must_use]
+pub(crate) fn is_loopback_bind_host(host: &str) -> bool {
+    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
+    trimmed.eq_ignore_ascii_case("localhost")
+        || trimmed
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 pub const SYMFORGE_DIR_NAME: &str = ".symforge";
@@ -744,6 +806,98 @@ mod tests {
     use super::*;
 
     use tempfile::TempDir;
+
+    #[test]
+    fn regular_file_is_accepted_as_non_link() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("plain.txt");
+        std::fs::write(&path, b"ok").expect("write");
+        let meta = path_must_be_regular_non_link(&path).expect("regular file");
+        assert!(meta.file_type().is_file());
+        assert!(!metadata_is_symlink_or_reparse(&meta));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_symlink_is_refused_as_non_link() {
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("target.txt");
+        let link = dir.path().join("link.txt");
+        std::fs::write(&target, b"secret").expect("write target");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let err = path_must_be_regular_non_link(&link).expect_err("symlink must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            !err.to_string().contains("secret"),
+            "refusal must not carry target bytes"
+        );
+        let target_ok = path_must_be_regular_non_link(&target).expect("positive control");
+        assert!(target_ok.file_type().is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_dir_symlink_abs_does_not_stay_under_repo_root() {
+        let repo = TempDir::new().expect("repo");
+        let outside = TempDir::new().expect("outside");
+        std::fs::write(outside.path().join("secret.txt"), b"secret").expect("secret");
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("junc")).expect("dir symlink");
+        let nested = repo.path().join("junc/secret.txt");
+        assert!(
+            !canonical_abs_stays_under_relative_root(&nested, "junc/secret.txt"),
+            "canonicalize must place the nested file outside the repo"
+        );
+        let plain = repo.path().join("plain.txt");
+        std::fs::write(&plain, b"ok").expect("plain");
+        assert!(canonical_abs_stays_under_relative_root(&plain, "plain.txt"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_is_reported_as_symlink_or_reparse() {
+        let root = TempDir::new().expect("temp root");
+        let outside = TempDir::new().expect("outside");
+        std::fs::write(outside.path().join("escaped.txt"), b"outside").expect("outside file");
+        let junction = root.path().join("link");
+        let status = crate::process_util::hidden_command("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(outside.path())
+            .output()
+            .expect("mklink runs");
+        assert!(
+            status.status.success(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let meta = std::fs::symlink_metadata(&junction).expect("symlink_metadata");
+        assert!(
+            metadata_is_symlink_or_reparse(&meta),
+            "a junction must be unsafe to follow"
+        );
+        path_must_be_regular_non_link(&junction)
+            .expect_err("a junction is not a regular non-link file");
+        let nested = junction.join("escaped.txt");
+        assert!(
+            !canonical_abs_stays_under_relative_root(&nested, "link/escaped.txt"),
+            "nested file under a junction must canonicalize outside the repo"
+        );
+        let regular = root.path().join("plain.txt");
+        std::fs::write(&regular, b"ok").expect("write");
+        path_must_be_regular_non_link(&regular).expect("positive control");
+    }
+
+    #[test]
+    fn loopback_bind_hosts_are_localhost_and_loopback_ips() {
+        assert!(is_loopback_bind_host("127.0.0.1"));
+        assert!(is_loopback_bind_host("localhost"));
+        assert!(is_loopback_bind_host("LOCALHOST"));
+        assert!(is_loopback_bind_host("[::1]"));
+        assert!(is_loopback_bind_host("::1"));
+        assert!(!is_loopback_bind_host("0.0.0.0"));
+        assert!(!is_loopback_bind_host("192.168.1.1"));
+        assert!(!is_loopback_bind_host(""));
+    }
 
     #[test]
     fn every_state_consumer_requires_its_typed_owner() {

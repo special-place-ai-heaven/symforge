@@ -32,7 +32,27 @@ pub(super) fn scan_doc_range(
     if spec.comment_node_types.is_empty() && spec.custom_doc_check.is_none() {
         return None;
     }
+    if let Some(range) = scan_doc_range_direct(node, source, spec) {
+        return Some(range);
+    }
+    let mut current = *node;
+    while let Some(parent) = current.parent() {
+        if matches!(
+            parent.kind(),
+            "export_statement" | "lexical_declaration" | "variable_declaration"
+        ) {
+            if let Some(range) = scan_doc_range_direct(&parent, source, spec) {
+                return Some(range);
+            }
+            current = parent;
+        } else {
+            break;
+        }
+    }
+    None
+}
 
+fn scan_doc_range_direct(node: &Node, source: &str, spec: &DocCommentSpec) -> Option<(u32, u32)> {
     let mut earliest_start: Option<u32> = None;
     let mut latest_end: Option<u32> = None;
     let mut next_start_byte = node.start_byte();

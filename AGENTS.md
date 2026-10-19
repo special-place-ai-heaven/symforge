@@ -1,5 +1,29 @@
 # AGENTS.md
 
+<!-- PROJECT-TEAM START -->
+## Development team dispatch
+
+Stable project ID: `symforge`. Rust MCP server and embed engine: rust-pro. Verify supported configurations and affected consumers for public API changes.
+
+For nontrivial engineering, the main session MUST read
+~/.codex/skills/project-team/SKILL.md and dispatch implementation to a matching
+named custom agent before editing production code. This explicit routing
+replaces optional dispatch suggestions; all repository product rules below
+remain authoritative. Trivial mechanical edits can stay with the lead.
+Use five role slots only as needed: one lead, appropriate engineer(s),
+verifier, and independent reviewer for meaningful changes.
+
+Handoffs include original goal, acceptance criteria, exact checkout/project ID,
+ownership, dependencies, revision/dirty changes, constraints/authorization
+and required checks. Preserve others' edits. Only the lead dispatches agents;
+one heavy suite at a time. Index the exact checkout through SymForge before
+code work and reindex on root changes. Execute through Terminal Commander
+with bounded signals and terminal receipts; continue incomplete jobs, never
+read silence/null exits as passes. Web proof uses Charlotte. Explain actual
+tool limits before permitted fallback; never bypass secret-bearing refusals.
+Production/external actions require existing explicit authorization.
+<!-- PROJECT-TEAM END -->
+
 This repository is `symforge`.
 
 It is a Rust-native, coding-first MCP project for code indexing, retrieval, and recovery.
@@ -266,6 +290,11 @@ Direct file reads are still appropriate for:
 - configuration files where exact raw contents are the point of inspection
 
 Do not default to broad raw file reads for source-code inspection when SymForge can answer the question more directly.
+
+## Branch, Worktree & Tooling Hygiene
+
+- **OMP `bash` tool finite-command rule**: Never pass a non-null `name` or `ready` parameter to `bash` for finite commands (`name` activates `startService()` managed service mode, which rejects `timeout` and `async`); always pass `name: null, ready: null`.
+- **Branch & worktree consolidation rule**: When a PR lands (especially via squash-merge) or a worktree slice completes, immediately verify patch/tree equivalence (`git patch-id` / `git diff`) and prune superseded local branches, remote branches, and worktrees so diverged/unmerged branches never accumulate.
 
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
