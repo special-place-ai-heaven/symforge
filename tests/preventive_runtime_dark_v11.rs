@@ -1142,9 +1142,9 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // + capability-evidence-explicit): same 89 excluded files, no new edge into
 // src/index_lifecycle or server_api.rs.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "69b5bfca0f712e9dc57acf3474deb30ad6b6ea2d31b9fc29204eccc902218cf6",
+    "3d5ea7fdfbb1516fcacb871c6c758f8417c4a2b3d6cfc29ce5a1cd64a6db2913",
     89,
-    2203795,
+    2207839,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1302,9 +1302,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // + capability-evidence-explicit): same 312 files, no new caller file and no
 // new edge into src/index_lifecycle or server_api.rs.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "edc0f7be26470b625df0ec2966ebd206e051acbb30b8435ee2c32151d241874c",
+    "1356b0850ce5e967bee83e265eea318080068b8e5dc74bf1183b57d22ba55857",
     312,
-    12123021,
+    12137926,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

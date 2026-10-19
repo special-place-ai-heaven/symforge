@@ -1955,10 +1955,7 @@ pub(crate) fn git_root_above(start: &Path) -> Option<PathBuf> {
         if current.join(".git").exists() && !is_forbidden_root(&current) {
             return Some(current);
         }
-        match current.parent() {
-            Some(parent) => current = parent.to_path_buf(),
-            None => return None,
-        }
+        current = current.parent()?.to_path_buf();
     }
 }
 
@@ -2441,18 +2438,13 @@ pub fn parse_root_uri(uri: &str) -> Option<PathBuf> {
     // to the path component only when the authority is `localhost`/empty.
     let rest = if let Some(after) = trimmed.strip_prefix("file://") {
         // `after` is `<authority><path>`; the path begins at the first `/`.
-        match after.find('/') {
-            Some(idx) => {
-                let authority = &after[..idx];
-                if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
-                    &after[idx..]
-                } else {
-                    // Remote/UNC host — not a local workspace root.
-                    return None;
-                }
-            }
-            // `file://something` with no path — nothing usable.
-            None => return None,
+        let idx = after.find('/')?;
+        let authority = &after[..idx];
+        if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
+            &after[idx..]
+        } else {
+            // Remote/UNC host — not a local workspace root.
+            return None;
         }
     } else {
         trimmed

@@ -965,13 +965,15 @@ pub(crate) fn outline_text_for_generation(
     }
 
     // Apply budget enforcement.
-    // Hook path: default 200 tokens (800 bytes) for compact hook output.
-    // Tool path: no cap unless explicitly requested — section filtering
-    // must be visible, not masked by a tiny default budget.
+    // `Some(n)` is used by `get_file_context` (which always resolves a concrete
+    // token budget via `resolve_read_max_tokens`) and by explicit `max_tokens` callers.
+    // `None if include_savings_footer` is the compact sidecar hook default (200 * 4 bytes).
+    // `None` (when `include_savings_footer` is false) is unbudgeted (0) for direct
+    // projection callers that omit `max_tokens`.
     let max_bytes = match params.max_tokens {
         Some(n) => n * 4,
-        None if include_savings_footer => 200 * 4, // hook path: compact
-        None => 0,                                 // tool path: unlimited (0 = no cap)
+        None if include_savings_footer => 200 * 4, // compact sidecar hook default
+        None => 0, // direct projection caller without max_tokens: unbudgeted
     };
     let (body_text, remaining) = build_with_budget(&body_lines, max_bytes);
     let completeness = if remaining > 0 || budget_omissions {
@@ -1190,4 +1192,103 @@ pub fn withheld_not_searched_note(
         "Note: {count} files withheld as unverified since restore were not searched: {listed}. \
          A successful re-read releases each one, and index_folder rebuilds the project from source."
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::index_lifecycle::guidance::file_read::resolve_read_max_tokens;
+    use crate::live_index::LiveIndex;
+
+    #[test]
+    fn d1_file_context_budget_resolution_pins_all_three_input_shapes() {
+        let raw_chars = 8_000usize;
+
+        // (1) Explicit max_tokens: Some(400) wins regardless of knowledge_requested.
+        for knowledge_requested in [true, false] {
+            let budget = resolve_read_max_tokens(
+                Some(400).or_else(|| knowledge_requested.then_some(1000)),
+                raw_chars,
+            );
+            assert_eq!(budget, 400);
+        }
+
+        // (2) max_tokens: None with sections: None -> knowledge_requested = true -> 1000.
+        let budget_default_sections =
+            resolve_read_max_tokens(None.or_else(|| true.then_some(1000)), raw_chars);
+        assert_eq!(budget_default_sections, 1000);
+
+        // (3) max_tokens: None with sections: Some(["outline"]) -> knowledge_requested = false
+        //     -> falls back to resolve_read_max_tokens(None, raw_chars) (1000 for >= 4000 chars,
+        //     64 floor for tiny files).
+        let budget_outline_large =
+            resolve_read_max_tokens(None.or_else(|| false.then_some(1000)), raw_chars);
+        assert_eq!(budget_outline_large, 1000);
+
+        let budget_outline_tiny =
+            resolve_read_max_tokens(None.or_else(|| false.then_some(1000)), 120);
+        assert_eq!(budget_outline_tiny, 64);
+    }
+
+    #[test]
+    fn d3_outline_projection_caps_symbols_when_budgeted_and_stays_unbudgeted_when_none() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        let mut source = String::new();
+        for index in 0..40 {
+            source.push_str(&format!(
+                "pub fn item_{index:02}() -> usize {{ {index} }}\n"
+            ));
+        }
+        fs::write(root.path().join("src/lib.rs"), &source).unwrap();
+
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let published = shared.published_generation();
+
+        let budgeted_params = OutlineProjectionParams {
+            path: "src/lib.rs".to_string(),
+            max_tokens: Some(100),
+            sections: Some(vec!["outline".to_string()]),
+        };
+        let (budgeted_text, _, _) = outline_text_for_generation(
+            &published,
+            &budgeted_params,
+            false,
+            ContextSourceAuthority::CurrentIndex,
+        )
+        .expect("indexed file should render budgeted outline");
+        assert!(
+            budgeted_text.contains("Completeness: budget-limited"),
+            "Some(budget) must enforce symbol/byte cap: {budgeted_text}"
+        );
+        assert!(
+            budgeted_text.contains("[truncated]")
+                || budgeted_text.contains("...omitted 15 symbols due to budget"),
+            "Some(100) must enforce the 100-token budget cap: {budgeted_text}"
+        );
+        assert!(!budgeted_text.contains("item_39"));
+
+        let unbudgeted_params = OutlineProjectionParams {
+            path: "src/lib.rs".to_string(),
+            max_tokens: None,
+            sections: Some(vec!["outline".to_string()]),
+        };
+        let (unbudgeted_text, _, _) = outline_text_for_generation(
+            &published,
+            &unbudgeted_params,
+            false,
+            ContextSourceAuthority::CurrentIndex,
+        )
+        .expect("indexed file should render unbudgeted outline");
+        assert!(
+            unbudgeted_text.contains("Trust: exact | current index | parsed | full"),
+            "None with include_savings_footer=false must leave direct projection unbudgeted: {unbudgeted_text}"
+        );
+        assert!(unbudgeted_text.contains("item_00"));
+        assert!(unbudgeted_text.contains("item_39"));
+    }
 }

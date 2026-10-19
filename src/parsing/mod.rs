@@ -433,7 +433,7 @@ pub(crate) fn parse_source(
 /// pattern.
 fn source_has_backslash_crlf(source: &str) -> bool {
     let b = source.as_bytes();
-    b.windows(3).any(|w| w == [b'\\', b'\r', b'\n'])
+    b.windows(3).any(|w| w == b"\\\r\n")
 }
 
 /// SF-STRESS-007 recovery: reparse `source` with every `\`+CR+LF line splice

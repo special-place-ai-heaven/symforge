@@ -285,13 +285,9 @@ pub(crate) fn guarded_atomic_write_file_expected(
         // changed the file after the caller's read; reject without writing.
         // Re-read via the pinned (canonical) path so we compare the same file
         // we are about to write.
-        match std::fs::read(&pinned) {
-            Ok(on_disk) => {
-                if on_disk.as_slice() != base {
-                    return Ok(GuardedWriteOutcome::Rejected);
-                }
-            }
-            Err(err) => return Err(err),
+        let on_disk = std::fs::read(&pinned)?;
+        if on_disk.as_slice() != base {
+            return Ok(GuardedWriteOutcome::Rejected);
         }
     }
 
