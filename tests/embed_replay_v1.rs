@@ -1216,3 +1216,152 @@ fn replay_record_struct_literal_stays_constructible() {
     assert_eq!(record.request, request);
     assert_eq!(record.uncertain_since(), None);
 }
+
+#[cfg(feature = "__test-internals")]
+#[test]
+fn renew_lease_extends_live_lease_and_refuses_stale_foreign_or_expired() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path(), &dir.path().join("state"));
+    let k = key();
+    let req = request();
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_200);
+
+    let lease = acquired(
+        store
+            .reserve_with_lease_at(&k, &req, Duration::from_secs(10), t0)
+            .unwrap(),
+    );
+    let renewed_not_started = store
+        .renew_lease_at(&lease, Duration::from_secs(20), t0 + Duration::from_secs(6))
+        .unwrap();
+    assert_eq!(renewed_not_started.state, ReplayState::NotStarted);
+    assert_eq!(renewed_not_started.generation, 1);
+    assert_eq!(
+        store
+            .lease_remaining_at(&k, t0 + Duration::from_secs(12))
+            .unwrap(),
+        Some(Duration::from_secs(14))
+    );
+
+    let started = store
+        .mark_started_with_lease_at(
+            &lease,
+            Duration::from_secs(10),
+            t0 + Duration::from_secs(12),
+        )
+        .unwrap();
+    assert_eq!(started.state, ReplayState::Started);
+    assert_eq!(started.generation, 2);
+
+    let renewed_started = store
+        .renew_lease_at(
+            &lease,
+            Duration::from_secs(30),
+            t0 + Duration::from_secs(18),
+        )
+        .unwrap();
+    assert_eq!(renewed_started.state, ReplayState::Started);
+    assert_eq!(renewed_started.generation, 2);
+    assert_eq!(
+        store
+            .lease_remaining_at(&k, t0 + Duration::from_secs(25))
+            .unwrap(),
+        Some(Duration::from_secs(23))
+    );
+
+    let k_foreign = ReplayKey::new("foreign-replay-key").unwrap();
+    let foreign_lease = acquired(
+        store
+            .reserve_with_lease_at(&k_foreign, &req, Duration::from_secs(10), t0)
+            .unwrap(),
+    );
+    store.release_not_started(&foreign_lease).unwrap();
+    assert!(matches!(
+        store.renew_lease_at(
+            &foreign_lease,
+            Duration::from_secs(10),
+            t0 + Duration::from_secs(1)
+        ),
+        Err(ReplayError::StaleOwner)
+    ));
+
+    let k_unleased = ReplayKey::new("unleased-replay-key").unwrap();
+    let unleased = acquired(store.reserve(&k_unleased, &req).unwrap());
+    assert!(matches!(
+        store.renew_lease(&unleased, Duration::from_secs(10)),
+        Err(ReplayError::StaleOwner)
+    ));
+
+    let outcome =
+        ReplayOutcome::from_response_and_post_image(OutcomeKind::Applied, b"ok", b"post-renew")
+            .unwrap();
+    let completed = store.complete(&lease, &outcome).unwrap();
+    assert_eq!(completed.state, ReplayState::Completed);
+    assert!(completed.matches_post_image(b"post-renew"));
+    assert!(matches!(
+        store.renew_lease_at(
+            &lease,
+            Duration::from_secs(10),
+            t0 + Duration::from_secs(26)
+        ),
+        Err(ReplayError::StaleOwner)
+    ));
+
+    let k_expired_not_started = ReplayKey::new("expired-not-started-key").unwrap();
+    let expired_not_started_lease = acquired(
+        store
+            .reserve_with_lease_at(&k_expired_not_started, &req, Duration::from_secs(10), t0)
+            .unwrap(),
+    );
+    assert!(matches!(
+        store.renew_lease_at(
+            &expired_not_started_lease,
+            Duration::from_secs(10),
+            t0 + Duration::from_secs(11),
+        ),
+        Err(ReplayError::StaleOwner)
+    ));
+    let takeover_lease = acquired(
+        store
+            .reserve_with_lease_at(
+                &k_expired_not_started,
+                &req,
+                Duration::from_secs(10),
+                t0 + Duration::from_secs(12),
+            )
+            .unwrap(),
+    );
+    assert!(takeover_lease.took_over());
+    assert!(matches!(
+        store.renew_lease_at(
+            &expired_not_started_lease,
+            Duration::from_secs(10),
+            t0 + Duration::from_secs(13),
+        ),
+        Err(ReplayError::StaleOwner)
+    ));
+
+    let k_expired_started = ReplayKey::new("expired-started-key").unwrap();
+    let expired_started_lease = acquired(
+        store
+            .reserve_with_lease_at(&k_expired_started, &req, Duration::from_secs(10), t0)
+            .unwrap(),
+    );
+    store
+        .mark_started_with_lease_at(&expired_started_lease, Duration::from_secs(10), t0)
+        .unwrap();
+    assert!(matches!(
+        store.renew_lease_at(
+            &expired_started_lease,
+            Duration::from_secs(10),
+            t0 + Duration::from_secs(11),
+        ),
+        Err(ReplayError::StaleOwner)
+    ));
+    let inspected = store
+        .inspect_at(&k_expired_started, t0 + Duration::from_secs(11))
+        .unwrap()
+        .unwrap();
+    assert_eq!(inspected.state, ReplayState::Uncertain);
+    assert!(inspected.uncertain_since().is_some());
+}

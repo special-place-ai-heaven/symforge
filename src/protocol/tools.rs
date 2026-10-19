@@ -5394,6 +5394,7 @@ impl SymForgeServer {
                 files_scope: matches!(params.0.scope, ImpactScope::Files),
                 include_untracked: params.0.include_untracked,
                 include_data: params.0.include_data.unwrap_or(false),
+                paths: None,
             },
             // Gated (D8 closed): the git-object store is a disclosure lane
             // exactly like the working tree. A refusal collapses to "no

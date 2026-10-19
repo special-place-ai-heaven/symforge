@@ -28,6 +28,7 @@ pub(crate) struct ImpactRequest<'a> {
     pub files_scope: bool,
     pub include_untracked: bool,
     pub include_data: bool,
+    pub paths: Option<&'a [String]>,
 }
 
 /// The complete, uncapped blast radius. `blast_entries` is ordered most severe
@@ -93,43 +94,49 @@ pub(crate) fn compute_detect_impact(
     // header so the output is self-describing.
     let mut staleness_note: Option<String> = None;
     let base_branch: Option<String> = if request.base_branch.is_none() && request.since.is_none() {
-        let origin = repo.resolve_ref_commit("origin/main");
-        let local = repo.resolve_ref_commit("main");
-        let resolved = match (origin, local) {
-            (Some(origin_oid), Some(local_oid)) => {
-                if origin_oid != local_oid {
-                    // Direction-aware disclosure (Wave 1 Fix 3): behind is the
-                    // motivating stale-local case; ahead means unpushed local
-                    // work landed in the base; both means diverged. `ahead` =
-                    // commits in local not in origin; `behind` = the reverse.
-                    staleness_note = Some(match repo.ahead_behind(local_oid, origin_oid) {
-                        Some((ahead, behind)) if behind > 0 && ahead == 0 => {
-                            "local main is behind origin/main; using origin/main".to_string()
-                        }
-                        Some((ahead, behind)) if ahead > 0 && behind == 0 => {
-                            "local main is ahead of origin/main (unpushed commits); using \
-                             origin/main — the blast radius includes your unpushed work \
-                             relative to the shared base"
-                                .to_string()
-                        }
-                        Some((ahead, behind)) if ahead > 0 && behind > 0 => {
-                            "local main and origin/main have diverged; using origin/main"
-                                .to_string()
-                        }
-                        // No common ancestor (or the unreachable both-zero given
-                        // origin != local): fall back to the direction-neutral note.
-                        _ => "local main differs from origin/main; using origin/main".to_string(),
-                    });
+        if request.paths.is_some() {
+            None
+        } else {
+            let origin = repo.resolve_ref_commit("origin/main");
+            let local = repo.resolve_ref_commit("main");
+            let resolved = match (origin, local) {
+                (Some(origin_oid), Some(local_oid)) => {
+                    if origin_oid != local_oid {
+                        // Direction-aware disclosure (Wave 1 Fix 3): behind is the
+                        // motivating stale-local case; ahead means unpushed local
+                        // work landed in the base; both means diverged. `ahead` =
+                        // commits in local not in origin; `behind` = the reverse.
+                        staleness_note = Some(match repo.ahead_behind(local_oid, origin_oid) {
+                            Some((ahead, behind)) if behind > 0 && ahead == 0 => {
+                                "local main is behind origin/main; using origin/main".to_string()
+                            }
+                            Some((ahead, behind)) if ahead > 0 && behind == 0 => {
+                                "local main is ahead of origin/main (unpushed commits); using \
+                                 origin/main — the blast radius includes your unpushed work \
+                                 relative to the shared base"
+                                    .to_string()
+                            }
+                            Some((ahead, behind)) if ahead > 0 && behind > 0 => {
+                                "local main and origin/main have diverged; using origin/main"
+                                    .to_string()
+                            }
+                            // No common ancestor (or the unreachable both-zero given
+                            // origin != local): fall back to the direction-neutral note.
+                            _ => {
+                                "local main differs from origin/main; using origin/main".to_string()
+                            }
+                        });
+                    }
+                    "origin/main"
                 }
-                "origin/main"
-            }
-            (Some(_), None) => "origin/main",
-            // No origin/main (or neither ref exists): fall back to local
-            // `main`. When neither exists, merge_git_changed_paths surfaces
-            // the existing "Invalid git ref" error below, unchanged.
-            (None, _) => "main",
-        };
-        Some(resolved.to_string())
+                (Some(_), None) => "origin/main",
+                // No origin/main (or neither ref exists): fall back to local
+                // `main`. When neither exists, merge_git_changed_paths surfaces
+                // the existing "Invalid git ref" error below, unchanged.
+                (None, _) => "main",
+            };
+            Some(resolved.to_string())
+        }
     } else {
         request.base_branch.map(str::to_owned)
     };
@@ -137,13 +144,17 @@ pub(crate) fn compute_detect_impact(
     // the explicit caller value; `None` when only `since` was supplied.
     let base_disclosure: Option<String> = base_branch.clone();
 
-    let changed_files = match repo.merge_git_changed_paths(
-        base_branch.as_deref(),
-        request.since,
-        request.include_untracked,
-    ) {
-        Ok(paths) => paths,
-        Err(e) => return Err(format!("Error: Invalid git ref: {e}")),
+    let changed_files = if let Some(explicit_paths) = request.paths {
+        explicit_paths.to_vec()
+    } else {
+        match repo.merge_git_changed_paths(
+            base_branch.as_deref(),
+            request.since,
+            request.include_untracked,
+        ) {
+            Ok(paths) => paths,
+            Err(e) => return Err(format!("Error: Invalid git ref: {e}")),
+        }
     };
 
     // US1 (018) FR-001/FR-002: source-focus the impact seed by default so
@@ -188,6 +199,7 @@ pub(crate) fn compute_detect_impact(
         let guard = live;
         let mut changed_symbols: Vec<crate::live_index::graph::SymbolId> = Vec::new();
         for path in &changed_files {
+            let before_len = changed_symbols.len();
             // Kind lookup for the CURRENT symbols comes from the live index;
             // removed symbols (absent from current) default to Function to
             // match the graph's own entry-point default.
@@ -280,6 +292,18 @@ pub(crate) fn compute_detect_impact(
                 let name = name.as_str();
                 if seen.insert(name) && !current_by_name.contains_key(name) {
                     seed(name);
+                }
+            }
+            if request.paths.is_some()
+                && changed_symbols.len() == before_len
+                && let Some(file) = guard.files.get(path)
+            {
+                for sym in &file.symbols {
+                    changed_symbols.push(crate::live_index::graph::SymbolId {
+                        path: path.clone(),
+                        name: sym.name.clone(),
+                        kind: sym.kind,
+                    });
                 }
             }
         }

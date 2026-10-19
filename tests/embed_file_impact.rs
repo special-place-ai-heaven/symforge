@@ -293,3 +293,68 @@ fn analyze_file_impact_keeps_the_pre_edit_baseline_across_a_worker_reload() {
         "{again}"
     );
 }
+
+#[test]
+fn s10_file_impact_updates_census_and_queries_without_whole_worktree_reload() {
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path());
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+
+    let before_version = handle.runtime_view().source_version;
+    let before_progress = handle.index_progress();
+
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "pub fn alpha() -> u32 {\n    7\n}\n\npub fn zeta() -> u32 {\n    2\n}\n\npub fn gamma() -> u32 {\n    3\n}\n",
+    )
+    .unwrap();
+
+    handle
+        .query(
+            &QueryRequest::FileImpact(FileImpactRequest {
+                path: "src/lib.rs".into(),
+                ..Default::default()
+            }),
+            QueryLimits::default(),
+        )
+        .unwrap();
+
+    assert!(
+        handle.runtime_view().source_version > before_version,
+        "FileImpact should synchronously publish a new Current generation without request_refresh()"
+    );
+    assert_eq!(
+        handle.index_progress().files_parsed,
+        before_progress.files_parsed,
+        "whole-worktree worker should not re-parse the repository"
+    );
+
+    let census_claim = handle.index_census().unwrap();
+    let census = census_claim.value();
+    assert_eq!(census.total_symbols, 5);
+    let lib_entry = census
+        .files
+        .iter()
+        .find(|file| file.path == "src/lib.rs")
+        .expect("src/lib.rs in index_census");
+    assert_eq!(lib_entry.symbol_count, 3);
+
+    let search_claim = handle
+        .query(
+            &QueryRequest::SearchSymbols {
+                query: Some("gamma".into()),
+                path_prefix: None,
+                kind: None,
+                include_tests: false,
+            },
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::Symbols(symbols) = search_claim.value() else {
+        panic!("expected symbol search output");
+    };
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "gamma");
+    assert_eq!(symbols[0].path, "src/lib.rs");
+}

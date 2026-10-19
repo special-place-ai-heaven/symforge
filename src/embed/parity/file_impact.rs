@@ -1,8 +1,22 @@
 //! MCP `analyze_file_impact` for an admitted embedded source: re-admit one
 //! file from disk and report its symbol diff, or index a new file.
+//!
+//! `QueryRequest::FileImpact` is the supported single-file re-admission path
+//! for embedded sources: it re-reads and re-parses only the requested `path`
+//! (`O(1)` file cost, without waking the whole-worktree refresh worker or
+//! re-parsing other files), advances `source_version` and
+//! `current_publication_identity` synchronously, and leaves `index_census()`
+//! and subsequent queries immediately consistent for `path`.
 
 /// Every MCP `analyze_file_impact` option. `path` is repository-relative or
 /// absolute beneath the source root, as MCP accepts.
+///
+/// Passing a [`FileImpactRequest`] via `QueryRequest::FileImpact` (with
+/// `estimate` unset or `Some(false)`) synchronously re-reads and re-parses
+/// only `path` (`O(1)` single-file cost, without waking the whole-worktree
+/// refresh worker or re-parsing other files), advances `source_version` and
+/// `current_publication_identity`, and leaves `index_census()` and queries
+/// consistent for `path`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FileImpactRequest {

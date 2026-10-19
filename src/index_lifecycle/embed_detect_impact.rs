@@ -21,7 +21,39 @@ pub(super) fn validate(request: &DetectImpactRequest) -> Result<(), QueryRefusal
     {
         return Err(QueryRefusalKind::InvalidRequest);
     }
+    if let Some(paths) = &request.paths
+        && paths.iter().any(|path| path.trim().is_empty())
+    {
+        return Err(QueryRefusalKind::InvalidRequest);
+    }
     Ok(())
+}
+
+fn normalize_explicit_paths(
+    root: &std::path::Path,
+    raw_paths: &[String],
+) -> Result<Vec<String>, QueryRefusalKind> {
+    let mut seen = std::collections::BTreeSet::new();
+    for raw in raw_paths {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.contains('\0') {
+            return Err(QueryRefusalKind::InvalidRequest);
+        }
+        let requested = std::path::Path::new(trimmed);
+        let absolute = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            root.join(requested)
+        };
+        let relative = crate::paths::normalize_event_path(&absolute, root)
+            .ok_or(QueryRefusalKind::InvalidRequest)?;
+        let normalized = crate::live_index::query::normalize_path_query(&relative);
+        super::embed_query::validate_path(&normalized, false)?;
+        super::guidance::freshen::safe_repo_path_for_freshen(root, &normalized)
+            .map_err(|_| QueryRefusalKind::InvalidRequest)?;
+        seen.insert(normalized);
+    }
+    Ok(seen.into_iter().collect())
 }
 
 fn page(total: usize, returned: usize) -> ImpactPage {
@@ -39,6 +71,10 @@ pub(super) fn project(
 ) -> Result<QueryOutput, QueryRefusalKind> {
     let live = snapshot.generation.live.as_ref();
     let repo = open_repository(&snapshot.root).ok_or(QueryRefusalKind::GitUnavailable)?;
+    let explicit_paths = match &request.paths {
+        Some(raw) => Some(normalize_explicit_paths(&snapshot.root, raw)?),
+        None => None,
+    };
     let report = compute_detect_impact(
         live,
         &repo,
@@ -49,6 +85,7 @@ pub(super) fn project(
             files_scope: request.scope == ImpactScope::Files,
             include_untracked: request.include_untracked,
             include_data: request.include_data,
+            paths: explicit_paths.as_deref(),
         },
         &mut |git_ref, path| gated_text(live, &repo, git_ref, path),
         &mut |path| gated_text(live, &repo, "", path),
