@@ -2297,20 +2297,20 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - runner: [self-hosted, linux, fresh]
             target: x86_64-unknown-linux-gnu
             artifact: symforge-linux-x64
             binary: target/x86_64-unknown-linux-gnu/release/symforge
             builder: cargo
-          - os: ubuntu-latest
+          - runner: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: symforge-windows-x64.exe
             binary: target/x86_64-pc-windows-msvc/release/symforge.exe
-            builder: xwin
+            builder: cargo
 
-    # hosted minutes are exhausted. Both binaries build on the Linux runners.
-    # Windows is x86_64-pc-windows-msvc via cargo-xwin. macOS is not built.
-    runs-on: [self-hosted, linux, fresh]
+    # Linux builds on the self-hosted pool; Windows builds natively on
+    # GitHub-hosted windows-latest (public repo). macOS is not built.
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2331,6 +2331,7 @@ jobs:
         run: bash execution/ensure_rustup.sh target add ${{ matrix.target }}
 
       - name: Build release binary
+        shell: bash
         run: bash execution/build_release_binary.sh "${{ matrix.builder }}" "${{ matrix.target }}"
 
       - name: Rename artifact
