@@ -1,10 +1,30 @@
 use tree_sitter::Node;
 
 use super::{
-    NO_DOC_SPEC, SymbolSink, collect_symbols, find_first_named_child, push_named_symbol,
+    DocCommentSpec, SymbolSink, collect_symbols, find_first_named_child, push_named_symbol,
     push_symbol, walk_children,
 };
 use crate::domain::{SymbolKind, SymbolRecord};
+
+fn is_python_doc(node: &Node, source: &str) -> bool {
+    if !matches!(node.kind(), "expression_statement" | "string") {
+        return false;
+    }
+    let start = node.start_byte();
+    let end = node.end_byte();
+    if end > source.len() {
+        return false;
+    }
+    let text = source[start..end].trim();
+    (text.starts_with("\"\"\"") && text.ends_with("\"\"\"") && text.len() >= 6)
+        || (text.starts_with("'''") && text.ends_with("'''") && text.len() >= 6)
+}
+
+pub(super) const DOC_SPEC: DocCommentSpec = DocCommentSpec {
+    comment_node_types: &[],
+    doc_prefixes: None,
+    custom_doc_check: Some(is_python_doc),
+};
 
 pub fn extract_symbols(node: &Node, source: &str) -> Vec<SymbolRecord> {
     collect_symbols(node, source, walk_node)
@@ -33,7 +53,7 @@ fn walk_node(
                 if let Some(k) = inner_kind
                     && let Some(name) = find_name(&child, source)
                 {
-                    let mut sink = SymbolSink::new(source, sort_order, symbols, &NO_DOC_SPEC);
+                    let mut sink = SymbolSink::new(source, sort_order, symbols, &DOC_SPEC);
                     push_symbol(node, name, k, depth, &mut sink);
                     // Recurse into the inner definition's children (nested classes/methods)
                     walk_children(
@@ -53,7 +73,7 @@ fn walk_node(
     };
 
     {
-        let mut sink = SymbolSink::new(source, sort_order, symbols, &NO_DOC_SPEC);
+        let mut sink = SymbolSink::new(source, sort_order, symbols, &DOC_SPEC);
         push_named_symbol(
             node,
             depth,
