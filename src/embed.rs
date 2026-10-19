@@ -26,6 +26,30 @@
 //! at the bottom names every contracted item so a rename, removal, or
 //! signature drift becomes a COMPILE FAILURE in SymForge's own embed test
 //! suite rather than a downstream surprise.
+//!
+//! ## Single-Open & Per-File Refresh Rules
+//!
+//! - **Single open handle per canonical root per process (`S12`)**:
+//!   [`ProcessIndexRuntime::open_embedded_source`] enforces at most one open
+//!   [`EmbeddedSourceHandle`] per canonical project folder across the entire
+//!   process (even across multiple [`ProcessIndexRuntime::acquire`] instances).
+//!   A second open of an already-open canonical root refuses with
+//!   [`SourceRefusal`] ([`SourceRefusalKind::SelectionUnavailable`],
+//!   [`OperationKind::OpenEmbeddedSource`], [`RetryAdvice::OnEvent`]) until the
+//!   existing handle is closed (`close()`, `begin_close()`, or [`Drop`]).
+//!   Embedders that share an index across components in one process should
+//!   share the [`EmbeddedSourceHandle`] (e.g. behind [`std::sync::Arc`]) rather
+//!   than opening the same folder twice.
+//! - **Single-file re-admission (`S10`)**:
+//!   [`EmbeddedSourceHandle::request_refresh`] queues an asynchronous
+//!   whole-worktree reload. To re-index a single modified or newly created file
+//!   synchronously without re-parsing the rest of the worktree, call
+//!   `handle.query(&QueryRequest::FileImpact(FileImpactRequest { path, new_file, .. }), limits)`.
+//!   `FileImpact` re-reads and re-parses only `path` through the canonical
+//!   single-file admission seam (`O(1)` single-file cost), publishes the
+//!   resulting `Current` generation (`source_version` advances), and leaves
+//!   [`EmbeddedSourceHandle::index_census`] and subsequent queries immediately
+//!   consistent for `path`.
 
 // ── The kept engine identity (migration category v10-03, decision: keep) ──
 

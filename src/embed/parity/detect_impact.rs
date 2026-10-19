@@ -17,6 +17,8 @@ pub struct DetectImpactRequest {
     pub scope: ImpactScope,
     pub include_untracked: bool,
     pub include_data: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
 }
 
 impl Default for DetectImpactRequest {
@@ -28,6 +30,7 @@ impl Default for DetectImpactRequest {
             scope: ImpactScope::Symbols,
             include_untracked: true,
             include_data: false,
+            paths: None,
         }
     }
 }

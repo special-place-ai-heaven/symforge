@@ -1007,6 +1007,32 @@ impl ReplayStore {
         self.advance_to_started(lease, None, Some(time_to_ms(now)))
     }
 
+    /// Extend a live `not_started` or `started` lease by `extension` from now.
+    ///
+    /// Performs a compare-and-swap on `key_hash`, `request_hash`, `owner_token`,
+    /// state (`not_started` at `lease.generation` or `started` at
+    /// `lease.generation + 1`), and `lease_expires_at > now`. Never revives an
+    /// expired or unleased row and does not advance `generation`, so `lease`
+    /// remains valid for subsequent renewals or terminal transitions.
+    pub fn renew_lease(
+        &self,
+        lease: &OwnerLease,
+        extension: Duration,
+    ) -> Result<ReplayRecord, ReplayError> {
+        self.renew_lease_inner(lease, extension, None)
+    }
+
+    /// `renew_lease` at one caller-supplied clock reading. Test builds only.
+    #[cfg(feature = "__test-internals")]
+    pub fn renew_lease_at(
+        &self,
+        lease: &OwnerLease,
+        extension: Duration,
+        now: SystemTime,
+    ) -> Result<ReplayRecord, ReplayError> {
+        self.renew_lease_inner(lease, extension, Some(time_to_ms(now)))
+    }
+
     /// Release is valid only before the host has begun the external effect.
     /// The owner token and generation are compared in the deletion itself.
     pub fn release_not_started(&self, lease: &OwnerLease) -> Result<(), ReplayError> {
@@ -1087,6 +1113,42 @@ impl ReplayStore {
                 lease.request_hash,
                 lease.generation,
                 lease.token,
+                now,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ReplayError::StaleOwner);
+        }
+        let record = read_record(&tx, &lease.key_hash)?.ok_or(ReplayError::StaleOwner)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    fn renew_lease_inner(
+        &self,
+        lease: &OwnerLease,
+        extension: Duration,
+        now_ms: Option<i64>,
+    ) -> Result<ReplayRecord, ReplayError> {
+        self.legacy_guard(&lease.key_hash)?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_ms.unwrap_or_else(wall_now_ms);
+        let fresh_expiry = now.saturating_add(lease_to_ms(extension));
+        let changed = tx.execute(
+            "UPDATE replay_entries
+                 SET lease_expires_at = ?1
+             WHERE key_hash = ?2 AND request_hash = ?3 AND owner_token = ?4
+                 AND ((state = 'not_started' AND generation = ?5)
+                      OR (state = 'started' AND generation = ?6))
+                 AND lease_expires_at IS NOT NULL AND lease_expires_at > ?7",
+            params![
+                fresh_expiry,
+                lease.key_hash,
+                lease.request_hash,
+                lease.token,
+                lease.generation,
+                lease.generation + 1,
                 now,
             ],
         )?;
