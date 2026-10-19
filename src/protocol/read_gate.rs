@@ -398,6 +398,8 @@ impl ReadGate {
 
 #[cfg(test)]
 mod tests {
+    use super::{admit_worktree_text, observe_disk_beneath};
+
     /// The recorded-demotion line re-read has exactly one caller: the disk-read
     /// core behind `admit_disk_read`, on its rendering branch. Visibility keeps
     /// it inside this file; this pin keeps it out of every other lane here.
@@ -595,5 +597,98 @@ mod tests {
             // here. Closing it unblocks a client still stuck in `ReadFile`.
             unsafe { CloseHandle(self.handle) }.ok();
         }
+    }
+
+    const OUTBOUND_CANARY: &str = "OUTBOUND_LINK_CANARY_VALUE";
+    const PLAIN: &str = "OUTBOUND_LINK_PLAIN_ok";
+
+    fn plant_outbound_link(repo: &std::path::Path) -> (tempfile::TempDir, &'static str) {
+        let outside = tempfile::TempDir::new().expect("outside root");
+        std::fs::write(
+            outside.path().join("outside.txt"),
+            format!("{OUTBOUND_CANARY}\n"),
+        )
+        .expect("outside file");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                outside.path().join("outside.txt"),
+                repo.join("outbound_link.txt"),
+            )
+            .expect("file symlink");
+            (outside, "outbound_link.txt")
+        }
+        #[cfg(windows)]
+        {
+            let junction = repo.join("junc");
+            let status = crate::process_util::hidden_command("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&junction)
+                .arg(outside.path())
+                .output()
+                .expect("mklink runs");
+            assert!(
+                status.status.success(),
+                "mklink /J failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+            (outside, "junc/outside.txt")
+        }
+    }
+
+    #[test]
+    fn outbound_link_admit_worktree_text_refuses_secret_and_serves_plain() {
+        let dir = tempfile::TempDir::new().expect("repo");
+        git2::Repository::init(dir.path()).expect("git init");
+        std::fs::write(dir.path().join("plain.txt"), format!("{PLAIN}\n")).expect("plain");
+        let (_outside, link_path) = plant_outbound_link(dir.path());
+        let live = crate::live_index::LiveIndex::load(dir.path()).expect("load");
+        let repo = crate::git::GitRepo::open(dir.path()).expect("open git");
+
+        let refused = admit_worktree_text(&live.read(), &repo, link_path);
+        assert!(
+            refused.as_ref().is_err()
+                || refused.as_ref().is_ok_and(|opt| {
+                    opt.as_deref()
+                        .is_none_or(|text| !text.contains(OUTBOUND_CANARY))
+                }),
+            "nested outbound path must not disclose outside file: {refused:?}"
+        );
+
+        let plain = admit_worktree_text(&live.read(), &repo, "plain.txt")
+            .expect("plain read")
+            .expect("plain present");
+        assert!(plain.contains(PLAIN), "ordinary file must still be served");
+        assert!(
+            live.read().get_file(link_path).is_none()
+                || live.read().get_file(link_path).is_some_and(|file| {
+                    !String::from_utf8_lossy(&file.content).contains(OUTBOUND_CANARY)
+                }),
+            "outside file must not be indexed"
+        );
+    }
+
+    #[test]
+    fn outbound_link_observe_disk_beneath_refuses_secret_and_serves_plain() {
+        let dir = tempfile::TempDir::new().expect("repo");
+        git2::Repository::init(dir.path()).expect("git init");
+        std::fs::write(dir.path().join("plain.txt"), format!("{PLAIN}\n")).expect("plain");
+        let (_outside, link_path) = plant_outbound_link(dir.path());
+        let live = crate::live_index::LiveIndex::load(dir.path()).expect("load");
+
+        let refused = observe_disk_beneath(&live.read(), dir.path(), link_path);
+        assert!(
+            refused.as_ref().is_err()
+                || refused
+                    .as_ref()
+                    .is_ok_and(|bytes| !String::from_utf8_lossy(bytes).contains(OUTBOUND_CANARY)),
+            "observe_disk_beneath must not disclose nested outside file: {refused:?}"
+        );
+
+        let plain = observe_disk_beneath(&live.read(), dir.path(), "plain.txt").expect("plain");
+        assert!(
+            String::from_utf8_lossy(&plain).contains(PLAIN),
+            "ordinary file must still be served"
+        );
     }
 }

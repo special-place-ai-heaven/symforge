@@ -11,10 +11,10 @@
 //! Dark payload simplifications, in the `runtime.rs` idiom: source content
 //! is a generation stamp, rendering is a length-bounded stand-in, promotion
 //! evidence is the committed candidate root (its content is not yet
-//! consulted), and the four health surfaces are modeled INSIDE this module —
-//! the live `health_view.rs`/`src/protocol/` wiring frozen T063 names is
-//! activation work (T064/T066), because the darkness sweep forbids this
-//! module's name in live files. The authority SEMANTICS — atomic
+//! consulted), and the four health surfaces are modeled INSIDE this module.
+//! Production already names `HealthProjection` from
+//! `src/live_index/health_view.rs`; protocol lease wiring remains activation
+//! work. The authority SEMANTICS — atomic
 //! exact-bijection capture, refusal-not-no-match, stale/retarget
 //! finalization fences, sealed render authority whose truncation cannot
 //! change identity, protected roots reaching Current only through full
@@ -23,9 +23,8 @@
 //! as evidence today, and binding it to the specific source is a recorded
 //! cut obligation.
 //!
-//! **Nothing in production calls this module.** Only the Slice 4 oracle
-//! suites and this directory do; activation (T064/T066) is the only planned
-//! production caller.
+//! Production names `HealthProjection` from `src/live_index/health_view.rs`.
+//! Strict query leases stay in-directory and oracle-suite only.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;

@@ -6285,4 +6285,108 @@ mod tests {
             "hook path should still truncate the references section at the lean budget: {hook}"
         );
     }
+
+    const OUTBOUND_LINK_CANARY: &str = "OUTBOUND_LINK_CANARY_VALUE";
+    const OUTBOUND_LINK_PLAIN: &str = "OUTBOUND_LINK_PLAIN_ok";
+
+    fn plant_outbound_link(repo: &std::path::Path) -> (TempDir, &'static str) {
+        let outside = TempDir::new().expect("outside root");
+        std::fs::write(
+            outside.path().join("outside.txt"),
+            format!("{OUTBOUND_LINK_CANARY}\n"),
+        )
+        .expect("outside");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                outside.path().join("outside.txt"),
+                repo.join("outbound_link.txt"),
+            )
+            .expect("file symlink");
+            (outside, "outbound_link.txt")
+        }
+        #[cfg(windows)]
+        {
+            let junction = repo.join("junc");
+            let status = crate::process_util::hidden_command("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&junction)
+                .arg(outside.path())
+                .output()
+                .expect("mklink runs");
+            assert!(
+                status.status.success(),
+                "mklink /J failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+            (outside, "junc/outside.txt")
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_link_sidecar_source_read_after_freshen_refuses_secret() {
+        let dir = TempDir::new().expect("repo");
+        std::fs::write(
+            dir.path().join("plain.rs"),
+            format!("fn plain() {{ let _ = \"{OUTBOUND_LINK_PLAIN}\"; }}\n"),
+        )
+        .expect("plain");
+        let (_outside, link_path) = plant_outbound_link(dir.path());
+        let index = LiveIndex::load(dir.path()).expect("load");
+        let state = SidecarState {
+            index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+                index,
+            ),
+            token_stats: TokenStats::new(),
+            repo_root: Some(dir.path().to_path_buf()),
+            symbol_cache: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        let leaked = workflow_source_read_handler(
+            State(state.clone()),
+            Query(OutlineParams {
+                path: link_path.to_string(),
+                max_tokens: None,
+                sections: None,
+            }),
+        )
+        .await;
+        if let Ok(body) = leaked {
+            assert!(
+                !body.contains(OUTBOUND_LINK_CANARY),
+                "source-read after freshen must not contain outside file: {body}"
+            );
+        }
+        assert!(
+            state
+                .index
+                .data_plane()
+                .read()
+                .get_file(link_path)
+                .is_none()
+                || state
+                    .index
+                    .data_plane()
+                    .read()
+                    .get_file(link_path)
+                    .is_some_and(|file| !String::from_utf8_lossy(&file.content)
+                        .contains(OUTBOUND_LINK_CANARY)),
+            "freshen must not index the outside file"
+        );
+
+        let plain = workflow_source_read_handler(
+            State(state),
+            Query(OutlineParams {
+                path: "plain.rs".to_string(),
+                max_tokens: None,
+                sections: None,
+            }),
+        )
+        .await
+        .expect("ordinary file source-read");
+        assert!(
+            plain.contains(OUTBOUND_LINK_PLAIN) || plain.contains("plain.rs"),
+            "ordinary in-repo file must still be served: {plain}"
+        );
+    }
 }

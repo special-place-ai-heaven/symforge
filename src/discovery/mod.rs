@@ -813,8 +813,9 @@ pub fn discover_files_with_exclusions(
     let mut files: Vec<DiscoveredFile> = Vec::new();
     for entry_result in repository_walk(&root, exclusions) {
         let Ok(entry) = entry_result else { continue };
-        let path =
-            std::fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path().to_path_buf());
+        let Ok(path) = std::fs::canonicalize(entry.path()) else {
+            continue;
+        };
 
         // Use the already-known file_type from the walker instead of
         // path.is_file() which would issue a redundant stat() syscall.
@@ -939,8 +940,9 @@ fn discover_all_files_with_exclusions_and_issues_cancellable(
                 continue;
             }
         };
-        let path =
-            std::fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path().to_path_buf());
+        let Ok(path) = std::fs::canonicalize(entry.path()) else {
+            continue;
+        };
 
         if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             continue;
@@ -1131,7 +1133,7 @@ pub(crate) fn scout_single_path(relative_path: &str, absolute_path: &Path) -> Re
     scout_single_path_with_io(
         relative_path,
         absolute_path,
-        |path| std::fs::metadata(path),
+        crate::paths::path_must_be_regular_non_link,
         read_binary_probe,
     )
 }
@@ -6243,6 +6245,60 @@ mod tests {
                 decoded.to_string_lossy().replace('\\', "/"),
                 "/tmp/a b/c+d",
                 "percent escapes must decode to literal bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn outbound_link_scout_single_path_refuses_link_and_accepts_regular_file() {
+        const SECRET: &str = "OUTBOUND_LINK_SECRET_7f3a9c2e";
+        const PLAIN: &str = "OUTBOUND_LINK_PLAIN_ok";
+        let dir = TempDir::new().unwrap();
+        create_file(
+            dir.path(),
+            "plain.rs",
+            &format!("fn plain() {{ let _ = \"{PLAIN}\"; }}\n"),
+        );
+        let regular = scout_single_path("plain.rs", &dir.path().join("plain.rs")).expect("plain");
+        assert!(
+            matches!(regular.decision, ScoutDecision::Ingest { .. }),
+            "ordinary file must still be scouted, got {:?}",
+            regular.decision
+        );
+
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), format!("{SECRET}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("outbound_link.txt");
+            std::os::unix::fs::symlink(outside.path().join("secret.txt"), &link).unwrap();
+            let entry = scout_single_path("outbound_link.txt", &link)
+                .expect("symlink scout stays catalogued");
+            assert!(
+                matches!(entry.decision, ScoutDecision::Unavailable { .. }),
+                "a file symlink must not be ingested, got {:?}",
+                entry.decision
+            );
+        }
+        #[cfg(windows)]
+        {
+            let junction = dir.path().join("junc");
+            let status = crate::process_util::hidden_command("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&junction)
+                .arg(outside.path())
+                .output()
+                .expect("mklink runs");
+            assert!(
+                status.status.success(),
+                "mklink /J failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+            let entry = scout_single_path("junc", &junction).expect("junction scout");
+            assert!(
+                !matches!(entry.decision, ScoutDecision::Ingest { .. }),
+                "a junction must not be ingested, got {:?}",
+                entry.decision
             );
         }
     }

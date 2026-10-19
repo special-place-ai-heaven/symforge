@@ -63,7 +63,8 @@ pub(crate) fn replacement_splice_range(
 
 /// Splice `replacement` bytes into `content` at the given byte range [start, end).
 pub(crate) fn apply_splice(content: &[u8], range: (u32, u32), replacement: &[u8]) -> Vec<u8> {
-    let (start, end) = (range.0 as usize, range.1 as usize);
+    let start = (range.0 as usize).min(content.len());
+    let end = (range.1 as usize).clamp(start, content.len());
     let mut result = Vec::with_capacity(content.len() - (end - start) + replacement.len());
     result.extend_from_slice(&content[..start]);
     result.extend_from_slice(replacement);

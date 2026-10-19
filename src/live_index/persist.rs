@@ -1,7 +1,7 @@
 /// LiveIndex persistence: serialize on shutdown, load on startup.
 ///
 /// Uses postcard (compact binary) for fast round-trips.
-/// Atomic write (tmp → rename) to prevent corruption on crash.
+/// Durable write (named tmp → fsync → rename; Unix parent-dir fsync) on crash.
 /// Background verification corrects stale entries after loading a snapshot.
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -142,6 +142,65 @@ fn cleanup_snapshot_temp(path: &Path) {
             "failed to clean snapshot temp file after write error: {error}"
         ),
     }
+}
+
+/// Named-tmp durable persist: write, flush, `sync_all`, close, rename.
+/// Unix also `sync_all`s the destination parent directory. Leftover tmp is
+/// removed when the write or rename fails. The file handle is dropped before
+/// rename so Windows can replace the destination.
+fn persist_named_tmp(tmp_path: &Path, final_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Err(error) = write_tmp_file_synced(tmp_path, bytes) {
+        cleanup_snapshot_temp(tmp_path);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(tmp_path, final_path) {
+        cleanup_snapshot_temp(tmp_path);
+        return Err(error);
+    }
+    note_persist_stage("rename");
+    #[cfg(unix)]
+    {
+        let parent = final_path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("path has no parent directory: {}", final_path.display()),
+            )
+        })?;
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn write_tmp_file_synced(tmp_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(tmp_path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    #[cfg(test)]
+    if FAIL_NAMED_TMP_SYNC_ALL.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("simulated sync_all failure"));
+    }
+    file.sync_all()?;
+    note_persist_stage("sync_all");
+    Ok(())
+}
+
+fn note_persist_stage(stage: &'static str) {
+    #[cfg(test)]
+    SNAPSHOT_PERSIST_STAGES.with(|cell| {
+        if let Some(stages) = cell.borrow_mut().as_mut() {
+            stages.push(stage);
+        }
+    });
+    #[cfg(not(test))]
+    let _ = stage;
+}
+
+#[cfg(test)]
+thread_local! {
+    static SNAPSHOT_PERSIST_STAGES: std::cell::RefCell<Option<Vec<&'static str>>> =
+        const { std::cell::RefCell::new(None) };
+    static FAIL_NAMED_TMP_SYNC_ALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn resolved_snapshot_state<'a>(
@@ -1043,8 +1102,9 @@ pub fn artifact_round_trip_report(
 
 /// Export the current index as the Best-tier `.symforge/index.bin.zst` team
 /// artifact plus its `artifact.json` sidecar, and ensure the `.gitattributes`
-/// `*.zst merge=ours` hint (A-US2-04) exists at `project_root`. Atomic write
-/// (tmp -> rename), mirroring [`write_snapshot`].
+/// `*.zst merge=ours` hint (A-US2-04) exists at `project_root`. Durable write
+/// (named tmp, `sync_all`, rename) for the zst, mirroring [`write_snapshot`];
+/// `artifact.json` uses [`crate::idempotency::write_bytes_atomic`].
 pub fn export_artifact(
     index: &LiveIndex,
     project_root: &Path,
@@ -1077,16 +1137,8 @@ pub fn export_artifact(
     let dir = paths::ensure_symforge_dir(project_root)?;
     let final_path = dir.join(ARTIFACT_FILENAME);
     let tmp_path = dir.join(ARTIFACT_TMP_FILENAME);
-    std::fs::write(&tmp_path, &compressed).map_err(|e| {
+    persist_named_tmp(&tmp_path, &final_path, &compressed).map_err(|e| {
         anyhow::anyhow!("writing team artifact tmp at {}: {}", tmp_path.display(), e)
-    })?;
-    std::fs::rename(&tmp_path, &final_path).map_err(|e| {
-        anyhow::anyhow!(
-            "renaming team artifact {} -> {}: {}",
-            tmp_path.display(),
-            final_path.display(),
-            e
-        )
     })?;
 
     let metadata_path = dir.join(ARTIFACT_METADATA_FILENAME);
@@ -1096,13 +1148,14 @@ pub fn export_artifact(
         "compressed_bytes": compressed.len(),
         "files": file_count,
     });
-    std::fs::write(&metadata_path, serde_json::to_vec_pretty(&metadata)?).map_err(|e| {
-        anyhow::anyhow!(
-            "writing team artifact metadata at {}: {}",
-            metadata_path.display(),
-            e
-        )
-    })?;
+    crate::idempotency::write_bytes_atomic(&metadata_path, &serde_json::to_vec_pretty(&metadata)?)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "writing team artifact metadata at {}: {}",
+                metadata_path.display(),
+                e
+            )
+        })?;
 
     ensure_gitattributes_merge_hint(project_root)?;
 
@@ -1227,8 +1280,8 @@ fn read_verified_artifact(project_root: &Path) -> Option<VerifiedArtifact> {
     // contracts/team-artifact.md § Import flow requires "verify content_hash"
     // BEFORE loading. A missing/unparseable sidecar means the hash cannot be
     // verified — reachable when a crash (or partial checkout) lands between
-    // `export_artifact`'s artifact rename and its separate, non-atomic sidecar
-    // write. Do NOT silently trust an unverifiable payload: treat it as an
+    // `export_artifact`'s artifact rename and its separate sidecar persist.
+    // Do NOT silently trust an unverifiable payload: treat it as an
     // integrity failure (§ Integrity failure), quarantine, and fall back to a
     // full index build.
     let Some(expected_hash) = read_artifact_content_hash(&metadata_path) else {
@@ -1708,23 +1761,12 @@ fn write_snapshot(
         .parent()
         .expect("snapshot path must have a parent directory");
 
-    // Atomic write: tmp file then rename
+    // Durable write: named tmp, fsync, rename (Unix parent-dir fsync).
     let tmp_path = next_snapshot_temp_path(dir);
-
-    if let Err(error) = std::fs::write(&tmp_path, &bytes) {
-        cleanup_snapshot_temp(&tmp_path);
+    if let Err(error) = persist_named_tmp(&tmp_path, &final_path, &bytes) {
         return Err(anyhow::anyhow!(
             "writing index snapshot tmp at {}: {}",
             tmp_path.display(),
-            error
-        ));
-    }
-    if let Err(error) = std::fs::rename(&tmp_path, &final_path) {
-        cleanup_snapshot_temp(&tmp_path);
-        return Err(anyhow::anyhow!(
-            "renaming index snapshot {} -> {}: {}",
-            tmp_path.display(),
-            final_path.display(),
             error
         ));
     }
@@ -9240,6 +9282,116 @@ mod tests {
         assert!(
             leftover_temps.is_empty(),
             "failed writes must remove their own temp file: {leftover_temps:?}"
+        );
+    }
+
+    fn capture_named_tmp_persist_stages<R>(op: impl FnOnce() -> R) -> (R, Vec<&'static str>) {
+        super::SNAPSHOT_PERSIST_STAGES.with(|cell| {
+            *cell.borrow_mut() = Some(Vec::new());
+        });
+        let result = op();
+        let stages = super::SNAPSHOT_PERSIST_STAGES
+            .with(|cell| cell.borrow_mut().take())
+            .unwrap_or_default();
+        (result, stages)
+    }
+
+    fn assert_sync_all_before_rename(stages: &[&'static str]) {
+        let sync_all = stages
+            .iter()
+            .position(|stage| *stage == "sync_all")
+            .expect("persist wrapper must observe File::sync_all");
+        let rename = stages
+            .iter()
+            .position(|stage| *stage == "rename")
+            .expect("persist wrapper must observe rename");
+        assert!(
+            sync_all < rename,
+            "sync_all must be recorded before rename, got {stages:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_sync_all_is_observed_before_rename() {
+        let tmp = TempDir::new().expect("create project");
+        let dest = tmp.path().join("index.bin");
+        let named_tmp = tmp.path().join("index.bin.tmp.1.0");
+        std::fs::write(&dest, b"old-bytes").expect("seed previous dest");
+
+        let ((), helper_stages) = capture_named_tmp_persist_stages(|| {
+            super::persist_named_tmp(&named_tmp, &dest, b"new-bytes").expect("helper persist");
+        });
+        assert_sync_all_before_rename(&helper_stages);
+        assert_eq!(
+            std::fs::read(&dest).expect("read helper dest"),
+            b"new-bytes",
+            "completed persist leaves the new bytes"
+        );
+
+        let index = make_live_index_with_files(vec![("src/lib.rs", b"fn lib() {}")]);
+        let ((), snapshot_stages) = capture_named_tmp_persist_stages(|| {
+            serialize_index(&index, tmp.path()).expect("write_snapshot persist");
+        });
+        assert_sync_all_before_rename(&snapshot_stages);
+        let snapshot_path = tmp.path().join(".symforge").join(INDEX_FILENAME);
+        let snapshot_bytes = std::fs::read(&snapshot_path).expect("read snapshot");
+        let restored = postcard::from_bytes::<IndexSnapshot>(&snapshot_bytes)
+            .expect("completed write_snapshot leaves decodable new bytes");
+        assert_eq!(restored.files.len(), 1);
+
+        let (report, artifact_stages) = capture_named_tmp_persist_stages(|| {
+            export_artifact_legacy(&index, tmp.path()).expect("export_artifact persist")
+        });
+        assert_sync_all_before_rename(&artifact_stages);
+        let zst = std::fs::read(&report.path).expect("read zst");
+        assert!(
+            !zst.is_empty(),
+            "completed artifact persist leaves zst bytes"
+        );
+        let metadata = std::fs::read(&report.metadata_path).expect("read artifact.json");
+        assert!(
+            !metadata.is_empty(),
+            "artifact.json persist leaves the new bytes"
+        );
+    }
+
+    struct FailNamedTmpSyncAll;
+
+    impl Drop for FailNamedTmpSyncAll {
+        fn drop(&mut self) {
+            super::FAIL_NAMED_TMP_SYNC_ALL.with(|cell| cell.set(false));
+        }
+    }
+
+    #[test]
+    fn snapshot_sync_all_failure_does_not_rename_or_report_success() {
+        let tmp = TempDir::new().expect("create project");
+        let dest = tmp.path().join("index.bin");
+        let named_tmp = tmp.path().join("index.bin.tmp.1.0");
+        std::fs::write(&dest, b"old-bytes").expect("seed previous dest");
+        let _fail = FailNamedTmpSyncAll;
+        super::FAIL_NAMED_TMP_SYNC_ALL.with(|cell| cell.set(true));
+
+        let (result, stages) = capture_named_tmp_persist_stages(|| {
+            super::persist_named_tmp(&named_tmp, &dest, b"new-bytes")
+        });
+        assert!(
+            result.is_err(),
+            "simulated sync_all failure must not report success"
+        );
+        assert!(
+            !stages.contains(&"rename"),
+            "sync_all failure must not rename, got {stages:?}"
+        );
+        assert_eq!(
+            std::fs::read(&dest).expect("read dest after failed persist"),
+            b"old-bytes",
+            "previous dest bytes stay in place"
+        );
+        assert!(
+            !named_tmp.exists(),
+            "failed write must remove its tmp: {}",
+            named_tmp.display()
         );
     }
 

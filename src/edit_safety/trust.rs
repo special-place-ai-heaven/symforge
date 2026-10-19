@@ -344,7 +344,7 @@ impl ProjectConfigTrust {
             fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(store)?;
-        fs::write(&self.store_path, json)?;
+        crate::idempotency::write_bytes_atomic(&self.store_path, json.as_bytes())?;
         Ok(())
     }
 }
@@ -449,6 +449,13 @@ fn collect_optional_config_file(
             ));
         }
     };
+    if crate::paths::metadata_is_symlink_or_reparse(&metadata) {
+        warnings.push(format!(
+            "skipped symlink or reparse point {}; project config is untrusted until fixed",
+            path.display()
+        ));
+        return Ok(());
+    }
     let file_type = metadata.file_type();
     if file_type.is_file() {
         files.push(path.to_path_buf());
@@ -466,6 +473,31 @@ fn collect_config_dir(
     files: &mut Vec<PathBuf>,
     warnings: &mut Vec<String>,
 ) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(format!(
+                "could not inspect config directory {}: {err}",
+                dir.display()
+            ));
+        }
+    };
+    if crate::paths::metadata_is_symlink_or_reparse(&metadata) {
+        warnings.push(format!(
+            "skipped symlink or reparse point {}; project config is untrusted until fixed",
+            dir.display()
+        ));
+        return Ok(());
+    }
+    if !metadata.file_type().is_dir() {
+        warnings.push(format!(
+            "skipped unsupported config path {}; project config is untrusted until fixed",
+            dir.display()
+        ));
+        return Ok(());
+    }
+
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -493,6 +525,13 @@ fn collect_config_dir(
         }
         let metadata = fs::symlink_metadata(&path)
             .map_err(|err| format!("could not inspect config path {}: {err}", path.display()))?;
+        if crate::paths::metadata_is_symlink_or_reparse(&metadata) {
+            warnings.push(format!(
+                "skipped symlink or reparse point {}; project config is untrusted until fixed",
+                path.display()
+            ));
+            continue;
+        }
         let file_type = metadata.file_type();
         if file_type.is_file() {
             files.push(path);
@@ -515,4 +554,258 @@ fn relative_project_path(project_root: &Path, path: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    const OUTSIDE_SECRET: &str = "OUTSIDE_SECRET_SHOULD_NOT_ENTER_HASH";
+    const REGULAR_CONFIG: &str = "rank_by = \"path\"\n";
+
+    fn write_regular_config(project_root: &Path) {
+        let config_dir = project_root.join(".symforge").join("config");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        fs::write(config_dir.join("keep.toml"), REGULAR_CONFIG).expect("regular config");
+    }
+
+    fn plant_reparse(link: &Path, outside: &Path) {
+        #[cfg(windows)]
+        {
+            let status = crate::process_util::hidden_command("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(outside)
+                .output()
+                .expect("mklink runs");
+            assert!(
+                status.status.success(),
+                "mklink /J failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside, link).expect("symlink");
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = (link, outside);
+            panic!("reparse/symlink plant requires windows or unix");
+        }
+    }
+
+    fn plant_outbound_config_link(config_dir: &Path, outside: &Path) {
+        plant_reparse(&config_dir.join("leak"), outside);
+    }
+
+    #[test]
+    fn trust_config_reparse() {
+        let control_root = TempDir::new().expect("control project");
+        write_regular_config(control_root.path());
+        let control = ProjectConfigTrust::with_store_path(control_root.path().join("trust.json"))
+            .evaluate(control_root.path());
+        assert_eq!(control.actual_hash.len(), 64);
+        assert!(
+            control
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("symlink") && !warning.contains("reparse")),
+            "positive control must not warn about links: {:?}",
+            control.warnings
+        );
+
+        let outside = TempDir::new().expect("outside");
+        fs::write(outside.path().join("secret.toml"), OUTSIDE_SECRET).expect("outside secret");
+
+        let linked_root = TempDir::new().expect("linked project");
+        write_regular_config(linked_root.path());
+        plant_outbound_config_link(
+            &linked_root.path().join(".symforge").join("config"),
+            outside.path(),
+        );
+
+        let linked = ProjectConfigTrust::with_store_path(linked_root.path().join("trust.json"))
+            .evaluate(linked_root.path());
+        assert!(
+            matches!(linked.status, TrustStatus::Untrusted),
+            "reparse/symlink under config is fail-closed, got {:?}",
+            linked.status
+        );
+        assert_eq!(
+            linked.actual_hash, control.actual_hash,
+            "hash input must be the regular config file only"
+        );
+        let leak_path = linked_root
+            .path()
+            .join(".symforge")
+            .join("config")
+            .join("leak");
+        assert!(
+            linked.warnings.iter().any(|warning| {
+                warning.contains(&leak_path.display().to_string())
+                    && warning.contains("untrusted")
+                    && !warning.contains(OUTSIDE_SECRET)
+            }),
+            "warning must name the skipped path: {:?}",
+            linked.warnings
+        );
+    }
+
+    #[test]
+    fn trust_config_reparse_rejects_config_directory_that_is_itself_a_link() {
+        let outside = TempDir::new().expect("outside");
+        fs::write(outside.path().join("secret.toml"), OUTSIDE_SECRET).expect("outside secret");
+
+        let linked_root = TempDir::new().expect("linked project");
+        fs::create_dir_all(linked_root.path().join(".symforge")).expect(".symforge");
+        plant_reparse(
+            &linked_root.path().join(".symforge").join("config"),
+            outside.path(),
+        );
+
+        let linked = ProjectConfigTrust::with_store_path(linked_root.path().join("trust.json"))
+            .evaluate(linked_root.path());
+        assert!(
+            matches!(linked.status, TrustStatus::Untrusted),
+            "config directory reparse is fail-closed, got {:?}",
+            linked.status
+        );
+        let config_dir = linked_root.path().join(".symforge").join("config");
+        assert!(
+            linked.warnings.iter().any(|warning| {
+                warning.contains(&config_dir.display().to_string())
+                    && warning.contains("untrusted")
+                    && !warning.contains(OUTSIDE_SECRET)
+            }),
+            "warning must name the skipped config directory: {:?}",
+            linked.warnings
+        );
+        assert!(
+            !linked.actual_hash.is_empty(),
+            "evaluation still produces a hash of the remaining regular files"
+        );
+    }
+
+    struct BlockNewFilesInParent {
+        parent: PathBuf,
+        #[cfg(unix)]
+        previous_mode: u32,
+        #[cfg(windows)]
+        user: String,
+    }
+
+    impl BlockNewFilesInParent {
+        fn engage(parent: &Path) -> Self {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let metadata = fs::metadata(parent).expect("parent metadata");
+                let previous_mode = metadata.permissions().mode();
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(0o555);
+                fs::set_permissions(parent, permissions).expect("block new files");
+                Self {
+                    parent: parent.to_path_buf(),
+                    previous_mode,
+                }
+            }
+            #[cfg(windows)]
+            {
+                let user = whoami_user();
+                let status = crate::process_util::hidden_command("icacls")
+                    .arg(parent)
+                    .arg("/deny")
+                    .arg(format!("{user}:(WD,AD)"))
+                    .output()
+                    .expect("icacls deny");
+                assert!(
+                    status.status.success(),
+                    "icacls deny failed: {}",
+                    String::from_utf8_lossy(&status.stderr)
+                );
+                Self {
+                    parent: parent.to_path_buf(),
+                    user,
+                }
+            }
+        }
+    }
+
+    impl Drop for BlockNewFilesInParent {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(metadata) = fs::metadata(&self.parent) {
+                    let mut permissions = metadata.permissions();
+                    permissions.set_mode(self.previous_mode);
+                    let _ = fs::set_permissions(&self.parent, permissions);
+                }
+            }
+            #[cfg(windows)]
+            {
+                let _ = crate::process_util::hidden_command("icacls")
+                    .arg(&self.parent)
+                    .arg("/remove:d")
+                    .arg(&self.user)
+                    .output();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn whoami_user() -> String {
+        let output = crate::process_util::hidden_command("whoami")
+            .output()
+            .expect("whoami");
+        assert!(output.status.success(), "whoami failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn trust_store_atomic() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("edit-safety").join("trust.json");
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let previous = r#"{"schema_version":1,"records":{}}"#;
+        fs::write(&path, previous).expect("seed previous");
+
+        let trust = ProjectConfigTrust::with_store_path(&path);
+        let record = TrustRecord {
+            project_key: "proj-key".to_string(),
+            trusted_hash: "ab".repeat(32),
+            trusted_at: "2026-09-18T00:00:00Z".to_string(),
+            writer: "symforge/test".to_string(),
+        };
+        let mut store = TrustStore::default();
+        store
+            .records
+            .insert(record.project_key.clone(), record.clone());
+
+        {
+            let parent = path.parent().expect("parent");
+            let _fence = BlockNewFilesInParent::engage(parent);
+            trust
+                .write_store(&store)
+                .expect_err("replace must not run while new files are blocked");
+            let kept = fs::read_to_string(&path).expect("read previous");
+            let loaded: TrustStore = serde_json::from_str(&kept).expect("previous JSON parseable");
+            assert!(
+                loaded.records.is_empty(),
+                "crash before replace must keep the previous store"
+            );
+            assert_eq!(loaded.schema_version, TRUST_STORE_SCHEMA_VERSION);
+        }
+
+        trust.write_store(&store).expect("completed persist");
+        let loaded: TrustStore =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(
+            loaded.records.get("proj-key"),
+            Some(&record),
+            "completed persist is the new store"
+        );
+    }
 }

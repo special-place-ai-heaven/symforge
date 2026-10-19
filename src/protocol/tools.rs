@@ -33104,4 +33104,137 @@ mod tests {
             findings.len()
         );
     }
+
+    const OUTBOUND_LINK_CANARY: &str = "OUTBOUND_LINK_CANARY_VALUE";
+    const OUTBOUND_LINK_PLAIN: &str = "OUTBOUND_LINK_PLAIN_ok";
+
+    fn plant_outbound_link(repo: &Path) -> (tempfile::TempDir, &'static str) {
+        let outside = tempfile::TempDir::new().expect("outside root");
+        std::fs::write(
+            outside.path().join("outside.txt"),
+            format!("{OUTBOUND_LINK_CANARY}\n"),
+        )
+        .expect("write outside");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                outside.path().join("outside.txt"),
+                repo.join("outbound_link.txt"),
+            )
+            .expect("file symlink");
+            (outside, "outbound_link.txt")
+        }
+        #[cfg(windows)]
+        {
+            let junction = repo.join("junc");
+            let status = crate::process_util::hidden_command("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&junction)
+                .arg(outside.path())
+                .output()
+                .expect("mklink runs");
+            assert!(
+                status.status.success(),
+                "mklink /J failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+            (outside, "junc/outside.txt")
+        }
+    }
+
+    fn index_holds_outbound_canary(server: &SymForgeServer, link_path: &str) -> bool {
+        let guard = server.index().data_plane().read();
+        [
+            link_path,
+            "junc/outside.txt",
+            "outbound_link.txt",
+            "outside.txt",
+        ]
+        .into_iter()
+        .any(|path| {
+            guard.get_file(path).is_some_and(|file| {
+                String::from_utf8_lossy(&file.content).contains(OUTBOUND_LINK_CANARY)
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn outbound_link_get_file_content_and_untracked_search_text_refuse_secret() {
+        let dir = init_git_repo();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/plain.rs"),
+            format!("fn plain() {{ let _ = \"{OUTBOUND_LINK_PLAIN}\"; }}\n"),
+        )
+        .unwrap();
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "plain"]);
+        let (_outside, link_path) = plant_outbound_link(dir.path());
+
+        let index = LiveIndex::load(dir.path()).unwrap();
+        let watcher_info = Arc::new(parking_lot::Mutex::new(
+            crate::watcher::WatcherInfo::default(),
+        ));
+        let server = SymForgeServer::new(
+            index,
+            "test_project".to_string(),
+            watcher_info,
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+
+        let leaked = server
+            .get_file_content(Parameters(get_file_content_input(link_path)))
+            .await;
+        assert!(
+            !leaked.contains(OUTBOUND_LINK_CANARY),
+            "get_file_content must not return outside file: {leaked}"
+        );
+
+        let plain = server
+            .get_file_content(Parameters(get_file_content_input("src/plain.rs")))
+            .await;
+        assert!(
+            plain.contains(OUTBOUND_LINK_PLAIN),
+            "ordinary in-repo file must still be served: {plain}"
+        );
+
+        let search = server
+            .search_text(Parameters(super::SearchTextInput {
+                query: Some(format!("^{OUTBOUND_LINK_CANARY}$")),
+                terms: None,
+                regex: Some(true),
+                path_prefix: None,
+                language: None,
+                limit: None,
+                max_per_file: None,
+                include_generated: None,
+                include_tests: None,
+                glob: None,
+                exclude_glob: None,
+                context: None,
+                case_sensitive: None,
+                whole_word: None,
+                group_by: None,
+                follow_refs: None,
+                follow_refs_limit: None,
+                ranked: None,
+                estimate: None,
+                max_tokens: None,
+                structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
+                project: None,
+                projects: None,
+            }))
+            .await;
+        assert!(
+            search.contains("No matches"),
+            "untracked search_text must return zero hits, not a file hit: {search}"
+        );
+        assert!(
+            !index_holds_outbound_canary(&server, link_path),
+            "the live index must not publish the outside file"
+        );
+    }
 }

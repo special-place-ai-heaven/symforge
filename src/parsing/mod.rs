@@ -1144,21 +1144,76 @@ pub fn extract_symbols_for_diff(source: &str, path: &str) -> Option<Vec<(String,
         Ok(Ok(output)) => output,
         _ => return None,
     };
-    let pairs: Vec<(String, String)> = symbols
+    Some(symbol_diff_pairs(source, &symbols))
+}
+
+fn symbol_diff_pairs(source: &str, symbols: &[SymbolRecord]) -> Vec<(String, String)> {
+    symbols
         .iter()
-        .map(|sym| {
-            let (start, end) = sym.byte_range;
-            let body = &source[start as usize..end as usize];
-            (sym.name.clone(), crate::hash::digest_hex(body.as_bytes()))
+        .filter_map(|sym| {
+            let start = sym.byte_range.0 as usize;
+            let end = sym.byte_range.1 as usize;
+            if start > end
+                || end > source.len()
+                || !source.is_char_boundary(start)
+                || !source.is_char_boundary(end)
+            {
+                return None;
+            }
+            let body = &source[start..end];
+            Some((sym.name.clone(), digest_hex(body.as_bytes())))
         })
-        .collect();
-    Some(pairs)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::{FileOutcome, LanguageId, SymbolKind};
+
+    fn diff_test_symbol(name: &str, byte_range: (u32, u32)) -> SymbolRecord {
+        SymbolRecord {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            depth: 0,
+            sort_order: 0,
+            byte_range,
+            line_range: (0, 0),
+            doc_byte_range: None,
+            item_byte_range: None,
+        }
+    }
+
+    #[test]
+    fn test_extract_symbols_for_diff_skips_illegal_ranges() {
+        // "café" is 5 bytes: c a f [C3 A9]. Byte 4 sits inside é.
+        let source = "caf\u{e9}";
+        assert_eq!(source.len(), 5);
+        assert!(!source.is_char_boundary(4));
+
+        let symbols = [
+            diff_test_symbol("ok", (0, 3)),
+            diff_test_symbol("inverted", (3, 1)),
+            diff_test_symbol("oob", (0, 9)),
+            diff_test_symbol("mid_char", (4, 5)),
+            diff_test_symbol("accent", (3, 5)),
+        ];
+        let pairs = symbol_diff_pairs(source, &symbols);
+        let names: Vec<&str> = pairs.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["ok", "accent"]);
+    }
+
+    #[test]
+    fn test_extract_symbols_for_diff_hashes_ascii_fn() {
+        let source = "fn foo() {}\n";
+        let pairs = extract_symbols_for_diff(source, "lib.rs").expect("rust source parses");
+        assert!(
+            pairs
+                .iter()
+                .any(|(name, hash)| name == "foo" && !hash.is_empty()),
+            "got {pairs:?}"
+        );
+    }
 
     // SF-STRESS-005: content classification of a `.h` header for grammar routing.
     #[test]

@@ -16,6 +16,28 @@ const REPLAY_RECORD_SCHEMA_VERSION: u8 = 1;
 const RECORD_FILE_NAME: &str = "record.json";
 const MAX_REPLAY_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// Control-state persist: tmp + `sync_all` + rename (+ Unix parent dir sync).
+/// Not for repository source bytes (`protocol::edit::atomic_write_file`).
+pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path has no parent directory: {}", path.display()),
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct IdempotencyKey(String);
 
@@ -831,21 +853,8 @@ impl FileReplayStore {
 
     fn write_record_atomic(&self, record: &ReplayRecord) -> Result<(), IdempotencyError> {
         let path = self.record_path_for_hash(&record.key_hash);
-        let parent = path.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("record path has no parent: {}", path.display()),
-            )
-        })?;
-        fs::create_dir_all(parent)?;
-
         let bytes = serde_json::to_vec_pretty(record)?;
-        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-        tmp.write_all(&bytes)?;
-        tmp.flush()?;
-        tmp.as_file().sync_all()?;
-        tmp.persist(&path)
-            .map_err(|error| IdempotencyError::Io(error.error))?;
+        write_bytes_atomic(&path, &bytes).map_err(IdempotencyError::Io)?;
         #[cfg(test)]
         if std::env::var_os("SYMFORGE_REPLAY_COMPLETE_CRASH").is_some()
             && record.status == ReplayStatus::Completed
@@ -1729,6 +1738,20 @@ mod tests {
         assert_ne!(
             canonical_project_key(&native),
             canonical_project_key(&lossy_collision)
+        );
+    }
+
+    #[test]
+    fn write_bytes_atomic_replaces_previous_file_with_exact_bytes() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("nested").join("trust.json");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, b"old").expect("seed");
+        write_bytes_atomic(&path, b"{\"ok\":true}").expect("atomic write");
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"{\"ok\":true}",
+            "positive control: completed persist is the new bytes"
         );
     }
 }
