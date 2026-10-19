@@ -154,3 +154,136 @@ fn new_stores_the_safety_and_cost_it_was_given() {
     assert_eq!(evidence.safety, CapabilitySafety::WriteRequiresConsent);
     assert_eq!(evidence.freshness, CapabilityFreshness::Unknown);
 }
+
+#[test]
+fn policy_display_and_from_str_round_trip_and_const_constructors_work() {
+    for variant in [
+        FrecencyCollectionPolicy::Session,
+        FrecencyCollectionPolicy::Persistent,
+        FrecencyCollectionPolicy::Disabled,
+    ] {
+        let rendered = variant.to_string();
+        assert_eq!(rendered.parse::<FrecencyCollectionPolicy>(), Ok(variant));
+        assert_eq!(
+            format!("  {}  ", rendered.to_uppercase()).parse::<FrecencyCollectionPolicy>(),
+            Ok(variant)
+        );
+    }
+    assert!("invalid".parse::<FrecencyCollectionPolicy>().is_err());
+
+    for variant in [
+        CouplingPreparePolicy::LazyOnRequest,
+        CouplingPreparePolicy::WarmOnStart,
+        CouplingPreparePolicy::Disabled,
+    ] {
+        let rendered = variant.to_string();
+        assert_eq!(rendered.parse::<CouplingPreparePolicy>(), Ok(variant));
+        assert_eq!(
+            format!("  {}  ", rendered.to_uppercase()).parse::<CouplingPreparePolicy>(),
+            Ok(variant)
+        );
+    }
+    assert!("invalid".parse::<CouplingPreparePolicy>().is_err());
+
+    for variant in [
+        WorktreeRoutingPolicy::ExplicitCallTime,
+        WorktreeRoutingPolicy::Disabled,
+    ] {
+        let rendered = variant.to_string();
+        assert_eq!(rendered.parse::<WorktreeRoutingPolicy>(), Ok(variant));
+        assert_eq!(
+            format!("  {}  ", rendered.to_uppercase()).parse::<WorktreeRoutingPolicy>(),
+            Ok(variant)
+        );
+    }
+    assert!("invalid".parse::<WorktreeRoutingPolicy>().is_err());
+
+    for variant in [
+        RankingDiagnosticsPolicy::CallTimeExplain,
+        RankingDiagnosticsPolicy::DefaultOn,
+        RankingDiagnosticsPolicy::Disabled,
+    ] {
+        let rendered = variant.to_string();
+        assert_eq!(rendered.parse::<RankingDiagnosticsPolicy>(), Ok(variant));
+        assert_eq!(
+            format!("  {}  ", rendered.to_uppercase()).parse::<RankingDiagnosticsPolicy>(),
+            Ok(variant)
+        );
+    }
+    assert!("invalid".parse::<RankingDiagnosticsPolicy>().is_err());
+
+    const POLICY: CapabilityPolicy = CapabilityPolicy::new(
+        FrecencyCollectionPolicy::Persistent,
+        CouplingPreparePolicy::WarmOnStart,
+        WorktreeRoutingPolicy::ExplicitCallTime,
+        RankingDiagnosticsPolicy::DefaultOn,
+    );
+    const DISABLED: CapabilityPolicy = CapabilityPolicy::disabled();
+
+    assert_eq!(
+        POLICY.frecency_collection,
+        FrecencyCollectionPolicy::Persistent
+    );
+    assert_eq!(POLICY.coupling_prepare, CouplingPreparePolicy::WarmOnStart);
+    assert_eq!(
+        POLICY.worktree_routing,
+        WorktreeRoutingPolicy::ExplicitCallTime
+    );
+    assert_eq!(
+        POLICY.ranking_diagnostics,
+        RankingDiagnosticsPolicy::DefaultOn
+    );
+    assert_eq!(
+        DISABLED,
+        CapabilityPolicy::new(
+            FrecencyCollectionPolicy::Disabled,
+            CouplingPreparePolicy::Disabled,
+            WorktreeRoutingPolicy::Disabled,
+            RankingDiagnosticsPolicy::Disabled,
+        )
+    );
+}
+
+#[test]
+fn same_capability_state_ignores_free_form_detail() {
+    let first = CapabilityEvidence::new(
+        CapabilityName::CoChangeRanking,
+        CapabilityStatus::Applied,
+        CapabilityCost::Bounded,
+        CapabilitySafety::ReadOnly,
+    )
+    .with_freshness(CapabilityFreshness::Current)
+    .with_detail("coupled with 3 files");
+
+    let second = CapabilityEvidence::new(
+        CapabilityName::CoChangeRanking,
+        CapabilityStatus::Applied,
+        CapabilityCost::Bounded,
+        CapabilitySafety::ReadOnly,
+    )
+    .with_freshness(CapabilityFreshness::Current)
+    .with_detail("coupled with 12 files");
+
+    assert!(first.same_capability_state(&second));
+    assert_ne!(first, second);
+
+    let different_status = CapabilityEvidence::new(
+        CapabilityName::CoChangeRanking,
+        CapabilityStatus::FallbackUsed,
+        CapabilityCost::Bounded,
+        CapabilitySafety::ReadOnly,
+    )
+    .with_freshness(CapabilityFreshness::Current)
+    .with_detail("coupled with 3 files");
+    assert!(!first.same_capability_state(&different_status));
+
+    let different_freshness = CapabilityEvidence::new(
+        CapabilityName::CoChangeRanking,
+        CapabilityStatus::Applied,
+        CapabilityCost::Bounded,
+        CapabilitySafety::ReadOnly,
+    )
+    .with_freshness(CapabilityFreshness::Stale)
+    .with_detail("coupled with 3 files");
+    assert!(!first.same_capability_state(&different_freshness));
+}

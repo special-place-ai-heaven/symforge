@@ -395,25 +395,65 @@ fn all_tools_have_valid_schemas() {
 #[test]
 fn minimal_payloads_deserialize_for_all_tools() {
     // For each tool, build a minimal JSON payload from the schema's required
-    // fields and verify it deserializes without error.
+    // fields, roundtrip it through JSON serialization, and verify it satisfies
+    // every schema-required field and declared JSON property type.
     for tool in SymForgeServer::tool_definitions() {
         let schema = tool.input_schema.as_ref();
         let payload = build_minimal_payload(schema);
 
-        // The payload must be valid JSON
         let serialized = serde_json::to_string(&payload).unwrap_or_else(|e| {
             panic!(
                 "tool '{}' minimal payload failed to serialize: {e}",
                 tool.name
             )
         });
-        let _: Value = serde_json::from_str(&serialized).unwrap_or_else(|e| {
+        let roundtripped: Value = serde_json::from_str(&serialized).unwrap_or_else(|e| {
             panic!(
                 "tool '{}' minimal payload failed to roundtrip: {e}",
                 tool.name
             )
         });
+        validate_minimal_payload_against_schema(schema, &roundtripped).unwrap_or_else(|err| {
+            panic!(
+                "tool '{}' minimal payload failed schema validation: {err}",
+                tool.name
+            )
+        });
     }
+}
+
+#[test]
+fn minimal_payload_validator_rejects_missing_or_mistyped_required_field() {
+    let schema = SymForgeServer::tool_definitions()
+        .into_iter()
+        .find(|t| t.name.as_ref() == "find_dependents")
+        .expect("find_dependents must be registered")
+        .input_schema;
+    let valid = build_minimal_payload(schema.as_ref());
+    assert!(
+        validate_minimal_payload_against_schema(schema.as_ref(), &valid).is_ok(),
+        "valid minimal payload for find_dependents must pass validator"
+    );
+
+    let mut missing_required = valid.as_object().expect("object payload").clone();
+    missing_required.remove("path");
+    let missing_err =
+        validate_minimal_payload_against_schema(schema.as_ref(), &Value::Object(missing_required))
+            .expect_err("payload missing required field 'path' must be rejected");
+    assert!(
+        missing_err.contains("missing required field 'path'"),
+        "unexpected error for missing required field: {missing_err}"
+    );
+
+    let mut mistyped_required = valid.as_object().expect("object payload").clone();
+    mistyped_required.insert("path".to_string(), json!(42));
+    let mistyped_err =
+        validate_minimal_payload_against_schema(schema.as_ref(), &Value::Object(mistyped_required))
+            .expect_err("payload with integer for string field 'path' must be rejected");
+    assert!(
+        mistyped_err.contains("field 'path' has wrong JSON type"),
+        "unexpected error for mistyped required field: {mistyped_err}"
+    );
 }
 
 fn assert_advertised_tool_description(name: &str, desc: Option<&str>) {
@@ -1265,4 +1305,84 @@ fn default_value_for(schema: &Value) -> Value {
             json!("test")
         }
     }
+}
+
+fn validate_minimal_payload_against_schema(
+    schema: &serde_json::Map<String, Value>,
+    payload: &Value,
+) -> Result<(), String> {
+    let obj = payload
+        .as_object()
+        .ok_or_else(|| "payload must be a JSON object".to_string())?;
+    let properties = schema
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| "schema must contain 'properties' object".to_string())?;
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    for req_key in required {
+        let prop_schema = properties.get(req_key).ok_or_else(|| {
+            format!("required field '{req_key}' is not declared in schema 'properties'")
+        })?;
+        let value = obj
+            .get(req_key)
+            .ok_or_else(|| format!("missing required field '{req_key}'"))?;
+        if !value_matches_schema_type(prop_schema, value) {
+            return Err(format!(
+                "field '{req_key}' has wrong JSON type for schema {prop_schema}: got {value}"
+            ));
+        }
+    }
+
+    for (key, value) in obj {
+        let prop_schema = properties.get(key).ok_or_else(|| {
+            format!("payload field '{key}' is not declared in schema 'properties'")
+        })?;
+        if !value_matches_schema_type(prop_schema, value) {
+            return Err(format!(
+                "field '{key}' has wrong JSON type for schema {prop_schema}: got {value}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn value_matches_schema_type(prop_schema: &Value, value: &Value) -> bool {
+    fn matches_single_type(expected: &str, value: &Value) -> bool {
+        match expected {
+            "string" => value.is_string(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "array" => value.is_array(),
+            "object" => value.is_object(),
+            "null" => value.is_null(),
+            _ => false,
+        }
+    }
+
+    if let Some(expected) = prop_schema.get("type").and_then(|t| t.as_str()) {
+        return matches_single_type(expected, value);
+    }
+    if let Some(arr) = prop_schema.get("type").and_then(|t| t.as_array()) {
+        return arr
+            .iter()
+            .filter_map(|t| t.as_str())
+            .any(|expected| matches_single_type(expected, value));
+    }
+    if let Some(variants) = prop_schema
+        .get("anyOf")
+        .or_else(|| prop_schema.get("oneOf"))
+        .and_then(|v| v.as_array())
+    {
+        return variants
+            .iter()
+            .any(|variant| value_matches_schema_type(variant, value));
+    }
+    true
 }

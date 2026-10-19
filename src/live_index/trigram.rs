@@ -456,7 +456,7 @@ mod tests {
         // Both files must be tracked
         assert_eq!(idx.path_to_id.len(), 2);
         // The trigram "par" from "parse" must be in the index
-        let par: [u8; 3] = [b'p', b'a', b'r'];
+        let par: [u8; 3] = *b"par";
         assert!(
             idx.map.contains_key(&par),
             "trigram 'par' must be indexed from 'parse'"

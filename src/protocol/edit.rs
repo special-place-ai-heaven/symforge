@@ -566,10 +566,9 @@ impl SingleEdit {
         // Parse path::name
         let (path, name) = if let Some(pos) = target.find("::") {
             (target[..pos].trim(), &target[pos + 2..])
-        } else if let Some(pos) = target.rfind(':') {
-            (target[..pos].trim(), &target[pos + 1..])
         } else {
-            return None;
+            let pos = target.rfind(':')?;
+            (target[..pos].trim(), &target[pos + 1..])
         };
 
         if path.is_empty() || name.is_empty() {
@@ -593,15 +592,14 @@ impl SingleEdit {
             EditOperation::InsertAfter {
                 content: body.to_string(),
             }
-        } else if let Some(body) = op_str.strip_prefix("edit_within ") {
+        } else {
+            let body = op_str.strip_prefix("edit_within ")?;
             // Format: "old_text >>> new_text"
             let (old_text, new_text) = body.split_once(" >>> ")?;
             EditOperation::EditWithin {
                 old_text: old_text.to_string(),
                 new_text: new_text.to_string(),
             }
-        } else {
-            return None;
         };
 
         Some(SingleEdit {

@@ -4,6 +4,20 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 pub const META_SCHEMA_VERSION: &str = "schema_version";
 
+pub const MAX_TOOL_NAME_BYTES: usize = 128;
+pub const MAX_SURFACE_BYTES: usize = 64;
+pub const MAX_CONFIGURED_SCOPE_BYTES: usize = 128;
+pub const MAX_CAPABILITY_STATE_JSON_BYTES: usize = 4096;
+
+pub const SCHEMA_OUTCOME_CLASSES: &[&str] = &[
+    "found",
+    "not_found",
+    "ambiguous",
+    "invalid_request",
+    "empty_result",
+    "internal_failure",
+];
+
 pub const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS analytics_meta (
     key   TEXT PRIMARY KEY,
@@ -11,7 +25,7 @@ CREATE TABLE IF NOT EXISTS analytics_meta (
 );
 
 CREATE TABLE IF NOT EXISTS analytics_tool_calls (
-    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    id                    INTEGER PRIMARY KEY,
     tool_name             TEXT NOT NULL CHECK (length(CAST(tool_name AS BLOB)) <= 128),
     surface               TEXT NOT NULL CHECK (length(CAST(surface AS BLOB)) <= 64),
     configured_scope      TEXT NOT NULL CHECK (length(CAST(configured_scope AS BLOB)) <= 128),

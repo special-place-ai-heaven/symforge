@@ -1,6 +1,6 @@
 # 031 — untrue self-claims: three sites where the code misdescribes itself
 
-**Status:** draft, not started.
+**Status:** implemented.
 **Depends on:** spec 030 (`specs/030-llm-onboarding/`) merging first. All three sites live inside 030's
 `OWNS` set (`src/protocol/**`, `src/sidecar/**`, `tests/**`), so executing 031 concurrently would collide.
 **Anchors verified:** 2026-08-26, against `main` at the time of writing. **They will drift when 030 lands** —
@@ -108,6 +108,12 @@ Out: any behaviour change to `get_file_context`'s budget resolution beyond what 
    before writing code.
 4. Then implement, with the negative control on D2 as the non-negotiable one.
 
+
+## Recorded Decisions (Implemented)
+
+- **D1 (`src/protocol/tools.rs` `get_file_context`):** Deleted the unreachable `.or_else(|| large_default_summary.then_some(LARGE_FILE_CONTEXT_DEFAULT_TOKENS))` branch and the dead `LARGE_FILE_CONTEXT_DEFAULT_TOKENS` constant. `large_default_summary` implies `visible_default_sections`, which implies `knowledge_requested`, so `.or_else(|| knowledge_requested.then_some(1000))` always resolved first to the identical `1000`-token default. Pinned by `read_context::tests::d1_file_context_budget_resolution_pins_all_three_input_shapes`.
+- **D2 (`tests/conformance.rs` `minimal_payloads_deserialize_for_all_tools`):** Upgraded `minimal_payloads_deserialize_for_all_tools` to validate every tool's generated minimal payload against its schema `required` keys and declared property JSON types via `validate_minimal_payload_against_schema` (complementing `tests/schema_roundtrip.rs`'s per-tool typed struct deserialization), and added the mandatory negative control `minimal_payload_validator_rejects_missing_or_mistyped_required_field`.
+- **D3 (`src/index_lifecycle/guidance/read_context.rs` `outline_text_for_generation`):** Corrected the `max_bytes` comment to accurately state that `Some(n)` is used by `get_file_context` (which always resolves a concrete budget via `resolve_read_max_tokens`) and explicit `max_tokens` callers, `None if include_savings_footer` is the compact sidecar hook default (`200 * 4` bytes), and `None` (with `include_savings_footer == false`) is unbudgeted (`0`) for direct projection callers that omit `max_tokens`. Kept the `None` arm for direct projection callers and pinned both budgeted and unbudgeted projection paths in `read_context::tests::d3_outline_projection_caps_symbols_when_budgeted_and_stays_unbudgeted_when_none`.
 ## Provenance
 
 Found during the 030 adversarial review: D1 while tracing the default token budget, D2 while checking whether

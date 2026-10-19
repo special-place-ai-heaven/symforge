@@ -12,13 +12,12 @@ use crate::domain::index::ProjectStateDir;
 use crate::paths::{ANALYTICS_DB_NAME, ensure_project_state_db_path, project_state_path};
 use crate::protocol::result_status::OutcomeClass;
 
-use super::schema::{CURRENT_SCHEMA_VERSION, META_SCHEMA_VERSION, SCHEMA_V1};
+pub use super::schema::{
+    CURRENT_SCHEMA_VERSION, MAX_CAPABILITY_STATE_JSON_BYTES, MAX_CONFIGURED_SCOPE_BYTES,
+    MAX_SURFACE_BYTES, MAX_TOOL_NAME_BYTES, META_SCHEMA_VERSION, SCHEMA_OUTCOME_CLASSES, SCHEMA_V1,
+};
 
-pub const MAX_TOOL_NAME_BYTES: usize = 128;
-pub const MAX_SURFACE_BYTES: usize = 64;
-pub const MAX_CONFIGURED_SCOPE_BYTES: usize = 128;
 pub const MAX_CAPABILITY_DETAIL_BYTES: usize = 256;
-pub const MAX_CAPABILITY_STATE_JSON_BYTES: usize = 4096;
 pub const MAX_CAPABILITY_ITEMS: usize = 16;
 pub const DEFAULT_ANALYTICS_EXPORT_LIMIT: usize = 100;
 pub const MAX_ANALYTICS_EXPORT_LIMIT: usize = 1_000;
@@ -310,6 +309,37 @@ impl SqliteAnalyticsStore {
 
     pub fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock().expect("analytics mutex poisoned");
+        let has_meta_table = table_exists(&conn, "analytics_meta")?;
+        let has_tool_calls_table = table_exists(&conn, "analytics_tool_calls")?;
+
+        if has_meta_table {
+            let stored_version: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM analytics_meta WHERE key = ?1",
+                    params![META_SCHEMA_VERSION],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match stored_version {
+                Some(raw) => {
+                    let version: u32 = raw.parse().map_err(|_| {
+                        anyhow::anyhow!("corrupt analytics schema_version: {raw:?}")
+                    })?;
+                    if version != CURRENT_SCHEMA_VERSION {
+                        anyhow::bail!(
+                            "unsupported analytics schema_version {version} (expected {CURRENT_SCHEMA_VERSION})"
+                        );
+                    }
+                }
+                None if has_tool_calls_table => {
+                    anyhow::bail!("unversioned legacy analytics_tool_calls table");
+                }
+                None => {}
+            }
+        } else if has_tool_calls_table {
+            anyhow::bail!("unversioned legacy analytics_tool_calls table");
+        }
+
         conn.execute_batch(SCHEMA_V1)
             .context("applying analytics schema v1")?;
         conn.execute(
@@ -437,6 +467,17 @@ impl SqliteAnalyticsStore {
         let conn = self.conn.lock().expect("analytics mutex poisoned");
         enforce_record_retention(&conn, max_records)
     }
+}
+
+fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table_name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 fn normalize_export_limit(limit: usize) -> usize {
@@ -683,6 +724,134 @@ mod tests {
         assert_eq!(
             store.schema_version().expect("schema version"),
             CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn migrate_rejects_unsupported_or_unversioned_legacy_schema() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        for bad_version in ["0", "99", "not-a-number"] {
+            let db_path = tmp.path().join(format!("analytics_v_{bad_version}.db"));
+            {
+                let conn = Connection::open(&db_path).expect("seed connection");
+                conn.execute_batch(
+                    "CREATE TABLE analytics_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+                )
+                .expect("create meta");
+                conn.execute(
+                    "INSERT INTO analytics_meta (key, value) VALUES (?1, ?2)",
+                    params![META_SCHEMA_VERSION, bad_version],
+                )
+                .expect("seed bad schema_version");
+            }
+            let err = SqliteAnalyticsStore::open(&db_path)
+                .expect_err("unsupported or corrupt schema_version must fail");
+            assert!(
+                err.to_string().contains("schema_version"),
+                "expected error mentioning schema_version for {bad_version:?}, got: {err:#}"
+            );
+        }
+
+        let legacy_no_meta_path = tmp.path().join("analytics_legacy_no_meta.db");
+        {
+            let conn = Connection::open(&legacy_no_meta_path).expect("seed connection");
+            conn.execute_batch("CREATE TABLE analytics_tool_calls (id INTEGER PRIMARY KEY);")
+                .expect("create legacy table");
+        }
+        let err = SqliteAnalyticsStore::open(&legacy_no_meta_path)
+            .expect_err("legacy table without analytics_meta must fail");
+        assert!(
+            err.to_string()
+                .contains("unversioned legacy analytics_tool_calls table"),
+            "expected unversioned legacy error, got: {err:#}"
+        );
+
+        let legacy_empty_meta_path = tmp.path().join("analytics_legacy_empty_meta.db");
+        {
+            let conn = Connection::open(&legacy_empty_meta_path).expect("seed connection");
+            conn.execute_batch(
+                "CREATE TABLE analytics_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE analytics_tool_calls (id INTEGER PRIMARY KEY);",
+            )
+            .expect("create legacy table with empty meta");
+        }
+        let err = SqliteAnalyticsStore::open(&legacy_empty_meta_path)
+            .expect_err("legacy table without schema_version row must fail");
+        assert!(
+            err.to_string()
+                .contains("unversioned legacy analytics_tool_calls table"),
+            "expected unversioned legacy error, got: {err:#}"
+        );
+
+        let fresh_path = tmp.path().join("analytics_fresh.db");
+        let store = SqliteAnalyticsStore::open(&fresh_path).expect("fresh db open");
+        assert_eq!(
+            store.schema_version().expect("schema_version"),
+            CURRENT_SCHEMA_VERSION
+        );
+        store
+            .migrate()
+            .expect("re-running migrate on v1 db is idempotent");
+        assert_eq!(
+            store
+                .schema_version()
+                .expect("schema_version after re-migrate"),
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn schema_outcome_classes_and_byte_limits_match_runtime_constants() {
+        let variants = [
+            OutcomeClass::Found,
+            OutcomeClass::NotFound,
+            OutcomeClass::Ambiguous,
+            OutcomeClass::InvalidRequest,
+            OutcomeClass::EmptyResult,
+            OutcomeClass::InternalFailure,
+        ];
+        assert_eq!(SCHEMA_OUTCOME_CLASSES.len(), 6);
+        for variant in variants {
+            let s = variant.as_str();
+            assert!(
+                SCHEMA_OUTCOME_CLASSES.contains(&s),
+                "OutcomeClass::{variant:?} ({s:?}) missing from SCHEMA_OUTCOME_CLASSES"
+            );
+            let sql_literal = format!("'{s}'");
+            assert!(
+                SCHEMA_V1.contains(&sql_literal),
+                "OutcomeClass::{variant:?} ({sql_literal}) missing from SCHEMA_V1"
+            );
+        }
+
+        assert!(
+            SCHEMA_V1.contains(&format!(
+                "CHECK (length(CAST(tool_name AS BLOB)) <= {MAX_TOOL_NAME_BYTES})"
+            )),
+            "SCHEMA_V1 must enforce MAX_TOOL_NAME_BYTES ({MAX_TOOL_NAME_BYTES})"
+        );
+        assert!(
+            SCHEMA_V1.contains(&format!(
+                "CHECK (length(CAST(surface AS BLOB)) <= {MAX_SURFACE_BYTES})"
+            )),
+            "SCHEMA_V1 must enforce MAX_SURFACE_BYTES ({MAX_SURFACE_BYTES})"
+        );
+        assert!(
+            SCHEMA_V1.contains(&format!(
+                "CHECK (length(CAST(configured_scope AS BLOB)) <= {MAX_CONFIGURED_SCOPE_BYTES})"
+            )),
+            "SCHEMA_V1 must enforce MAX_CONFIGURED_SCOPE_BYTES ({MAX_CONFIGURED_SCOPE_BYTES})"
+        );
+        assert!(
+            SCHEMA_V1.contains(&format!(
+                "CHECK (length(CAST(capability_state_json AS BLOB)) <= {MAX_CAPABILITY_STATE_JSON_BYTES})"
+            )),
+            "SCHEMA_V1 must enforce MAX_CAPABILITY_STATE_JSON_BYTES ({MAX_CAPABILITY_STATE_JSON_BYTES})"
+        );
+        assert!(
+            !SCHEMA_V1.contains("AUTOINCREMENT"),
+            "SCHEMA_V1 must not use AUTOINCREMENT on append-only analytics_tool_calls"
         );
     }
 

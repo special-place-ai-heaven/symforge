@@ -2211,7 +2211,6 @@ impl SymForgeServer {
                 return format::not_found_file(&params.0.path);
             }
         }
-        const LARGE_FILE_CONTEXT_DEFAULT_TOKENS: u64 = 1000;
         let (file_exists, raw_chars, line_count, symbol_count, reference_count) = {
             published
                 .live
@@ -2262,8 +2261,7 @@ impl SymForgeServer {
             params
                 .0
                 .max_tokens
-                .or_else(|| knowledge_requested.then_some(1000))
-                .or_else(|| large_default_summary.then_some(LARGE_FILE_CONTEXT_DEFAULT_TOKENS)),
+                .or_else(|| knowledge_requested.then_some(1000)),
             raw_chars,
         ));
         let knowledge_section = knowledge_requested

@@ -1,5 +1,7 @@
 use std::fmt;
+use std::str::FromStr;
 
+/// Controls how symbol/file access frecency signals are collected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FrecencyCollectionPolicy {
     Session,
@@ -18,6 +20,22 @@ impl fmt::Display for FrecencyCollectionPolicy {
     }
 }
 
+impl FromStr for FrecencyCollectionPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "session" => Ok(Self::Session),
+            "persistent" => Ok(Self::Persistent),
+            "disabled" => Ok(Self::Disabled),
+            other => Err(format!(
+                "unknown frecency collection policy {other:?}; expected 'session', 'persistent', or 'disabled'"
+            )),
+        }
+    }
+}
+
+/// Controls when the co-change coupling store is prepared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CouplingPreparePolicy {
     LazyOnRequest,
@@ -36,6 +54,22 @@ impl fmt::Display for CouplingPreparePolicy {
     }
 }
 
+impl FromStr for CouplingPreparePolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "lazy on request" => Ok(Self::LazyOnRequest),
+            "warm on start" => Ok(Self::WarmOnStart),
+            "disabled" => Ok(Self::Disabled),
+            other => Err(format!(
+                "unknown coupling prepare policy {other:?}; expected 'lazy on request', 'warm on start', or 'disabled'"
+            )),
+        }
+    }
+}
+
+/// Controls whether requests may route to an explicit call-time worktree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorktreeRoutingPolicy {
     ExplicitCallTime,
@@ -52,6 +86,21 @@ impl fmt::Display for WorktreeRoutingPolicy {
     }
 }
 
+impl FromStr for WorktreeRoutingPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "explicit call-time" => Ok(Self::ExplicitCallTime),
+            "disabled" => Ok(Self::Disabled),
+            other => Err(format!(
+                "unknown worktree routing policy {other:?}; expected 'explicit call-time' or 'disabled'"
+            )),
+        }
+    }
+}
+
+/// Controls when ranking score breakdowns and diagnostics are emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RankingDiagnosticsPolicy {
     CallTimeExplain,
@@ -70,6 +119,22 @@ impl fmt::Display for RankingDiagnosticsPolicy {
     }
 }
 
+impl FromStr for RankingDiagnosticsPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "call-time explain" => Ok(Self::CallTimeExplain),
+            "default on" => Ok(Self::DefaultOn),
+            "disabled" => Ok(Self::Disabled),
+            other => Err(format!(
+                "unknown ranking diagnostics policy {other:?}; expected 'call-time explain', 'default on', or 'disabled'"
+            )),
+        }
+    }
+}
+
+/// Aggregated operator policy governing optional ranking and routing capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CapabilityPolicy {
     pub frecency_collection: FrecencyCollectionPolicy,
@@ -79,13 +144,29 @@ pub struct CapabilityPolicy {
 }
 
 impl CapabilityPolicy {
-    pub fn disabled() -> Self {
+    /// Constructs a capability policy with explicit settings for all four domains.
+    pub const fn new(
+        frecency_collection: FrecencyCollectionPolicy,
+        coupling_prepare: CouplingPreparePolicy,
+        worktree_routing: WorktreeRoutingPolicy,
+        ranking_diagnostics: RankingDiagnosticsPolicy,
+    ) -> Self {
         Self {
-            frecency_collection: FrecencyCollectionPolicy::Disabled,
-            coupling_prepare: CouplingPreparePolicy::Disabled,
-            worktree_routing: WorktreeRoutingPolicy::Disabled,
-            ranking_diagnostics: RankingDiagnosticsPolicy::Disabled,
+            frecency_collection,
+            coupling_prepare,
+            worktree_routing,
+            ranking_diagnostics,
         }
+    }
+
+    /// Returns a policy with every optional capability disabled.
+    pub const fn disabled() -> Self {
+        Self::new(
+            FrecencyCollectionPolicy::Disabled,
+            CouplingPreparePolicy::Disabled,
+            WorktreeRoutingPolicy::Disabled,
+            RankingDiagnosticsPolicy::Disabled,
+        )
     }
 }
 
