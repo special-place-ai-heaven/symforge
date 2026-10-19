@@ -5,11 +5,13 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use symforge::embed::parity::host::{
-    HostIndexFailureCause, HostPhase, HostRequest, HostResponse, HostRights, HostRoom,
-    HostRoomConfig, HostRoomGrant, HostRuntimeOwner, HostLimits,
+    HostIndexFailureCause, HostLimits, HostPhase, HostRequest, HostResponse, HostRights, HostRoom,
+    HostRoomConfig, HostRoomGrant, HostRuntimeOwner,
 };
 use symforge::embed::parity::{QueryLimits, QueryOutput, QueryRequest};
-use symforge::embed::{EmbeddedSourceHandle, EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase};
+use symforge::embed::{
+    EmbeddedSourceHandle, EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase,
+};
 
 fn settle(handle: &EmbeddedSourceHandle, after: u64) {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -59,7 +61,9 @@ fn s4_query_symbol_exposes_doc_byte_range_for_rust_ts_python() {
 
     let runtime = ProcessIndexRuntime::acquire().unwrap();
     let handle = runtime
-        .open_embedded_source(EmbeddedSourceSpec::current_worktree(root.path().to_path_buf()))
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+            root.path().to_path_buf(),
+        ))
         .unwrap();
     settle(&handle, 0);
 
@@ -105,7 +109,10 @@ fn s4_query_symbol_exposes_doc_byte_range_for_rust_ts_python() {
 fn s5_symbol_diff_exposes_old_and_new_signatures_on_param_change() {
     let root = tempfile::tempdir().unwrap();
     git(root.path(), &["init"]);
-    git(root.path(), &["config", "user.email", "symforge@example.invalid"]);
+    git(
+        root.path(),
+        &["config", "user.email", "symforge@example.invalid"],
+    );
     git(root.path(), &["config", "user.name", "symforge"]);
     fs::create_dir_all(root.path().join("src")).unwrap();
     fs::write(
@@ -137,7 +144,9 @@ fn s5_symbol_diff_exposes_old_and_new_signatures_on_param_change() {
 
     let runtime = ProcessIndexRuntime::acquire().unwrap();
     let handle = runtime
-        .open_embedded_source(EmbeddedSourceSpec::current_worktree(root.path().to_path_buf()))
+        .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+            root.path().to_path_buf(),
+        ))
         .unwrap();
     settle(&handle, 0);
 
@@ -168,10 +177,7 @@ fn s5_symbol_diff_exposes_old_and_new_signatures_on_param_change() {
         .as_deref()
         .expect("new-side signature");
     assert!(before.contains("reshape(a: u32)"), "before={before}");
-    assert!(
-        after.contains("reshape(a: u32, b: u32)"),
-        "after={after}"
-    );
+    assert!(after.contains("reshape(a: u32, b: u32)"), "after={after}");
     assert_ne!(before, after);
 }
 

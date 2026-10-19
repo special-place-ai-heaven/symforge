@@ -1138,10 +1138,13 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // The new fields and enums stay in embedded.rs and public_api.rs. embed.rs
 // re-exports those two enums through the existing pub use. No new caller
 // file and no new edge into server_api.rs.
+// Refreshed for branch consolidation (033 containment-durability + AAP S4-S6
+// + capability-evidence-explicit): same 89 excluded files, no new edge into
+// src/index_lifecycle or server_api.rs.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "375632c65e35b3a68dae25422bb6b6cef9e17f2be485fc01d8a623fae6a233f8",
+    "69b5bfca0f712e9dc57acf3474deb30ad6b6ea2d31b9fc29204eccc902218cf6",
     89,
-    2202260,
+    2203795,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1295,10 +1298,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // index_lifecycle/embed_{batch,mutation,remediation,symforge_edit}.rs
 // (reserve_with_lease call sites). Additive replay API only; no new
 // caller file and no new edge into server_api.rs.
+// Refreshed for branch consolidation (033 containment-durability + AAP S4-S6
+// + capability-evidence-explicit): same 312 files, no new caller file and no
+// new edge into src/index_lifecycle or server_api.rs.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "4dd1ded17b60345e80e6c570da863e486927d3671b1bae77a4bab7b471485cee",
+    "edc0f7be26470b625df0ec2966ebd206e051acbb30b8435ee2c32151d241874c",
     312,
-    12028435,
+    12123021,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
@@ -1429,8 +1435,8 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "8a1b989684769413:17233"),
-    ("release.yml", "addb84653ead805c:113428"),
+    ("ci.yml", "421d20ccbbba0786:17233"),
+    ("release.yml", "04324ae896e1b62b:113428"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an

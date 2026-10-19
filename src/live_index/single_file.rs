@@ -1081,7 +1081,7 @@ pub(crate) fn freshen_file_if_stale(
     if let Some(root) = abs_path
         .ancestors()
         .nth(std::path::Path::new(relative_path).components().count())
-        && crate::protocol::edit::safe_repo_path(root, relative_path)
+        && crate::index_lifecycle::guidance::read_gate::resolve_repo_path(root, relative_path)
             .is_err_and(|message| message.contains("outside the repository"))
     {
         return FreshenResult::Fresh;

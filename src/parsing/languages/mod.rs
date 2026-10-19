@@ -52,11 +52,7 @@ pub(super) fn scan_doc_range(
     None
 }
 
-fn scan_doc_range_direct(
-    node: &Node,
-    source: &str,
-    spec: &DocCommentSpec,
-) -> Option<(u32, u32)> {
+fn scan_doc_range_direct(node: &Node, source: &str, spec: &DocCommentSpec) -> Option<(u32, u32)> {
     let mut earliest_start: Option<u32> = None;
     let mut latest_end: Option<u32> = None;
     let mut next_start_byte = node.start_byte();

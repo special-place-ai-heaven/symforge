@@ -2141,13 +2141,14 @@ fn diff_symbols(path: &str, bytes: Option<&[u8]>) -> Result<(DiffSymbols, bool),
         let body = bytes
             .get(symbol.byte_range.0 as usize..symbol.byte_range.1 as usize)
             .ok_or(QueryRefusalKind::InvalidSpan)?;
-        let signature = super::guidance::edit_body::extract_signature(
-            bytes,
-            symbol.byte_range,
-        );
+        let signature = super::guidance::edit_body::extract_signature(bytes, symbol.byte_range);
         symbols.insert(
             (kind, symbol.name, *occurrence),
-            (crate::hash::digest_hex(body), symbol.line_range.0 + 1, signature),
+            (
+                crate::hash::digest_hex(body),
+                symbol.line_range.0 + 1,
+                signature,
+            ),
         );
         *occurrence += 1;
     }
