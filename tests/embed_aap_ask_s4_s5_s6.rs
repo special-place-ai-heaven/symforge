@@ -1,7 +1,6 @@
-#![cfg(feature = "embed")]
+#![cfg(all(feature = "embed", feature = "__test-internals"))]
 
 use std::fs;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use symforge::embed::parity::host::{
@@ -26,7 +25,7 @@ fn settle(handle: &EmbeddedSourceHandle, after: u64) {
 }
 
 fn git(root: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = symforge::process_util::hidden_command("git")
         .args(args)
         .current_dir(root)
         .env("GIT_AUTHOR_NAME", "symforge")
@@ -123,7 +122,7 @@ fn s5_symbol_diff_exposes_old_and_new_signatures_on_param_change() {
     git(root.path(), &["add", "."]);
     git(root.path(), &["commit", "-m", "base"]);
     let base = String::from_utf8(
-        Command::new("git")
+        symforge::process_util::hidden_command("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(root.path())
             .output()
