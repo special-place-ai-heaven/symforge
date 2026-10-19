@@ -42,11 +42,14 @@ fn cochange_ranking_evidence(
     cost: CapabilityCost,
     detail: impl Into<String>,
 ) -> CapabilityEvidence {
-    CapabilityEvidence::new(CapabilityName::CoChangeRanking, status)
-        .with_freshness(freshness)
-        .with_cost(cost)
-        .with_safety(CapabilitySafety::ReadOnly)
-        .with_detail(detail)
+    CapabilityEvidence::new(
+        CapabilityName::CoChangeRanking,
+        status,
+        cost,
+        CapabilitySafety::ReadOnly,
+    )
+    .with_freshness(freshness)
+    .with_detail(detail)
 }
 
 /// Build the precise `FallbackUsed` co-change detail for the case where the
@@ -412,10 +415,14 @@ fn frecency_ranking_evidence(
     status: CapabilityStatus,
     detail: impl Into<String>,
 ) -> CapabilityEvidence {
-    CapabilityEvidence::new(CapabilityName::FrecencyRanking, status)
-        .with_freshness(CapabilityFreshness::Current)
-        .with_safety(CapabilitySafety::ReadOnly)
-        .with_detail(detail)
+    CapabilityEvidence::new(
+        CapabilityName::FrecencyRanking,
+        status,
+        CapabilityCost::Low,
+        CapabilitySafety::ReadOnly,
+    )
+    .with_freshness(CapabilityFreshness::Current)
+    .with_detail(detail)
 }
 
 const RANKING_DIAGNOSTICS_ENV: &str = "SYMFORGE_DEBUG_RANKING";
@@ -444,10 +451,14 @@ fn ranking_diagnostics_evidence(
     status: CapabilityStatus,
     detail: impl Into<String>,
 ) -> CapabilityEvidence {
-    CapabilityEvidence::new(CapabilityName::RankingDiagnostics, status)
-        .with_freshness(CapabilityFreshness::Current)
-        .with_safety(CapabilitySafety::ReadOnly)
-        .with_detail(detail)
+    CapabilityEvidence::new(
+        CapabilityName::RankingDiagnostics,
+        status,
+        CapabilityCost::Low,
+        CapabilitySafety::ReadOnly,
+    )
+    .with_freshness(CapabilityFreshness::Current)
+    .with_detail(detail)
 }
 
 fn search_files_debug_ranking_requested(

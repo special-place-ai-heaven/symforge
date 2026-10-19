@@ -652,11 +652,14 @@ mod tests {
             OutcomeClass::Found,
         )
         .with_capability_state(vec![
-            CapabilityEvidence::new(CapabilityName::FrecencyRanking, CapabilityStatus::Ready)
-                .with_freshness(CapabilityFreshness::Current)
-                .with_cost(CapabilityCost::Low)
-                .with_safety(CapabilitySafety::ReadOnly)
-                .with_detail("persistent history available"),
+            CapabilityEvidence::new(
+                CapabilityName::FrecencyRanking,
+                CapabilityStatus::Ready,
+                CapabilityCost::Low,
+                CapabilitySafety::ReadOnly,
+            )
+            .with_freshness(CapabilityFreshness::Current)
+            .with_detail("persistent history available"),
         ])
     }
 
@@ -792,6 +795,8 @@ mod tests {
             CapabilityEvidence::new(
                 CapabilityName::RankingDiagnostics,
                 CapabilityStatus::DisabledByPolicy,
+                CapabilityCost::Low,
+                CapabilitySafety::ReadOnly,
             )
             .with_detail(format!("{key_keyword}={marker} {}", "y".repeat(1000))),
         ]);
@@ -838,6 +843,8 @@ mod tests {
             CapabilityEvidence::new(
                 CapabilityName::RankingDiagnostics,
                 CapabilityStatus::DisabledByPolicy,
+                CapabilityCost::Low,
+                CapabilitySafety::ReadOnly,
             )
             .with_detail(marked),
         ]);

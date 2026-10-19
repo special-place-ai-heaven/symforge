@@ -63,32 +63,44 @@ fn policy_can_express_operator_defaults_without_evidence_reading_env() {
 fn evidence_rendering_is_stable_for_call_time_states() {
     let cases = [
         (
-            CapabilityEvidence::new(CapabilityName::FrecencyRanking, CapabilityStatus::Applied)
-                .with_freshness(CapabilityFreshness::Current)
-                .with_cost(CapabilityCost::Low)
-                .with_safety(CapabilitySafety::ReadOnly)
-                .with_detail("frecency history used"),
+            CapabilityEvidence::new(
+                CapabilityName::FrecencyRanking,
+                CapabilityStatus::Applied,
+                CapabilityCost::Low,
+                CapabilitySafety::ReadOnly,
+            )
+            .with_freshness(CapabilityFreshness::Current)
+            .with_detail("frecency history used"),
             "Capability: frecency ranking applied - frecency history used.",
         ),
         (
-            CapabilityEvidence::new(CapabilityName::FrecencyRanking, CapabilityStatus::Ready)
-                .with_detail("session collection available"),
+            CapabilityEvidence::new(
+                CapabilityName::FrecencyRanking,
+                CapabilityStatus::Ready,
+                CapabilityCost::Low,
+                CapabilitySafety::ReadOnly,
+            )
+            .with_detail("session collection available"),
             "Capability: frecency ranking ready - session collection available.",
         ),
         (
-            CapabilityEvidence::new(CapabilityName::CoChangeRanking, CapabilityStatus::Preparing)
-                .with_freshness(CapabilityFreshness::Unknown)
-                .with_cost(CapabilityCost::Bounded)
-                .with_safety(CapabilitySafety::ReadOnly)
-                .with_detail("coupling store warming; path ranking returned"),
+            CapabilityEvidence::new(
+                CapabilityName::CoChangeRanking,
+                CapabilityStatus::Preparing,
+                CapabilityCost::Bounded,
+                CapabilitySafety::ReadOnly,
+            )
+            .with_freshness(CapabilityFreshness::Unknown)
+            .with_detail("coupling store warming; path ranking returned"),
             "Capability: co-change ranking preparing - coupling store warming; path ranking returned.",
         ),
         (
             CapabilityEvidence::new(
                 CapabilityName::WorktreeRouting,
                 CapabilityStatus::Unavailable,
+                CapabilityCost::Low,
+                CapabilitySafety::WriteRequiresConsent,
             )
-            .with_safety(CapabilitySafety::WriteRequiresConsent)
             .with_detail("working_directory did not match a known worktree"),
             "Capability: worktree routing unavailable - working_directory did not match a known worktree.",
         ),
@@ -96,21 +108,29 @@ fn evidence_rendering_is_stable_for_call_time_states() {
             CapabilityEvidence::new(
                 CapabilityName::WorktreeRouting,
                 CapabilityStatus::DisabledByPolicy,
+                CapabilityCost::Low,
+                CapabilitySafety::WriteRequiresConsent,
             )
-            .with_safety(CapabilitySafety::WriteRequiresConsent)
             .with_detail("operator disabled write rerouting"),
             "Capability: worktree routing disabled by policy - operator disabled write rerouting.",
         ),
         (
-            CapabilityEvidence::new(CapabilityName::RankingDiagnostics, CapabilityStatus::Stale)
-                .with_freshness(CapabilityFreshness::Stale)
-                .with_detail("score breakdown is older than the current index generation"),
+            CapabilityEvidence::new(
+                CapabilityName::RankingDiagnostics,
+                CapabilityStatus::Stale,
+                CapabilityCost::Low,
+                CapabilitySafety::ReadOnly,
+            )
+            .with_freshness(CapabilityFreshness::Stale)
+            .with_detail("score breakdown is older than the current index generation"),
             "Capability: ranking diagnostics stale - score breakdown is older than the current index generation.",
         ),
         (
             CapabilityEvidence::new(
                 CapabilityName::CoChangeRanking,
                 CapabilityStatus::FallbackUsed,
+                CapabilityCost::Low,
+                CapabilitySafety::ReadOnly,
             )
             .with_detail("path ranking returned"),
             "Capability: co-change ranking fallback used - path ranking returned.",
@@ -120,4 +140,17 @@ fn evidence_rendering_is_stable_for_call_time_states() {
     for (evidence, expected) in cases {
         assert_eq!(capability_evidence_line(&evidence), expected);
     }
+}
+
+#[test]
+fn new_stores_the_safety_and_cost_it_was_given() {
+    let evidence = CapabilityEvidence::new(
+        CapabilityName::WorktreeRouting,
+        CapabilityStatus::Unavailable,
+        CapabilityCost::Bounded,
+        CapabilitySafety::WriteRequiresConsent,
+    );
+    assert_eq!(evidence.cost, CapabilityCost::Bounded);
+    assert_eq!(evidence.safety, CapabilitySafety::WriteRequiresConsent);
+    assert_eq!(evidence.freshness, CapabilityFreshness::Unknown);
 }
