@@ -1436,7 +1436,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
     ("ci.yml", "bc6c092b4a79e57e:17253"),
-    ("release.yml", "9241af445fdf1a4b:113452"),
+    ("release.yml", "1dc9e1ee33a09edf:113450"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an

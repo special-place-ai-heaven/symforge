@@ -2575,7 +2575,7 @@ jobs:
           set -euo pipefail
           for package in \
             symforge-windows-x64 \
-            symforge-linux-x64 \
+            symforge-linux-x64
           do
             python execution/release_ops.py publish-npm \
               --tarball "./dist/${package}-${VERSION}.tgz" \
