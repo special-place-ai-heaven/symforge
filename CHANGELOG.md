@@ -44,6 +44,26 @@ Embedders keep their own response bytes and check them with `ReplayOutcome::resp
 
 `ReplayStore::renew_lease` extends a live `not_started` or `started` lease via a CAS on token, generation, state, and `lease_expires_at > now` without reviving expired leases or bumping `generation`. `DetectImpactRequest::paths` accepts an optional explicit list of repository paths to seed blast-radius analysis without a git branch or time range, refusing paths outside the source root. `QueryRequest::FileImpact` is documented as the supported single-file re-admission path (`O(1)` file parse and synchronous publication swap leaving `index_census` and queries consistent without a whole-worktree `request_refresh`). `ProcessIndexRuntime::open_embedded_source` documents the process-wide single-open-per-canonical-root invariant (`SourceRefusalKind::SelectionUnavailable` on a second open).
 
+## [11.9.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.8.6...v11.9.0) (2026-10-19)
+
+
+### Features
+
+* **033:** consolidate containment and durability stories (US1-US6, US9) ([8328608](https://github.com/special-place-ai-heaven/symforge/commit/832860845b81545f842fd08689713e0b90a216c6))
+* **embed:** add ReplayStore::renew_lease, DetectImpactRequest::paths, and S10/S12 docs [skip ci] ([66097cb](https://github.com/special-place-ai-heaven/symforge/commit/66097cb93276cce2b9c759e74b19470987a9b970))
+* **embed:** add ReplayStore::renew_lease, DetectImpactRequest::paths, and S10/S12 docs [skip ci] ([289a9ff](https://github.com/special-place-ai-heaven/symforge/commit/289a9ffdce77be0e82380d4b33863eb63edc79f9))
+* **embed:** expose QuerySymbol doc byte ranges, diff signatures, and HostIndexFailure ([c359cc0](https://github.com/special-place-ai-heaven/symforge/commit/c359cc0e7e7d3156b23e8239d6e982a67b0f8a00))
+
+
+### Bug Fixes
+
+* **capability:** require explicit safety and cost on CapabilityEvidence ([da78e44](https://github.com/special-place-ai-heaven/symforge/commit/da78e441d9eb1b55f76a76bc20f56418cb00b9c2))
+* **ci:** bootstrap clang from LLVM tarball for xwin releases ([a373091](https://github.com/special-place-ai-heaven/symforge/commit/a37309101af2f87d53c30547094119887cfde284))
+* complete OCR review analytics/capability items, Spec 031 D1-D3, and Rust 1.98 clippy cleanups [skip ci] ([fbc1aa2](https://github.com/special-place-ai-heaven/symforge/commit/fbc1aa2c41a36e64f042f9265fe09a6ce26166f0))
+* **deps:** relax tree-sitter pin for AAP S3 ([a03f61e](https://github.com/special-place-ai-heaven/symforge/commit/a03f61e7ec2df637f27ddef5af274eddaac45f2a))
+* OCR review items, Spec 031, and Rust 1.98 clippy [skip ci] ([114ef35](https://github.com/special-place-ai-heaven/symforge/commit/114ef352df0a79561b0d472fcd024efdc5b669fc))
+* **test:** route embed s4-s6 git spawns through hidden_command ([#815](https://github.com/special-place-ai-heaven/symforge/issues/815)) ([3ab9943](https://github.com/special-place-ai-heaven/symforge/commit/3ab9943b6a476e565c3a655bfd984eddd8d0b59e))
+
 ## [11.8.6](https://github.com/special-place-ai-heaven/symforge/compare/v11.8.5...v11.8.6) (2026-10-18)
 
 
