@@ -30,6 +30,7 @@ pub fn use_refresh_v1_api(
 
     if let Ok(lease) = lease {
         let _: &GraphPublicationLease = &lease;
+        let _: &dyn std::fmt::Debug = &lease;
         let _ = handle.query_with_graph_lease(request, limits, &lease);
         let _ = handle.query_with_graph_lease_and_control(request, limits, &lease, control);
     }

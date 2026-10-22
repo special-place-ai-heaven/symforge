@@ -31,6 +31,7 @@ pub(super) struct EmbeddedQuerySnapshot {
     pub publication_identity: String,
     pub serving_publication_identity: String,
     pub source_version: u64,
+    pub lifecycle_epoch: u64,
     pub source_phase: crate::embed::parity::SourceRuntimePhase,
     pub authority_publication: crate::lifecycle_identity::PublicationIdentity,
     pub authority: Arc<super::activation::ProjectSourceAuthority>,
@@ -560,14 +561,14 @@ fn execute_inner(
             })?,
         SnapshotMode::AllowRefreshing => handle
             .capture_query_snapshot_allowing_refresh(&normalized)
-            .map_err(|kind| {
+            .map_err(|error| {
                 refuse(
-                    kind,
-                    if kind == QueryRefusalKind::SourceUnavailable {
-                        RetryAdvice::OnEvent
+                    if error.kind() == SourceRefusalKind::AdmissionUnavailable {
+                        QueryRefusalKind::AdmissionUnavailable
                     } else {
-                        RetryAdvice::Never
+                        QueryRefusalKind::SourceUnavailable
                     },
+                    error.retry(),
                 )
             })?,
         SnapshotMode::GraphLease(lease) => handle
@@ -747,16 +748,18 @@ fn execute_inner(
                 ));
             }
         }
-        SnapshotMode::AllowRefreshing => handle.validate_refresh_snapshot().map_err(|kind| {
-            refuse(
-                kind,
-                if kind == QueryRefusalKind::SourceUnavailable {
-                    RetryAdvice::OnEvent
-                } else {
-                    RetryAdvice::Never
-                },
-            )
-        })?,
+        SnapshotMode::AllowRefreshing => handle
+            .validate_refresh_snapshot(snapshot.lifecycle_epoch, &normalized)
+            .map_err(|error| {
+                refuse(
+                    if error.kind() == SourceRefusalKind::AdmissionUnavailable {
+                        QueryRefusalKind::AdmissionUnavailable
+                    } else {
+                        QueryRefusalKind::SourceUnavailable
+                    },
+                    error.retry(),
+                )
+            })?,
         SnapshotMode::GraphLease(lease) => handle
             .validate_graph_lease(lease)
             .map_err(|kind| refuse(kind, RetryAdvice::Never))?,
@@ -1030,6 +1033,49 @@ mod admission_tests {
         assert_eq!(delivered.session_evidence().unwrap().revision_after, 1);
         assert_eq!(session.revision(), 1);
         assert_eq!(session.cache_status().resident_entries, 1);
+    }
+
+    #[test]
+    fn closing_during_refresh_output_admission_never_retries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("lib.rs"), "pub fn loaded() {}\n").unwrap();
+        let runtime = ProcessIndexRuntime::acquire().unwrap();
+        let handle = runtime
+            .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+                root.path().to_path_buf(),
+            ))
+            .unwrap();
+        let started = Instant::now();
+        loop {
+            let since = handle.change_version();
+            if handle.runtime_view().phase == SourceRuntimePhase::Current {
+                break;
+            }
+            let remaining = Duration::from_secs(20).saturating_sub(started.elapsed());
+            assert!(!remaining.is_zero());
+            handle.wait_for_change(since, remaining).unwrap();
+        }
+        let request = QueryRequest::Graph {
+            path_prefix: None,
+            offset: 0,
+            expected_publication: None,
+        };
+        let refusal = execute_inner(
+            &handle,
+            &request,
+            QueryLimits::default(),
+            None,
+            None,
+            QueryPolicy::default(),
+            SnapshotMode::AllowRefreshing,
+            |_| {
+                let _ = handle.begin_close();
+                true
+            },
+        )
+        .unwrap_err();
+        assert_eq!(refusal.kind(), QueryRefusalKind::SourceUnavailable);
+        assert_eq!(refusal.retry(), RetryAdvice::Never);
     }
 }
 

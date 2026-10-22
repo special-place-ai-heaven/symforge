@@ -120,6 +120,12 @@ fn refresh_opt_in_serves_all_aap_snapshot_queries_from_the_last_publication() {
         .to_owned();
     let before_refresh = handle.query(&graph(0), QueryLimits::default()).unwrap();
     let publication = before_refresh.publication_identity().to_owned();
+    let current = handle
+        .query_allowing_refresh(&graph(0), QueryLimits::default())
+        .unwrap();
+    assert_eq!(current.source_phase(), SourceRuntimePhase::Current);
+    assert!(!current.is_refreshing());
+    assert_eq!(current.publication_identity(), publication);
     assert_eq!(
         before_refresh.source_capture_publication_identity(),
         capture_publication
@@ -681,4 +687,80 @@ fn refresh_opt_in_refuses_after_admission_revocation() {
     assert_eq!(refusal.kind(), QueryRefusalKind::AdmissionUnavailable);
     assert_eq!(refusal.retry(), symforge::embed::RetryAdvice::Never);
     drop(gate);
+}
+
+#[test]
+fn closed_refresh_queries_and_lease_begin_never_retry() {
+    let root = fixture(1);
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let control = OperationControl::new(Duration::from_secs(5)).unwrap();
+    handle.close().unwrap();
+    for controlled in [false, true] {
+        let refusal = if controlled {
+            handle.query_allowing_refresh_with_control(&graph(0), QueryLimits::default(), &control)
+        } else {
+            handle.query_allowing_refresh(&graph(0), QueryLimits::default())
+        }
+        .unwrap_err();
+        assert_eq!(refusal.kind(), QueryRefusalKind::SourceUnavailable);
+        assert_eq!(refusal.retry(), symforge::embed::RetryAdvice::Never);
+    }
+    let refusal = handle
+        .begin_graph_publication_lease(Duration::from_secs(20))
+        .unwrap_err();
+    assert_eq!(refusal.kind(), SourceRefusalKind::SourceUnavailable);
+    assert_eq!(refusal.retry(), symforge::embed::RetryAdvice::Never);
+}
+
+#[test]
+fn graph_lease_pages_require_the_captured_publication_identity() {
+    let root = fixture(4);
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let lease = handle
+        .begin_graph_publication_lease(Duration::from_secs(20))
+        .unwrap();
+    let first = handle
+        .query_with_graph_lease(
+            &graph(0),
+            QueryLimits {
+                max_results: 1,
+                max_bytes: 16 * 1024,
+            },
+            &lease,
+        )
+        .unwrap();
+    let QueryOutput::Graph(page) = first.value() else {
+        panic!("expected graph");
+    };
+    let offset = page.next_offset.expect("fixture must require another page");
+    let missing = handle
+        .query_with_graph_lease(&graph(offset), QueryLimits::default(), &lease)
+        .unwrap_err();
+    assert_eq!(missing.kind(), QueryRefusalKind::InvalidRequest);
+    let wrong = QueryRequest::Graph {
+        path_prefix: None,
+        offset,
+        expected_publication: Some("wrong-publication".into()),
+    };
+    assert_eq!(
+        handle
+            .query_with_graph_lease(&wrong, QueryLimits::default(), &lease)
+            .unwrap_err()
+            .kind(),
+        QueryRefusalKind::StalePublication,
+    );
+    let correct = QueryRequest::Graph {
+        path_prefix: None,
+        offset,
+        expected_publication: Some(first.publication_identity().to_owned()),
+    };
+    assert_eq!(
+        handle
+            .query_with_graph_lease(&correct, QueryLimits::default(), &lease)
+            .unwrap()
+            .publication_identity(),
+        first.publication_identity(),
+    );
 }

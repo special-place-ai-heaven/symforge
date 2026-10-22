@@ -412,6 +412,8 @@ struct EmbeddedRuntimeState {
     observer_epoch: u64,
     source_version: u64,
     change_revision: u64,
+    #[cfg(feature = "embed")]
+    lifecycle_epoch: u64,
 }
 
 #[derive(Debug, Default)]
@@ -436,6 +438,15 @@ pub struct GraphPublicationLease {
     binding: std::sync::Weak<EmbeddedBinding>,
     id: u64,
     source_id: u64,
+    lifecycle_epoch: u64,
+}
+
+#[cfg(feature = "embed")]
+impl std::fmt::Debug for GraphPublicationLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphPublicationLease")
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "embed")]
@@ -610,6 +621,8 @@ impl EmbeddedBinding {
                 observer_epoch: 0,
                 source_version: 0,
                 change_revision: 0,
+                #[cfg(feature = "embed")]
+                lifecycle_epoch: 0,
             }),
             change_wake: Condvar::new(),
             #[cfg(feature = "embed")]
@@ -943,37 +956,79 @@ impl EmbeddedBinding {
     fn complete_query_snapshot(
         &self,
         state: &EmbeddedRuntimeState,
-    ) -> Result<super::embed_query::EmbeddedQuerySnapshot, crate::embed::parity::QueryRefusalKind>
+        normalized: &[u8],
+    ) -> Result<super::embed_query::EmbeddedQuerySnapshot, super::public_api::EmbedSourceRefusal>
     {
-        use super::public_api::SourceRuntimePhase;
-        use crate::embed::parity::QueryRefusalKind;
-        if state.phase != SourceRuntimePhase::Current {
-            return Err(QueryRefusalKind::SourceUnavailable);
+        use super::public_api::{
+            OperationKind, RetryAdvice, SourceRefusalKind, SourceRuntimePhase,
+        };
+        let refuse = |kind, retry| {
+            super::public_api::bound_source_refusal(
+                kind,
+                OperationKind::IndexCensus,
+                retry,
+                normalized,
+            )
+        };
+        if self.shutdown_started.load(Ordering::Acquire)
+            || matches!(
+                state.phase,
+                SourceRuntimePhase::Stopping | SourceRuntimePhase::Stopped
+            )
+        {
+            return Err(refuse(
+                SourceRefusalKind::SourceUnavailable,
+                RetryAdvice::Never,
+            ));
         }
         let index = self
             .runtime
             .acquire()
-            .map_err(|_| QueryRefusalKind::AdmissionUnavailable)?;
+            .map_err(|_| refuse(SourceRefusalKind::AdmissionUnavailable, RetryAdvice::Never))?;
         let authority = Arc::clone(&self.authority);
         authority
             .verify_physical_root_anchor()
-            .map_err(|_| QueryRefusalKind::SourceUnavailable)?;
+            .map_err(|_| refuse(SourceRefusalKind::SourceUnavailable, RetryAdvice::Never))?;
+        if state.phase == SourceRuntimePhase::Refreshing {
+            return self
+                .refresh_snapshot
+                .lock()
+                .expect("refresh snapshot mutex")
+                .as_ref()
+                .filter(|snapshot| snapshot.lifecycle_epoch == state.lifecycle_epoch)
+                .map(|snapshot| (**snapshot).clone())
+                .ok_or_else(|| refuse(SourceRefusalKind::SourceUnavailable, RetryAdvice::OnEvent));
+        }
+        if state.phase != SourceRuntimePhase::Current {
+            return Err(refuse(
+                SourceRefusalKind::SourceUnavailable,
+                RetryAdvice::OnEvent,
+            ));
+        }
         let authority_publication = authority
             .current_publication()
-            .ok_or(QueryRefusalKind::SourceUnavailable)?;
+            .ok_or_else(|| refuse(SourceRefusalKind::SourceUnavailable, RetryAdvice::OnEvent))?;
         let source_set = index.published_source_set();
         let generation = source_set.current_generation();
         let publication_identity = format!(
             "embed-publication-{}-{}",
             self.identity.raw(),
-            generation.publication_generation
+            generation.publication_generation,
         );
         if state.current_publication_identity.as_deref() != Some(&publication_identity)
             || !matches!(generation.freshness.as_ref(), FreshnessStatus::Current)
             || authority.current_publication() != Some(authority_publication)
-            || self.shutdown_started.load(Ordering::Acquire)
         {
-            return Err(QueryRefusalKind::SourceUnavailable);
+            return Err(refuse(
+                SourceRefusalKind::SourceUnavailable,
+                RetryAdvice::OnEvent,
+            ));
+        }
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return Err(refuse(
+                SourceRefusalKind::SourceUnavailable,
+                RetryAdvice::Never,
+            ));
         }
         let binding_identity = format!("source-{}", self.identity.raw());
         let serving_publication_identity = super::embed_query::serving_publication_identity(
@@ -994,6 +1049,7 @@ impl EmbeddedBinding {
             publication_identity,
             serving_publication_identity,
             source_version: state.source_version,
+            lifecycle_epoch: state.lifecycle_epoch,
             source_phase: SourceRuntimePhase::Current,
             authority_publication,
             authority,
@@ -1039,7 +1095,7 @@ impl EmbeddedBinding {
             && state.phase == super::public_api::SourceRuntimePhase::Current
         {
             let snapshot = self
-                .complete_query_snapshot(&state)
+                .complete_query_snapshot(&state, b"refresh-snapshot")
                 .ok()
                 .map(|mut snapshot| {
                     snapshot.source_phase = super::public_api::SourceRuntimePhase::Refreshing;
@@ -1071,9 +1127,11 @@ impl EmbeddedBinding {
                 | super::public_api::SourceRuntimePhase::Stopping
                 | super::public_api::SourceRuntimePhase::Stopped
         ) {
-            drop(state);
             #[cfg(feature = "embed")]
-            self.graph_leases.lock().expect("graph lease mutex").clear();
+            {
+                state.lifecycle_epoch = state.lifecycle_epoch.wrapping_add(1);
+                self.graph_leases.lock().expect("graph lease mutex").clear();
+            }
         }
     }
 
@@ -1085,9 +1143,12 @@ impl EmbeddedBinding {
         if state.phase != super::public_api::SourceRuntimePhase::Blocked {
             state.phase = super::public_api::SourceRuntimePhase::Blocked;
             state.current_publication_identity = None;
+            #[cfg(feature = "embed")]
+            {
+                state.lifecycle_epoch = state.lifecycle_epoch.wrapping_add(1);
+            }
             self.advance_change(&mut state);
         }
-        drop(state);
         #[cfg(feature = "embed")]
         {
             *self
@@ -2001,65 +2062,88 @@ impl EmbeddedSourceHandle {
     #[cfg(feature = "embed")]
     pub(super) fn capture_query_snapshot_allowing_refresh(
         &self,
-        _normalized: &[u8],
-    ) -> Result<super::embed_query::EmbeddedQuerySnapshot, crate::embed::parity::QueryRefusalKind>
+        normalized: &[u8],
+    ) -> Result<super::embed_query::EmbeddedQuerySnapshot, super::public_api::EmbedSourceRefusal>
     {
-        use super::public_api::SourceRuntimePhase;
-        use crate::embed::parity::QueryRefusalKind;
+        use super::public_api::{OperationKind, RetryAdvice, SourceRefusalKind};
+        let unavailable = || {
+            super::public_api::bound_source_refusal(
+                SourceRefusalKind::SourceUnavailable,
+                OperationKind::IndexCensus,
+                RetryAdvice::Never,
+                normalized,
+            )
+        };
         if self.closed.load(Ordering::Acquire) {
-            return Err(QueryRefusalKind::SourceUnavailable);
+            return Err(unavailable());
         }
-        let binding = self
-            .binding
-            .as_ref()
-            .ok_or(QueryRefusalKind::SourceUnavailable)?;
+        let binding = self.binding.as_ref().ok_or_else(unavailable)?;
         let state = binding.state.lock().expect("embedded state mutex");
-        if state.phase == SourceRuntimePhase::Refreshing {
-            if binding.runtime.acquire().is_err() {
-                return Err(QueryRefusalKind::AdmissionUnavailable);
-            }
-            if binding.authority.verify_physical_root_anchor().is_err()
-                || self.closed.load(Ordering::Acquire)
-            {
-                return Err(QueryRefusalKind::SourceUnavailable);
-            }
-            return binding
-                .refresh_snapshot
-                .lock()
-                .expect("refresh snapshot mutex")
-                .as_ref()
-                .map(|snapshot| (**snapshot).clone())
-                .ok_or(QueryRefusalKind::SourceUnavailable);
+        let snapshot = binding.complete_query_snapshot(&state, normalized)?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(unavailable());
         }
-        if state.phase != SourceRuntimePhase::Current {
-            return Err(QueryRefusalKind::SourceUnavailable);
-        }
-        binding.complete_query_snapshot(&state)
+        Ok(snapshot)
     }
 
     #[cfg(feature = "embed")]
     pub(super) fn validate_refresh_snapshot(
         &self,
-    ) -> Result<(), crate::embed::parity::QueryRefusalKind> {
-        use super::public_api::SourceRuntimePhase;
-        use crate::embed::parity::QueryRefusalKind;
-        let Some(binding) = self.binding.as_ref() else {
-            return Err(QueryRefusalKind::SourceUnavailable);
+        lifecycle_epoch: u64,
+        normalized: &[u8],
+    ) -> Result<(), super::public_api::EmbedSourceRefusal> {
+        use super::public_api::{
+            OperationKind, RetryAdvice, SourceRefusalKind, SourceRuntimePhase,
         };
+        let refuse = |kind, retry| {
+            super::public_api::bound_source_refusal(
+                kind,
+                OperationKind::IndexCensus,
+                retry,
+                normalized,
+            )
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return Err(refuse(
+                SourceRefusalKind::SourceUnavailable,
+                RetryAdvice::Never,
+            ));
+        }
+        let binding = self
+            .binding
+            .as_ref()
+            .ok_or_else(|| refuse(SourceRefusalKind::SourceUnavailable, RetryAdvice::Never))?;
         let state = binding.state.lock().expect("embedded state mutex");
         if self.closed.load(Ordering::Acquire)
+            || binding.shutdown_started.load(Ordering::Acquire)
             || matches!(
                 state.phase,
-                SourceRuntimePhase::Blocked
-                    | SourceRuntimePhase::Stopping
-                    | SourceRuntimePhase::Stopped
+                SourceRuntimePhase::Stopping | SourceRuntimePhase::Stopped
             )
-            || binding.authority.verify_physical_root_anchor().is_err()
         {
-            return Err(QueryRefusalKind::SourceUnavailable);
+            return Err(refuse(
+                SourceRefusalKind::SourceUnavailable,
+                RetryAdvice::Never,
+            ));
         }
-        if binding.runtime.acquire().is_err() {
-            return Err(QueryRefusalKind::AdmissionUnavailable);
+        binding
+            .runtime
+            .acquire()
+            .map_err(|_| refuse(SourceRefusalKind::AdmissionUnavailable, RetryAdvice::Never))?;
+        binding
+            .authority
+            .verify_physical_root_anchor()
+            .map_err(|_| refuse(SourceRefusalKind::SourceUnavailable, RetryAdvice::Never))?;
+        if lifecycle_epoch != state.lifecycle_epoch
+            || !matches!(
+                state.phase,
+                SourceRuntimePhase::Current | SourceRuntimePhase::Refreshing
+            )
+        {
+            return Err(refuse(
+                SourceRefusalKind::SourceUnavailable,
+                RetryAdvice::OnEvent,
+            ));
         }
         Ok(())
     }
@@ -2072,53 +2156,23 @@ impl EmbeddedSourceHandle {
     ) -> Result<GraphPublicationLease, super::public_api::EmbedSourceRefusal> {
         use super::public_api::{OperationKind, RetryAdvice, SourceRefusalKind};
         let normalized = b"begin-graph-publication-lease";
-        let binding = self.binding.as_ref().ok_or_else(|| {
+        let unavailable = || {
             super::public_api::bound_source_refusal(
                 SourceRefusalKind::SourceUnavailable,
                 OperationKind::IndexCensus,
                 RetryAdvice::Never,
                 normalized,
             )
-        })?;
-        let snapshot = self
-            .capture_query_snapshot_allowing_refresh(normalized)
-            .map_err(|kind| {
-                super::public_api::bound_source_refusal(
-                    if kind == crate::embed::parity::QueryRefusalKind::AdmissionUnavailable {
-                        SourceRefusalKind::AdmissionUnavailable
-                    } else {
-                        SourceRefusalKind::SourceUnavailable
-                    },
-                    OperationKind::IndexCensus,
-                    RetryAdvice::Never,
-                    normalized,
-                )
-            })?;
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return Err(unavailable());
+        }
+        let binding = self.binding.as_ref().ok_or_else(unavailable)?;
         let mut state = binding.state.lock().expect("embedded state mutex");
-        if binding.runtime.acquire().is_err() {
-            return Err(super::public_api::bound_source_refusal(
-                SourceRefusalKind::AdmissionUnavailable,
-                OperationKind::IndexCensus,
-                RetryAdvice::Never,
-                normalized,
-            ));
+        if self.closed.load(Ordering::Acquire) {
+            return Err(unavailable());
         }
-        if self.closed.load(Ordering::Acquire)
-            || matches!(
-                state.phase,
-                super::public_api::SourceRuntimePhase::Blocked
-                    | super::public_api::SourceRuntimePhase::Stopping
-                    | super::public_api::SourceRuntimePhase::Stopped
-            )
-            || binding.authority.verify_physical_root_anchor().is_err()
-        {
-            return Err(super::public_api::bound_source_refusal(
-                SourceRefusalKind::SourceUnavailable,
-                OperationKind::IndexCensus,
-                RetryAdvice::Never,
-                normalized,
-            ));
-        }
+        let snapshot = binding.complete_query_snapshot(&state, normalized)?;
         binding.prune_graph_leases(&mut state);
         let mut leases = binding.graph_leases.lock().expect("graph lease mutex");
         if leases.len() >= 8 {
@@ -2157,6 +2211,7 @@ impl EmbeddedSourceHandle {
             binding: Arc::downgrade(binding),
             id,
             source_id: self.identity.raw(),
+            lifecycle_epoch: state.lifecycle_epoch,
         })
     }
 
@@ -2192,6 +2247,9 @@ impl EmbeddedSourceHandle {
         }
         if binding.runtime.acquire().is_err() {
             return Err(QueryRefusalKind::AdmissionUnavailable);
+        }
+        if lease.lifecycle_epoch != state.lifecycle_epoch {
+            return Err(QueryRefusalKind::SourceUnavailable);
         }
         binding.prune_graph_leases(&mut state);
         binding
@@ -2292,6 +2350,7 @@ impl EmbeddedSourceHandle {
             publication_identity,
             serving_publication_identity,
             source_version: state.source_version,
+            lifecycle_epoch: state.lifecycle_epoch,
             source_phase: SourceRuntimePhase::Current,
             authority_publication,
             authority,
@@ -3230,5 +3289,180 @@ impl Drop for EmbeddedSourceHandle {
         if !self.closed.swap(true, Ordering::AcqRel) {
             let _ = self.registration.close_one(&self.key, self.identity);
         }
+    }
+}
+
+#[cfg(all(test, feature = "embed"))]
+mod refresh_lifecycle_tests {
+    use super::*;
+    use crate::embed::parity::{QueryLimits, QueryRefusalKind, QueryRequest};
+    use crate::embed::{EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase};
+
+    fn wait_current(handle: &EmbeddedSourceHandle, after: u64) {
+        let started = std::time::Instant::now();
+        loop {
+            let since = handle.change_version();
+            let view = handle.runtime_view();
+            if view.phase == SourceRuntimePhase::Current && view.source_version > after {
+                return;
+            }
+            let remaining = Duration::from_secs(20).saturating_sub(started.elapsed());
+            assert!(
+                !remaining.is_zero(),
+                "source did not become Current: {view:?}"
+            );
+            handle.wait_for_change(since, remaining).unwrap();
+        }
+    }
+
+    fn open_current() -> (
+        tempfile::TempDir,
+        ProcessIndexRuntime,
+        Arc<EmbeddedSourceHandle>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("lib.rs"), "pub fn loaded() {}\n").unwrap();
+        let runtime = ProcessIndexRuntime::acquire().unwrap();
+        let handle = Arc::new(
+            runtime
+                .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+                    root.path().to_path_buf(),
+                ))
+                .unwrap(),
+        );
+        wait_current(&handle, 0);
+        (root, runtime, handle)
+    }
+
+    #[test]
+    #[cfg(feature = "__test-internals")]
+    fn lease_begin_preserves_transient_and_invalid_root_retry_advice() {
+        use super::super::public_api::{RetryAdvice, SourceRefusalKind};
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("source");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn loaded() {}\n").unwrap();
+        let reload_hold = crate::live_index::store::hold_reload_after_discovery_for_test(&root);
+        let runtime = ProcessIndexRuntime::acquire().unwrap();
+        let handle = runtime
+            .open_embedded_source(EmbeddedSourceSpec::current_worktree(root.clone()))
+            .unwrap();
+        // Release the reload hold before the handle during assertion unwinding.
+        let gate = reload_hold;
+        assert!(gate.wait_until_blocked(Duration::from_secs(5)));
+        assert_eq!(handle.runtime_view().phase, SourceRuntimePhase::Loading);
+        let loading = handle
+            .begin_graph_publication_lease(Duration::from_secs(20))
+            .unwrap_err();
+        assert_eq!(loading.kind(), SourceRefusalKind::SourceUnavailable);
+        assert_eq!(loading.retry(), RetryAdvice::OnEvent);
+        let binding = handle.binding.as_ref().unwrap();
+        binding.set_phase(SourceRuntimePhase::Refreshing);
+        let refreshing = handle
+            .begin_graph_publication_lease(Duration::from_secs(20))
+            .unwrap_err();
+        assert_eq!(refreshing.kind(), SourceRefusalKind::SourceUnavailable);
+        assert_eq!(refreshing.retry(), RetryAdvice::OnEvent);
+
+        std::fs::rename(&root, parent.path().join("original")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let invalid = handle
+            .begin_graph_publication_lease(Duration::from_secs(20))
+            .unwrap_err();
+        assert_eq!(invalid.kind(), SourceRefusalKind::SourceUnavailable);
+        assert_eq!(invalid.retry(), RetryAdvice::Never);
+        let captured = handle
+            .capture_query_snapshot_allowing_refresh(b"invalid-root")
+            .err()
+            .expect("invalid root must refuse capture");
+        assert_eq!(captured.kind(), SourceRefusalKind::SourceUnavailable);
+        assert_eq!(captured.retry(), RetryAdvice::Never);
+        let completed = handle
+            .validate_refresh_snapshot(0, b"invalid-root")
+            .unwrap_err();
+        assert_eq!(completed.kind(), SourceRefusalKind::SourceUnavailable);
+        assert_eq!(completed.retry(), RetryAdvice::Never);
+        drop(gate);
+    }
+
+    #[test]
+    #[cfg(feature = "__test-internals")]
+    fn blocked_recovery_invalidates_leases_and_retained_completion() {
+        use super::super::public_api::{RetryAdvice, SourceRefusalKind};
+        let (root, _runtime, handle) = open_current();
+        let initial = handle.runtime_view();
+        let lease = handle
+            .begin_graph_publication_lease(Duration::from_secs(20))
+            .unwrap();
+        assert_eq!(format!("{lease:?}"), "GraphPublicationLease { .. }");
+        let snapshot = handle
+            .capture_query_snapshot_allowing_refresh(b"before-blocked")
+            .unwrap();
+        let gate = crate::live_index::store::hold_reload_after_discovery_for_test(root.path());
+        handle.request_refresh().unwrap();
+        assert!(gate.wait_until_blocked(Duration::from_secs(5)));
+        assert!(handle.capture_graph_lease_snapshot(&lease).is_ok());
+        let binding = handle.binding.as_ref().unwrap();
+        binding.set_blocked();
+        binding.set_phase(SourceRuntimePhase::Refreshing);
+        assert_eq!(
+            handle
+                .capture_graph_lease_snapshot(&lease)
+                .err()
+                .expect("invalidated lease must refuse"),
+            QueryRefusalKind::SourceUnavailable,
+        );
+        let completion = handle
+            .validate_refresh_snapshot(snapshot.lifecycle_epoch, b"after-blocked")
+            .unwrap_err();
+        assert_eq!(completion.kind(), SourceRefusalKind::SourceUnavailable);
+        assert_eq!(completion.retry(), RetryAdvice::OnEvent);
+        let unavailable = handle
+            .begin_graph_publication_lease(Duration::from_secs(20))
+            .unwrap_err();
+        assert_eq!(unavailable.kind(), SourceRefusalKind::SourceUnavailable);
+        assert_eq!(unavailable.retry(), RetryAdvice::OnEvent);
+        drop(gate);
+        wait_current(&handle, initial.source_version);
+        assert_eq!(
+            handle
+                .capture_graph_lease_snapshot(&lease)
+                .err()
+                .expect("invalidated lease must refuse"),
+            QueryRefusalKind::SourceUnavailable,
+        );
+        let replacement = handle
+            .begin_graph_publication_lease(Duration::from_secs(20))
+            .unwrap();
+        assert!(handle.capture_graph_lease_snapshot(&replacement).is_ok());
+    }
+
+    #[test]
+    fn unsupported_freshening_request_refuses_before_taking_source_state() {
+        let (root, _runtime, handle) = open_current();
+        let request = QueryRequest::Syntax {
+            path: "lib.rs".into(),
+        };
+        assert_eq!(request.freshen_path(), Some("lib.rs"));
+        let binding = handle.binding.as_ref().unwrap();
+        let state = binding.state.lock().unwrap();
+        std::fs::write(root.path().join("lib.rs"), "pub fn changed() {}\n").unwrap();
+        let (sent, received) = std::sync::mpsc::sync_channel(1);
+        let querying = Arc::clone(&handle);
+        let worker = std::thread::spawn(move || {
+            sent.send(querying.query_allowing_refresh(&request, QueryLimits::default()))
+                .unwrap();
+        });
+        let result = received.recv_timeout(Duration::from_secs(2));
+        drop(state);
+        worker.join().unwrap();
+        let refusal = result
+            .expect("unsupported request entered the source/freshening path")
+            .unwrap_err();
+        assert_eq!(refusal.kind(), QueryRefusalKind::UnsupportedOption);
+        assert_eq!(
+            refusal.retry(),
+            super::super::public_api::RetryAdvice::Never
+        );
     }
 }
