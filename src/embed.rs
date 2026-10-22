@@ -7,9 +7,12 @@
 //! symforge = { version = "*", default-features = false, features = ["embed"] }
 //! ```
 //!
-//! This namespace exposes EXACTLY the frozen contract's V11 embed atoms
-//! (`specs/020-repository-knowledge-index/contracts/public-api-v11.json`,
-//! `migration_v10.introduced_v11_atoms`) plus the kept engine identity
+//! This namespace exposes the frozen V11 base atoms plus explicitly documented
+//! additive embed surfaces: the versioned parity API and the refresh contract
+//! (`docs/contracts/embed-refresh-v1.json`).
+//! The frozen base remains recorded in
+//! `specs/020-repository-knowledge-index/contracts/public-api-v11.json`
+//! (`migration_v10.introduced_v11_atoms`), alongside the kept engine identity
 //! (`EngineInfo`/`engine_info`). The V10 raw surface this file used to
 //! re-export — live-index state, authorityless search, raw per-file
 //! mutation, snapshot loaders, parser/domain types, `GitRepo`, the STEL
@@ -121,6 +124,8 @@ pub(crate) mod lifecycle {
     };
 }
 
+pub use crate::index_lifecycle::embedded::{GraphPublicationLease, SourceChangeVersion};
+
 /// Additive engine query contracts, versioned separately from the frozen V11 core.
 pub mod parity;
 
@@ -135,13 +140,13 @@ mod contract {
     #[allow(unused_imports)]
     use crate::embed::{
         AtomicAuthority, CensusFile, CensusParseStatus, CensusVerifyPhase, Claim, ClaimProvenance,
-        EmbeddedSourceHandle, EmbeddedSourceSpec, EngineInfo, EvaluationProvenance, IndexCensus,
-        IndexProgress, KnowledgeMatch, KnowledgeSearchRequest, KnowledgeSearchResult,
-        OperationKind, OperationReceipt, ProcessIndexRuntime, ReceiptWaitError, RefreshTicket,
-        RetryAdvice, ShutdownReceipt, ShutdownReport, SourceCloseReceipt, SourceCloseReport,
-        SourceRefusal, SourceRefusalKind, SourceRuntimePhase, SourceRuntimeView, SymbolMatch,
-        SymbolSearchRequest, SymbolSearchResult, TextMatch, TextSearchRequest, TextSearchResult,
-        engine_info,
+        EmbeddedSourceHandle, EmbeddedSourceSpec, EngineInfo, EvaluationProvenance,
+        GraphPublicationLease, IndexCensus, IndexProgress, KnowledgeMatch, KnowledgeSearchRequest,
+        KnowledgeSearchResult, OperationKind, OperationReceipt, ProcessIndexRuntime,
+        ReceiptWaitError, RefreshTicket, RetryAdvice, ShutdownReceipt, ShutdownReport,
+        SourceChangeVersion, SourceCloseReceipt, SourceCloseReport, SourceRefusal,
+        SourceRefusalKind, SourceRuntimePhase, SourceRuntimeView, SymbolMatch, SymbolSearchRequest,
+        SymbolSearchResult, TextMatch, TextSearchRequest, TextSearchResult, engine_info,
     };
 
     #[test]
@@ -211,6 +216,8 @@ mod contract {
         _assert_named::<Claim<u64>>();
         _assert_named::<ClaimProvenance>();
         _assert_named::<EmbeddedSourceHandle>();
+        _assert_named::<GraphPublicationLease>();
+        _assert_named::<SourceChangeVersion>();
         _assert_named::<EmbeddedSourceSpec>();
         _assert_named::<EvaluationProvenance>();
         _assert_named::<IndexCensus>();
@@ -260,6 +267,35 @@ mod contract {
             &KnowledgeSearchRequest,
         ) -> Result<Claim<KnowledgeSearchResult>, SourceRefusal> =
             EmbeddedSourceHandle::search_knowledge;
+        let _change_version: fn(&EmbeddedSourceHandle) -> SourceChangeVersion =
+            EmbeddedSourceHandle::change_version;
+        let _wait_for_change: fn(
+            &EmbeddedSourceHandle,
+            SourceChangeVersion,
+            std::time::Duration,
+        ) -> Result<SourceRuntimeView, SourceRefusal> = EmbeddedSourceHandle::wait_for_change;
+        let _begin_graph_lease: fn(
+            &EmbeddedSourceHandle,
+            std::time::Duration,
+        ) -> Result<GraphPublicationLease, SourceRefusal> =
+            EmbeddedSourceHandle::begin_graph_publication_lease;
+        let _refresh_query: fn(
+            &EmbeddedSourceHandle,
+            &crate::embed::parity::QueryRequest,
+            crate::embed::parity::QueryLimits,
+        ) -> Result<
+            crate::embed::parity::QueryClaim,
+            crate::embed::parity::QueryRefusal,
+        > = EmbeddedSourceHandle::query_allowing_refresh;
+        let _lease_query: fn(
+            &EmbeddedSourceHandle,
+            &crate::embed::parity::QueryRequest,
+            crate::embed::parity::QueryLimits,
+            &GraphPublicationLease,
+        ) -> Result<
+            crate::embed::parity::QueryClaim,
+            crate::embed::parity::QueryRefusal,
+        > = EmbeddedSourceHandle::query_with_graph_lease;
         let _ = (
             _acquire,
             _open,

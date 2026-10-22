@@ -1,5 +1,7 @@
 # Lessons
 
+- 2026-10-20: Use Terminal Commander for all terminal work. On Windows, run native argv with the checkout as `cwd` or choose an explicit PowerShell shell; the default Bash route may be WSL and reject Windows paths, which is shell selection rather than a Terminal Commander access limit. Dogfood SymForge for code intelligence and structural edits, then record concrete tool failures or recovery limits instead of silently switching tools.
+
 - 2026-09-15: For Fathom, “knowledge layer works” means its embedded handle can retrieve the admitted repository knowledge corpus itself — documents, text/config knowledge, provenance, coverage/withholding truth, authority, and relationships. Do not answer a documentation product’s embed requirement by merely making server `search_text` disclose that prose belongs somewhere else; retain code-search semantics and add the typed embedded knowledge lane additively.
 
 - 2026-09-15: When a downstream product depends on SymForge as a foundational embedded knowledge engine, do not reduce an evidence-backed lifecycle-and-retrieval program to the first isolated defect. Preserve the complete intended use cases in the plan: process-wide admission, cancellation/close guarantees, honest code-versus-prose coverage, selector/path correctness, verification, and release handoff. Only defer items with an explicit product decision and documented consequence.

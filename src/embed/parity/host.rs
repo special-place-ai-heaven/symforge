@@ -895,6 +895,7 @@ impl HostRefusal {
             | QueryRefusalKind::BudgetTooSmall
             | QueryRefusalKind::StaleHandle
             | QueryRefusalKind::PolicyMismatch => HostRefusalKind::InvalidRequest,
+            QueryRefusalKind::GraphPublicationLeaseExpired => HostRefusalKind::SourceUnavailable,
             QueryRefusalKind::ForeignSession => HostRefusalKind::Denied,
             QueryRefusalKind::SessionRequired => HostRefusalKind::EngineFailure,
             _ => HostRefusalKind::SourceUnavailable,

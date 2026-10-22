@@ -1,0 +1,9 @@
+[package]
+name = "symforge-embed-refresh-v1-consumer"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+symforge = { path = "../../..", default-features = false, features = ["embed"] }
+
+[workspace]
