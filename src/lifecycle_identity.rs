@@ -282,7 +282,9 @@ pub enum RetryAdvice {
     /// The request is wrong in a way repetition cannot fix.
     Never,
     /// Retry after an observable event: a completed refresh, an installed
-    /// successor generation, a selection change.
+    /// successor generation, a selection change. Block on the source's change
+    /// wait primitive rather than polling; embedded callers can capture a
+    /// `SourceChangeVersion` and pass it to `EmbeddedSourceHandle::wait_for_change`.
     OnEvent,
     /// Retry requires an operator action, such as a rebind to the correct root.
     Operator,

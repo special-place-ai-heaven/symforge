@@ -20,6 +20,7 @@ use super::public_api::{
     EmbedClaim, EmbedClaimProvenance, OperationKind, RetryAdvice, SourceRefusalKind,
 };
 
+#[derive(Clone)]
 pub(super) struct EmbeddedQuerySnapshot {
     pub root: PathBuf,
     pub state_dir: Option<PathBuf>,
@@ -30,6 +31,8 @@ pub(super) struct EmbeddedQuerySnapshot {
     pub publication_identity: String,
     pub serving_publication_identity: String,
     pub source_version: u64,
+    pub lifecycle_epoch: u64,
+    pub source_phase: crate::embed::parity::SourceRuntimePhase,
     pub authority_publication: crate::lifecycle_identity::PublicationIdentity,
     pub authority: Arc<super::activation::ProjectSourceAuthority>,
     pub state_anchor: Option<super::embedded::AdmittedStateAnchor>,
@@ -113,6 +116,7 @@ pub struct QueryClaim {
     publication_identity: String,
     source_capture_publication_identity: String,
     source_version: u64,
+    source_phase: crate::embed::parity::SourceRuntimePhase,
     publication_generation: u64,
     content_generation: u64,
     truncated: bool,
@@ -157,6 +161,15 @@ impl QueryClaim {
     pub fn source_capture_publication_identity(&self) -> &str {
         &self.source_capture_publication_identity
     }
+    /// Runtime phase when this immutable publication snapshot was captured, not a live phase read. Lease-backed claims retain the phase recorded by the pinned snapshot.
+    pub fn source_phase(&self) -> crate::embed::parity::SourceRuntimePhase {
+        self.source_phase
+    }
+    /// True when this claim answers from the last complete publication during refresh.
+    pub fn is_refreshing(&self) -> bool {
+        self.source_phase == crate::embed::parity::SourceRuntimePhase::Refreshing
+    }
+
     pub fn source_version(&self) -> u64 {
         self.source_version
     }
@@ -297,6 +310,13 @@ pub(super) fn validate_syntax_from_disk(
     })
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum SnapshotMode<'a> {
+    Strict,
+    AllowRefreshing,
+    GraphLease(&'a super::embedded::GraphPublicationLease),
+}
+
 pub(super) fn execute(
     handle: &EmbeddedSourceHandle,
     request: &QueryRequest,
@@ -309,6 +329,7 @@ pub(super) fn execute(
         None,
         None,
         QueryPolicy::default(),
+        SnapshotMode::Strict,
         |_| true,
     )
 }
@@ -326,6 +347,44 @@ pub(super) fn execute_with_control(
         Some(control.clone()),
         None,
         QueryPolicy::default(),
+        SnapshotMode::Strict,
+        |_| true,
+    )
+}
+
+pub(super) fn execute_allowing_refresh(
+    handle: &EmbeddedSourceHandle,
+    request: &QueryRequest,
+    limits: QueryLimits,
+    control: Option<&OperationControl>,
+) -> Result<QueryClaim, QueryRefusal> {
+    execute_inner(
+        handle,
+        request,
+        limits,
+        control.cloned(),
+        None,
+        QueryPolicy::default(),
+        SnapshotMode::AllowRefreshing,
+        |_| true,
+    )
+}
+
+pub(super) fn execute_with_graph_lease(
+    handle: &EmbeddedSourceHandle,
+    request: &QueryRequest,
+    limits: QueryLimits,
+    control: Option<&OperationControl>,
+    lease: &super::embedded::GraphPublicationLease,
+) -> Result<QueryClaim, QueryRefusal> {
+    execute_inner(
+        handle,
+        request,
+        limits,
+        control.cloned(),
+        None,
+        QueryPolicy::default(),
+        SnapshotMode::GraphLease(lease),
         |_| true,
     )
 }
@@ -344,6 +403,7 @@ pub(super) fn execute_with_session(
         control.cloned(),
         Some(session),
         QueryPolicy::default(),
+        SnapshotMode::Strict,
         |_| true,
     )
 }
@@ -363,6 +423,7 @@ pub(super) fn execute_with_policy(
         control.cloned(),
         session,
         policy,
+        SnapshotMode::Strict,
         |_| true,
     )
 }
@@ -383,10 +444,15 @@ pub(super) fn execute_with_policy_admitted(
         control.cloned(),
         session,
         policy,
+        SnapshotMode::Strict,
         admit,
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Query entry points share one dispatcher for admission and snapshot validation."
+)]
 fn execute_inner(
     handle: &EmbeddedSourceHandle,
     request: &QueryRequest,
@@ -394,6 +460,7 @@ fn execute_inner(
     control: Option<OperationControl>,
     session: Option<&super::embed_session::QuerySession>,
     policy: QueryPolicy,
+    snapshot_mode: SnapshotMode<'_>,
     admit: impl FnOnce(&QueryClaim) -> bool,
 ) -> Result<QueryClaim, QueryRefusal> {
     let normalized =
@@ -410,6 +477,24 @@ fn execute_inner(
     let mut budget =
         Budget::new(limits, control).map_err(|kind| refuse(kind, RetryAdvice::Never))?;
     validate_request(request).map_err(|kind| refuse(kind, RetryAdvice::Never))?;
+    match snapshot_mode {
+        SnapshotMode::Strict => {}
+        SnapshotMode::AllowRefreshing
+            if matches!(
+                request,
+                QueryRequest::Graph { .. }
+                    | QueryRequest::File { .. }
+                    | QueryRequest::SymbolSearch(_)
+                    | QueryRequest::References { .. }
+            ) => {}
+        SnapshotMode::GraphLease(_) if matches!(request, QueryRequest::Graph { .. }) => {}
+        _ => {
+            return Err(refuse(
+                QueryRefusalKind::UnsupportedOption,
+                RetryAdvice::Never,
+            ));
+        }
+    }
     budget
         .check()
         .map_err(|kind| refuse(kind, RetryAdvice::Never))?;
@@ -461,18 +546,35 @@ fn execute_inner(
             })?;
         budget.file_impact = Some(admission);
     }
-    let snapshot = handle
-        .capture_query_snapshot(&normalized)
-        .map_err(|error| {
-            refuse(
-                if error.kind() == SourceRefusalKind::AdmissionUnavailable {
-                    QueryRefusalKind::AdmissionUnavailable
-                } else {
-                    QueryRefusalKind::SourceUnavailable
-                },
-                error.retry(),
-            )
-        })?;
+    let snapshot = match snapshot_mode {
+        SnapshotMode::Strict => handle
+            .capture_query_snapshot(&normalized)
+            .map_err(|error| {
+                refuse(
+                    if error.kind() == SourceRefusalKind::AdmissionUnavailable {
+                        QueryRefusalKind::AdmissionUnavailable
+                    } else {
+                        QueryRefusalKind::SourceUnavailable
+                    },
+                    error.retry(),
+                )
+            })?,
+        SnapshotMode::AllowRefreshing => handle
+            .capture_query_snapshot_allowing_refresh(&normalized)
+            .map_err(|error| {
+                refuse(
+                    if error.kind() == SourceRefusalKind::AdmissionUnavailable {
+                        QueryRefusalKind::AdmissionUnavailable
+                    } else {
+                        QueryRefusalKind::SourceUnavailable
+                    },
+                    error.retry(),
+                )
+            })?,
+        SnapshotMode::GraphLease(lease) => handle
+            .capture_graph_lease_snapshot(lease)
+            .map_err(|kind| refuse(kind, RetryAdvice::Never))?,
+    };
     debug_assert!(Arc::ptr_eq(
         &snapshot.generation,
         &snapshot.source_set.current_generation()
@@ -612,6 +714,7 @@ fn execute_inner(
         publication_identity: snapshot.serving_publication_identity.clone(),
         source_capture_publication_identity: snapshot.publication_identity.clone(),
         source_version: snapshot.source_version,
+        source_phase: snapshot.source_phase,
         publication_generation: snapshot.generation.publication_generation,
         content_generation: snapshot.generation.content_generation,
         truncated: budget.truncated,
@@ -633,14 +736,33 @@ fn execute_inner(
             RetryAdvice::Never,
         ));
     }
-    let current = handle
-        .capture_query_snapshot(&normalized)
-        .map_err(|_| refuse(QueryRefusalKind::SourceUnavailable, RetryAdvice::OnEvent))?;
-    if current.serving_publication_identity != snapshot.serving_publication_identity {
-        return Err(refuse(
-            QueryRefusalKind::StalePublication,
-            RetryAdvice::OnEvent,
-        ));
+    match snapshot_mode {
+        SnapshotMode::Strict => {
+            let current = handle
+                .capture_query_snapshot(&normalized)
+                .map_err(|_| refuse(QueryRefusalKind::SourceUnavailable, RetryAdvice::OnEvent))?;
+            if current.serving_publication_identity != snapshot.serving_publication_identity {
+                return Err(refuse(
+                    QueryRefusalKind::StalePublication,
+                    RetryAdvice::OnEvent,
+                ));
+            }
+        }
+        SnapshotMode::AllowRefreshing => handle
+            .validate_refresh_snapshot(snapshot.lifecycle_epoch, &normalized)
+            .map_err(|error| {
+                refuse(
+                    if error.kind() == SourceRefusalKind::AdmissionUnavailable {
+                        QueryRefusalKind::AdmissionUnavailable
+                    } else {
+                        QueryRefusalKind::SourceUnavailable
+                    },
+                    error.retry(),
+                )
+            })?,
+        SnapshotMode::GraphLease(lease) => handle
+            .validate_graph_lease(lease)
+            .map_err(|kind| refuse(kind, RetryAdvice::Never))?,
     }
 
     // No fallible projection remains. The source and exact transport envelope have been
@@ -648,80 +770,82 @@ fn execute_inner(
     // An Ask commits what its routed query returned, exactly as that query
     // would have committed it when called directly.
     // A facade commits what each of its executed primitives returned.
-    let committed_values: Vec<Option<&QueryOutput>> = match result.value() {
-        QueryOutput::Ask(ask) => vec![ask.output.as_deref()],
-        QueryOutput::Symforge(answer) => answer
-            .steps
-            .iter()
-            .map(|step| step.output.as_deref())
-            .collect(),
-        value => vec![Some(value)],
-    };
-    for committed_value in committed_values {
-        let committed_path = match committed_value {
-            None => None,
-            Some(value) => match value {
-                QueryOutput::File { file, .. } => Some(file.path.as_str()),
-                QueryOutput::Symbol(symbol) => Some(symbol.path.as_str()),
-                QueryOutput::Context(context) => Some(context.symbol.path.as_str()),
-                QueryOutput::SymbolContext(context)
-                    if context.estimate.is_none() && context.refusal.is_none() =>
-                {
-                    context.path.as_deref()
-                }
-                QueryOutput::FileContent(content) if !content.cache_hit => {
-                    Some(content.path.as_str())
-                }
-                QueryOutput::FileContext(content)
-                    if !content.cache_hit && content.estimated_tokens.is_none() =>
-                {
-                    Some(content.path.as_str())
-                }
-                QueryOutput::SourcePage(page) => Some(page.path.as_str()),
-                _ => None,
-            },
-        };
-        if let Some(path) = committed_path {
-            snapshot.record_commitment(&[PathBuf::from(path)]);
-        }
-        if let Some(QueryOutput::SymbolRead(content)) = committed_value
-            && !content.cache_hit
-            && content.estimated_tokens.is_none()
-        {
-            let paths = content
-                .entries
+    if matches!(snapshot_mode, SnapshotMode::Strict) {
+        let committed_values: Vec<Option<&QueryOutput>> = match result.value() {
+            QueryOutput::Ask(ask) => vec![ask.output.as_deref()],
+            QueryOutput::Symforge(answer) => answer
+                .steps
                 .iter()
-                .filter(|entry| entry.source.is_some())
-                .map(|entry| PathBuf::from(&entry.path))
-                .collect::<Vec<_>>();
-            snapshot.record_commitment(&paths);
+                .map(|step| step.output.as_deref())
+                .collect(),
+            value => vec![Some(value)],
+        };
+        for committed_value in committed_values {
+            let committed_path = match committed_value {
+                None => None,
+                Some(value) => match value {
+                    QueryOutput::File { file, .. } => Some(file.path.as_str()),
+                    QueryOutput::Symbol(symbol) => Some(symbol.path.as_str()),
+                    QueryOutput::Context(context) => Some(context.symbol.path.as_str()),
+                    QueryOutput::SymbolContext(context)
+                        if context.estimate.is_none() && context.refusal.is_none() =>
+                    {
+                        context.path.as_deref()
+                    }
+                    QueryOutput::FileContent(content) if !content.cache_hit => {
+                        Some(content.path.as_str())
+                    }
+                    QueryOutput::FileContext(content)
+                        if !content.cache_hit && content.estimated_tokens.is_none() =>
+                    {
+                        Some(content.path.as_str())
+                    }
+                    QueryOutput::SourcePage(page) => Some(page.path.as_str()),
+                    _ => None,
+                },
+            };
+            if let Some(path) = committed_path {
+                snapshot.record_commitment(&[PathBuf::from(path)]);
+            }
+            if let Some(QueryOutput::SymbolRead(content)) = committed_value
+                && !content.cache_hit
+                && content.estimated_tokens.is_none()
+            {
+                let paths = content
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.source.is_some())
+                    .map(|entry| PathBuf::from(&entry.path))
+                    .collect::<Vec<_>>();
+                snapshot.record_commitment(&paths);
+            }
+            if let Some(QueryOutput::InspectMatch(content)) = committed_value
+                && content.estimated_tokens.is_none()
+            {
+                snapshot.record_commitment(&[PathBuf::from(&content.path)]);
+            }
         }
-        if let Some(QueryOutput::InspectMatch(content)) = committed_value
-            && content.estimated_tokens.is_none()
-        {
-            snapshot.record_commitment(&[PathBuf::from(&content.path)]);
-        }
-    }
-    if let Some(session) = session {
-        session.commit_observation(result.value());
-        if let Some(prepared) = prepared_session_result {
-            let committed =
-                session.commit_result(&snapshot, request, result.value(), prepared, limits);
-            debug_assert_eq!(committed.as_deref(), result.retrieve_handle());
-        }
-    }
-    if let Some(operation) = session_operation {
-        let committed = operation.commit();
-        debug_assert_eq!(Some(committed), result.session_evidence);
-    }
-    // MCP's facade records its economics event in the session ledger and the
-    // durable store once the answer is served; here, once it is committed.
-    if let Some(event) = budget.stel_event.take() {
         if let Some(session) = session {
-            session.stel_ledger().push(event.clone());
+            session.commit_observation(result.value());
+            if let Some(prepared) = prepared_session_result {
+                let committed =
+                    session.commit_result(&snapshot, request, result.value(), prepared, limits);
+                debug_assert_eq!(committed.as_deref(), result.retrieve_handle());
+            }
         }
-        if let Some(store) = budget.stel_store.as_deref() {
-            crate::stel::runtime::record_durably_inline(store, &event);
+        if let Some(operation) = session_operation {
+            let committed = operation.commit();
+            debug_assert_eq!(Some(committed), result.session_evidence);
+        }
+        // MCP's facade records its economics event in the session ledger and the
+        // durable store once the answer is served; here, once it is committed.
+        if let Some(event) = budget.stel_event.take() {
+            if let Some(session) = session {
+                session.stel_ledger().push(event.clone());
+            }
+            if let Some(store) = budget.stel_store.as_deref() {
+                crate::stel::runtime::record_durably_inline(store, &event);
+            }
         }
     }
     Ok(result)
@@ -909,6 +1033,49 @@ mod admission_tests {
         assert_eq!(delivered.session_evidence().unwrap().revision_after, 1);
         assert_eq!(session.revision(), 1);
         assert_eq!(session.cache_status().resident_entries, 1);
+    }
+
+    #[test]
+    fn closing_during_refresh_output_admission_never_retries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("lib.rs"), "pub fn loaded() {}\n").unwrap();
+        let runtime = ProcessIndexRuntime::acquire().unwrap();
+        let handle = runtime
+            .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+                root.path().to_path_buf(),
+            ))
+            .unwrap();
+        let started = Instant::now();
+        loop {
+            let since = handle.change_version();
+            if handle.runtime_view().phase == SourceRuntimePhase::Current {
+                break;
+            }
+            let remaining = Duration::from_secs(20).saturating_sub(started.elapsed());
+            assert!(!remaining.is_zero());
+            handle.wait_for_change(since, remaining).unwrap();
+        }
+        let request = QueryRequest::Graph {
+            path_prefix: None,
+            offset: 0,
+            expected_publication: None,
+        };
+        let refusal = execute_inner(
+            &handle,
+            &request,
+            QueryLimits::default(),
+            None,
+            None,
+            QueryPolicy::default(),
+            SnapshotMode::AllowRefreshing,
+            |_| {
+                let _ = handle.begin_close();
+                true
+            },
+        )
+        .unwrap_err();
+        assert_eq!(refusal.kind(), QueryRefusalKind::SourceUnavailable);
+        assert_eq!(refusal.retry(), RetryAdvice::Never);
     }
 }
 

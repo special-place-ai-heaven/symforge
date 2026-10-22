@@ -11,6 +11,11 @@ const ACCEPTANCE_PATH = "specs/020-repository-knowledge-index/contracts/lifecycl
 const RETIREMENT_PATH = "specs/020-repository-knowledge-index/contracts/v10-authority-retirement-v11.md";
 const TASKS_PATH = "specs/020-repository-knowledge-index/tasks.md";
 const PUBLIC_API_PATH = "specs/020-repository-knowledge-index/contracts/public-api-v11.json";
+const REFRESH_V1_CONTRACT_PATH = "docs/contracts/embed-refresh-v1.json";
+const EXPECTED_REFRESH_V1_PUBLIC_EXPORTS = [
+  "symforge::embed::GraphPublicationLease",
+  "symforge::embed::SourceChangeVersion",
+];
 const CHECKER_PATH = "scripts/validate-lifecycle-oracle-traceability.cjs";
 const RELEASE_GATE_REVIEW_PATH = "docs/reviews/FEATURE-020-V11-RELEASE-GATE.md";
 const RELEASE_WORKFLOW_PATH = ".github/workflows/release.yml";
@@ -2051,6 +2056,37 @@ function deriveLifecyclePublicAtoms(sourceMap, manifest) {
   return [...result].sort();
 }
 
+function loadRefreshV1PublicExports() {
+  const text = readText(REFRESH_V1_CONTRACT_PATH);
+  if (text === null) {
+    fail("REFRESH_V1_CONTRACT_MISSING", REFRESH_V1_CONTRACT_PATH);
+    return [];
+  }
+  let contract;
+  try {
+    contract = JSON.parse(text);
+  } catch (error) {
+    fail("REFRESH_V1_CONTRACT_JSON_INVALID", `${REFRESH_V1_CONTRACT_PATH}: ${error.message}`);
+    return [];
+  }
+  if (!exactKeys(contract, [
+    "api_version", "additive_to", "scope", "refresh_reads", "change_wait",
+    "graph_publication_lease", "public_exports",
+  ], "refresh_v1_contract")) return [];
+  if (contract.api_version !== 1
+    || contract.additive_to !== PUBLIC_API_PATH
+    || contract.scope !== "symforge::embed") {
+    fail("REFRESH_V1_CONTRACT_BINDING_INVALID", REFRESH_V1_CONTRACT_PATH);
+    return [];
+  }
+  const publicExportsValid = Array.isArray(contract.public_exports)
+    && JSON.stringify(contract.public_exports) === JSON.stringify(EXPECTED_REFRESH_V1_PUBLIC_EXPORTS);
+  exactArray(contract.public_exports, EXPECTED_REFRESH_V1_PUBLIC_EXPORTS,
+    "REFRESH_V1_PUBLIC_EXPORTS_INVALID", `${REFRESH_V1_CONTRACT_PATH}:public_exports`);
+  if (!publicExportsValid) return [];
+  return contract.public_exports;
+}
+
 function ordinaryRetirementLifecycle(sourceMap, manifest) {
   const actual = deriveLifecyclePublicAtoms(sourceMap, manifest);
   const preactivation = directPublicAtoms(migrationAtoms(manifest));
@@ -2062,10 +2098,12 @@ function ordinaryRetirementLifecycle(sourceMap, manifest) {
   const introduced = manifest && manifest.migration_v10 && manifest.migration_v10.introduced_v11_atoms;
   const postactivation = directPublicAtoms([...kept, ...(Array.isArray(introduced) ? introduced : [])]);
   if (JSON.stringify(actual) === JSON.stringify(preactivation)) return "preactivation";
-  if (JSON.stringify(actual) === JSON.stringify(postactivation)) return "postactivation";
+  const refreshExports = loadRefreshV1PublicExports();
+  const contractedPostactivation = directPublicAtoms([...postactivation, ...refreshExports]);
+  if (JSON.stringify(actual) === JSON.stringify(contractedPostactivation)) return "postactivation";
   fail(
     "RETIREMENT_LIFECYCLE_PHASE_INVALID",
-    `public API is neither frozen preactivation (${preactivation.length}) nor postactivation (${postactivation.length}); actual=${actual.length}`,
+    `public API is neither frozen preactivation (${preactivation.length}) nor contract-bound postactivation (${contractedPostactivation.length}); actual=${actual.length}`,
   );
   return "invalid";
 }

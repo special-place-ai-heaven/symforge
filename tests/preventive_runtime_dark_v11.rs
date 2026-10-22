@@ -1142,9 +1142,9 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // + capability-evidence-explicit): same 89 excluded files, no new edge into
 // src/index_lifecycle or server_api.rs.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "5f569498d164a6be470137efaf4b275a695fb693642e02104ef1fc31abee52e2",
+    "fb226057b7b863ad77b0a97cd1a60b33adfafd1ce2f0727fc4ec59f5b4c6fb59",
     89,
-    2210260,
+    2246988,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1301,10 +1301,15 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Refreshed for branch consolidation (033 containment-durability + AAP S4-S6
 // + capability-evidence-explicit): same 312 files, no new caller file and no
 // new edge into src/index_lifecycle or server_api.rs.
+// Refreshed after full source-diff audit: embed.rs, embed/parity.rs,
+// embed/parity/host.rs, embed/parity/replay.rs, lifecycle_identity.rs, and
+// index_lifecycle/embedded.rs + embed_query.rs (including helper bodies/tests).
+// Same 89 excluded / 312 total candidates; no new boundary bridge.
+
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "0299d976af526646fe11f20dae7f2f3c3ae0d4246478caf3b4fc52b9f9d76898",
+    "e42859439fbd87bfda2b4f5c59d461d55330f8d2926581e649157bec2d703347",
     312,
-    12145282,
+    12184264,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
@@ -1435,8 +1440,8 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "bc6c092b4a79e57e:17253"),
-    ("release.yml", "1dc9e1ee33a09edf:113450"),
+    ("ci.yml", "55403c3921076892:17264"),
+    ("release.yml", "b7c043c3754a1a5d:113265"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an
@@ -1529,6 +1534,10 @@ const CARGO_LINES: &[(&str, usize)] = &[
     ),
     ("run: cargo build --release", 2),
     ("run: cargo check", 1),
+    (
+        "run: cargo check --manifest-path tests/fixtures/embed-refresh-v1-consumer/Cargo.toml --target-dir target",
+        1,
+    ),
     ("run: cargo clippy --all-targets -- -D warnings", 2),
     (
         "run: cargo clippy --no-default-features --features embed,__test-internals --lib -- -D warnings",
@@ -1568,8 +1577,13 @@ const CARGO_LINES: &[(&str, usize)] = &[
         1,
     ),
     (
+        "cargo test --no-default-features --features embed,__test-internals --test embed_parity --test embed_replay_v1 --test embed_aap_refresh_s14_s16 -- --test-threads=1 2>&1 | tee /tmp/embed-parity-replay.log",
+        1,
+    ),
+    // Release CI retains the parity and replay binaries without the focused refresh target.
+    (
         "cargo test --no-default-features --features embed,__test-internals --test embed_parity --test embed_replay_v1 -- --test-threads=1 2>&1 | tee /tmp/embed-parity-replay.log",
-        2,
+        1,
     ),
     (
         "run: cargo test --release --test coupling_calibration calibrate_current_repo_smoke -- --ignored --test-threads=1 --nocapture",
@@ -2441,8 +2455,8 @@ fn no_gate_builds_doctests() {
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(
         (seen.len(), distinct.len(), files),
-        (44, 34, 2),
-        "the CI workflows hold forty-four cargo-mentioning lines, thirty-four \
+        (45, 36, 2),
+        "the CI workflows hold forty-five cargo-mentioning lines, thirty-six \
          of them distinct, across two workflow files; this walk saw {:?}. A gate \
          added, removed, reworded, or a workflow file added — reconcile \
          CARGO_LINES with the workflows deliberately, never by loosening this \

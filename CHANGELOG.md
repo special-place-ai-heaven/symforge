@@ -44,6 +44,8 @@ Embedders keep their own response bytes and check them with `ReplayOutcome::resp
 
 `ReplayStore::renew_lease` extends a live `not_started` or `started` lease via a CAS on token, generation, state, and `lease_expires_at > now` without reviving expired leases or bumping `generation`. `DetectImpactRequest::paths` accepts an optional explicit list of repository paths to seed blast-radius analysis without a git branch or time range, refusing paths outside the source root. `QueryRequest::FileImpact` is documented as the supported single-file re-admission path (`O(1)` file parse and synchronous publication swap leaving `index_census` and queries consistent without a whole-worktree `request_refresh`). `ProcessIndexRuntime::open_embedded_source` documents the process-wide single-open-per-canonical-root invariant (`SourceRefusalKind::SelectionUnavailable` on a second open).
 
+AAP S14-S16 add opt-in refresh-safe snapshot reads for Graph, File, SymbolSearch, and References via `EmbeddedSourceHandle::query_allowing_refresh`; the claim keeps the prior publication identity and reports `Refreshing`. Strict `query` remains Current-only, and mutating/mixed-disk variants are refused before freshening. `change_version` plus blocking `wait_for_change` provide lossless phase/publication event waits. `begin_graph_publication_lease` pins one Graph snapshot across pages for at most 30 seconds; no more than eight leases are live per source, and expired leases return `GraphPublicationLeaseExpired`.
+
 ## [11.9.1](https://github.com/special-place-ai-heaven/symforge/compare/v11.9.0...v11.9.1) (2026-10-19)
 
 

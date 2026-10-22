@@ -92,11 +92,42 @@ function main() {
   const preactivation = directPublicAtoms(categories.flatMap((c) => c.atoms || []));
   const kept = categories.filter((c) => c.decision === "keep").flatMap((c) => c.atoms || []);
   const postactivation = directPublicAtoms([...kept, ...introduced]);
+  const refreshExports = [
+    "symforge::embed::GraphPublicationLease",
+    "symforge::embed::SourceChangeVersion",
+  ];
+  const refreshContractKeys = [
+    "additive_to",
+    "api_version",
+    "change_wait",
+    "graph_publication_lease",
+    "public_exports",
+    "refresh_reads",
+    "scope",
+  ];
 
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  let validRefreshContract = false;
+  if (!same(actual, preactivation)) {
+    try {
+      const refreshContract = JSON.parse(read("docs/contracts/embed-refresh-v1.json"));
+      const exactContractShape = refreshContract !== null
+        && typeof refreshContract === "object"
+        && !Array.isArray(refreshContract)
+        && same(Object.keys(refreshContract).sort(), refreshContractKeys);
+      validRefreshContract = exactContractShape
+        && refreshContract.api_version === 1
+        && refreshContract.additive_to === "specs/020-repository-knowledge-index/contracts/public-api-v11.json"
+        && refreshContract.scope === "symforge::embed"
+        && same(refreshContract.public_exports, refreshExports);
+    } catch {
+      validRefreshContract = false;
+    }
+  }
+  const contractedPostactivation = directPublicAtoms([...postactivation, ...refreshExports]);
   const phase = same(actual, preactivation)
     ? "preactivation"
-    : same(actual, postactivation)
+    : validRefreshContract && same(actual, contractedPostactivation)
       ? "postactivation"
       : "INVALID";
 
@@ -104,10 +135,10 @@ function main() {
 
   process.stdout.write(
     `PHASE: ${phase}\n` +
-      `actual: ${actual.length}  pre: ${preactivation.length}  post: ${postactivation.length}\n` +
+      `actual: ${actual.length}  pre: ${preactivation.length}  post: ${contractedPostactivation.length}\n` +
       `scannedModules: [${[...scanned].join(", ")}]\n` +
-      `actualOnly: [${actual.filter((a) => !postactivation.includes(a)).join(", ")}]\n` +
-      `postOnly: [${postactivation.filter((a) => !actual.includes(a)).join(", ")}]\n` +
+      `actualOnly: [${actual.filter((a) => !contractedPostactivation.includes(a)).join(", ")}]\n` +
+      `postOnly: [${contractedPostactivation.filter((a) => !actual.includes(a)).join(", ")}]\n` +
       `introduced atoms invisible to this set (>3 segments): ${deep} of ${introduced.length}` +
       ` — covered by execution/refreeze_v11.py, not by the lifecycle checker\n`,
   );

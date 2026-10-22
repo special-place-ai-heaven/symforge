@@ -1,0 +1,42 @@
+{
+  "api_version": 1,
+  "additive_to": "specs/020-repository-knowledge-index/contracts/public-api-v11.json",
+  "scope": "symforge::embed",
+  "public_exports": [
+    "symforge::embed::GraphPublicationLease",
+    "symforge::embed::SourceChangeVersion"
+  ],
+  "refresh_reads": {
+    "methods": [
+      "EmbeddedSourceHandle::query_allowing_refresh",
+      "EmbeddedSourceHandle::query_allowing_refresh_with_control"
+    ],
+    "allowed_requests": ["Graph", "File", "SymbolSearch", "References"],
+    "claim_source_phase": "captured phase: Current or Refreshing",
+    "publication_identity": "last complete immutable publication",
+    "strict_query_unchanged": true,
+    "unsupported_requests": "UnsupportedOption before disk freshening or mutation"
+  },
+  "change_wait": {
+    "change_version_type": "SourceChangeVersion",
+    "methods": ["EmbeddedSourceHandle::change_version", "EmbeddedSourceHandle::wait_for_change"],
+    "wait_semantics": "capture change_version before a retryable operation, then block with the predicate checked under the source state mutex; phase/publication changes and full-to-available graph lease capacity advance the revision, possibly with an unchanged view; timeout returns the latest view",
+    "foreign_token_refusal": "SourceUnavailable"
+  },
+  "graph_publication_lease": {
+    "methods": [
+      "EmbeddedSourceHandle::begin_graph_publication_lease",
+      "EmbeddedSourceHandle::query_with_graph_lease",
+      "EmbeddedSourceHandle::query_with_graph_lease_and_control"
+    ],
+    "request": "Graph only",
+    "max_live_per_source": 8,
+    "max_ttl_seconds": 30,
+    "zero_timeout": "immediately expired lease",
+    "capacity_refusal": "AdmissionUnavailable with RetryAdvice::OnEvent",
+    "foreign_lease_refusal": "StaleHandle",
+    "expired_refusal": "GraphPublicationLeaseExpired",
+    "root_close_or_phase_invalidation": "SourceUnavailable",
+    "registry_admission_invalidation": "AdmissionUnavailable with RetryAdvice::Never"
+  }
+}

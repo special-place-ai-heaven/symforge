@@ -1276,6 +1276,7 @@ fn wall_now_ms() -> i64 {
     }
 }
 
+#[cfg(feature = "__test-internals")]
 fn time_to_ms(now: SystemTime) -> i64 {
     match now.duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),

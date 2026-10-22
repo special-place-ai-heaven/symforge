@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: ["**"]
     tags-ignore:
       - "v*"
   pull_request:
@@ -19,7 +20,7 @@ concurrency:
 
 jobs:
   conventional-commits:
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -45,7 +46,7 @@ jobs:
 
   release-version:
     needs: conventional-commits
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -94,11 +95,11 @@ jobs:
 
   rust:
     needs: release-version
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # hosted disk cleanup deletes docker images; skip it on the shared self-hosted pool
+      # Hosted-runner cleanup frees disk space for Rust builds.
       - name: Free disk space for Rust builds
         if: runner.environment == 'github-hosted'
         run: bash execution/free_runner_disk.sh
@@ -202,7 +203,7 @@ jobs:
 
   embed-build:
     needs: release-version
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -222,6 +223,9 @@ jobs:
       - name: Clippy engine-only embed feature
         run: cargo clippy --no-default-features --features embed,__test-internals --lib -- -D warnings
 
+      - name: Check external embed consumer
+        run: cargo check --manifest-path tests/fixtures/embed-refresh-v1-consumer/Cargo.toml --target-dir target
+
       - name: Run embed-feature lib tests
         run: cargo test --no-default-features --features embed --lib -- --test-threads=1
 
@@ -231,17 +235,17 @@ jobs:
       - name: Run embed parity and replay contracts
         run: |
           set -euo pipefail
-          cargo test --no-default-features --features embed,__test-internals --test embed_parity --test embed_replay_v1 -- --test-threads=1 2>&1 | tee /tmp/embed-parity-replay.log
+          cargo test --no-default-features --features embed,__test-internals --test embed_parity --test embed_replay_v1 --test embed_aap_refresh_s14_s16 -- --test-threads=1 2>&1 | tee /tmp/embed-parity-replay.log
           if grep -E 'running 0 tests' /tmp/embed-parity-replay.log; then
-            echo 'embed_parity or embed_replay_v1 executed zero tests' >&2
+            echo 'embed_parity, embed_replay_v1, or embed_aap_refresh_s14_s16 executed zero tests' >&2
             exit 1
           fi
           matches=$(grep -cE 'test result: ok\. [1-9][0-9]* passed' /tmp/embed-parity-replay.log || true)
-          test "$matches" -ge 2
+          test "$matches" -ge 3
 
   embed-musl:
     needs: release-version
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -284,9 +288,7 @@ jobs:
 
   darwin-serve-port:
     needs: release-version
-    # hosted minutes are exhausted and there is no macOS self-hosted runner
-    if: false
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -314,7 +316,7 @@ jobs:
   performance-smoke:
     needs: release-version
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -332,7 +334,7 @@ jobs:
 
   npm:
     needs: release-version
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

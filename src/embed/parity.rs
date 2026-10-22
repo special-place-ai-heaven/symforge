@@ -2,8 +2,10 @@
 //!
 //! Lines are one-based and inclusive; byte spans are zero-based and exclusive
 //! at the end. Every query captures one admitted publication. Returned source
-//! is byte-exact. Graph pages must carry the first page's publication identity
-//! when resuming; a refresh refuses that continuation instead of mixing rows.
+//! is byte-exact. Graph pages without a lease must carry the first page's
+//! publication identity when resuming; a changed publication refuses that
+//! strict continuation instead of mixing rows. An explicit graph publication
+//! lease pins one immutable publication across pages, including during refresh.
 //! The original V11 facade remains source-compatible.
 
 pub mod ask;
@@ -30,6 +32,7 @@ pub mod symbol_context;
 /// Contract version of the additive query namespace.
 pub const API_VERSION: u32 = 1;
 
+pub use crate::embed::SourceRuntimePhase;
 pub use crate::embed::lifecycle::embed_query::{QueryClaim, QueryOperationReceipt, QueryRefusal};
 
 /// Trusted host policy. This grant is supplied in process and is never decoded
@@ -294,6 +297,7 @@ pub enum QueryRefusalKind {
     SessionRequired,
     ForeignSession,
     StaleHandle,
+    GraphPublicationLeaseExpired,
     PolicyMismatch,
     /// A trusted output adapter rejected the complete projected envelope before
     /// read history, cache, frecency, or session revision were committed.
