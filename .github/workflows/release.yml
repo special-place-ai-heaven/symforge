@@ -25,7 +25,7 @@ permissions:
 
 jobs:
   resolve-release-ref:
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
     outputs:
       release_ref: ${{ steps.resolve.outputs.release_ref }}
       tag_name: ${{ steps.resolve.outputs.tag_name }}
@@ -233,7 +233,7 @@ jobs:
 
   verify-release-ref:
     needs: resolve-release-ref
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -249,7 +249,7 @@ jobs:
         with:
           node-version: '22'
 
-      # hosted disk cleanup deletes docker images; skip it on the shared self-hosted pool
+      # Free disk space for Rust builds on GitHub-hosted runners.
       - name: Free disk space for Rust builds
         if: runner.environment == 'github-hosted'
         run: bash execution/free_runner_disk.sh
@@ -473,7 +473,7 @@ jobs:
       - resolve-release-ref
       - verify-release-ref
     if: needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
     environment: feature-020-v11-release-approval
     permissions:
       actions: read
@@ -1957,7 +1957,7 @@ jobs:
       - verify-release-ref
       - feature-020-v11-gate
     if: ${{ always() }}
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
     outputs:
       release_ref: ${{ steps.gate.outputs.release_ref }}
     steps:
@@ -2009,7 +2009,7 @@ jobs:
     # below it must name a status function to stop inheriting that skip, and must
     # then restate the success it would otherwise have got implicitly.
     if: ${{ !cancelled() && needs.resolve-release-ref.result == 'success' && needs.gate-release-ref.result == 'success' }}
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
     permissions:
       actions: write
       contents: write
@@ -2297,7 +2297,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: [self-hosted, linux, fresh]
+          - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: symforge-linux-x64
             binary: target/x86_64-unknown-linux-gnu/release/symforge
@@ -2308,8 +2308,8 @@ jobs:
             binary: target/x86_64-pc-windows-msvc/release/symforge.exe
             builder: cargo
 
-    # Linux builds on the self-hosted pool; Windows builds natively on
-    # GitHub-hosted windows-latest (public repo). macOS is not built.
+    # Linux builds on GitHub-hosted ubuntu-latest; Windows builds natively on
+    # windows-latest. macOS is not built.
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2351,7 +2351,7 @@ jobs:
       - gate-release-ref
       - build
     if: ${{ !cancelled() && needs.gate-release-ref.result == 'success' && needs.prepare-release.result == 'success' && needs.build.result == 'success' && needs.prepare-release.outputs.release_created == 'true' }}
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2457,7 +2457,7 @@ jobs:
       - build
       - build-npm-package
     if: ${{ !cancelled() && needs.gate-release-ref.result == 'success' && needs.prepare-release.result == 'success' && needs.build.result == 'success' && needs.build-npm-package.result == 'success' && needs.prepare-release.outputs.release_created == 'true' }}
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: write
@@ -2496,7 +2496,7 @@ jobs:
       - build-npm-package
       - upload-release-assets
     if: ${{ !cancelled() && needs.gate-release-ref.result == 'success' && needs.prepare-release.result == 'success' && needs.build.result == 'success' && needs.build-npm-package.result == 'success' && needs.upload-release-assets.result == 'success' && needs.prepare-release.outputs.release_created == 'true' }}
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
     environment: cargo-publish
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2528,7 +2528,7 @@ jobs:
       - build-npm-package
       - upload-release-assets
     if: ${{ !cancelled() && needs.gate-release-ref.result == 'success' && needs.prepare-release.result == 'success' && needs.build-npm-package.result == 'success' && needs.upload-release-assets.result == 'success' && needs.prepare-release.outputs.release_created == 'true' }}
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
     environment: npm-publish
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
