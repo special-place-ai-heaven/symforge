@@ -2,6 +2,10 @@
   "api_version": 1,
   "additive_to": "specs/020-repository-knowledge-index/contracts/public-api-v11.json",
   "scope": "symforge::embed",
+  "public_exports": [
+    "symforge::embed::GraphPublicationLease",
+    "symforge::embed::SourceChangeVersion"
+  ],
   "refresh_reads": {
     "methods": [
       "EmbeddedSourceHandle::query_allowing_refresh",

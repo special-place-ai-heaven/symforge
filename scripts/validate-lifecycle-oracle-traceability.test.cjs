@@ -29,6 +29,7 @@ const fixturePaths = [
   "specs/020-repository-knowledge-index/contracts/lifecycle-acceptance-oracles-v11.md",
   "specs/020-repository-knowledge-index/contracts/v10-authority-retirement-v11.md",
   "specs/020-repository-knowledge-index/contracts/public-api-v11.json",
+  "docs/contracts/embed-refresh-v1.json",
   "specs/020-repository-knowledge-index/tasks.md",
   "scripts/validate-lifecycle-oracle-traceability.cjs",
   "execution/refreeze_v11.py",
@@ -284,8 +285,15 @@ function createPostactivationOrdinaryFixture(root) {
   const keepAtoms = manifest.migration_v10.categories
     .filter((category) => category.decision === "keep")
     .flatMap((category) => category.atoms);
-  const directAtoms = [...new Set([...keepAtoms, ...manifest.migration_v10.introduced_v11_atoms]
-    .filter((atom) => atom.split("::").length <= 3))].sort();
+  const refreshContract = JSON.parse(fs.readFileSync(
+    path.join(root, "docs/contracts/embed-refresh-v1.json"),
+    "utf8",
+  ));
+  const directAtoms = [...new Set([
+    ...keepAtoms,
+    ...manifest.migration_v10.introduced_v11_atoms,
+    ...refreshContract.public_exports,
+  ].filter((atom) => atom.split("::").length <= 3))].sort();
   const modules = [...new Set(directAtoms.filter((atom) => atom.split("::").length >= 2)
     .map((atom) => atom.split("::")[1]))].sort();
   writeFixtureFile(root, "src/lib.rs", `${modules.map((module) => `pub mod ${module};`).join("\n")}\n`);
@@ -1870,6 +1878,64 @@ try {
 } finally {
   safeRemoveFixture(postactivationOrdinaryRoot);
 }
+function checkContractRejection(label, expectedCode, mutate) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "symforge-lifecycle-oracle-"));
+  try {
+    copyFixture(root);
+    createPostactivationOrdinaryFixture(root);
+    mutate(root);
+    const result = runChecker(root);
+    const output = `${result.stdout || ""}${result.stderr || ""}`;
+    if (result.error || result.status === 0 || !output.includes(expectedCode)) {
+      failures.push(`${label}: checker did not reject the refresh-v1 contract (${output.trim()})`);
+    }
+  } finally {
+    safeRemoveFixture(root);
+  }
+}
+checkContractRejection("rogue refresh-v1 export", "REFRESH_V1_PUBLIC_EXPORTS_INVALID", (root) => {
+  const file = path.join(root, "docs/contracts/embed-refresh-v1.json");
+  const contract = JSON.parse(fs.readFileSync(file, "utf8"));
+  contract.public_exports.push("symforge::embed::RogueExport");
+  fs.writeFileSync(file, `${JSON.stringify(contract, null, 2)}\n`);
+});
+checkContractRejection("missing refresh-v1 export", "RETIREMENT_LIFECYCLE_PHASE_INVALID", (root) => {
+  const file = path.join(root, "src/embed.rs");
+  const source = fs.readFileSync(file, "utf8");
+  const line = "pub struct GraphPublicationLease;";
+  if (!source.includes(line)) throw new Error("refresh-v1 export anchor missing");
+  fs.writeFileSync(file, source.replace(line, ""));
+});
+checkContractRejection("missing expected refresh-v1 declaration", "REFRESH_V1_PUBLIC_EXPORTS_INVALID", (root) => {
+  const file = path.join(root, "docs/contracts/embed-refresh-v1.json");
+  const contract = JSON.parse(fs.readFileSync(file, "utf8"));
+  contract.public_exports.pop();
+  fs.writeFileSync(file, `${JSON.stringify(contract, null, 2)}\n`);
+});
+checkContractRejection("missing refresh-v1 contract", "REFRESH_V1_CONTRACT_MISSING", (root) => {
+  fs.unlinkSync(path.join(root, "docs/contracts/embed-refresh-v1.json"));
+});
+checkContractRejection("malformed refresh-v1 contract", "REFRESH_V1_CONTRACT_JSON_INVALID", (root) => {
+  fs.writeFileSync(path.join(root, "docs/contracts/embed-refresh-v1.json"), "{");
+});
+checkContractRejection("missing refresh-v1 contract field", "SCHEMA_MISSING_KEY", (root) => {
+  const file = path.join(root, "docs/contracts/embed-refresh-v1.json");
+  const contract = JSON.parse(fs.readFileSync(file, "utf8"));
+  delete contract.refresh_reads;
+  fs.writeFileSync(file, JSON.stringify(contract, null, 2));
+});
+checkContractRejection("invalid refresh-v1 binding", "REFRESH_V1_CONTRACT_BINDING_INVALID", (root) => {
+  const file = path.join(root, "docs/contracts/embed-refresh-v1.json");
+  const contract = JSON.parse(fs.readFileSync(file, "utf8"));
+  contract.scope = "symforge::other";
+  fs.writeFileSync(file, JSON.stringify(contract, null, 2));
+});
+checkContractRejection("invalid refresh-v1 version", "REFRESH_V1_CONTRACT_BINDING_INVALID", (root) => {
+  const file = path.join(root, "docs/contracts/embed-refresh-v1.json");
+  const contract = JSON.parse(fs.readFileSync(file, "utf8"));
+  contract.api_version = 2;
+  fs.writeFileSync(file, JSON.stringify(contract, null, 2));
+});
 const positiveMaterializedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "symforge-lifecycle-oracle-"));
 let positiveMaterializedFakeBin = null;
 let materializedTamperCount = 0;

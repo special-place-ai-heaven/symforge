@@ -1,5 +1,7 @@
 # Lessons
 
+- 2026-10-22: Before pushing additive embed APIs, run the complete lifecycle traceability gate as well as Rust integrity tests. The V11 phase classifier compares exact public-export sets, so new versioned API contracts must be recognized explicitly without rewriting the historical migration baseline or allowing arbitrary exports.
+
 - 2026-10-22: SymForge is public; use standard GitHub-hosted CI runners unless a concrete requirement justifies self-hosting. The owner authorizes normal hosted runs. Check actual runner availability and workflow events: a push filter with only tags/tags-ignore does not trigger branch pushes. Verify a run was created instead of treating a successful push as CI evidence.
 
 - 2026-10-20: Use Terminal Commander for all terminal work. On Windows, run native argv with the checkout as `cwd` or choose an explicit PowerShell shell; the default Bash route may be WSL and reject Windows paths, which is shell selection rather than a Terminal Commander access limit. Dogfood SymForge for code intelligence and structural edits, then record concrete tool failures or recovery limits instead of silently switching tools.
