@@ -46,6 +46,21 @@ Embedders keep their own response bytes and check them with `ReplayOutcome::resp
 
 AAP S14-S16 add opt-in refresh-safe snapshot reads for Graph, File, SymbolSearch, and References via `EmbeddedSourceHandle::query_allowing_refresh`; the claim keeps the prior publication identity and reports `Refreshing`. Strict `query` remains Current-only, and mutating/mixed-disk variants are refused before freshening. `change_version` plus blocking `wait_for_change` provide lossless phase/publication event waits. `begin_graph_publication_lease` pins one Graph snapshot across pages for at most 30 seconds; no more than eight leases are live per source, and expired leases return `GraphPublicationLeaseExpired`.
 
+## [11.10.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.9.1...v11.10.0) (2026-10-22)
+
+
+### Features
+
+* **embed:** add refresh-safe reads, change waits, and graph leases ([fdfa5f5](https://github.com/special-place-ai-heaven/symforge/commit/fdfa5f53d5d49ecc658e8a5da66eb6b5809a5590))
+* **embed:** support refresh-safe AAP queries and graph leases ([9ee14cb](https://github.com/special-place-ai-heaven/symforge/commit/9ee14cb10b507048ae8ec5eadeacda97ef607bb0))
+
+
+### Bug Fixes
+
+* **ci:** recognize contracted embed API additions ([6419aad](https://github.com/special-place-ai-heaven/symforge/commit/6419aadb3b4103ade61517a777d6fc823cb855af))
+* **ci:** run release automation on hosted runners ([61978bb](https://github.com/special-place-ai-heaven/symforge/commit/61978bb2e42bd9aaeb3399485913b78e4db030fc))
+* **embed:** harden lifecycle reads and run hosted CI ([aaab84e](https://github.com/special-place-ai-heaven/symforge/commit/aaab84e114d12d3ede9a27374734823f0ecc8b9e))
+
 ## [11.9.1](https://github.com/special-place-ai-heaven/symforge/compare/v11.9.0...v11.9.1) (2026-10-19)
 
 
