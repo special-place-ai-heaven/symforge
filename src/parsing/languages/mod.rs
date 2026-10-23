@@ -143,6 +143,8 @@ pub fn extract_symbols(node: &Node, source: &str, language: &LanguageId) -> Vec<
     }
 }
 
+pub(crate) use rust::insertion_prefix_start as rust_insertion_prefix_start;
+
 pub(super) fn collect_symbols(node: &Node, source: &str, walk: WalkNodeFn) -> Vec<SymbolRecord> {
     let mut symbols = Vec::new();
     let mut sort_order = 0u32;

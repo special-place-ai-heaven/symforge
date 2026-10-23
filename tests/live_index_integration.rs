@@ -1175,10 +1175,9 @@ fn test_persist_round_trip() {
         .expect("snapshot should be loadable after serialize");
 
     assert_eq!(
-        snapshot.version, 10,
-        "snapshot version should match current schema (8 -> 9: persisted trigram \
-         index; 9 -> 10: dismissal store state in snapshot — see \
-         src/live_index/persist.rs::CURRENT_VERSION)"
+        snapshot.version, 11,
+        "snapshot format 11 includes the payload checksum trailer — see \
+         src/live_index/persist.rs::CURRENT_VERSION"
     );
     assert_eq!(snapshot.files.len(), 2, "snapshot should contain 2 files");
     assert!(
@@ -1283,10 +1282,14 @@ fn test_persist_version_mismatch() {
         .expect("current snapshot should checkpoint");
     let snapshot_path = dir.path().join(".symforge").join("index.bin");
     let current_bytes = fs::read(&snapshot_path).unwrap();
-    let mut future_snapshot: IndexSnapshot =
-        postcard::from_bytes(&current_bytes).expect("current snapshot should deserialize");
+    let payload_len = current_bytes.len() - 32;
+    let mut future_snapshot: IndexSnapshot = postcard::from_bytes(&current_bytes[..payload_len])
+        .expect("current snapshot payload should deserialize");
     future_snapshot.version = 999;
-    let bytes = postcard::to_stdvec(&future_snapshot).expect("postcard serialize should work");
+    let mut bytes = postcard::to_stdvec(&future_snapshot).expect("postcard serialize should work");
+    use sha2::Digest;
+    let checksum = sha2::Sha256::digest(&bytes);
+    bytes.extend_from_slice(&checksum);
     fs::write(snapshot_path, &bytes).unwrap();
 
     // Must return None (version mismatch)

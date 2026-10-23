@@ -16,6 +16,73 @@ pub fn extract_symbols(node: &Node, source: &str) -> Vec<SymbolRecord> {
     collect_symbols(node, source, walk_node)
 }
 
+pub(crate) fn insertion_prefix_start(source: &str, symbol: &SymbolRecord) -> Result<u32, String> {
+    let (start, end) = (symbol.byte_range.0 as usize, symbol.byte_range.1 as usize);
+    if start >= end || source.get(start..end).is_none() {
+        return Err("Cannot determine Rust insertion boundary: invalid core range".to_string());
+    }
+    let tree = super::super::parse_source_tree(source, &crate::domain::LanguageId::Rust, false)?;
+    let node = tree
+        .root_node()
+        .named_descendant_for_byte_range(start, end)
+        .filter(|node| node.start_byte() == start && node.end_byte() == end && !node.has_error())
+        .filter(|node| {
+            matches!(
+                node.kind(),
+                "function_item"
+                    | "macro_definition"
+                    | "struct_item"
+                    | "enum_item"
+                    | "trait_item"
+                    | "impl_item"
+                    | "const_item"
+                    | "static_item"
+                    | "mod_item"
+                    | "type_item"
+            ) || (node.kind() == "macro_invocation" && is_module_level(node))
+        })
+        .ok_or_else(|| {
+            "Cannot determine Rust insertion boundary: core item no longer matches".to_string()
+        })?;
+    let owner = node
+        .parent()
+        .filter(|parent| {
+            node.kind() == "macro_invocation" && parent.kind() == "expression_statement"
+        })
+        .unwrap_or(node);
+    if owner.has_error() {
+        return Err(
+            "Cannot determine Rust insertion boundary: malformed owning statement".to_string(),
+        );
+    }
+    let mut boundary = owner.start_byte();
+    let mut sibling = owner.prev_named_sibling();
+    while let Some(previous) = sibling {
+        if previous.has_error() {
+            return Err(
+                "Cannot determine Rust insertion boundary: malformed item prefix".to_string(),
+            );
+        }
+        match previous.kind() {
+            "attribute_item" => boundary = previous.start_byte(),
+            "line_comment" | "block_comment" => {
+                let text = &source[previous.byte_range()];
+                if text.starts_with("//!") || text.starts_with("/*!") {
+                    break;
+                }
+                let outer_doc = (text.starts_with("///") && !text.starts_with("////"))
+                    || (text.starts_with("/**") && !text.starts_with("/***") && text != "/**/");
+                if outer_doc {
+                    boundary = previous.start_byte();
+                }
+            }
+            _ => break,
+        }
+        sibling = previous.prev_named_sibling();
+    }
+    Ok(boundary as u32)
+}
+
 fn walk_node(
     node: &Node,
     source: &str,
@@ -88,9 +155,9 @@ fn is_module_level(node: &Node) -> bool {
     };
     match parent.kind() {
         "source_file" | "declaration_list" => true,
-        "expression_statement" => parent
-            .parent()
-            .is_some_and(|grandparent| matches!(grandparent.kind(), "source_file" | "declaration_list")),
+        "expression_statement" => parent.parent().is_some_and(|grandparent| {
+            matches!(grandparent.kind(), "source_file" | "declaration_list")
+        }),
         _ => false,
     }
 }
@@ -107,7 +174,12 @@ fn is_module_level(node: &Node) -> bool {
 /// and `Alpha`/`Beta` in `declare_pair!(Alpha, Beta, ...)` while rejecting
 /// `::`-adjacent path segments and identifiers nested in larger expressions.
 /// Under-capture is the safe direction. Capped and deduplicated.
-fn push_macro_generated_names(node: &Node, source: &str, depth: u32, sink: &mut SymbolSink<'_, '_>) {
+fn push_macro_generated_names(
+    node: &Node,
+    source: &str,
+    depth: u32,
+    sink: &mut SymbolSink<'_, '_>,
+) {
     const MAX_NAMES_PER_INVOCATION: usize = 8;
     let mut cursor = node.walk();
     let Some(token_tree) = node
@@ -128,9 +200,14 @@ fn push_macro_generated_names(node: &Node, source: &str, depth: u32, sink: &mut 
             continue;
         }
         // Preceding token must start the tree or a top-level arg.
-        let prev_ok = i == 0 || tokens.get(i - 1).is_some_and(|prev| matches!(prev.kind(), "(" | "[" | "{" | ","));
+        let prev_ok = i == 0
+            || tokens
+                .get(i - 1)
+                .is_some_and(|prev| matches!(prev.kind(), "(" | "[" | "{" | ","));
         // Following token must end the arg (or terminate the tree).
-        let next_ok = tokens.get(i + 1).is_none_or(|next| matches!(next.kind(), "," | ")" | "]" | "}"));
+        let next_ok = tokens
+            .get(i + 1)
+            .is_none_or(|next| matches!(next.kind(), "," | ")" | "]" | "}"));
         if !prev_ok || !next_ok {
             continue;
         }
@@ -143,7 +220,13 @@ fn push_macro_generated_names(node: &Node, source: &str, depth: u32, sink: &mut 
         seen.push(name.to_string());
         // Anchor to the whole invocation so get_symbol returns the declaring
         // line (`define_id_type!(ProjectId);`), not a bare token.
-        push_symbol(node, name.to_string(), SymbolKind::MacroGenerated, depth, sink);
+        push_symbol(
+            node,
+            name.to_string(),
+            SymbolKind::MacroGenerated,
+            depth,
+            sink,
+        );
     }
 }
 

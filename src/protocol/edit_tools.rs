@@ -1391,7 +1391,21 @@ impl SymForgeServer {
         }
         let line_ending = edit::detect_line_ending(&file.content);
         let new_content = if position == "before" {
-            edit::build_insert_before(&file.content, &sym, &params.0.content, line_ending)
+            match edit::build_insert_before(
+                &file.content,
+                &sym,
+                &params.0.content,
+                line_ending,
+                &file.language,
+            ) {
+                Ok(content) => content,
+                Err(message) => {
+                    return fail_and_return_bound_mutation_replay(
+                        &idempotency,
+                        format!("Error: {message}"),
+                    );
+                }
+            }
         } else {
             edit::build_insert_after(&file.content, &sym, &params.0.content, line_ending)
         };

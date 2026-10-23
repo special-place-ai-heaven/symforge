@@ -47,6 +47,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 
 use super::ServerRuntime;
+use super::auth::host_allow_list;
 use crate::protocol::SymForgeServer;
 use crate::sidecar::governor::RequestGovernor;
 
@@ -142,20 +143,6 @@ fn build_mcp_service(
         Arc::new(LocalSessionManager::default()),
         config,
     )
-}
-
-/// The `allowed_hosts` list: the rmcp loopback defaults plus the operator bind host.
-fn host_allow_list(bind_host: &str) -> Vec<String> {
-    let mut hosts = vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-        "::1".to_string(),
-    ];
-    let host = bind_host.trim();
-    if !host.is_empty() && !hosts.iter().any(|h| h == host) {
-        hosts.push(host.to_string());
-    }
-    hosts
 }
 
 /// Build the axum [`Router`] mounting the MCP transport at [`MCP_PATH`].

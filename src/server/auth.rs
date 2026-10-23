@@ -278,6 +278,125 @@ pub fn apply_origin_gate(router: axum::Router, state: OriginLayerState) -> axum:
     ))
 }
 
+/// Shared MCP and unauthenticated-loopback authority policy.
+pub(crate) fn host_allow_list(bind_host: &str) -> Vec<String> {
+    let mut hosts = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    let host = bind_host.trim();
+    if !host.is_empty() && !hosts.iter().any(|allowed| allowed == host) {
+        hosts.push(host.to_string());
+    }
+    hosts
+}
+
+fn parse_http_authority(value: &str) -> Option<axum::http::uri::Authority> {
+    if value.contains(['@', ',']) || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return None;
+    }
+    let authority = value.parse::<axum::http::uri::Authority>().ok()?;
+    let host = authority.host();
+    if host.is_empty() {
+        return None;
+    }
+    if host.starts_with('[') {
+        host.strip_prefix('[')?
+            .strip_suffix(']')?
+            .parse::<std::net::Ipv6Addr>()
+            .ok()?;
+    }
+    // Authority::port() also returns None for malformed ports.
+    let suffix = value.strip_prefix(host)?;
+    if !suffix.is_empty() {
+        let port = suffix.strip_prefix(':')?;
+        if !port.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        port.parse::<u16>().ok()?;
+    }
+    Some(authority)
+}
+
+fn same_authority_host(left: &str, right: &str) -> bool {
+    let left = left.trim_start_matches('[').trim_end_matches(']');
+    let right = right.trim_start_matches('[').trim_end_matches(']');
+    match (
+        left.parse::<std::net::IpAddr>(),
+        right.parse::<std::net::IpAddr>(),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        (Err(_), Err(_)) => left.eq_ignore_ascii_case(right),
+        _ => false,
+    }
+}
+
+fn request_authority(request: &axum::extract::Request) -> Option<axum::http::uri::Authority> {
+    let mut values = request.headers().get_all(axum::http::header::HOST).iter();
+    let host = match values.next() {
+        Some(value) => Some(parse_http_authority(value.to_str().ok()?)?),
+        None => None,
+    };
+    if values.next().is_some() {
+        return None;
+    }
+    let authority = match request.uri().authority() {
+        Some(value) => Some(parse_http_authority(value.as_str())?),
+        None => None,
+    };
+    if let (Some(host), Some(authority)) = (&host, &authority)
+        && (!same_authority_host(host.host(), authority.host())
+            || host.port_u16() != authority.port_u16())
+    {
+        return None;
+    }
+    authority.or(host)
+}
+
+fn authority_is_allowed(request: &axum::extract::Request, allowed: &[String]) -> bool {
+    request_authority(request).is_some_and(|authority| {
+        allowed
+            .iter()
+            .any(|host| same_authority_host(authority.host(), host))
+    })
+}
+
+async fn require_allowed_authority(
+    axum::extract::State(allowed): axum::extract::State<std::sync::Arc<Vec<String>>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if authority_is_allowed(&request, &allowed) {
+        next.run(request).await
+    } else {
+        (
+            axum::http::StatusCode::FORBIDDEN,
+            "Forbidden: request authority not allowed",
+        )
+            .into_response()
+    }
+}
+
+/// Gate the merged surface. Open-loopback proxies must rewrite Host or enable authentication.
+pub(crate) fn apply_http_gates(
+    router: axum::Router,
+    bound_addr: std::net::SocketAddr,
+    state: AuthLayerState,
+) -> axum::Router {
+    let router = if state.auth.requires_auth(state.is_loopback) {
+        router
+    } else {
+        router.layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::new(host_allow_list(&bound_addr.ip().to_string())),
+            require_allowed_authority,
+        ))
+    };
+    let router = apply_origin_gate(router, OriginLayerState::from_bind_addr(bound_addr));
+    apply_bearer_auth(router, state)
+}
+
 /// Startup-time auth policy violation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AuthStartupError {
@@ -335,6 +454,289 @@ mod tests {
     fn constant_time_eq_matches_for_equal_slices() {
         assert!(constant_time_eq(b"sf_demo_key", b"sf_demo_key"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    fn authority_request(uri: &str, hosts: &[&str]) -> axum::extract::Request {
+        let mut builder = axum::http::Request::builder()
+            .uri(uri)
+            .version(axum::http::Version::HTTP_2);
+        for host in hosts {
+            builder = builder.header(axum::http::header::HOST, *host);
+        }
+        builder.body(axum::body::Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn authority_gate_validates_http2_authority_host_and_ambiguity() {
+        let allowed = host_allow_list("127.0.0.1");
+        let cases: &[(&str, &[&str], bool)] = &[
+            ("/", &[], false),
+            ("/", &["LOCALHOST:8787"], true),
+            ("http://localhost/api/v1/status", &[], true),
+            (
+                "http://LOCALHOST:8787/api/v1/status",
+                &["localhost:8787"],
+                true,
+            ),
+            ("http://localhost:8787/api/v1/status", &["localhost"], false),
+            (
+                "http://localhost:8787/api/v1/status",
+                &["localhost:8788"],
+                false,
+            ),
+            (
+                "http://outside.invalid/api/v1/status",
+                &["localhost"],
+                false,
+            ),
+            (
+                "http://localhost/api/v1/status",
+                &["outside.invalid"],
+                false,
+            ),
+            ("http://outside.invalid/api/v1/status", &[], false),
+            (
+                "http://[::1]:8787/api/v1/status",
+                &["[0:0:0:0:0:0:0:1]:8787"],
+                true,
+            ),
+            ("http://user@localhost/api/v1/status", &["localhost"], false),
+            ("/", &["localhost", "localhost"], false),
+            ("/", &["localhost", "outside.invalid"], false),
+        ];
+        for (uri, hosts, expected) in cases {
+            assert_eq!(
+                authority_is_allowed(&authority_request(uri, hosts), &allowed),
+                *expected,
+                "{uri} {hosts:?}"
+            );
+        }
+        for host in [
+            "",
+            "localhost,localhost",
+            "user@localhost",
+            "localhost:",
+            "localhost:abc",
+            "localhost:+80",
+            "localhost:-1",
+            "localhost:65536",
+            " localhost",
+            "localhost ",
+            "[::1",
+            "::1",
+            "[localhost]",
+            "[::1]:junk",
+            "[::1]:65536",
+            "localhost/path",
+            "localhost#fragment",
+        ] {
+            assert!(
+                !authority_is_allowed(&authority_request("/", &[host]), &allowed),
+                "{host}"
+            );
+        }
+        let mut request = authority_request("/", &[]);
+        request.headers_mut().insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+        assert!(!authority_is_allowed(&request, &allowed));
+    }
+
+    async fn authority_test_server(
+        auth: AuthConfig,
+        policy_ip: std::net::IpAddr,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mcp = axum::Router::new().route("/mcp", axum::routing::get(|| async { "ok" }));
+        let admin =
+            axum::Router::new().route("/api/v1/status", axum::routing::get(|| async { "ok" }));
+        let app = apply_http_gates(
+            mcp.merge(admin),
+            std::net::SocketAddr::new(policy_ip, addr.port()),
+            AuthLayerState::new(auth, policy_ip.is_loopback()),
+        );
+        let (shutdown, receive) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = receive.await;
+                })
+                .await
+                .unwrap();
+        });
+        (addr, shutdown, join)
+    }
+
+    #[tokio::test]
+    async fn authority_gate_protects_both_merged_routes_without_origin() {
+        use axum::http::StatusCode;
+        let (addr, shutdown, join) =
+            authority_test_server(AuthConfig::default(), std::net::Ipv4Addr::LOCALHOST.into())
+                .await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for path in ["/mcp", "/api/v1/status"] {
+            let url = format!("http://{addr}{path}");
+            for host in [
+                "localhost",
+                "LOCALHOST:80",
+                "127.0.0.1",
+                "127.0.0.1:65535",
+                "[::1]",
+                "[::1]:8787",
+                "[0:0:0:0:0:0:0:1]:443",
+            ] {
+                assert_eq!(
+                    client
+                        .get(&url)
+                        .header("Host", host)
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::OK,
+                    "{path}: {host}"
+                );
+            }
+            assert_eq!(
+                client
+                    .get(&url)
+                    .header("Host", "outside.invalid")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                client
+                    .get(&url)
+                    .header("Host", "outside.invalid")
+                    .header("Forwarded", "host=localhost;proto=http")
+                    .header("X-Forwarded-Host", "localhost")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                client
+                    .get(&url)
+                    .header("Host", "localhost")
+                    .header("Forwarded", "host=outside.invalid")
+                    .header("X-Forwarded-Host", "outside.invalid")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+            assert_eq!(
+                client
+                    .get(&url)
+                    .header("Host", "localhost")
+                    .header("Origin", "http://outside.invalid")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let _ = shutdown.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(5), join)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn authority_gate_preserves_authenticated_admin_proxy_and_bearer_order() {
+        use axum::http::StatusCode;
+        let placeholder = "[redacted-test-placeholder]".to_string();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for policy_ip in [
+            std::net::Ipv4Addr::LOCALHOST,
+            std::net::Ipv4Addr::UNSPECIFIED,
+        ] {
+            let (addr, shutdown, join) =
+                authority_test_server(AuthConfig::new(Some(placeholder.clone())), policy_ip.into())
+                    .await;
+            let url = format!("http://{addr}/api/v1/status");
+            assert_eq!(
+                client
+                    .get(&url)
+                    .header("Host", "outside.invalid")
+                    .header("Origin", "http://outside.invalid")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                client
+                    .get(&url)
+                    .header("Host", "outside.invalid")
+                    .bearer_auth(&placeholder)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+            assert_eq!(
+                client
+                    .get(&url)
+                    .header("Host", "outside.invalid")
+                    .bearer_auth(&placeholder)
+                    .header("Origin", "http://outside.invalid")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+            let _ = shutdown.send(());
+            tokio::time::timeout(std::time::Duration::from_secs(5), join)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let (addr, shutdown, join) = authority_test_server(
+            AuthConfig::default(),
+            std::net::Ipv4Addr::UNSPECIFIED.into(),
+        )
+        .await;
+        assert_eq!(
+            client
+                .get(format!("http://{addr}/api/v1/status"))
+                .header("Host", "localhost")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let _ = shutdown.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(5), join)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

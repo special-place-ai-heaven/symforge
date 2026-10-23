@@ -15,9 +15,9 @@ use crate::edit_safety::preview::render_safe_batch;
 use crate::edit_safety::rename::{RenamePlanInput, build_rename_plan};
 use crate::edit_safety::structural::{
     SpliceFootprint, WithinSelectionError, apply_splice, build_delete, build_insert_after,
-    build_insert_before, cleanup_invalidates_splice, delete_cleanup_ranges, delete_source_range,
-    detect_line_ending, insert_after_position, insert_before_position, prepare_replace,
-    replacement_splice_range, select_edit_within_body, splice_footprints_overlap,
+    cleanup_invalidates_splice, delete_cleanup_ranges, delete_source_range, detect_line_ending,
+    insert_after_position, insert_before_position, prepare_replace, replacement_splice_range,
+    select_edit_within_body, splice_footprints_overlap,
 };
 use crate::embed::parity::edit::{
     BatchEditAction, BatchEditApplied, BatchEditPreview, BatchEditRequest, BatchFilePreview,
@@ -336,7 +336,12 @@ fn stage_batch(
                     BatchEditAction::Insert(request) => {
                         SpliceFootprint::Insert(match request.position {
                             crate::embed::parity::edit::InsertPosition::Before => {
-                                insert_before_position(&file.content, &resolved.symbol)
+                                insert_before_position(
+                                    &file.content,
+                                    &resolved.symbol,
+                                    &file.language,
+                                )
+                                .map_err(|_| EditErrorKind::StaleContent)?
                             }
                             crate::embed::parity::edit::InsertPosition::After => {
                                 insert_after_position(&file.content, &resolved.symbol)
@@ -383,7 +388,7 @@ fn stage_batch(
             }
         }
         let mut content = file.content.clone();
-        for resolved in &actions {
+        for (action_index, resolved) in actions.iter().enumerate() {
             content = match resolved.action {
                 BatchEditAction::Replace(request) => {
                     prepare_replace(&content, &resolved.symbol, &request.new_body)
@@ -393,12 +398,22 @@ fn stage_batch(
                 BatchEditAction::Insert(request) => {
                     let line_ending = detect_line_ending(&content);
                     match request.position {
-                        crate::embed::parity::edit::InsertPosition::Before => build_insert_before(
-                            &content,
-                            &resolved.symbol,
-                            &request.content,
-                            line_ending,
-                        ),
+                        crate::embed::parity::edit::InsertPosition::Before => {
+                            let SpliceFootprint::Insert(position) = footprints[action_index] else {
+                                return Err(EditErrorKind::StaleContent);
+                            };
+                            crate::edit_safety::structural::build_insert_before_at_position(
+                                &content,
+                                &resolved.symbol,
+                                &request.content,
+                                line_ending,
+                                position,
+                                &crate::edit_safety::structural::detect_indentation(
+                                    &file.content,
+                                    resolved.symbol.byte_range.0,
+                                ),
+                            )
+                        }
                         crate::embed::parity::edit::InsertPosition::After => build_insert_after(
                             &content,
                             &resolved.symbol,

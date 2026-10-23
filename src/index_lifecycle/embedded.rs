@@ -816,6 +816,12 @@ impl EmbeddedBinding {
         {
             return Ok(());
         }
+        #[cfg(test)]
+        if let Some(hook) =
+            refresh_lifecycle_tests::BEFORE_FRESHEN_GENERATION.with(|hook| hook.take())
+        {
+            hook();
+        }
         let shared = self.runtime.data_plane();
         let expected_gen = shared.current_project_generation();
         if super::guidance::freshen::freshen_exact_path(
@@ -901,14 +907,20 @@ impl EmbeddedBinding {
             self.set_blocked();
             return None;
         };
-        let published = self.runtime.data_plane().published_generation();
-        if !matches!(published.freshness.as_ref(), FreshnessStatus::Current) {
-            self.set_blocked();
-            return Some(fingerprint);
+        #[cfg(all(test, feature = "embed"))]
+        if let Some(hook) = refresh_lifecycle_tests::BEFORE_OBSERVED_STATE.with(|hook| hook.take())
+        {
+            hook();
         }
         let mut state = self.state.lock().expect("embedded state mutex");
         if self.shutdown_started.load(Ordering::Acquire) {
             return None;
+        }
+        let published = self.runtime.data_plane().published_generation();
+        if !matches!(published.freshness.as_ref(), FreshnessStatus::Current) {
+            drop(state);
+            self.set_blocked();
+            return Some(fingerprint);
         }
         state.source_version = state.source_version.saturating_add(1).max(1);
         state.current_publication_identity = Some(format!(
@@ -3298,6 +3310,13 @@ mod refresh_lifecycle_tests {
     use crate::embed::parity::{QueryLimits, QueryRefusalKind, QueryRequest};
     use crate::embed::{EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase};
 
+    thread_local! {
+        pub(super) static BEFORE_FRESHEN_GENERATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+        pub(super) static BEFORE_OBSERVED_STATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     fn wait_current(handle: &EmbeddedSourceHandle, after: u64) {
         let started = std::time::Instant::now();
         loop {
@@ -3332,6 +3351,189 @@ mod refresh_lifecycle_tests {
         );
         wait_current(&handle, 0);
         (root, runtime, handle)
+    }
+
+    #[test]
+    fn observed_publication_includes_freshening_admitted_before_refresh() {
+        let (root, _runtime, handle) = open_current();
+        let binding = Arc::clone(handle.binding.as_ref().unwrap());
+        // Keep the observer out while the test drives the worker's publication path.
+        let control = binding.control.lock().unwrap();
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let freshening = Arc::clone(&binding);
+        let freshener = std::thread::spawn(move || {
+            BEFORE_FRESHEN_GENERATION.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    admitted_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }));
+            });
+            let result = freshening.freshen_exact_path("lib.rs");
+            finished_tx.send(result).unwrap();
+        });
+        admitted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        binding.set_phase(SourceRuntimePhase::Refreshing);
+        let shared = binding.runtime.data_plane();
+        let previous_project_generation = shared.current_project_generation();
+        shared
+            .refresh_bound_tree_cancellable(
+                &binding.root,
+                binding.state_placement.directory().cloned(),
+                crate::discovery::SourceExclusions::for_state_placement(
+                    &binding.root,
+                    &binding.state_placement,
+                ),
+                &binding.shutdown_started,
+            )
+            .unwrap();
+        assert!(shared.current_project_generation() > previous_project_generation);
+        let before = shared.published_generation().publication_generation;
+        let mtime = shared.read().get_file("lib.rs").unwrap().mtime_secs;
+        let final_bytes = b"pub fn freshened_after_reload() {}\n";
+        std::fs::write(root.path().join("lib.rs"), final_bytes).unwrap();
+        filetime::set_file_mtime(
+            root.path().join("lib.rs"),
+            filetime::FileTime::from_unix_time(mtime as i64 + 2, 0),
+        )
+        .unwrap();
+
+        let publishing = Arc::clone(&binding);
+        BEFORE_OBSERVED_STATE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                resume_tx.send(()).unwrap();
+                finished_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    publishing.runtime_view().phase,
+                    SourceRuntimePhase::Refreshing
+                );
+                assert!(
+                    publishing
+                        .runtime
+                        .data_plane()
+                        .published_generation()
+                        .publication_generation
+                        > before
+                );
+            }));
+        });
+        let fingerprint = binding.publish_observed_current().unwrap();
+        let published = shared.published_generation();
+        let snapshot = handle.capture_query_snapshot(b"freshened-during-refresh");
+        let unchanged_fingerprint = binding.observe_fingerprint();
+        let current_identity = binding
+            .state
+            .lock()
+            .unwrap()
+            .current_publication_identity
+            .clone();
+        let assertions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(Some(fingerprint), unchanged_fingerprint);
+            assert_eq!(handle.runtime_view().phase, SourceRuntimePhase::Current);
+            assert_eq!(
+                current_identity,
+                Some(format!(
+                    "embed-publication-{}-{}",
+                    binding.identity.raw(),
+                    published.publication_generation
+                )),
+                "Current lifecycle identity must match the freshened publication"
+            );
+            let snapshot = snapshot.expect("Current must capture the latest freshened publication");
+            assert_eq!(
+                snapshot.generation.publication_generation,
+                published.publication_generation
+            );
+            assert_eq!(
+                snapshot
+                    .generation
+                    .live
+                    .get_file("lib.rs")
+                    .unwrap()
+                    .content
+                    .as_slice(),
+                final_bytes
+            );
+            assert!(
+                handle
+                    .query(
+                        &QueryRequest::File {
+                            path: "lib.rs".into(),
+                            start_line: None,
+                            end_line: None,
+                        },
+                        QueryLimits::default(),
+                    )
+                    .is_ok()
+            );
+        }));
+        drop(control);
+        freshener.join().unwrap();
+        if let Err(panic) = assertions {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    fn observed_non_current_freshness_blocks_without_relocking_state() {
+        const CHILD_ENV: &str = "SYMFORGE_NON_CURRENT_PUBLICATION_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let (_root, _runtime, handle) = open_current();
+            let binding = Arc::clone(handle.binding.as_ref().unwrap());
+            let control = binding.control.lock().unwrap();
+            binding
+                .runtime
+                .data_plane()
+                .set_freshness_status(FreshnessStatus::Verifying);
+            assert!(binding.publish_observed_current().is_some());
+            assert_eq!(handle.runtime_view().phase, SourceRuntimePhase::Blocked);
+            drop(control);
+            return;
+        }
+
+        let mut child = crate::process_util::hidden_command(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "internals::index_lifecycle::embedded::refresh_lifecycle_tests::observed_non_current_freshness_blocks_without_relocking_state",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                outcome => {
+                    let _ = child.kill();
+                    let reaped = child.wait();
+                    panic!(
+                        "non-Current publication child timed out or could not be observed: {outcome:?}; reaped: {reaped:?}"
+                    );
+                }
+            }
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "non-Current publication child failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "child must execute the exact non-Current publication fixture"
+        );
     }
 
     #[test]

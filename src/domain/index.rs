@@ -97,7 +97,7 @@ impl LanguageId {
         match ext.to_ascii_lowercase().as_str() {
             "rs" => Some(Self::Rust),
             "py" => Some(Self::Python),
-            "js" | "jsx" => Some(Self::JavaScript),
+            "js" | "jsx" | "cjs" | "mjs" => Some(Self::JavaScript),
             "ts" | "tsx" => Some(Self::TypeScript),
             "go" => Some(Self::Go),
             "java" => Some(Self::Java),
@@ -223,7 +223,7 @@ impl LanguageId {
         match self {
             Self::Rust => &["rs"],
             Self::Python => &["py"],
-            Self::JavaScript => &["js", "jsx"],
+            Self::JavaScript => &["js", "jsx", "cjs", "mjs"],
             Self::TypeScript => &["ts", "tsx"],
             Self::Go => &["go"],
             Self::Java => &["java"],
@@ -2100,6 +2100,30 @@ mod tests {
             IndexTargets::for_path("src/lib.rs", Some(&rust)),
             IndexTargets::Code
         );
+    }
+
+    #[test]
+    fn javascript_module_aliases_route_to_code() {
+        for extension in ["js", "jsx", "cjs", "mjs", "CJS", "MJS"] {
+            assert_eq!(
+                LanguageId::from_extension(extension),
+                Some(LanguageId::JavaScript),
+                "{extension} must use the JavaScript parser"
+            );
+            let path = format!("execution/module.{extension}");
+            let language = LanguageId::from_path(&path);
+            assert_eq!(language, Some(LanguageId::JavaScript), "{path}");
+            assert_eq!(
+                IndexTargets::for_path(&path, language.as_ref()),
+                IndexTargets::Code
+            );
+            assert!(FileClassification::for_indexed_path(&path, IndexTargets::Code).is_code());
+            assert!(
+                LanguageId::JavaScript
+                    .extensions()
+                    .contains(&extension.to_ascii_lowercase().as_str())
+            );
+        }
     }
 
     #[test]
