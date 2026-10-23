@@ -32,13 +32,33 @@ External Claude review completed against the frozen packet above: six-fix logic 
 
 Performance follow-up: quiet alternating fresh-process runs passed the unchanged 500 ms assertion on baseline three times and current source three times. Five-sample traced medians were 212.213 ms baseline and 241.754 ms current; maxima 312.293/339.012 ms. Discovery dominated. Receipt job_01a16892ffcf75d6854a88a9be765a65 observed exit 0; no optimization or threshold change justified by this sample. The initial baseline 733 ms run overlapped CPU-active Node validation and is excluded from the comparison. All earlier failures remain recorded. Final integration rerun remains required. The root lifecycle self-test was deliberately cancelled (job_01a1688c5faf73ae9aa2b3884b96bb02, null exit, cleanup complete) to obtain a quiet timing window; only its completed 37-case normalizer passed, and the unfinished checks must be rerun.
 
-Verified checkpoint committed as 2cc08257 on fix/reliability-triage-2026-10-23: six initial fixes, exact20-file external-review manifest match (job_01a168981a9b77e4a0b5ffdf4d2b29a0, observed0) and cached diffcheck. Unverified follow-up working-tree changes were excluded. Nothing pushed at this checkpoint; combined gates and reviewed pin refresh remain pending.
+Verified checkpoint committed as 2cc08257 on fix/reliability-triage-2026-10-23: six initial fixes, exact20-file external-review manifest match (job_01a168981a9b77e4a0b5ffdf4d2b29a0, observed exit 0) and cached diffcheck. Unverified follow-up working-tree changes were excluded. Nothing pushed at this checkpoint; combined gates and reviewed pin refresh remain pending.
 
-H-03 and F-02 closure: immutable Phase1 source captures now serve offset planning and staging; Phase3 rejects different current bytes before any splice and existing disk preimages remain guarded. Permanent insertion refusals map only to existing InvalidReplacement; genuine stale guards retain their categories. Real-path H-03 RED is above; F-02 RED job_01a168980867775695a8867ee5a764ad observed101. Final batch-edit gate job_01a1689f2d7872b5b50af1e74c86fcc1 observed0 (17 tests, including apply/dry-run preservation); public embed gate job_01a1689d59a271bda78bc6a8caf4fc4d observed0 (2 tests covering attribute preservation and all four refusal lanes). Independent source review approved the final four-file delta.
+H-03 and F-02 closure: immutable Phase1 source captures now serve offset planning and staging; Phase3 rejects different current bytes before any splice and existing disk preimages remain guarded. Permanent insertion refusals map only to existing InvalidReplacement; genuine stale guards retain their categories. Real-path H-03 RED is above; F-02 RED job_01a168980867775695a8867ee5a764ad observed exit 101. Final batch-edit gate job_01a1689f2d7872b5b50af1e74c86fcc1 observed exit 0 (17 tests, including apply/dry-run preservation); public embed gate job_01a1689d59a271bda78bc6a8caf4fc4d observed exit 0 (2 tests covering attribute preservation and all four refusal lanes). Independent source review approved the final four-file delta.
 
-Final integration follow-up: the Cargo combined run passed edit integration 5/5 and live-index functional checks 30/30, but failed the unchanged timing guard at 599 ms (job_01a168a678157385b53527f78b93833c, observed101). A subsequent quiet full-suite pair used saved executables: current def781f6 passed31 with1existingignored, including the500ms guard; baseline in-process guard also passed (job_01a168a988ca775497dc8fcd43d0cc47, observed0 and bothchild exits0). Baseline child-spawn cases could use the current shared app binary, so those cases are not independent baseline proof. Earlier timing failures remain real and their cause is unproven; no guard was relaxed, no ignore added. No further performance change is justified by this evidence.
+Final integration follow-up: the Cargo combined run passed edit integration 5/5 and live-index functional checks 30/30, but failed the unchanged timing guard at 599 ms (job_01a168a678157385b53527f78b93833c, observed exit 101). A subsequent quiet full-suite pair used saved executables: current def781f6 passed31 with1existing ignored, including the500ms guard; baseline in-process guard also passed (job_01a168a988ca775497dc8fcd43d0cc47, observed exit 0 and bothchild exits0). Baseline child-spawn cases could use the current shared app binary, so those cases are not independent baseline proof. Earlier timing failures remain real and their cause is unproven; no guard was relaxed, no ignore added. No further performance change is justified by this evidence.
 
 H-02 automated closure: original oracle7passed/3expectedseal failures (job_01a168a293b670ca823ed5b4fe99e888,101); reviewed final target10passed/0failed/0ignored (job_01a168a51d2772b1a9ad4bd5fddf5ccf,0). Source rosters/pathsets,45/36/2 cargo census and policy assertions retained. Review rationale and exact oracle values: docs/reviews/2026-10-23-reliability-darkness-pin-review.md. Owner/human no-doctest attestation remains pending.
+
+## Final local verification and cleanup checkpoint
+
+All implementation and intentional pin changes are committed through `6882ecd3` (source `def781f6`); final evidence below concerns those unchanged source bytes.
+
+| Gate | Result / receipt |
+|---|---|
+| Formatting | PASS, job_01a168aad0dc73a79e627e5c7dee2cc5 |
+| Embed-only lifecycle | 5 passed, job_01a168ab530676358f857aa0317db38d |
+| Embed AAP / bound index | 11 passed /25 passed+1 existing ignored, job_01a168acd7a7779aaf4d4ca380e1fd9e |
+| Default all-target Clippy | PASS, job_01a168ad85a47329a23e65eaa7ee9544 |
+| Lifecycle traceability checker | PASS:78 requirements/24 oracles/13 retirement categories, job_01a168bff7567040b5e9c2a996fde982 |
+| Version alignment | PASS 11.10.0, job_01a168c055fa73ad8a85bd2d45d243f8 |
+| Frozen V11 internal integrity | PASS, job_01a168c07aaf72cb9fa490645e5ec408 |
+
+The embed-only Clippy command failed with OS error 3 while writing a target fingerprint (job_01a168bbcb26736a8d6aaa2f0757bc56, observed exit 101), with no reported SymForge lint diagnostic. The entire target tree was subsequently observed absent. The lead had not deleted it; the owner reports deleting ZIP files only, so the target removal remains unexplained. Consumer compilation and the temporary current-binary D-01 probe were not run because artifacts/current binary were gone. No cache rebuild followed the cleanup request. The cancelled unchanged validator self-test is not claimed as passing; the actual checker above passed. Fresh hosted CI is required for remaining build gates.
+
+Initial external Claude review completed, approved six-fix logic within limits and supplied the follow-up findings. Its final correction review produced no verdict: two CLI attempts exited 1, and the installed Claude connector confirmed a weekly usage limit resetting 2026-10-26 11:00 Europe/Ljubljana. No further attempts were made. Independent internal correction review approved F-02/H-03; external follow-up approval and owner no-doctest attestation remain pending. The exact correction packet/source hashes are retained outside the repository for resumption.
+
+Cleanup was limited to identified generated data after owned checks exited: 1739 synthetic test-scratch files under .tmp/execution-tests and 6 owned performance executable copies (311342080 logical bytes) removed, job_01a168c36a5e7367bfc101606f95ed19 observed exit 0/cleanupcomplete. The missing target was not recreated. Source, Git history, review notes, measurement logs and the active .symforge index were preserved; post-cleanup SymForge health remainedReady with 1591 indexed files. A cold local Rust rebuild is now required before executable-based checks.
 
 ## Work order and completion criteria
 
@@ -49,7 +69,7 @@ H-02 automated closure: original oracle7passed/3expectedseal failures (job_01a16
 - [x] Fix, independently review and verify H-01 before medium-severity hardening.
 - [x] Reproduce C-01 and promote the confirmed race to M-03.
 - [x] Fix and independently review M-03; both new regressions and the five-test lifecycle module passed.
-- [ ] Run supported embed-only wait/lease/refresh integration gate on the final combined source.
+- [x] Run supported embed-only gates: lifecycle 5, AAP 11, bound-index 25 passed (one existing bound-index ignore).
 - [x] Implement, verify and security-review M-01 using the bounded pinned-upstream design.
 - [x] Fix, security-review and verify confirmed M-02; 19 auth and 2 host-list tests passed.
 - [x] Reproduce C-03 and promote it to confirmed M-04.
