@@ -37,7 +37,7 @@ Read-only Terminal Commander receipts, all observed exit 0 in `E:/project/symfor
 - Guarded-token delta: `job_01a16890e6fa71c68540fcf0d95e96a6`.
 - Alias/impl/registration delta: `job_01a16892da3870e19bcc50654a9a8fe3`.
 
-The final F2/F3 delta against checkpoint `2cc08257` was then reviewed: `src/index_lifecycle/{embed_batch,embed_mutation}.rs`, `src/protocol/edit.rs`, and `tests/embed_edit_bodies.rs`. Receipt `job_01a1689c8645769d870860c35384d368` completed with observed exit 0 and no masked pipeline. It adds no inbound lifecycle/server-API edge, foreign-type impl, outward lifecycle re-export, production registration, or exported ABI hook. A test-only thread-local capture hook stays under the existing cfg-gated protocol test module. Any further source edit requires reviewing that new delta before recording final pin tuples.
+The final F2/F3 source/test delta against checkpoint `2cc08257` was then reviewed: `src/index_lifecycle/{embed_batch,embed_mutation}.rs`, `src/protocol/edit.rs`, and `tests/embed_edit_bodies.rs`. The six-file correction packet also includes the intentional seal refresh in `tests/preventive_runtime_dark_v11.rs` and this review document; their pin/closure evidence appears below. Receipt `job_01a1689c8645769d870860c35384d368` completed with observed exit 0 and no masked pipeline. It adds no inbound lifecycle/server-API edge, foreign-type impl, outward lifecycle re-export, production registration, or exported ABI hook. A test-only thread-local capture hook stays under the existing cfg-gated protocol test module. Any further source edit requires reviewing that new delta before recording final pin tuples.
 
 ## Workflow execution review
 
@@ -71,7 +71,7 @@ cargo test -p symforge --features embed --test preventive_runtime_dark_v11 -- --
 
 Both runs had `pipeline_exit_masked=false` and process cleanup complete. The walk-policy and observation-control fixtures deliberately catch panics; those tests passed in both runs.
 
-Final values came from the oracle assertions, not an approximate recomputation:
+These original closure values came from the test oracle assertions and describe source `def781f6`. The hosted-policy follow-up below supersedes only the full-source triple:
 
 | Seal | Final digest/fingerprint | Files | LF-normalized bytes |
 |---|---|---:|---:|
@@ -85,3 +85,31 @@ Only the two source triples and two workflow fingerprints changed, with rational
 The lead also reported the final correction gates green: embedded insertion integration 2/2 (`job_01a1689d59a271bda78bc6a8caf4fc4d`) and batch tests 17/17 (`job_01a1689f2d7872b5b50af1e74c86fcc1`), both observed exit 0 with cleanup complete. These are lead-provided receipts, distinct from this agent's pin-oracle runs.
 
 Automated closure is complete. Owner review and human no-doctest attestation are pending; this record does not claim either occurred. Pin equality and passing tripwires do not establish general compiler call-graph completeness or behavioral correctness.
+
+## Hosted-policy follow-up (base a55d1564)
+
+After the original closure, the hosted source-policy gate required the cfg(test)-only Rust probe to use the existing hidden-process helper. The exact source delta is one constructor substitution in `src/edit_safety/structural.rs`:
+
+```diff
+-            let mut command = std::process::Command::new("rustc");
++            let mut command = crate::process_util::hidden_command("rustc");
+```
+
+The surrounding `rust_insert_boundary_tests` module is cfg(test). Arguments, validation, and assertions are unchanged. This introduces no production lifecycle bridge; it uses the existing process helper outward from test code. The full-source seal includes inline tests, while the excluded set does not contain `edit_safety/structural.rs`.
+
+The exact `source_set_fingerprint` framing was reproduced: separate NUL-terminated domain, u64 little-endian record count, sorted UTF-8 source-relative paths with byte-length prefixes, CRLF-to-LF-only content normalization, and content-length prefixes. Before computing working bytes, both old seals were recomputed from Git blobs at `a55d1564baec769149f16efde3c055bb182afbab` and asserted equal to that commit's pins. The working pathset was identical; its sole changed normalized file was asserted to equal precisely the one constructor replacement, adding nine bytes.
+
+| Set | Old | New/current | Files | LF-normalized bytes |
+|---|---|---|---:|---:|
+| Full source | `3bec6a1a3ae7a2b60fd1596c18b7a41e30743ee83b107633f1785a042603eca4` | `49bb61f511bd5e14100cbda2408d7888f6fe333c1ff286236f45e7a96ad7c202` | 312 | 12238202 → 12238211 |
+| Excluded source | `3a07d1fa97037ed41b8a0c8c11a0b8b6693fd691995729561ae36ad2c589b63f` | unchanged | 89 | 2256251 |
+
+Native Terminal Commander evidence, `E:/project/symforge`, both observed exit 0 and unmasked:
+
+- Baseline-pin assertions, exact source-delta assertions, and working seals: `job_01a168e82d4175fab7b5da2594685b6e` (Python/hashlib with Git blob framing).
+- Independent working-tree implementation produced identical full and excluded triples: `job_01a168e9ac317722ba9848be1882f249` (Node crypto with an independent byte-normalization/framing implementation).
+- Actual one-line source diff inspected: `job_01a168e653c47625b69944d83eb62251`.
+
+Only the full-source digest and normalized-byte total are refreshed for this follow-up. Excluded source seal, domains, counts, rosters, pathsets, workflow fingerprints, cargo policies, and traversal logic remain unchanged. The six-file scope wording above was also corrected to include the pin test and review document.
+
+No Cargo command or build-target recreation was performed for this follow-up. The original 10/10 Rust-target receipt above remains historical evidence for its original source snapshot; it is not a rerun on these new bytes. Owner/human no-doctest attestation remains pending.

@@ -1314,10 +1314,14 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // snapshot format 11, JavaScript aliases, and inline tests. Same 312 files;
 // no new inbound lifecycle/server-API bridge. Agent review:
 // docs/reviews/2026-10-23-reliability-darkness-pin-review.md (owner review pending).
+// Refreshed after a55d1564 for the cfg(test)-only hidden rustc launcher.
+// Exact constructor substitution adds 9 LF-normalized bytes; same 312 files.
+// HEAD seals were verified before computing the working seal; excluded unchanged.
+// Follow-up evidence: docs/reviews/2026-10-23-reliability-darkness-pin-review.md.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "3bec6a1a3ae7a2b60fd1596c18b7a41e30743ee83b107633f1785a042603eca4",
+    "49bb61f511bd5e14100cbda2408d7888f6fe333c1ff286236f45e7a96ad7c202",
     312,
-    12238202,
+    12238211,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

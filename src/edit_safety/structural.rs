@@ -1160,7 +1160,7 @@ mod rust_insert_boundary_tests {
         let path = directory.path().join("probe.rs");
         std::fs::write(&path, edited).unwrap();
         let compile = |enabled: bool| {
-            let mut command = std::process::Command::new("rustc");
+            let mut command = crate::process_util::hidden_command("rustc");
             command
                 .arg("--crate-type=lib")
                 .arg("--edition=2024")
