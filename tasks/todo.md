@@ -1,3 +1,58 @@
+# SymForge reliability triage — 2026-10-23
+
+Baseline: `aadad9de82d3df5a9533545aa49c1c32ccfbbd54` / published `v11.10.0`. All 279 local Python tests passed without skips; the release, crate source identity, npm versions and artifact checksums were independently verified. This is baseline evidence, not proof that the findings below are fixed.
+
+Severity follows impact, likelihood, affected users and recovery options. Findings need evidence; hypotheses and expected protective behavior are not automatically defects. Work remains within SymForge.
+
+| ID | Severity | Evidence / impact | State | Required closure proof |
+|---|---|---|---|---|
+| H-01 | High | `insert_before_position` anchors after Rust outer attributes. A disposable harness using the current structural implementation compiled the original cfg-disabled fixture, then observed compilation fail after insertion transferred its guard. | Implemented and independently reviewed; 15 focused + LF + final embed API integration GREEN; delivery pending | Preserve original outer attributes/docs, including multiline and interleaved cases; preserve inner module attributes/docs; LF/CRLF and feature-compilation regressions; warm-snapshot behavior; independent review. |
+| H-02 | High; merge gate | External Claude found source/workflow darkness pins still match the old tree; their intentional assertions will block CI. | Complete source/edge and workflow review in progress; pins unchanged pending final source | Preserve source rosters, excluded paths and cargo-command multiset; refresh only justified digests after review and prove the actual gates. |
+| H-03 (external F-03) | High; data integrity | A deterministic actual execute_batch_edit interleaving published longer current bytes between planning and staging. The old offset inserted into the middle of the preceding function; the refreshed-bytes assertion failed. | Confirmed RED job_01a16895b193765e81c8d03379b32215, observed 101; minimal consistency fix in progress | Capture content with symbol resolution; refuse a changed capture before staging any file; preserve unrelated file and dry-run/apply behavior; independent review. |
+| M-01 | Medium | release-please stopped on a transient GraphQL query error; same-run retry succeeded. Its existing retries cover HTTP 502 only, not the observed error class. Manual intervention is currently required. | Implemented and security-reviewed; 21 focused GREEN, workflow Python 4/4 and actual upstream SDK transport proof; delivery pending | Bounded retry of classified transient failures; no auth/validation suppression; preserve gated commit, outputs and side-effect safety; permanent/exhausted failures still fail; regression tests and independent review. |
+| M-03 (formerly C-01) | Medium | Deterministic actual-path regression failed with Current identity embed-publication-2-2 while latest was embed-publication-2-3; disk fingerprint already matched. Queries remain refusing without another edit or explicit refresh. | Implemented and independently reviewed; 5 lifecycle tests GREEN; embed-only gate and delivery pending | GREEN interleaving and blocked-state/deadlock regressions; existing refresh/lease/wait gates; preserve lock order and independent review. |
+| M-02 | Medium | Current auth middleware accepted a foreign Host and absent Origin for a default loopback-open GET in a disposable in-memory router probe; a foreign-Origin control was refused. MCP Host validation does not cover the admin API. DNS rebinding requires a browser/network permitting local access; configured bearer authentication closes this path. | Implemented and security-reviewed; 19 auth and 2 host-list tests GREEN; delivery pending | Reject hostile authorities without Origin; retain supported local/IPv6 aliases, bearer and Origin checks; deterministic router regression and independent security review. |
+| M-04 (formerly C-03) | Medium | A valid snapshot control loaded; changing one symbol-name byte by XOR 1 with unchanged source/content digests was still accepted. The exact current-source test failed on the required refusal. This proves accidental metadata corruption acceptance; wrong-source editing was not demonstrated. | Implemented and independently reviewed; 121 persistence tests GREEN; genuine integration schema pin updated to 11; final integration gate pending | Verify checksum before hydration for local/artifact paths; current-version one-bit corruption quarantine; valid roundtrips, truncation/digest rejection, prior-format preservation/rebuild and engine-info reporting; independent review. |
+| M-05 | Medium | Existing language routing classified .cjs/.mjs as Text, preventing JavaScript symbol extraction. A current-source regression failed before the alias fix. | Implemented and independently reviewed; 3 alias/cold-load/update/credential-control tests GREEN; delivery pending | Reuse existing JS grammar; prove symbols on cold load and update, and preserve credential withholding/eviction for both aliases. |
+| C-02 | Expected protection; not a confirmed defect | A current-source synthetic probe admitted descriptive type metadata, explicit placeholders and short labels, while withholding ambiguous credential-key metadata and credential-shaped controls. | Closed as expected behavior; detector unchanged | Six assertions passed against byte-identical current detector source. Preserve fail-closed rules; use descriptive schema names or explicit placeholders. Historical refused content was not retrieved. |
+
+Evidence receipts: H-01 native Windows RED `job_01a168292eca7116b07d089b56400dab` (exit 101; 2 failed); M-03 native Windows RED `job_01a1682f2a1b71e884380e3b73f49f07` (exit 101; 1 failed); M-02 actual-auth in-memory probe `job_01a1682b809e74cc9e34c902c90ff40b` (exit 0; controls passed). These are reproduction evidence, not completed fixes.
+
+Dogfood observation D-01 (unclassified): connected runtime reports 11.9.1 while this checkout is 11.10.0. During concurrent bounded structural work, one post-edit `analyze_file_impact` returned literal HTTP 503 with `isError:false`; targeted reads stalled and later succeeded. An 18-symbol batch timed out after 120 seconds after its writes had landed; the owner inspected actual symbols/diff rather than replaying it. Subsequent scoped impact refreshes recovered, including final Rust prefix metadata. These observations do not establish a current-source cause or a passing result for the failed calls. Reproduce against the current runtime before assigning severity or changing lifecycle behavior.
+
+Intermediate proof: H-01 `job_01a1684abd0574628a776df51614f0c5` observed exit 0, 15 insertion tests passed; M-01 `job_01a1684c77c870d5a2a61bc31a00b607` observed exit 0, 20 Node contracts passed. Actual pinned upstream SDK probe `job_01a1684aafcc7738997e5528407a2944` confirmed the 1,586-byte query and repository/main variables, exactly three intercepted attempts, preserved SDK failure, and zero real write requests. Final verification and delivery remain outstanding.
+
+Additional receipts: final H-01 API integration `job_01a16854584176efbdf66ad67524cc8d` (exit 0; 1 test), M-03 lifecycle module `job_01a168519d5675dd9004d7c3c319237c` (exit 0; 5 tests), final M-01 contracts `job_01a168560d29774db1535421128afd5f` (exit 0; 21 tests), and M-04 actual one-bit metadata RED `job_01a1685abc9d777bb5de65328086f226` (exit 101; exactly 1 behavioral failure after valid control).
+
+Combined-source verification: persistence 121, auth 19, host-list 2, JavaScript aliases 3 and edit integration 4 passed. The live-index integration suite found a genuine stale version assertion (10 versus 11), now repaired without weakening behavior checks. Its 70-file fresh-load performance test failed at 828 ms; an isolated rerun also failed at 613 ms against the unchanged 500 ms limit (job_01a16887ff2e7308a2f5cdfcc5a879c9, observed exit 101). Same-machine baseline comparison and profiling are in progress; cause and severity are unclassified. No threshold relaxation or preexisting-failure claim.
+
+Initial external Claude CLI review completed against the frozen 20-file packet a46551b5dc175cf52e4ec97a58047b8686484177cee4da4315907bc366f79008. Its identified JSONL inbox/outbox protocol uses UTC timestamps and a 180-second interval; source hashes bind the verdict.
+
+External Claude review completed against the frozen packet above: six-fix logic approved within stated limits, changes requested for H-02, the stale darkness source/workflow pins. Those pins require independent edge review before a sanctioned refresh; they will not be blindly relaxed. Follow-up F-02 (Low, permanent refusal mapped as retryable StaleContent) is assigned to the Rust owner; F-03 is now confirmed High data-integrity defect H-03, with real-path RED proof. Per-target Rust reparsing is a Low performance observation, outside the failing fresh-load path; no optimization is justified without measurement.
+
+Performance follow-up: quiet alternating fresh-process runs passed the unchanged 500 ms assertion on baseline three times and current source three times. Five-sample traced medians were 212.213 ms baseline and 241.754 ms current; maxima 312.293/339.012 ms. Discovery dominated. Receipt job_01a16892ffcf75d6854a88a9be765a65 observed exit 0; no optimization or threshold change justified by this sample. The initial baseline 733 ms run overlapped CPU-active Node validation and is excluded from the comparison. All earlier failures remain recorded. Final integration rerun remains required. The root lifecycle self-test was deliberately cancelled (job_01a1688c5faf73ae9aa2b3884b96bb02, null exit, cleanup complete) to obtain a quiet timing window; only its completed 37-case normalizer passed, and the unfinished checks must be rerun.
+
+Verified checkpoint committed as 2cc08257 on fix/reliability-triage-2026-10-23: six initial fixes, exact20-file external-review manifest match (job_01a168981a9b77e4a0b5ffdf4d2b29a0, observed0) and cached diffcheck. Unverified follow-up working-tree changes were excluded. Nothing pushed at this checkpoint; combined gates and reviewed pin refresh remain pending.
+
+## Work order and completion criteria
+
+- [x] Establish current release/test baseline and bounded independent risk reviews.
+- [x] Fix, independently review and verify H-01 before medium-severity hardening.
+- [x] Reproduce C-01 and promote the confirmed race to M-03.
+- [x] Fix and independently review M-03; both new regressions and the five-test lifecycle module passed.
+- [ ] Run supported embed-only wait/lease/refresh integration gate on the final combined source.
+- [x] Implement, verify and security-review M-01 using the bounded pinned-upstream design.
+- [x] Fix, security-review and verify confirmed M-02; 19 auth and 2 host-list tests passed.
+- [x] Reproduce C-03 and promote it to confirmed M-04.
+- [x] Fix, verify and independently review M-04; 121 persistence tests passed. Final integration gate remains pending.
+- [x] Fix, independently review and verify M-05 with actual JavaScript cold/update and credential controls.
+- [x] Resolve C-02 with reproducible evidence and an explicit defect/expected-behavior disposition.
+- [ ] Inspect final diff, run affected deterministic/configuration checks, obtain independent review, and complete the authorized delivery path.
+
+No Critical security exploit was confirmed in this bounded pass. The review covered embed publication/lease/change-wait paths, structural-edit/source-binding boundaries, admission policy, and release commit/tag/publish controls; a separate bounded auth/server pass subsequently confirmed M-02, and persistence review confirmed M-04. JavaScript routing review confirmed M-05. This is not an exhaustive audit of every network or dependency surface. The lead is orchestrating approved fixes in severity order. At most two implementers edit independent files, and only one heavyweight suite runs at a time. Implementation is not completion: each confirmed issue still requires regression proof, independent review and delivery.
+
+---
+
 # Fathom Embed Alignment — 2026-09-15
 
 ## Plan
@@ -252,7 +307,7 @@ Evidence so far:
 ## Plan
 
 - [x] `compare-results.js` with `--preflight` (sf-bench commit `16acb4b`)
-- [x] `routes.golden.jsonl` 36-row skeleton + `fixtures/preflight-minimal.json`
+- [x] `routes.golden.jsonl` 36-row skeleton + `fixtures/preflight-minimal.json` (paths in the external sf-bench checkout)
 - [x] `scripts/measure-schema-bytes.ps1` stub (symforge `f7af058`)
 - [ ] Human review of golden `expected_decision` / `expected_equiv` (≥10 rows)
 - [ ] A-001..A-004 validated on real battery output
@@ -2003,7 +2058,7 @@ Gate L is the largest gate in the feature (worktrees + local refs, real git2 blo
 dedup, multi-source query composition, per-lane concurrency fences). It is being built as
 verifiable RED→GREEN increments; the gate stays OPEN until every L-R/L-G/L-V item is green.
 
-Landed so far (new module `src/live_index/local_ref_scout.rs`, wired into `live_index/mod.rs`):
+Landed so far (new module `src/live_index/local_ref_scout.rs`, wired into `src/live_index/mod.rs`):
 
 - Increment 1 — `scout_local_ref` (L-G02 core), commit `fd9bdeb`. Bounded in-process DFS over a
   local ref tree via libgit2 (no Git/LFS subprocess, L-R05). Enumerates blobs keyed by immutable
