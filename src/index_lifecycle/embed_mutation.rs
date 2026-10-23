@@ -262,7 +262,7 @@ fn prepare_structural(
                 crate::edit_safety::structural::detect_line_ending(&file.content),
                 &file.language,
             )
-            .map_err(|_| EditErrorKind::StaleContent)?
+            .map_err(|_| EditErrorKind::InvalidReplacement)?
         }
         StructuralOperation::Insert(InsertPosition::After, content) => {
             crate::edit_safety::structural::build_insert_after(

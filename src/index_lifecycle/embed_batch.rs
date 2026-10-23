@@ -341,7 +341,7 @@ fn stage_batch(
                                     &resolved.symbol,
                                     &file.language,
                                 )
-                                .map_err(|_| EditErrorKind::StaleContent)?
+                                .map_err(|_| EditErrorKind::InvalidReplacement)?
                             }
                             crate::embed::parity::edit::InsertPosition::After => {
                                 insert_after_position(&file.content, &resolved.symbol)

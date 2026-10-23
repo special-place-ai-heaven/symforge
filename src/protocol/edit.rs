@@ -773,10 +773,11 @@ pub(crate) fn execute_batch_edit(
     };
 
     let mut resolved = Vec::with_capacity(n);
+    let mut source_files = std::collections::HashMap::new();
     {
         let guard = index.read();
         for (i, edit) in edits.iter().enumerate() {
-            let file = guard.get_file(&edit.path).ok_or_else(|| {
+            let file = guard.capture_shared_file(&edit.path).ok_or_else(|| {
                 format!(
                     "File not indexed: {}{}",
                     edit.path,
@@ -784,7 +785,7 @@ pub(crate) fn execute_batch_edit(
                 )
             })?;
             let (_, sym) =
-                resolve_or_error(file, &edit.name, edit.kind.as_deref(), edit.symbol_line)
+                resolve_or_error(&file, &edit.name, edit.kind.as_deref(), edit.symbol_line)
                     .map_err(|e| {
                         format!("Edit {}: {e}{}", i + 1, rollback_footer(&targeted_paths))
                     })?;
@@ -794,6 +795,7 @@ pub(crate) fn execute_batch_edit(
                 operation: i,
                 language: file.language,
             });
+            source_files.entry(edit.path.clone()).or_insert(file);
         }
     }
 
@@ -830,12 +832,7 @@ pub(crate) fn execute_batch_edit(
                 }
             }
         }
-        let file = {
-            let guard = index.read();
-            guard
-                .capture_shared_file(path)
-                .ok_or_else(|| format!("File disappeared: {path}"))?
-        };
+        let file = &source_files[path];
         if indices.iter().any(|&index| {
             resolved[index].sym.effective_start() as usize > file.content.len()
                 || resolved[index].sym.byte_range.1 as usize > file.content.len()
@@ -947,6 +944,9 @@ pub(crate) fn execute_batch_edit(
         });
     }
 
+    #[cfg(test)]
+    tests::run_before_batch_edit_stage_hook();
+
     // Phase 3: Stage all edits per file in memory first.
     struct StagedFile {
         path: String,
@@ -966,12 +966,19 @@ pub(crate) fn execute_batch_edit(
     let mut file_order: Vec<(&String, &Vec<usize>)> = by_file.iter().collect();
     file_order.sort_by(|left, right| left.0.cmp(right.0));
     for (path, indices) in file_order {
-        let file = {
+        let file = &source_files[path];
+        {
             let guard = index.read();
-            guard
-                .capture_shared_file(path)
-                .ok_or_else(|| format!("File disappeared: {path}"))?
-        };
+            let current = guard
+                .get_file(path)
+                .ok_or_else(|| format!("File disappeared: {path}"))?;
+            if current.content != file.content {
+                return Err(format!(
+                    "Error: file `{path}` changed after symbol resolution; retry with fresh source.{}",
+                    rollback_footer(&targeted_paths),
+                ));
+            }
+        }
 
         let mut content = file.content.clone();
 
@@ -2895,6 +2902,87 @@ mod tests {
         assert!(!b_content.contains("beta"), "b.rs: {b_content}");
     }
 
+    std::thread_local! {
+        static BEFORE_BATCH_EDIT_STAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_before_batch_edit_stage_hook() {
+        BEFORE_BATCH_EDIT_STAGE.with(|hook| {
+            let callback = hook.borrow_mut().take();
+            if let Some(callback) = callback {
+                callback();
+            }
+        });
+    }
+
+    #[test]
+    fn batch_edit_refuses_changed_capture_before_staging() {
+        for dry_run in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let original = b"fn prefix() {}\n#[inline]\nfn target() {}\n";
+            let refreshed = b"fn prefix() { let changed = (); }\n#[inline]\nfn target() {}\n";
+            let untouched = b"fn other() {}\n";
+            let index = crate::live_index::LiveIndex::empty();
+            for (path, content) in [
+                ("a.rs", original.as_slice()),
+                ("b.rs", untouched.as_slice()),
+            ] {
+                std::fs::write(dir.path().join(path), content).unwrap();
+                index.update_file(
+                    path.to_string(),
+                    IndexedFile::from_parse_result(
+                        crate::parsing::process_file(path, content, LanguageId::Rust),
+                        content.to_vec(),
+                    ),
+                );
+            }
+            let edits = [
+                SingleEdit {
+                    path: "a.rs".to_string(),
+                    name: "target".to_string(),
+                    kind: None,
+                    symbol_line: None,
+                    operation: EditOperation::InsertBefore {
+                        content: "const ADDED: () = ();".to_string(),
+                    },
+                    working_directory: None,
+                },
+                SingleEdit {
+                    path: "b.rs".to_string(),
+                    name: "other".to_string(),
+                    kind: None,
+                    symbol_line: None,
+                    operation: EditOperation::Delete,
+                    working_directory: None,
+                },
+            ];
+            let published = index.clone();
+            let changed_path = dir.path().join("a.rs");
+            BEFORE_BATCH_EDIT_STAGE.with(|hook| {
+                assert!(hook.borrow().is_none());
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    std::fs::write(changed_path, refreshed).unwrap();
+                    published.update_file(
+                        "a.rs".to_string(),
+                        IndexedFile::from_parse_result(
+                            crate::parsing::process_file("a.rs", refreshed, LanguageId::Rust),
+                            refreshed.to_vec(),
+                        ),
+                    );
+                }));
+            });
+            let result = execute_batch_edit(&index, dir.path(), None, &edits, dry_run, None);
+            assert_eq!(std::fs::read(dir.path().join("a.rs")).unwrap(), refreshed);
+            assert_eq!(std::fs::read(dir.path().join("b.rs")).unwrap(), untouched);
+            let error = result.expect_err("a watcher refresh must invalidate planned offsets");
+            assert!(error.contains("changed after symbol resolution"), "{error}");
+            assert!(error.contains("No files were modified"), "{error}");
+            assert_eq!(index.read().get_file("a.rs").unwrap().content, refreshed);
+            assert_eq!(index.read().get_file("b.rs").unwrap().content, untouched);
+        }
+    }
+
     #[test]
     fn test_execute_batch_edit_rejects_overlapping() {
         let dir = tempfile::tempdir().unwrap();
@@ -2950,7 +3038,7 @@ mod tests {
         let edits = vec![
             SingleEdit {
                 path: "src/a.rs".to_string(),
-                name: "first".to_string(),
+                name: "second".to_string(),
                 kind: None,
                 symbol_line: None,
                 operation: EditOperation::Delete,
@@ -2958,10 +3046,10 @@ mod tests {
             },
             SingleEdit {
                 path: "src/a.rs".to_string(),
-                name: "second".to_string(),
+                name: "first".to_string(),
                 kind: None,
                 symbol_line: None,
-                operation: EditOperation::InsertBefore {
+                operation: EditOperation::InsertAfter {
                     content: "pub fn helper() {}".to_string(),
                 },
                 working_directory: None,
