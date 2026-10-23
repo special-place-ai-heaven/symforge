@@ -1141,10 +1141,13 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Refreshed for branch consolidation (033 containment-durability + AAP S4-S6
 // + capability-evidence-explicit): same 89 excluded files, no new edge into
 // src/index_lifecycle or server_api.rs.
+// Refreshed 2026-10-23 for insertion-prefix adapters and M03 publication ordering.
+// Same 89 paths; no new inbound lifecycle/server-API bridge. Agent review:
+// docs/reviews/2026-10-23-reliability-darkness-pin-review.md (owner review pending).
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "fb226057b7b863ad77b0a97cd1a60b33adfafd1ce2f0727fc4ec59f5b4c6fb59",
+    "3a07d1fa97037ed41b8a0c8c11a0b8b6693fd691995729561ae36ad2c589b63f",
     89,
-    2246988,
+    2256251,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1306,10 +1309,15 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // index_lifecycle/embedded.rs + embed_query.rs (including helper bodies/tests).
 // Same 89 excluded / 312 total candidates; no new boundary bridge.
 
+// Refreshed 2026-10-23 for source def781f6 against aadad9de: Rust insertion,
+// typed refusals/captured batch bytes, M03 ordering, merged HTTP authority,
+// snapshot format 11, JavaScript aliases, and inline tests. Same 312 files;
+// no new inbound lifecycle/server-API bridge. Agent review:
+// docs/reviews/2026-10-23-reliability-darkness-pin-review.md (owner review pending).
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "e42859439fbd87bfda2b4f5c59d461d55330f8d2926581e649157bec2d703347",
+    "3bec6a1a3ae7a2b60fd1596c18b7a41e30743ee83b107633f1785a042603eca4",
     312,
-    12184264,
+    12238202,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
@@ -1431,6 +1439,10 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
     );
 }
 
+// Refreshed 2026-10-23 for Node/release-wrapper changes. Agent comparison found
+// cargo/rustdoc step scalars and execution contexts unchanged; census 45/36/2.
+// Owner no-doctest review remains pending in:
+// docs/reviews/2026-10-23-reliability-darkness-pin-review.md.
 /// Each CI workflow's whole-file fingerprint, `<fnv1a-64>:<bytes>` over
 /// LF-normalized content. Round 14's backstop: the checks below read
 /// lines, CI executes YAML scalars, and that seam leaked twice — so no
@@ -1440,8 +1452,8 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "55403c3921076892:17264"),
-    ("release.yml", "b7c043c3754a1a5d:113265"),
+    ("ci.yml", "5b0a8d2def6e8c63:17377"),
+    ("release.yml", "0b3131b900d0f34d:114385"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an
