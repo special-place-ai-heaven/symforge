@@ -9,6 +9,16 @@ const PINS = Object.freeze({
   bundleUrl: 'https://raw.githubusercontent.com/googleapis/release-please-action/45996ed1f6d02564a971a2fa1b5860e934307cf7/dist/index.js',
   bundleSha256: '4fa35877a1c166013f0ecd7add1e6cf63ab44cf9082523dc96ce39212ae6a574',
   bundleBytes: 4303242,
+  assets: Object.freeze({
+    'commit.hbs': Object.freeze({bytes: 1194, sha256: '3b50b5b04d5067c0b00b768623c133ccf079c5b742d5ccd466ead967103d68d3'}),
+    'commit1.hbs': Object.freeze({bytes: 670, sha256: '87b17ec541bcadb6771923f323c63b87ea436106578f37565b73e6afad904021'}),
+    'footer.hbs': Object.freeze({bytes: 111, sha256: 'de814f47109202cb0f320a6474fb54a5ac6707454a894a205c544d5f1df607c0'}),
+    'footer1.hbs': Object.freeze({bytes: 0, sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'}),
+    'header.hbs': Object.freeze({bytes: 173, sha256: '48e811c21c68c9ffe09c358c01535f96bd1ab4113563295dabe11845e41551d2'}),
+    'header1.hbs': Object.freeze({bytes: 171, sha256: '2437dc15d41a68ed115b66e21a65ae3c6397f764ded3afd2dc28f6a8c19b8209'}),
+    'template.hbs': Object.freeze({bytes: 115, sha256: 'e00ca3ed9c69a4c18802fd54acbe5898191d28495287a285b38c343747528d42'}),
+    'template1.hbs': Object.freeze({bytes: 302, sha256: '6e2dba431e8f781dc9b3d21512f8f31a5c2a0c97244e350bcd9c9aeb977a57dc'}),
+  }),
   graphqlUrl: 'https://api.github.com/graphql',
   querySha256: 'c2ffe7bbe70586013cc308745041fa9c37d689e950837f008fb6b9cc5188cc41',
 });
@@ -89,21 +99,37 @@ function createRetryFetch(fetchImpl, {repository, signal, sleep: wait = sleep}) 
   };
 }
 
+async function readPinnedAsset(fetchImpl, url, pin, signal) {
+  const response = await fetchImpl(url, {redirect: 'error', signal});
+  if (!response.ok) throw new Error('action download failed');
+  const bytes = await readBounded(response, pin.bytes);
+  if (bytes.length !== pin.bytes || sha256(bytes) !== pin.sha256) throw new Error('action integrity check failed');
+  return bytes;
+}
+
 async function loadAction({fetchImpl = globalThis.fetch, signal} = {}) {
   const downloadSignal = AbortSignal.any([AbortSignal.timeout(30000), ...(signal ? [signal] : [])]);
-  const response = await fetchImpl(PINS.bundleUrl, {redirect: 'error', signal: downloadSignal});
-  if (!response.ok) throw new Error('action download failed');
-  const bytes = await readBounded(response, PINS.bundleBytes);
-  if (bytes.length !== PINS.bundleBytes || sha256(bytes) !== PINS.bundleSha256) throw new Error('action integrity check failed');
+  const bytes = await readPinnedAsset(fetchImpl, PINS.bundleUrl,
+    {bytes: PINS.bundleBytes, sha256: PINS.bundleSha256}, downloadSignal);
   const directory = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'symforge-release-please-'));
   const filename = path.join(directory, 'action.cjs');
+  const ownedFiles = [];
   const cleanup = () => {
     delete require.cache[filename];
-    if (fs.existsSync(filename)) fs.unlinkSync(filename);
+    for (const file of ownedFiles) if (fs.existsSync(file)) fs.unlinkSync(file);
     fs.rmdirSync(directory);
   };
+  const write = (file, contents) => {
+    ownedFiles.push(file);
+    fs.writeFileSync(file, contents, {flag: 'wx', mode: 0o600});
+  };
   try {
-    fs.writeFileSync(filename, bytes, {flag: 'wx', mode: 0o600});
+    write(filename, bytes);
+    // The upstream bundle reads its pinned changelog templates beside itself.
+    for (const [name, pin] of Object.entries(PINS.assets)) {
+      const asset = await readPinnedAsset(fetchImpl, new URL(name, PINS.bundleUrl).href, pin, downloadSignal);
+      write(path.join(directory, name), asset);
+    }
     const action = require(filename);
     if (typeof action.main !== 'function') throw new Error('action main export missing');
     return {main: action.main, cleanup};
@@ -125,7 +151,7 @@ function reportFailure(_error, log = console.error) {
   process.exitCode = 1;
 }
 
-module.exports = {PINS, createRetryFetch, loadAction, runReleasePlease, reportFailure};
+module.exports = {PINS, createRetryFetch, readPinnedAsset, loadAction, runReleasePlease, reportFailure};
 if (require.main === module) {
   const controller = new AbortController();
   const abort = () => controller.abort();

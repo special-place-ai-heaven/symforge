@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const {createRetryFetch, loadAction, runReleasePlease, reportFailure, PINS} = require('./release_please.cjs');
+const {createRetryFetch, readPinnedAsset, loadAction, runReleasePlease, reportFailure, PINS} = require('./release_please.cjs');
 const QUERY = "query pullRequestsSince($owner: String!, $repo: String!, $num: Int!, $maxFilesChanged: Int, $targetBranch: String!, $cursor: String) {\n      repository(owner: $owner, name: $repo) {\n        ref(qualifiedName: $targetBranch) {\n          target {\n            ... on Commit {\n              history(first: $num, after: $cursor) {\n                nodes {\n                  associatedPullRequests(first: 10) {\n                    nodes {\n                      number\n                      title\n                      baseRefName\n                      headRefName\n                      labels(first: 10) {\n                        nodes {\n                          name\n                        }\n                      }\n                      body\n                      mergeCommit {\n                        oid\n                      }\n                      files(first: $maxFilesChanged) {\n                        nodes {\n                          path\n                        }\n                        pageInfo {\n                          endCursor\n                          hasNextPage\n                        }\n                      }\n                    }\n                  }\n                  sha: oid\n                  message\n                  author {\n                    name\n                    email\n                    user {\n                      login\n                    }\n                  }\n                }\n                pageInfo {\n                  hasNextPage\n                  endCursor\n                }\n              }\n            }\n          }\n        }\n      }\n    }";
 const repository = 'special-place-ai-heaven/symforge';
 const message = 'Something went wrong while executing your query on 2026-10-22T15:49:45Z. Please include `ABCD:123:ABCDEF:123456:ABCDEF12` when reporting this issue.';
@@ -249,4 +249,28 @@ test('workflow guards reject a borrowed step condition and a test in another job
   assertCiRecoveryGate(fixture);
   const misplaced = fixture.replace(contract, '') + contract;
   assert.throws(() => assertCiRecoveryGate(misplaced), {code: 'ERR_ASSERTION'});
+});
+
+test('pinned companion assets preserve exact bytes including empty templates', async () => {
+  for (const content of [Buffer.from('template fixture\r\n'), Buffer.alloc(0)]) {
+    const pin = {bytes: content.length, sha256: require('node:crypto').createHash('sha256').update(content).digest('hex')};
+    const signal = AbortSignal.timeout(1000);
+    let calls = 0;
+    const actual = await readPinnedAsset(async (url, options) => {
+      calls++; assert.equal(url, 'https://example.invalid/template.hbs');
+      assert.equal(options.redirect, 'error'); assert.equal(options.signal, signal);
+      return new Response(content);
+    }, 'https://example.invalid/template.hbs', pin, signal);
+    assert.deepEqual(actual, content); assert.equal(calls, 1);
+  }
+});
+test('missing, oversized and same-length corrupt companion assets fail without retries', async () => {
+  const pin = PINS.assets['template.hbs'];
+  for (const response of [new Response('missing', {status: 404}),
+    new Response(Buffer.alloc(pin.bytes + 1)), new Response(Buffer.alloc(pin.bytes))]) {
+    let calls = 0;
+    await assert.rejects(readPinnedAsset(async () => {calls++; return response;},
+      'https://example.invalid/template.hbs', pin, AbortSignal.timeout(1000)));
+    assert.equal(calls, 1);
+  }
 });
