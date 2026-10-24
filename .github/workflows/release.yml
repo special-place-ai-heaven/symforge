@@ -249,6 +249,10 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Test release-please recovery contracts
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.tag == '' }}
+        run: node --test execution/test_release_please.cjs
+
       # Free disk space for Rust builds on GitHub-hosted runners.
       - name: Free disk space for Rust builds
         if: runner.environment == 'github-hosted'
@@ -2031,6 +2035,15 @@ jobs:
         with:
           python-version: '3.12'
 
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.tag == '' }}
+        with:
+          node-version: '24'
+
+      - name: Test release-please recovery contracts
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.tag == '' }}
+        run: node --test execution/test_release_please.cjs
+
       - name: Install GitHub CLI
         run: bash execution/ensure_gh.sh
 
@@ -2044,13 +2057,26 @@ jobs:
 
       - id: release
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.tag == '' }}
-        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
-        with:
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
-          skip-github-release: true
-          include-component-in-tag: false
-          config-file: .github/release-please-config.json
-          manifest-file: .github/.release-please-manifest.json
+        run: node execution/release_please.cjs
+        env:
+          INPUT_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          INPUT_RELEASE-TYPE: ''
+          INPUT_PATH: ''
+          INPUT_TARGET-BRANCH: ''
+          INPUT_CONFIG-FILE: .github/release-please-config.json
+          INPUT_MANIFEST-FILE: .github/.release-please-manifest.json
+          INPUT_REPO-URL: ${{ github.repository }}
+          INPUT_GITHUB-API-URL: ${{ github.api_url }}
+          INPUT_GITHUB-GRAPHQL-URL: ${{ github.graphql_url }}
+          INPUT_FORK: 'false'
+          INPUT_INCLUDE-COMPONENT-IN-TAG: 'false'
+          INPUT_PROXY-SERVER: ''
+          INPUT_SKIP-GITHUB-RELEASE: 'true'
+          INPUT_SKIP-GITHUB-PULL-REQUEST: 'false'
+          INPUT_SKIP-LABELING: 'false'
+          INPUT_CHANGELOG-HOST: ${{ github.server_url }}
+          INPUT_VERSIONING-STRATEGY: default
+          INPUT_RELEASE-AS: ''
 
       # release-please skipping is silent and indistinguishable from "nothing to
       # release". It has now bitten this repo four times: two merge-strategy

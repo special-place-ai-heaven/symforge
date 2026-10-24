@@ -237,22 +237,36 @@ pub(crate) fn apply_indentation(text: &str, indent: &[u8], line_ending: LineEndi
 // Insert helpers
 // ---------------------------------------------------------------------------
 
-/// Build the bytes to insert before a symbol: indented content + separator + existing content.
-/// Splices at the start of the line (before existing indentation) so indentation isn't doubled.
-/// Uses `\n\n` when the target symbol has no doc comments and no blank line already precedes
-/// the splice point (visual separation between definitions), and `\n` otherwise (avoids triple
-/// newlines when a blank line already exists, and keeps doc comments tight against their symbol).
+/// Build an insertion using a boundary verified against the current source bytes.
 pub(crate) fn build_insert_before(
     file_content: &[u8],
     sym: &SymbolRecord,
     new_code: &str,
     line_ending: LineEnding,
+    language: &crate::domain::LanguageId,
+) -> Result<Vec<u8>, String> {
+    let position = insert_before_position(file_content, sym, language)?;
+    Ok(build_insert_before_at_position(
+        file_content,
+        sym,
+        new_code,
+        line_ending,
+        position,
+        &detect_indentation(file_content, sym.byte_range.0),
+    ))
+}
+
+pub(crate) fn build_insert_before_at_position(
+    file_content: &[u8],
+    sym: &SymbolRecord,
+    new_code: &str,
+    line_ending: LineEnding,
+    line_start: u32,
+    indent: &[u8],
 ) -> Vec<u8> {
-    let line_start = insert_before_position(file_content, sym);
-    let indent = detect_indentation(file_content, sym.byte_range.0);
     let normalized = normalize_line_endings(new_code.as_bytes(), line_ending);
     let normalized_str = std::str::from_utf8(&normalized).unwrap_or(new_code);
-    let indented = apply_indentation(normalized_str, &indent, line_ending);
+    let indented = apply_indentation(normalized_str, indent, line_ending);
     let mut insertion = indented;
     let le = line_ending.as_bytes();
     let separator: Vec<u8> = if sym.doc_byte_range.is_some() {
@@ -289,13 +303,34 @@ pub(crate) fn build_insert_before(
     apply_splice(file_content, (line_start, line_start), &insertion)
 }
 
-pub(crate) fn insert_before_position(file_content: &[u8], sym: &SymbolRecord) -> u32 {
-    let sym_start = sym.effective_start() as usize;
-    file_content[..sym_start]
+pub(crate) fn insert_before_position(
+    file_content: &[u8],
+    sym: &SymbolRecord,
+    language: &crate::domain::LanguageId,
+) -> Result<u32, String> {
+    let sym_start = if *language == crate::domain::LanguageId::Rust {
+        let source = std::str::from_utf8(file_content).map_err(|_| {
+            "Cannot determine Rust insertion boundary: source is not UTF-8".to_string()
+        })?;
+        crate::parsing::languages::rust_insertion_prefix_start(source, sym)?
+    } else {
+        sym.effective_start()
+    } as usize;
+    let prefix = file_content
+        .get(..sym_start)
+        .ok_or_else(|| "Cannot determine insertion boundary: span is out of bounds".to_string())?;
+    let line_start = prefix
         .iter()
         .rposition(|&byte| byte == b'\n')
-        .map(|position| position + 1)
-        .unwrap_or(0) as u32
+        .map_or(0, |position| position + 1);
+    if *language == crate::domain::LanguageId::Rust
+        && !prefix[line_start..].iter().all(u8::is_ascii_whitespace)
+    {
+        return Err(
+            "Cannot insert before a Rust item sharing its line with preceding code".to_string(),
+        );
+    }
+    Ok(line_start as u32)
 }
 
 /// Build the bytes to insert after a symbol: existing content + blank line + indented content.
@@ -1023,6 +1058,184 @@ pub(crate) fn select_edit_within_body(
         count,
         untargeted_extra,
     })
+}
+
+#[cfg(test)]
+mod rust_insert_boundary_tests {
+    use super::*;
+    use crate::domain::LanguageId;
+
+    fn target(source: &str) -> SymbolRecord {
+        let (symbols, _, _, _, _) =
+            crate::parsing::parse_source(source, &LanguageId::Rust, false).unwrap();
+        symbols
+            .into_iter()
+            .find(|symbol| symbol.name == "target")
+            .unwrap()
+    }
+
+    #[test]
+    fn rust_insert_before_preserves_owned_prefix_and_warm_metadata() {
+        let fixtures = [
+            ("#[cfg(any())]\nfn target() { unavailable(); }\n", 0),
+            ("#[cfg(any())]\nmake_type!(target);\n", 0),
+            (
+                "mod nested {\n    #[cfg(any())]\n    make_type!(target);\n}\n",
+                "mod nested {\n".len(),
+            ),
+            (
+                "#[allow(dead_code)]\n/// target docs\n#[inline]\nfn target() {}\n",
+                0,
+            ),
+            (
+                "/// docs\n#[cfg_attr(\n    all(),\n    allow(dead_code)\n)]\n/** more docs */\nfn target() {}\n",
+                0,
+            ),
+            ("#[derive(Debug, Clone)]\nstruct target;\n", 0),
+            (
+                "#[cfg(all())]\n#[cfg_attr(all(), inline)]\n/// docs\nfn target() {}\n",
+                0,
+            ),
+            ("/// docs\n\n#[inline]\nfn target() {}\n", 0),
+            (
+                "struct S;\nimpl S {\n    #[inline]\n    fn target() {}\n}\n",
+                "struct S;\nimpl S {\n".len(),
+            ),
+            (
+                "/*! crate docs */\nfn target() {}\n",
+                "/*! crate docs */\n".len(),
+            ),
+            (
+                "mod nested {\n    #![allow(dead_code)]\n    //! module docs\n    #[inline]\n    fn target() {}\n}\n",
+                58,
+            ),
+            ("#![allow(dead_code)]\n//! crate docs\nfn target() {}\n", 36),
+            (
+                "fn previous() {}\n#[allow(dead_code)]\n// between attribute and item\nfn target() {}\n",
+                17,
+            ),
+        ];
+        for (lf, expected_lf_start) in fixtures {
+            for newline in ["\n", "\r\n"] {
+                let source = lf.replace('\n', newline);
+                let expected = lf[..expected_lf_start].replace('\n', newline).len();
+                let mut symbol = target(&source);
+                // A warm snapshot can contain only the original core range.
+                symbol.item_byte_range = Some(symbol.byte_range);
+                symbol.doc_byte_range = None;
+                let edited = build_insert_before(
+                    source.as_bytes(),
+                    &symbol,
+                    "fn inserted() {}",
+                    detect_line_ending(source.as_bytes()),
+                    &LanguageId::Rust,
+                )
+                .unwrap();
+                let inserted = String::from_utf8(edited).unwrap();
+                let start = inserted.find("fn inserted() {}").unwrap();
+                let indentation = source[expected..]
+                    .bytes()
+                    .take_while(|byte| *byte == b' ')
+                    .count();
+                assert_eq!(start, expected + indentation, "{source:?}");
+                assert_eq!(&inserted[..expected], &source[..expected]);
+                assert!(inserted.ends_with(&source[expected..]), "{inserted:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rust_insert_before_keeps_disabled_code_disabled() {
+        let source = "#[cfg(feature = \"enabled\")]\nfn target() { unavailable(); }\n";
+        let symbol = target(source);
+        let edited = build_insert_before(
+            source.as_bytes(),
+            &symbol,
+            "pub fn inserted() {}",
+            LineEnding::Lf,
+            &LanguageId::Rust,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("probe.rs");
+        std::fs::write(&path, edited).unwrap();
+        let compile = |enabled: bool| {
+            let mut command = crate::process_util::hidden_command("rustc");
+            command
+                .arg("--crate-type=lib")
+                .arg("--edition=2024")
+                .arg(&path)
+                .arg("--out-dir")
+                .arg(directory.path());
+            if enabled {
+                command.arg("--cfg").arg("feature=\"enabled\"");
+            }
+            command.output().unwrap()
+        };
+        assert!(
+            compile(false).status.success(),
+            "insertion exposed disabled code"
+        );
+        assert!(
+            !compile(true).status.success(),
+            "feature guard no longer belongs to target"
+        );
+    }
+
+    #[test]
+    fn rust_insert_before_refuses_unproven_or_inline_boundaries() {
+        let source = "#[inline]\nfn target() {}\n";
+        let mut symbol = target(source);
+        symbol.byte_range.1 -= 1;
+        assert!(insert_before_position(source.as_bytes(), &symbol, &LanguageId::Rust).is_err());
+
+        let source = "mod nested { #[inline] fn target() {} }";
+        let symbol = target(source);
+        assert!(insert_before_position(source.as_bytes(), &symbol, &LanguageId::Rust).is_err());
+    }
+
+    #[test]
+    fn rust_insert_before_footprint_covers_the_attribute_prefix() {
+        let source = "#[inline]\nfn target() {}\n";
+        let symbol = target(source);
+        let position =
+            insert_before_position(source.as_bytes(), &symbol, &LanguageId::Rust).unwrap();
+        assert!(splice_footprints_overlap(
+            SpliceFootprint::Insert(position),
+            SpliceFootprint::Bytes(0, symbol.byte_range.0),
+        ));
+        let inserted = build_insert_before_at_position(
+            source.as_bytes(),
+            &symbol,
+            "fn inserted() {}",
+            LineEnding::Lf,
+            position,
+            &[],
+        );
+        assert!(inserted.starts_with(b"fn inserted() {}"));
+        assert!(inserted.ends_with(source.as_bytes()));
+    }
+
+    #[test]
+    fn rust_insert_before_keeps_other_languages_on_their_existing_boundary() {
+        let source = "def target():\n    pass\n";
+        let (symbols, _, _, _, _) =
+            crate::parsing::parse_source(source, &LanguageId::Python, false).unwrap();
+        let symbol = symbols
+            .iter()
+            .find(|symbol| symbol.name == "target")
+            .unwrap();
+        let inserted = build_insert_before(
+            source.as_bytes(),
+            symbol,
+            "# inserted",
+            LineEnding::Lf,
+            &LanguageId::Python,
+        )
+        .unwrap();
+        assert!(inserted.starts_with(b"# inserted"));
+        assert!(inserted.ends_with(source.as_bytes()));
+    }
 }
 
 // ---------------------------------------------------------------------------

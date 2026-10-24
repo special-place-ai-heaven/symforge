@@ -773,10 +773,11 @@ pub(crate) fn execute_batch_edit(
     };
 
     let mut resolved = Vec::with_capacity(n);
+    let mut source_files = std::collections::HashMap::new();
     {
         let guard = index.read();
         for (i, edit) in edits.iter().enumerate() {
-            let file = guard.get_file(&edit.path).ok_or_else(|| {
+            let file = guard.capture_shared_file(&edit.path).ok_or_else(|| {
                 format!(
                     "File not indexed: {}{}",
                     edit.path,
@@ -784,7 +785,7 @@ pub(crate) fn execute_batch_edit(
                 )
             })?;
             let (_, sym) =
-                resolve_or_error(file, &edit.name, edit.kind.as_deref(), edit.symbol_line)
+                resolve_or_error(&file, &edit.name, edit.kind.as_deref(), edit.symbol_line)
                     .map_err(|e| {
                         format!("Edit {}: {e}{}", i + 1, rollback_footer(&targeted_paths))
                     })?;
@@ -794,6 +795,7 @@ pub(crate) fn execute_batch_edit(
                 operation: i,
                 language: file.language,
             });
+            source_files.entry(edit.path.clone()).or_insert(file);
         }
     }
 
@@ -803,6 +805,7 @@ pub(crate) fn execute_batch_edit(
     for (i, r) in resolved.iter().enumerate() {
         by_file.entry(r.path.clone()).or_default().push(i);
     }
+    let mut insert_before_positions = std::collections::HashMap::new();
     for (path, indices) in &by_file {
         for i in 0..indices.len() {
             for j in (i + 1)..indices.len() {
@@ -829,12 +832,7 @@ pub(crate) fn execute_batch_edit(
                 }
             }
         }
-        let file = {
-            let guard = index.read();
-            guard
-                .capture_shared_file(path)
-                .ok_or_else(|| format!("File disappeared: {path}"))?
-        };
+        let file = &source_files[path];
         if indices.iter().any(|&index| {
             resolved[index].sym.effective_start() as usize > file.content.len()
                 || resolved[index].sym.byte_range.1 as usize > file.content.len()
@@ -846,14 +844,21 @@ pub(crate) fn execute_batch_edit(
             .iter()
             .map(|&index| {
                 let symbol = &resolved[index].sym;
-                match &edits[resolved[index].operation].operation {
+                Ok(match &edits[resolved[index].operation].operation {
                     EditOperation::InsertBefore { .. } => {
-                        crate::edit_safety::structural::SpliceFootprint::Insert(
-                            crate::edit_safety::structural::insert_before_position(
-                                &file.content,
-                                symbol,
+                        let position = crate::edit_safety::structural::insert_before_position(
+                            &file.content,
+                            symbol,
+                            &file.language,
+                        )?;
+                        insert_before_positions.insert(
+                            index,
+                            (
+                                position,
+                                detect_indentation(&file.content, symbol.byte_range.0),
                             ),
-                        )
+                        );
+                        crate::edit_safety::structural::SpliceFootprint::Insert(position)
                     }
                     EditOperation::InsertAfter { .. } => {
                         crate::edit_safety::structural::SpliceFootprint::Insert(
@@ -887,9 +892,9 @@ pub(crate) fn execute_batch_edit(
                             symbol.byte_range.1,
                         )
                     }
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
         for left in 0..footprints.len() {
             for right in (left + 1)..footprints.len() {
                 if crate::edit_safety::structural::splice_footprints_overlap(
@@ -939,6 +944,9 @@ pub(crate) fn execute_batch_edit(
         });
     }
 
+    #[cfg(test)]
+    tests::run_before_batch_edit_stage_hook();
+
     // Phase 3: Stage all edits per file in memory first.
     struct StagedFile {
         path: String,
@@ -958,12 +966,19 @@ pub(crate) fn execute_batch_edit(
     let mut file_order: Vec<(&String, &Vec<usize>)> = by_file.iter().collect();
     file_order.sort_by(|left, right| left.0.cmp(right.0));
     for (path, indices) in file_order {
-        let file = {
+        let file = &source_files[path];
+        {
             let guard = index.read();
-            guard
-                .capture_shared_file(path)
-                .ok_or_else(|| format!("File disappeared: {path}"))?
-        };
+            let current = guard
+                .get_file(path)
+                .ok_or_else(|| format!("File disappeared: {path}"))?;
+            if current.content != file.content {
+                return Err(format!(
+                    "Error: file `{path}` changed after symbol resolution; retry with fresh source.{}",
+                    rollback_footer(&targeted_paths),
+                ));
+            }
+        }
 
         let mut content = file.content.clone();
 
@@ -1018,7 +1033,18 @@ pub(crate) fn execute_batch_edit(
                     ));
                 }
                 EditOperation::InsertBefore { content: code } => {
-                    content = build_insert_before(&content, &r.sym, code, line_ending);
+                    let (position, indent) = insert_before_positions.get(&ri).ok_or_else(|| {
+                        "Cannot determine batch insertion boundary; retry with fresh source"
+                            .to_string()
+                    })?;
+                    content = crate::edit_safety::structural::build_insert_before_at_position(
+                        &content,
+                        &r.sym,
+                        code,
+                        line_ending,
+                        *position,
+                        indent,
+                    );
                     file_summaries.push(super::edit_format::format_insert(
                         path,
                         &r.sym.name,
@@ -1672,13 +1698,40 @@ pub(crate) fn execute_batch_insert(
             }
         }
 
+        let positions = indices
+            .iter()
+            .map(|&ri| {
+                let symbol = &resolved[ri].sym;
+                match input.position {
+                    InsertPosition::Before => {
+                        let position = crate::edit_safety::structural::insert_before_position(
+                            &file.content,
+                            symbol,
+                            &file.language,
+                        )?;
+                        Ok((
+                            position,
+                            detect_indentation(&file.content, symbol.byte_range.0),
+                        ))
+                    }
+                    InsertPosition::After => Ok((symbol.byte_range.1, Vec::new())),
+                }
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let line_ending = detect_line_ending(&content);
         let mut file_summaries = Vec::with_capacity(indices.len());
-        for &ri in indices {
+        for (&ri, (position, indent)) in indices.iter().zip(&positions) {
             let target = &resolved[ri];
             content = match input.position {
                 InsertPosition::Before => {
-                    build_insert_before(&content, &target.sym, &input.content, line_ending)
+                    crate::edit_safety::structural::build_insert_before_at_position(
+                        &content,
+                        &target.sym,
+                        &input.content,
+                        line_ending,
+                        *position,
+                        indent,
+                    )
                 }
                 InsertPosition::After => {
                     build_insert_after(&content, &target.sym, &input.content, line_ending)
@@ -2544,7 +2597,14 @@ mod tests {
     fn test_build_insert_before_adds_content_with_indent() {
         let content = b"    fn existing() {}\n";
         let sym = make_test_symbol("existing", SymbolKind::Function, (4, 20), 1);
-        let result = build_insert_before(content, &sym, "fn new_fn() {}", LineEnding::Lf);
+        let result = build_insert_before(
+            content,
+            &sym,
+            "fn new_fn() {}",
+            LineEnding::Lf,
+            &LanguageId::Rust,
+        )
+        .unwrap();
         let text = std::str::from_utf8(&result).unwrap();
         // No doc comment on the symbol → expect \n\n separator for visual separation.
         assert!(
@@ -2842,6 +2902,87 @@ mod tests {
         assert!(!b_content.contains("beta"), "b.rs: {b_content}");
     }
 
+    std::thread_local! {
+        static BEFORE_BATCH_EDIT_STAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_before_batch_edit_stage_hook() {
+        BEFORE_BATCH_EDIT_STAGE.with(|hook| {
+            let callback = hook.borrow_mut().take();
+            if let Some(callback) = callback {
+                callback();
+            }
+        });
+    }
+
+    #[test]
+    fn batch_edit_refuses_changed_capture_before_staging() {
+        for dry_run in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let original = b"fn prefix() {}\n#[inline]\nfn target() {}\n";
+            let refreshed = b"fn prefix() { let changed = (); }\n#[inline]\nfn target() {}\n";
+            let untouched = b"fn other() {}\n";
+            let index = crate::live_index::LiveIndex::empty();
+            for (path, content) in [
+                ("a.rs", original.as_slice()),
+                ("b.rs", untouched.as_slice()),
+            ] {
+                std::fs::write(dir.path().join(path), content).unwrap();
+                index.update_file(
+                    path.to_string(),
+                    IndexedFile::from_parse_result(
+                        crate::parsing::process_file(path, content, LanguageId::Rust),
+                        content.to_vec(),
+                    ),
+                );
+            }
+            let edits = [
+                SingleEdit {
+                    path: "a.rs".to_string(),
+                    name: "target".to_string(),
+                    kind: None,
+                    symbol_line: None,
+                    operation: EditOperation::InsertBefore {
+                        content: "const ADDED: () = ();".to_string(),
+                    },
+                    working_directory: None,
+                },
+                SingleEdit {
+                    path: "b.rs".to_string(),
+                    name: "other".to_string(),
+                    kind: None,
+                    symbol_line: None,
+                    operation: EditOperation::Delete,
+                    working_directory: None,
+                },
+            ];
+            let published = index.clone();
+            let changed_path = dir.path().join("a.rs");
+            BEFORE_BATCH_EDIT_STAGE.with(|hook| {
+                assert!(hook.borrow().is_none());
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    std::fs::write(changed_path, refreshed).unwrap();
+                    published.update_file(
+                        "a.rs".to_string(),
+                        IndexedFile::from_parse_result(
+                            crate::parsing::process_file("a.rs", refreshed, LanguageId::Rust),
+                            refreshed.to_vec(),
+                        ),
+                    );
+                }));
+            });
+            let result = execute_batch_edit(&index, dir.path(), None, &edits, dry_run, None);
+            assert_eq!(std::fs::read(dir.path().join("a.rs")).unwrap(), refreshed);
+            assert_eq!(std::fs::read(dir.path().join("b.rs")).unwrap(), untouched);
+            let error = result.expect_err("a watcher refresh must invalidate planned offsets");
+            assert!(error.contains("changed after symbol resolution"), "{error}");
+            assert!(error.contains("No files were modified"), "{error}");
+            assert_eq!(index.read().get_file("a.rs").unwrap().content, refreshed);
+            assert_eq!(index.read().get_file("b.rs").unwrap().content, untouched);
+        }
+    }
+
     #[test]
     fn test_execute_batch_edit_rejects_overlapping() {
         let dir = tempfile::tempdir().unwrap();
@@ -2897,7 +3038,7 @@ mod tests {
         let edits = vec![
             SingleEdit {
                 path: "src/a.rs".to_string(),
-                name: "first".to_string(),
+                name: "second".to_string(),
                 kind: None,
                 symbol_line: None,
                 operation: EditOperation::Delete,
@@ -2905,10 +3046,10 @@ mod tests {
             },
             SingleEdit {
                 path: "src/a.rs".to_string(),
-                name: "second".to_string(),
+                name: "first".to_string(),
                 kind: None,
                 symbol_line: None,
-                operation: EditOperation::InsertBefore {
+                operation: EditOperation::InsertAfter {
                     content: "pub fn helper() {}".to_string(),
                 },
                 working_directory: None,
@@ -3190,6 +3331,55 @@ mod tests {
         assert!(a.contains("logging"), "a.rs: {a}");
         let b = std::fs::read_to_string(src.join("b.rs")).unwrap();
         assert!(b.contains("logging"), "b.rs: {b}");
+    }
+
+    #[test]
+    fn rust_insert_before_batch_preserves_attributes_for_repeated_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = b"mod nested {\n    #[cfg(any())]\n    fn target() { unavailable(); }\n}\n";
+        std::fs::write(dir.path().join("lib.rs"), original).unwrap();
+        let index = crate::live_index::LiveIndex::empty();
+        let parsed = crate::parsing::process_file("lib.rs", original, LanguageId::Rust);
+        index.update_file(
+            "lib.rs".to_string(),
+            IndexedFile::from_parse_result(parsed, original.to_vec()),
+        );
+        let input = BatchInsertInput {
+            project: None,
+            content: "\nconst _: () = {\n    let _ = ();\n};".to_string(),
+            position: InsertPosition::Before,
+            targets: (0..2)
+                .map(|_| InsertTarget {
+                    path: "lib.rs".to_string(),
+                    name: "target".to_string(),
+                    kind: None,
+                    symbol_line: None,
+                    working_directory: None,
+                })
+                .collect(),
+            dry_run: Some(false),
+            idempotency_key: None,
+            working_directory: None,
+        };
+        let (summaries, _) = execute_batch_insert(&index, dir.path(), None, &input).unwrap();
+        assert_eq!(summaries.len(), 2);
+        let edited = std::fs::read(dir.path().join("lib.rs")).unwrap();
+        assert!(edited.starts_with(b"mod nested {\n"));
+        assert!(edited.ends_with(&original[b"mod nested {\n".len()..]));
+        let edited = String::from_utf8(edited).unwrap();
+        assert_eq!(edited.matches("    const _: () = {").count(), 2);
+        for line in edited
+            .lines()
+            .filter(|line| line.trim_start().starts_with("const _:"))
+        {
+            assert_eq!(line, "    const _: () = {");
+        }
+        for line in edited
+            .lines()
+            .filter(|line| line.trim_start().starts_with("let _"))
+        {
+            assert_eq!(line, "        let _ = ();");
+        }
     }
 
     #[test]
@@ -3889,20 +4079,25 @@ mod tests {
 
     #[test]
     fn test_build_insert_before_goes_above_doc_comments() {
-        // "/// Doc for foo\n" = 16 bytes (0..16)
-        // "pub fn foo() {}\n" = 16 bytes (16..32)
         let content = b"/// Doc for foo\npub fn foo() {}\n";
         let sym = SymbolRecord {
             name: "foo".to_string(),
             kind: SymbolKind::Function,
             depth: 0,
             sort_order: 0,
-            byte_range: (16, 32),
+            byte_range: (16, 31),
             line_range: (1, 1),
             doc_byte_range: Some((0, 16)),
             item_byte_range: None,
         };
-        let result = build_insert_before(content, &sym, "use std::io;", LineEnding::Lf);
+        let result = build_insert_before(
+            content,
+            &sym,
+            "use std::io;",
+            LineEnding::Lf,
+            &LanguageId::Rust,
+        )
+        .unwrap();
         let result_str = String::from_utf8(result).unwrap();
         let use_pos = result_str
             .find("use std::io;")
@@ -3929,8 +4124,14 @@ mod tests {
             doc_byte_range: None,
             item_byte_range: None,
         };
-        let result =
-            build_insert_before(content, &sym, "struct Point3D { x: f64 }", LineEnding::Lf);
+        let result = build_insert_before(
+            content,
+            &sym,
+            "struct Point3D { x: f64 }",
+            LineEnding::Lf,
+            &LanguageId::Rust,
+        )
+        .unwrap();
         let result_str = String::from_utf8(result).unwrap();
         assert!(
             result_str.contains("Point3D { x: f64 }\n\nstruct Point"),
@@ -3949,12 +4150,19 @@ mod tests {
             kind: SymbolKind::Function,
             depth: 0,
             sort_order: 0,
-            byte_range: (1, 18),
+            byte_range: (1, 17),
             line_range: (1, 1),
             doc_byte_range: None,
             item_byte_range: None,
         };
-        let result = build_insert_before(content, &sym, "fn new_fn() {}", LineEnding::Lf);
+        let result = build_insert_before(
+            content,
+            &sym,
+            "fn new_fn() {}",
+            LineEnding::Lf,
+            &LanguageId::Rust,
+        )
+        .unwrap();
         let result_str = String::from_utf8(result).unwrap();
         assert!(
             !result_str.contains("\n\n\n"),
@@ -3984,7 +4192,14 @@ mod tests {
             doc_byte_range: None,
             item_byte_range: None,
         };
-        let result = build_insert_before(content, &sym, "fn before() {}", LineEnding::Lf);
+        let result = build_insert_before(
+            content,
+            &sym,
+            "fn before() {}",
+            LineEnding::Lf,
+            &LanguageId::Rust,
+        )
+        .unwrap();
         let result_str = String::from_utf8(result).unwrap();
         assert!(
             !result_str.contains("\n\n\n"),
@@ -4013,12 +4228,19 @@ mod tests {
             kind: SymbolKind::Function,
             depth: 0,
             sort_order: 0,
-            byte_range: (8, 23),
+            byte_range: (8, 22),
             line_range: (1, 1),
             doc_byte_range: Some((0, 8)),
             item_byte_range: None,
         };
-        let result = build_insert_before(content, &sym, "fn inserted() {}", LineEnding::Lf);
+        let result = build_insert_before(
+            content,
+            &sym,
+            "fn inserted() {}",
+            LineEnding::Lf,
+            &LanguageId::Rust,
+        )
+        .unwrap();
         let result_str = String::from_utf8(result).unwrap();
         // insertion goes above the doc comment, with \n separator (not \n\n)
         assert!(
@@ -4375,8 +4597,15 @@ fn uses_it() { Widget::default(); }
     fn test_build_insert_before_crlf_preserved() {
         // Build a CRLF file and insert before the symbol; verify no bare \n in output
         let content = b"fn existing() {\r\n    body();\r\n}\r\n";
-        let sym = make_test_symbol("existing", SymbolKind::Function, (0, 32), 1);
-        let result = build_insert_before(content, &sym, "fn new_fn() {}", LineEnding::CrLf);
+        let sym = make_test_symbol("existing", SymbolKind::Function, (0, 31), 1);
+        let result = build_insert_before(
+            content,
+            &sym,
+            "fn new_fn() {}",
+            LineEnding::CrLf,
+            &LanguageId::Rust,
+        )
+        .unwrap();
         // No bare \n in output (every \n must be preceded by \r)
         for (i, &byte) in result.iter().enumerate() {
             if byte == b'\n' {
@@ -4428,7 +4657,14 @@ fn uses_it() { Widget::default(); }
         // Editing an LF file must not introduce any \r
         let content = b"fn existing() {\n    body();\n}\n";
         let sym = make_test_symbol("existing", SymbolKind::Function, (0, 29), 1);
-        let result = build_insert_before(content, &sym, "fn new_fn() {}", LineEnding::Lf);
+        let result = build_insert_before(
+            content,
+            &sym,
+            "fn new_fn() {}",
+            LineEnding::Lf,
+            &LanguageId::Rust,
+        )
+        .unwrap();
         assert!(
             !result.contains(&b'\r'),
             "LF file edit must not introduce CR"

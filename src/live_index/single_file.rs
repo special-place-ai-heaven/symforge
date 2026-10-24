@@ -1231,6 +1231,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn javascript_module_aliases_extract_symbols_on_cold_load_and_update() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let modules = [
+            (
+                "module.cjs",
+                "function common_before() { return 1; }\nmodule.exports = common_before;\n",
+                "common_before",
+            ),
+            (
+                "module.mjs",
+                "export function module_before() { return 1; }\n",
+                "module_before",
+            ),
+        ];
+        for (path, source, _) in modules {
+            std::fs::write(dir.path().join(path), source).unwrap();
+        }
+        let shared = LiveIndex::load(dir.path()).unwrap();
+        for (path, source, before) in modules {
+            {
+                let index = shared.read();
+                let file = index.get_file(path).expect("cold module must be indexed");
+                assert_eq!(file.language, LanguageId::JavaScript);
+                assert!(file.classification.is_code());
+                assert!(file.symbols.iter().any(|symbol| symbol.name == before));
+            }
+            let after = before.replace("_before", "_after");
+            std::fs::write(dir.path().join(path), source.replace("_before", "_after")).unwrap();
+            assert!(matches!(
+                update_file_from_disk(&shared, dir.path(), path),
+                ReindexResult::Reindexed
+            ));
+            let index = shared.read();
+            let file = index
+                .get_file(path)
+                .expect("updated module must be indexed");
+            assert_eq!(file.language, LanguageId::JavaScript);
+            assert!(file.symbols.iter().any(|symbol| symbol.name == after));
+            assert!(!file.symbols.iter().any(|symbol| symbol.name == before));
+        }
+    }
+
+    #[test]
+    fn javascript_module_aliases_keep_credential_admission_on_cold_load_and_update() {
+        for extension in ["cjs", "mjs"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let safe = format!("safe.{extension}");
+            let guarded = format!("guarded.{extension}");
+            let canary = ["runtime", "-", "canary", "-", "segment"].concat();
+            let sensitive = format!("const password = \"{canary}\";\nfunction withheld() {{}}\n");
+            std::fs::write(dir.path().join(&safe), "function safe_function() {}\n").unwrap();
+            std::fs::write(dir.path().join(&guarded), &sensitive).unwrap();
+            let shared = LiveIndex::load(dir.path()).unwrap();
+            {
+                let index = shared.read();
+                assert!(
+                    index.get_file(&guarded).is_none(),
+                    "cold admission must withhold credentials"
+                );
+                assert_eq!(
+                    index.get_file(&safe).unwrap().language,
+                    LanguageId::JavaScript
+                );
+            }
+            std::fs::write(dir.path().join(&safe), &sensitive).unwrap();
+            assert!(matches!(
+                update_file_from_disk(&shared, dir.path(), &safe),
+                ReindexResult::Skipped
+            ));
+            assert!(
+                shared.read().get_file(&safe).is_none(),
+                "changed-file admission must evict credentials"
+            );
+        }
+    }
+
     const OUTBOUND_LINK_SECRET: &str = "OUTBOUND_LINK_SECRET_7f3a9c2e";
 
     fn plant_outbound_secret(repo: &Path) -> (tempfile::TempDir, &'static str) {

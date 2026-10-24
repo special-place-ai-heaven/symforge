@@ -1,5 +1,9 @@
 # Lessons
 
+- 2026-10-23: Long triage work needs durable verified checkpoints and clear progress reports. Commit passing, reviewed slices promptly instead of leaving all work dirty until an expanding audit finishes. Keep unfinished follow-ups out of the checkpoint; when files overlap, stage the exact verified review snapshot and preserve newer working-tree edits. State which gates are still pending and whether commits are local or pushed.
+
+- 2026-10-23: Treat confirmed SymForge defects as a severity-ranked work queue even when discovered outside the original task. Reproduce and classify findings by impact, likelihood and recovery; fix the highest risks first, then work through remaining confirmed issues with regression proof and independent review. Do not call a recovered release or a green test suite proof that all reliability gaps are closed; report remaining confirmed items and audit coverage explicitly.
+
 - 2026-10-22: Before pushing additive embed APIs, run the complete lifecycle traceability gate as well as Rust integrity tests. The V11 phase classifier compares exact public-export sets, so new versioned API contracts must be recognized explicitly without rewriting the historical migration baseline or allowing arbitrary exports.
 
 - 2026-10-22: SymForge is public; use standard GitHub-hosted CI runners unless a concrete requirement justifies self-hosting. The owner authorizes normal hosted runs. Check actual runner availability and workflow events: a push filter with only tags/tags-ignore does not trigger branch pushes. Verify a run was created instead of treating a successful push as CI evidence. Audit release workflows as well as CI when replacing runners. Complete the PR and release handoff within explicit authorization; a green feature branch still needs merging and publication before downstream users can consume its version. Delete the feature branch only after verifying its work is on main.

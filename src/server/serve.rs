@@ -12,7 +12,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use super::api_keys::ApiKeyStore;
-use super::auth::{AuthConfig, AuthLayerState, OriginLayerState};
+use super::auth::{AuthConfig, AuthLayerState};
 use super::{ServerRuntime, admin, mcp_http};
 use crate::domain::{
     ControlStateDir, RootCandidateSource, RootRequestMode, RootResolution, StatePlacement,
@@ -671,29 +671,15 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
         let _ = tx.try_send(Ok(local_addr));
     }
 
-    // Build the /mcp router plus the /admin + /api/v1 router (006), merge them,
-    // and layer Bearer auth + Origin gating in front (secure-default rule on
-    // AuthConfig/AuthLayerState; P1-B Origin on OriginLayerState). Bearer auth
-    // skips read-only admin static assets so the GUI loads when a key is set
-    // (P2-1); `/api/v1/*` and `/mcp` remain gated. Layer order: Bearer outermost,
-    // then Origin, then the handler.
+    // All merged routes share the same Bearer, Origin, and open-loopback authority gates.
     let mcp_router = mcp_http::build_mcp_router(&runtime, local_addr);
     let admin_router = admin::build_admin_router(&runtime);
     let merged = mcp_router.merge(admin_router);
-
-    // Origin gate (P1-B): reject arbitrary cross-origin browser fetches against
-    // the browser-facing surface; non-browser API clients send no Origin and are
-    // unaffected. Allowed origins are the server's own bound address + loopback
-    // aliases.
-    let origin_state = OriginLayerState::from_bind_addr(local_addr);
-    let gated = super::apply_origin_gate(merged, origin_state);
-
-    // Bearer auth: the bootstrap --api-key OR any active minted key (G-039).
     let mut auth_state = AuthLayerState::new(auth, is_loopback);
     if let Some(store) = runtime.key_store() {
         auth_state = auth_state.with_key_store(Arc::clone(store));
     }
-    let app = super::apply_bearer_auth(gated, auth_state);
+    let app = super::auth::apply_http_gates(merged, local_addr, auth_state);
 
     // Attach URL to stdout (the operator copies this into a second client).
     let attach_url = format!(

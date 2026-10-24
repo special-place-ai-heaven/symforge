@@ -308,6 +308,92 @@ fn embedded_edit_lanes_render_the_mcp_answer_for_every_edit_tool() {
     }
 }
 
+#[test]
+fn rust_insert_before_embedded_single_and_batch_preserve_attributes() {
+    let original = "#[cfg(any())]\n/// original docs\n#[inline]\nfn target() { unavailable(); }\n";
+    let files = serde_json::json!({"src/a.rs": original, "src/b.rs": original});
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    for tool in ["insert_symbol", "batch_insert"] {
+        let repo = fixture_repo(files.as_object().unwrap());
+        let handle = open(&runtime, repo.path());
+        let authority = EditApplyAuthority::for_source_root(
+            fs::canonicalize(repo.path()).unwrap(),
+            "rust-prefix-regression".to_string(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let input = serde_json::json!({
+            "path": "src/a.rs", "name": "target", "position": "before",
+            "content": "const _: () = ();",
+            "targets": [
+                {"path": "src/a.rs", "name": "target"},
+                {"path": "src/b.rs", "name": "target"}
+            ]
+        });
+        run_case(&handle, &authority, tool, &input, tool);
+        let edited = fs::read_to_string(repo.path().join("src/a.rs")).unwrap();
+        assert!(edited.starts_with("const _: () = ();"), "{edited}");
+        assert!(edited.ends_with(original), "{edited}");
+        let other = fs::read_to_string(repo.path().join("src/b.rs")).unwrap();
+        if tool == "batch_insert" {
+            assert!(other.starts_with("const _: () = ();"), "{other}");
+            assert!(other.ends_with(original), "{other}");
+        } else {
+            assert_eq!(other, original);
+        }
+        handle.close().unwrap();
+    }
+}
+
+#[test]
+fn rust_insert_before_permanent_refusal_is_invalid_replacement() {
+    use symforge::embed::parity::edit::{EditError, EditErrorKind};
+
+    let original = "mod nested { #[inline] fn target() {} }\n";
+    let files = serde_json::json!({"src/a.rs": original});
+    let repo = fixture_repo(files.as_object().unwrap());
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, repo.path());
+    let authority = EditApplyAuthority::for_source_root(
+        fs::canonicalize(repo.path()).unwrap(),
+        "rust-boundary-refusal-regression".to_string(),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let request = InsertRequest {
+        guard: guard(&handle, "src/a.rs", "target"),
+        position: InsertPosition::Before,
+        content: "const _: () = ();".to_string(),
+    };
+    assert!(matches!(
+        handle.preview_insert(&request),
+        Err(EditError::Edit(EditErrorKind::InvalidReplacement))
+    ));
+    assert!(matches!(
+        handle.apply_insert(&request, &authority, "single-refusal"),
+        Err(EditError::Edit(EditErrorKind::InvalidReplacement))
+    ));
+
+    let batch = BatchInsertRequest {
+        targets: vec![request.guard.clone()],
+        position: InsertPosition::Before,
+        content: request.content.clone(),
+    };
+    assert!(matches!(
+        handle.preview_batch_insert(&batch),
+        Err(EditError::Edit(EditErrorKind::InvalidReplacement))
+    ));
+    assert!(matches!(
+        handle.apply_batch_insert(&batch, &authority, "batch-refusal"),
+        Err(EditError::Edit(EditErrorKind::InvalidReplacement))
+    ));
+    assert_eq!(
+        fs::read(repo.path().join("src/a.rs")).unwrap(),
+        original.as_bytes()
+    );
+    handle.close().unwrap();
+}
+
 /// A project carrying `.symforge/config.toml` gets MCP's trust suffix. With
 /// no host control directory the store is unavailable, reported in MCP's
 /// exact words for a process without a user-local control directory; with

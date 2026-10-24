@@ -58,7 +58,10 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '22'
+          node-version: '24'
+
+      - name: Test release-please recovery contracts
+        run: node --test execution/test_release_please.cjs
 
       - name: Run version sync tests
         env:

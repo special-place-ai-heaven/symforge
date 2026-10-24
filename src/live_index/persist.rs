@@ -50,7 +50,8 @@ use crate::domain::ParseDiagnostic;
 // (034 dismissal index wiring, 2026-10-06): a format-9 snapshot carries no
 // dismissal digest, so treating it as stale is the honest outcome and a
 // one-time cold parse per user is acceptable.
-const CURRENT_VERSION: u32 = 10;
+// Format 11 appends a SHA-256 checksum covering every serialized snapshot field.
+const CURRENT_VERSION: u32 = 11;
 
 /// The on-disk snapshot format version this engine writes and restores
 /// (embed `engine_info` reporting; a mismatched snapshot fails soft to a
@@ -719,6 +720,26 @@ fn verify_snapshot_lineage_continuity(
     }
 }
 
+fn encode_snapshot(snapshot: &IndexSnapshot) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = postcard::to_stdvec(snapshot)?;
+    let checksum = crate::hash::digest(&bytes);
+    bytes.extend_from_slice(&checksum);
+    Ok(bytes)
+}
+
+fn decode_snapshot(bytes: &[u8]) -> anyhow::Result<IndexSnapshot> {
+    let payload_len = bytes
+        .len()
+        .checked_sub(32)
+        .ok_or_else(|| anyhow::anyhow!("snapshot checksum missing or truncated"))?;
+    let (payload, checksum) = bytes.split_at(payload_len);
+    anyhow::ensure!(
+        crate::hash::digest(payload).as_slice() == checksum,
+        "snapshot payload checksum mismatch"
+    );
+    Ok(postcard::from_bytes(payload)?)
+}
+
 fn serialize_captured_snapshot(
     snapshot_input: SnapshotBuildInput,
     project_root: &Path,
@@ -832,7 +853,7 @@ pub fn reset_snapshot_state(
                 format!("snapshot version {version}, expected {CURRENT_VERSION}"),
             ))
         } else {
-            match postcard::from_bytes::<IndexSnapshot>(&existing_bytes) {
+            match decode_snapshot(&existing_bytes) {
                 Ok(existing) if existing.version != CURRENT_VERSION => Some((
                     "version-mismatch",
                     format!(
@@ -1046,7 +1067,7 @@ fn build_compressed_snapshot(
         project_root,
         project_id,
     )?;
-    let raw = postcard::to_stdvec(&snapshot)?;
+    let raw = encode_snapshot(&snapshot)?;
     let compressed = zstd::encode_all(raw.as_slice(), ARTIFACT_BEST_ZSTD_LEVEL)?;
     Ok((snapshot, raw, compressed))
 }
@@ -1076,7 +1097,7 @@ pub fn artifact_round_trip_report(
 ) -> anyhow::Result<ArtifactRoundTripReport> {
     let (before, raw, compressed) = build_compressed_snapshot(index, project_root)?;
     let decompressed = decompress_artifact_bytes(&compressed)?;
-    let after: IndexSnapshot = postcard::from_bytes(&decompressed)?;
+    let after = decode_snapshot(&decompressed)?;
 
     let mut matched = 0usize;
     let mut mismatches = Vec::new();
@@ -1335,7 +1356,7 @@ fn read_verified_artifact(project_root: &Path) -> Option<VerifiedArtifact> {
         return None;
     }
 
-    match postcard::from_bytes::<IndexSnapshot>(&raw) {
+    match decode_snapshot(&raw) {
         Ok(snapshot)
             if snapshot.version == CURRENT_VERSION
                 && snapshot.manifest.secret_policy_version
@@ -1686,7 +1707,7 @@ fn write_snapshot(
     project_root: &Path,
 ) -> anyhow::Result<SnapshotWriteReport> {
     // Serialize with postcard
-    let bytes = postcard::to_stdvec(&snapshot)?;
+    let bytes = encode_snapshot(&snapshot)?;
     let file_count = snapshot.files.len();
 
     let (final_path, write_lock) = snapshot_path_and_lock(state_dir)?;
@@ -1702,7 +1723,7 @@ fn write_snapshot(
                     format!("snapshot version {version}, expected {CURRENT_VERSION}"),
                 ))
             } else {
-                match postcard::from_bytes::<IndexSnapshot>(&existing_bytes) {
+                match decode_snapshot(&existing_bytes) {
                     Ok(existing) => {
                         if existing.version != CURRENT_VERSION {
                             Some((
@@ -2161,7 +2182,7 @@ fn load_snapshot_with_dismissal_digest(
         return None;
     }
 
-    let snapshot: IndexSnapshot = match postcard::from_bytes(&bytes) {
+    let snapshot: IndexSnapshot = match decode_snapshot(&bytes) {
         Ok(s) => s,
         Err(e) => {
             warn!("failed to deserialize index snapshot (corrupt?): {e}");
@@ -7646,7 +7667,7 @@ mod tests {
     #[test]
     fn test_persist_format_version_is_pinned() {
         assert_eq!(
-            CURRENT_VERSION, 10,
+            CURRENT_VERSION, 11,
             "persist format version changed — a format bump breaks every existing \
              user's .symforge/index.bin and requires orchestrator approval"
         );
@@ -7800,8 +7821,7 @@ mod tests {
 
         // Tripwire on the serialized version field itself.
         let raw = std::fs::read(tmp.path().join(".symforge").join("index.bin")).unwrap();
-        let decoded: IndexSnapshot =
-            postcard::from_bytes(&raw).expect("persisted snapshot decodes");
+        let decoded: IndexSnapshot = decode_snapshot(&raw).expect("persisted snapshot decodes");
         assert_eq!(
             decoded.version, CURRENT_VERSION,
             "serialized snapshot must carry CURRENT_VERSION"
@@ -8050,7 +8070,7 @@ mod tests {
             tmp.path(),
         );
         snapshot.version = 999;
-        let bytes = postcard::to_stdvec(&snapshot).unwrap();
+        let bytes = encode_snapshot(&snapshot).unwrap();
         let dir = tmp.path().join(".symforge");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("index.bin"), &bytes).unwrap();
@@ -8162,7 +8182,7 @@ mod tests {
             super::capture_snapshot_build_input(&make_live_index_with_files(Vec::new())),
             tmp.path(),
         );
-        let current_bytes = postcard::to_stdvec(&current).unwrap();
+        let current_bytes = encode_snapshot(&current).unwrap();
         std::fs::write(dir.join("index.bin"), &current_bytes).unwrap();
         assert!(
             load_snapshot(tmp.path()).is_some(),
@@ -8198,7 +8218,7 @@ mod tests {
         )
         .unwrap();
 
-        let bytes = postcard::to_stdvec(&snapshot).unwrap();
+        let bytes = encode_snapshot(&snapshot).unwrap();
         let dir = tmp.path().join(".symforge");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("index.bin"), &bytes).unwrap();
@@ -8256,7 +8276,7 @@ mod tests {
         )
         .unwrap();
 
-        let bytes = postcard::to_stdvec(&snapshot).unwrap();
+        let bytes = encode_snapshot(&snapshot).unwrap();
         let dir = tmp.path().join(".symforge");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("index.bin"), &bytes).unwrap();
@@ -8469,8 +8489,8 @@ mod tests {
             let header_manifest_digest = snapshot.source_identity.manifest_digest.clone();
             let resident_content_digest = snapshot.source_identity.indexed_content_digest.clone();
 
-            let bytes = postcard::to_stdvec(&snapshot).unwrap();
-            let restored: IndexSnapshot = postcard::from_bytes(&bytes).unwrap();
+            let bytes = encode_snapshot(&snapshot).unwrap();
+            let restored = decode_snapshot(&bytes).unwrap();
 
             assert_eq!(restored.manifest.source_version, version);
             assert_eq!(restored.source_identity.source_version, version);
@@ -8577,6 +8597,135 @@ mod tests {
         let metadata: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&quarantine_metadata[0]).unwrap()).unwrap();
         assert_eq!(metadata["reason"], "deserialize-error");
+    }
+
+    #[test]
+    fn single_bit_symbol_metadata_corruption_is_quarantined() {
+        let tmp = TempDir::new().unwrap();
+        let content = b"fn my_func() { other_func(); }";
+        std::fs::write(tmp.path().join("main.rs"), content).unwrap();
+        let index = make_live_index_with_files(vec![("main.rs", content)]);
+        serialize_index(&index, tmp.path()).unwrap();
+
+        let path = tmp.path().join(".symforge").join(INDEX_FILENAME);
+        let original = std::fs::read(&path).unwrap();
+        let mut snapshot = load_snapshot(tmp.path()).expect("control: intact snapshot restores");
+        assert_eq!(snapshot.files["main.rs"].symbols[0].name, "my_func");
+        snapshot.files.get_mut("main.rs").unwrap().symbols[0].name = "ly_func".to_string();
+        let mut corrupt = postcard::to_stdvec(&snapshot).unwrap();
+        let payload_len = corrupt.len();
+        // Keep the checksum written before the metadata corruption.
+        corrupt.extend_from_slice(&original[payload_len..]);
+        assert_eq!(original.len(), corrupt.len());
+        let changed_bits: Vec<u8> = original
+            .iter()
+            .zip(&corrupt)
+            .filter_map(|(before, after)| (before != after).then_some(before ^ after))
+            .collect();
+        assert_eq!(changed_bits, vec![1], "fixture changes exactly one bit");
+        std::fs::write(&path, &corrupt).unwrap();
+
+        assert!(
+            load_snapshot(tmp.path()).is_none(),
+            "a one-bit symbol metadata corruption must never restore"
+        );
+        let quarantined = quarantine_files_with_extension(tmp.path(), "bin");
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(std::fs::read(&quarantined[0]).unwrap(), corrupt);
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(tmp.path().join("main.rs")).unwrap(), content);
+    }
+
+    #[test]
+    fn snapshot_wire_corruption_is_quarantined_before_restore() {
+        for corruption in ["content", "checksum", "truncated", "missing-checksum"] {
+            let tmp = TempDir::new().unwrap();
+            let content = b"fn my_func() { other_func(); }";
+            let index = make_live_index_with_files(vec![("main.rs", content)]);
+            serialize_index(&index, tmp.path()).unwrap();
+            let path = tmp.path().join(".symforge").join(INDEX_FILENAME);
+            let original = std::fs::read(&path).unwrap();
+            assert!(load_snapshot(tmp.path()).is_some());
+            let mut corrupt = original.clone();
+            match corruption {
+                "content" => {
+                    let offset = corrupt
+                        .windows(content.len())
+                        .position(|bytes| bytes == content)
+                        .unwrap();
+                    corrupt[offset] ^= 1;
+                }
+                "checksum" => *corrupt.last_mut().unwrap() ^= 1,
+                "truncated" => {
+                    corrupt.pop();
+                }
+                "missing-checksum" => corrupt.truncate(corrupt.len() - 32),
+                _ => unreachable!(),
+            }
+            std::fs::write(&path, &corrupt).unwrap();
+            assert!(
+                load_snapshot(tmp.path()).is_none(),
+                "{corruption} must refuse restore"
+            );
+            let quarantined = quarantine_files_with_extension(tmp.path(), "bin");
+            assert_eq!(quarantined.len(), 1, "{corruption}");
+            assert_eq!(
+                std::fs::read(&quarantined[0]).unwrap(),
+                corrupt,
+                "{corruption}"
+            );
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn corrupt_existing_snapshot_is_preserved_before_write_or_reset() {
+        for reset in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let index = make_live_index_with_files(vec![("main.rs", b"fn my_func() {}")]);
+            serialize_index(&index, tmp.path()).unwrap();
+            let path = tmp.path().join(".symforge").join(INDEX_FILENAME);
+            let mut corrupt = std::fs::read(&path).unwrap();
+            *corrupt.last_mut().unwrap() ^= 1;
+            std::fs::write(&path, &corrupt).unwrap();
+            let result = if reset {
+                reset_snapshot_state(tmp.path()).map(|_| ())
+            } else {
+                serialize_index(&index, tmp.path())
+            };
+            assert!(
+                result.is_err(),
+                "invalid existing snapshot must refuse mutation"
+            );
+            let quarantined = quarantine_files_with_extension(tmp.path(), "bin");
+            assert_eq!(quarantined.len(), 1);
+            assert_eq!(std::fs::read(&quarantined[0]).unwrap(), corrupt);
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn format_ten_snapshot_is_preserved_without_checksum() {
+        let tmp = TempDir::new().unwrap();
+        let mut snapshot = build_snapshot(
+            super::capture_snapshot_build_input(&make_live_index_with_files(Vec::new())),
+            tmp.path(),
+        );
+        snapshot.version = 10;
+        let original = postcard::to_stdvec(&snapshot).unwrap();
+        let dir = tmp.path().join(".symforge");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(INDEX_FILENAME), &original).unwrap();
+        assert!(load_snapshot(tmp.path()).is_none());
+        assert_eq!(std::fs::read(dir.join(INDEX_FILENAME)).unwrap(), original);
+        let quarantine = dir.join("v11").join("quarantine").join("index-snapshots");
+        let copies: Vec<_> = std::fs::read_dir(quarantine)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("bin"))
+            .collect();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(std::fs::read(&copies[0]).unwrap(), original);
     }
 
     #[test]
@@ -9335,7 +9484,7 @@ mod tests {
         assert_sync_all_before_rename(&snapshot_stages);
         let snapshot_path = tmp.path().join(".symforge").join(INDEX_FILENAME);
         let snapshot_bytes = std::fs::read(&snapshot_path).expect("read snapshot");
-        let restored = postcard::from_bytes::<IndexSnapshot>(&snapshot_bytes)
+        let restored = decode_snapshot(&snapshot_bytes)
             .expect("completed write_snapshot leaves decodable new bytes");
         assert_eq!(restored.files.len(), 1);
 
@@ -9958,7 +10107,7 @@ mod tests {
         let (before, raw, compressed) =
             build_compressed_snapshot(&index, tmp.path()).expect("build compressed snapshot");
         let decompressed = decompress_artifact_bytes(&compressed).expect("decompress");
-        let after: IndexSnapshot = postcard::from_bytes(&decompressed).expect("decode postcard");
+        let after: IndexSnapshot = decode_snapshot(&decompressed).expect("decode postcard");
 
         // SP-0B caveat (a), adapted: `IndexSnapshot.files` is a `HashMap`, so
         // re-serializing the *deserialized* snapshot is not guaranteed to
@@ -10076,6 +10225,46 @@ mod tests {
             1,
             "corrupt artifact should be quarantined under .symforge/quarantine/artifacts/"
         );
+    }
+
+    #[test]
+    fn artifact_checksum_and_prior_format_are_refused_with_valid_sidecar() {
+        for prior_format in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let index = make_live_index_with_files(vec![("main.rs", b"fn my_func() {}")]);
+            let report = export_artifact_legacy(&index, tmp.path()).unwrap();
+            let compressed = std::fs::read(&report.path).unwrap();
+            let mut raw = decompress_artifact_bytes(&compressed).unwrap();
+            if prior_format {
+                let mut snapshot = decode_snapshot(&raw).unwrap();
+                snapshot.version = 10;
+                raw = postcard::to_stdvec(&snapshot).unwrap();
+            } else {
+                *raw.last_mut().unwrap() ^= 1;
+            }
+            let corrupt = zstd::encode_all(raw.as_slice(), ARTIFACT_BEST_ZSTD_LEVEL).unwrap();
+            std::fs::write(&report.path, &corrupt).unwrap();
+            let mut metadata: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&report.metadata_path).unwrap()).unwrap();
+            metadata["content_hash"] = crate::hash::digest_hex(&raw).into();
+            std::fs::write(
+                &report.metadata_path,
+                serde_json::to_vec(&metadata).unwrap(),
+            )
+            .unwrap();
+
+            assert!(load_snapshot(tmp.path()).is_none());
+            assert!(!report.path.exists());
+            assert!(!tmp.path().join(".symforge").join(INDEX_FILENAME).exists());
+            let quarantine = paths::resolve_artifact_quarantine_dir(tmp.path());
+            let copies: Vec<_> = std::fs::read_dir(quarantine)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("zst"))
+                .collect();
+            assert_eq!(copies.len(), 1);
+            assert_eq!(std::fs::read(&copies[0]).unwrap(), corrupt);
+        }
     }
 
     #[test]
