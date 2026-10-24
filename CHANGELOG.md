@@ -46,6 +46,18 @@ Embedders keep their own response bytes and check them with `ReplayOutcome::resp
 
 AAP S14-S16 add opt-in refresh-safe snapshot reads for Graph, File, SymbolSearch, and References via `EmbeddedSourceHandle::query_allowing_refresh`; the claim keeps the prior publication identity and reports `Refreshing`. Strict `query` remains Current-only, and mutating/mixed-disk variants are refused before freshening. `change_version` plus blocking `wait_for_change` provide lossless phase/publication event waits. `begin_graph_publication_lease` pins one Graph snapshot across pages for at most 30 seconds; no more than eight leases are live per source, and expired leases return `GraphPublicationLeaseExpired`.
 
+## [11.10.1](https://github.com/special-place-ai-heaven/symforge/compare/v11.10.0...v11.10.1) (2026-10-24)
+
+
+### Bug Fixes
+
+* harden structural edits, lifecycle reads and recovery ([2cc0825](https://github.com/special-place-ai-heaven/symforge/commit/2cc08257ad32bcb44b34776f16627e16dd14dfa7))
+* include pinned release-please changelog templates ([5a718d9](https://github.com/special-place-ai-heaven/symforge/commit/5a718d9f6596f34ddc033fc2657ca6ffc81a7eec))
+* include pinned release-please changelog templates ([9b1f34a](https://github.com/special-place-ai-heaven/symforge/commit/9b1f34afecdced635f604990c627a74e53c9250d))
+* preserve edit integrity and harden embed recovery ([f503985](https://github.com/special-place-ai-heaven/symforge/commit/f503985fe44cc30627e72007c4f03ff903395ca9))
+* prevent stale batch offsets and classify permanent refusals ([def781f](https://github.com/special-place-ai-heaven/symforge/commit/def781f65a0f00b1fe7969b93ddf03d0cb2b7281))
+* **test:** use hidden compiler launcher in Rust regression ([c986341](https://github.com/special-place-ai-heaven/symforge/commit/c9863416f6f3c88492102b6228de15670891de61))
+
 ## [11.10.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.9.1...v11.10.0) (2026-10-22)
 
 
