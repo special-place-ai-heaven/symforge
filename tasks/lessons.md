@@ -1,5 +1,9 @@
 # Lessons
 
+- 2026-10-23: The owner requires fail-fast CI operation: as soon as any job or step turns red, cancel all unfinished related workflow runs immediately, diagnose the failure with the smallest relevant check, then retry. Apply this even when other gates are still running; waiting for the entire red workflow wastes the correction cycle.
+
+- 2026-10-23: Before retrying an expensive CI build after a dependency-network failure, isolate the exact registry request and dependency fetch on the same hosted runner class. A fresh Cargo-home probe with retries disabled confirmed automod connectivity in six seconds; this is network evidence, not a substitute for the failed build gate. Preserve completed evidence, and follow the owner's fail-fast cancellation rule for unfinished jobs.
+
 - 2026-10-23: Long triage work needs durable verified checkpoints and clear progress reports. Commit passing, reviewed slices promptly instead of leaving all work dirty until an expanding audit finishes. Keep unfinished follow-ups out of the checkpoint; when files overlap, stage the exact verified review snapshot and preserve newer working-tree edits. State which gates are still pending and whether commits are local or pushed.
 
 - 2026-10-23: Treat confirmed SymForge defects as a severity-ranked work queue even when discovered outside the original task. Reproduce and classify findings by impact, likelihood and recovery; fix the highest risks first, then work through remaining confirmed issues with regression proof and independent review. Do not call a recovered release or a green test suite proof that all reliability gaps are closed; report remaining confirmed items and audit coverage explicitly.
