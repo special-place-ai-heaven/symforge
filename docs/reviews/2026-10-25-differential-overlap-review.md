@@ -118,3 +118,23 @@ commands, triggers, permissions and publishing conditions are unchanged.
 The independently recalculated release fingerprint is
 `59c56876e87374bc:114505`. CI's fingerprint and both source seals above remain
 unchanged. Actual release execution remains the runtime verification gate.
+
+## Shared runner storage mitigation
+
+Publication verification for 11.10.2 and two separate main CI runners failed
+within seconds with ENOSPC on 2026-10-25 at 19:15 UTC. The earlier release
+verification of the same product source had passed. Both workflows now disable
+incremental artifacts and dev/test debug symbols, and their heavy Linux jobs
+report workspace disk/inode capacity before compilation. Test commands,
+assertions, release profile, publishing conditions and runner labels are intact.
+No shared cache or system directory is deleted.
+
+Cargo documents debug information and debug assertions as separate settings
+([profiles](https://doc.rust-lang.org/cargo/reference/profiles.html),
+[environment variables](https://doc.rust-lang.org/cargo/reference/environment-variables.html)).
+Lead comparison of the parsed before/after workflows confirmed that only the
+three requested environment values and four telemetry steps changed. The new
+normalized UTF-8 fingerprints were independently reproduced: CI
+`825a15648b584f41:19022`; release `85e2c04d7611de03:114808`.
+Source seals and the Cargo command census are unchanged. Runtime storage
+headroom and successful publication remain verification gates.
