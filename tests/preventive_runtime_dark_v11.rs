@@ -1562,7 +1562,10 @@ const CARGO_LINES: &[(&str, usize)] = &[
         1,
     ),
     ("run: cargo clippy --all-targets -- -D warnings", 2),
-    ("run: cargo clippy --all-targets --all-features -- -D warnings", 1),
+    (
+        "run: cargo clippy --all-targets --all-features -- -D warnings",
+        1,
+    ),
     (
         "run: cargo clippy --no-default-features --features embed,__test-internals --lib -- -D warnings",
         1,
