@@ -142,4 +142,23 @@ roster must therefore include the three nonexecuting settings twice each,
 growing from 48 lines/39 distinct values to 54/42 across the same two workflows.
 No command, doctest prohibition or guard assertion is removed. The mitigated
 run reported 181 GB available at startup; it passed compilation and reached
-this census assertion without ENOSPC. Successful publication remains open.
+this census assertion without ENOSPC. Publication was still open at that point.
+
+## Final delivery proof
+
+PR #829 completed the exact census update. Main CI
+[40227087594](https://github.com/special-place-ai-heaven/symforge/actions/runs/40227087594)
+passed on `8c83629d80c74c6dd661b93ae59ed911d8a43146`, including Windows,
+both server/embed parity tests and the Slice 0 contract upload. The release-owed
+proof required the earlier Release Please merge as the tag source, so the
+original publication run was resumed after concurrent artifact pressure fell.
+
+[Release 11.10.2](https://github.com/special-place-ai-heaven/symforge/releases/tag/v11.10.2)
+targets `686bcbe907afaa844e47958a8eafe0daded1a530`.
+[Publication run 40222515232, attempt 2](https://github.com/special-place-ai-heaven/symforge/actions/runs/40222515232)
+passed all verification, native builds and publishing jobs. Public npm and
+crates.io metadata confirmed 11.10.2; the Windows tarball's npm integrity and
+GitHub SHA-256 matched. Inspection confirmed its versioned manifest and native
+executable payload without local installation/execution. The tag's product
+source, Cargo and npm inputs match the tested main commit exactly.
+The canonical task ledger records the detailed receipts and installation command.

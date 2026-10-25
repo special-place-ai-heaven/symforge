@@ -8,8 +8,9 @@ landed on main through PR #826 at
 `113cc66978f487dabeb1d2bfad00d336bd916555` (2026-10-25 18:07 UTC).
 The merge tree exactly matches reviewed branch tip
 `276c627034c8dc8b7d6208c08d9547880780e52c`; its product source and Cargo/npm
-inputs are unchanged from the verified implementation. The remaining delivery
-work is publishing a new version, not implementing these mechanisms again.
+inputs are unchanged from the verified implementation. Delivery is complete:
+**11.10.2 is published** on GitHub Releases, npm and crates.io. No implementation
+gap remains among the three quoted Differential findings.
 
 Delivery: [PR #826](https://github.com/special-place-ai-heaven/symforge/pull/826).
 Verification: [CI run 40207500654, attempt 2](https://github.com/special-place-ai-heaven/symforge/actions/runs/40207500654),
@@ -23,6 +24,7 @@ completion; a green branch is not a merged or released product.
 `LANDED` means implemented, reviewed, verified and integrated into main.
 `OPEN` means its acceptance criteria have not been demonstrated. Close delivery
 items only with actual merge, tag and package evidence.
+`PUBLISHED` records verified tag, platform-artifact and registry delivery.
 
 | ID | Priority | Work item | State | Owner / dependency |
 | --- | --- | --- | --- | --- |
@@ -31,7 +33,7 @@ items only with actual merge, tag and package evidence.
 | D03 | P1 | Expose inspectable dependency evidence | LANDED | Rust graph/impact engineer; D01, D02 |
 | D04 | P1 | Verify server/embed parity for every fix | LANDED | Independent verifier; D01-D03 |
 | D05 | P1 | Consolidate unique branch work into main | CLOSED | Integration lead; D01-D04 |
-| D06 | P1 | Release an installable version with Release Please | OPEN | Release lead; D05 |
+| D06 | P1 | Release an installable version with Release Please | PUBLISHED (11.10.2) | Release lead; D05 |
 
 ## D01 — prevent cross-language false dependencies
 
@@ -125,6 +127,11 @@ justified by the quoted comparison alone.
   tests plus 2 paired tests; embed 1,838 library tests plus 25/11/31/32 contract
   tests; downstream consumer, musl, Darwin, npm, format and lint gates.
 
+After delivery fixes, [main CI 40227087594](https://github.com/special-place-ai-heaven/symforge/actions/runs/40227087594)
+also passed on `8c83629d80c74c6dd661b93ae59ed911d8a43146`, including Windows,
+both paired tests and the previously failing Slice 0 contract upload. The
+release publication run below independently passed its complete verification.
+
 The existing parser timing-ratio test failed once during concurrent CI and
 passed a targeted job retry with its assertion unchanged. A Windows lifecycle
 test passed Nextest's configured retry. Scheduled/manual performance-smoke was
@@ -168,11 +175,45 @@ workflow fingerprint passed; publishing execution verifies the runner path.
 - [x] Let the repository's Release Please configuration generate the version,
   changelog, Cargo and npm package updates after D05.
 - [x] Verify the generated release PR and required checks, then land it.
-- [ ] Verify the release tag points to main and contains D01-D04.
-- [ ] Verify required platform artifacts and npm packages publish successfully.
-- [ ] Record the exact version and a Windows installation command, then verify
-  the published executable reports that version. Do not replace or restart the
-  owner's active daemon implicitly.
+- [x] Verify the release tag points to main and contains D01-D04.
+- [x] Verify required platform artifacts and npm packages publish successfully.
+- [x] Record the exact version and a Windows installation command; independently
+  verify the published Windows archive, executable payload and registry integrity.
+
+Publication proof:
+
+- [Release v11.10.2](https://github.com/special-place-ai-heaven/symforge/releases/tag/v11.10.2)
+  targets `686bcbe907afaa844e47958a8eafe0daded1a530`, the Release Please merge.
+  It is an ancestor of main. `git diff` confirms identical `src/`, Cargo and npm
+  inputs between the tag and the tested post-delivery-fix main commit.
+- [Publication run 40222515232, attempt 2](https://github.com/special-place-ai-heaven/symforge/actions/runs/40222515232)
+  completed successfully, including verification, both native platform builds,
+  package creation, asset upload, npm publication and crates.io publication.
+- Public npm metadata confirms `symforge`, `symforge-linux-x64` and
+  `symforge-windows-x64` version 11.10.2. The root's `latest` is 11.10.2 and its
+  two optional dependencies are pinned to 11.10.2. The Windows package index
+  independently confirms its latest version and downloadable tarball.
+- The downloaded Windows tarball passed its npm integrity hash and exactly
+  matched the GitHub release tarball's SHA-256. It contains
+  `package/bin/symforge.exe` (66,554,880 bytes, valid MZ header) and a matching
+  11.10.2 package manifest. It was inspected in memory, not installed or executed
+  on the owner's computer.
+- The GitHub release contains both native executables and all three npm
+  tarballs, each nonempty with a recorded digest. The crates.io API confirms
+  `symforge` 11.10.2 exists and is not yanked.
+
+Windows installation and owner-side runtime confirmation:
+
+```powershell
+npm install -g symforge@11.10.2
+symforge --version
+```
+
+The owner-side command is supplied for checking the installed executable;
+local installation/runtime validation was not performed by the agent. No
+active daemon was replaced or restarted and no antivirus setting was changed.
+
+The notes below retain the publication history and superseded blockers.
 
 Release Please generated and auto-merged
 [PR #827](https://github.com/special-place-ai-heaven/symforge/pull/827), version
@@ -180,8 +221,8 @@ Release Please generated and auto-merged
 Its seven-file diff is restricted to release metadata, changelog, Cargo and npm
 versions. Main ancestry confirms that it contains the landed improvements.
 [Publication run 40222515232](https://github.com/special-place-ai-heaven/symforge/actions/runs/40222515232)
-is the remaining execution gate; version metadata alone is not proof of
-published installable artifacts.
+was the publication execution gate; its final success and independent registry
+checks above establish delivery rather than version metadata alone.
 
 Publication run 40222515232 stopped before tag/package creation because its
 embed compilation exhausted runner disk space. Two separate main-CI runners
@@ -194,7 +235,8 @@ The bounded CI mitigation disables incremental artifacts and dev/test debug
 symbols, retains debug assertions and the release profile, and adds disk/inode
 observations before heavy Cargo work. It does not remove test gates, delete
 system caches, reduce the five-runner pool or move Windows off hosted runners.
-Publishing remains open until a successful retry/new workflow and registry proof.
+At that checkpoint publishing remained open pending a successful retry and
+registry proof; both have now completed as recorded above.
 
 [PR #828](https://github.com/special-place-ai-heaven/symforge/pull/828) landed
 the storage mitigation at `cebb2ecc3f1178750c7a53df46771a340ff5a734`.
@@ -203,6 +245,15 @@ compiled the native suite without ENOSPC, then stopped at the strict workflow
 line census: the new Cargo environment settings also require explicit review.
 The follow-up adds exactly three settings with count two each (54 lines/42
 distinct values), preserving the closed roster and every doctest guard.
+
+[PR #829](https://github.com/special-place-ai-heaven/symforge/pull/829) landed
+that exact census correction at main commit
+`8c83629d80c74c6dd661b93ae59ed911d8a43146`. Main CI then passed.
+The later CI-only push could not cut an older untagged release: the existing
+release-owed proof requires the Release Please merge itself as the tag source.
+Publication therefore resumed the original 686bcbe9 push run after shared
+storage pressure was reduced by the bounded profiles in the other CI jobs.
+That retry passed and tagged the intended commit; no tag/ref proof was bypassed.
 
 ## Scope boundaries and separate follow-ups
 
