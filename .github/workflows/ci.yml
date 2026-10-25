@@ -256,7 +256,7 @@ jobs:
         run: bash execution/ensure_rustup.sh
 
       - name: Run all-targets, all-features Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --keep-going -- -D warnings
 
       - name: Run server and embed parity tests
         run: |

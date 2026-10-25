@@ -77,14 +77,11 @@ fn check_local_config_preserved(root: &Path) {
     let scratch = tempfile::tempdir().unwrap();
     let (_runtime, source) = prepared_source(root, scratch.path());
     let isolated = source.prepared_git_repository_for_test().unwrap();
-    assert_eq!(
-        isolated
-            .config()
-            .unwrap()
-            .get_bool("core.filemode")
-            .unwrap(),
-        false
-    );
+    assert!(!isolated
+        .config()
+        .unwrap()
+        .get_bool("core.filemode")
+        .unwrap());
     let commit = isolated.head().unwrap().peel_to_commit().unwrap();
     let entry = commit
         .tree()
@@ -143,11 +140,9 @@ fn check_attribute_and_exclude_isolation(root: &Path) {
         )
         .unwrap();
     assert_eq!(git2::AttrValue::from_string(local), git2::AttrValue::True);
-    assert!(
-        isolated
-            .status_should_ignore(Path::new("local-ignore.rs"))
-            .unwrap()
-    );
+    assert!(isolated
+        .status_should_ignore(Path::new("local-ignore.rs"))
+        .unwrap());
 }
 
 /// Initialize `root` with one committed `lib.rs`; the prepared view copies files only.

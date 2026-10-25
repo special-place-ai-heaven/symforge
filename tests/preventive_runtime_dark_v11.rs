@@ -1463,7 +1463,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "5c94f633876b0552:18448"),
+    ("ci.yml", "b2a549dab71ee282:18461"),
     ("release.yml", "0b3131b900d0f34d:114385"),
 ];
 
@@ -1563,7 +1563,7 @@ const CARGO_LINES: &[(&str, usize)] = &[
     ),
     ("run: cargo clippy --all-targets -- -D warnings", 2),
     (
-        "run: cargo clippy --all-targets --all-features -- -D warnings",
+        "run: cargo clippy --all-targets --all-features --keep-going -- -D warnings",
         1,
     ),
     (
