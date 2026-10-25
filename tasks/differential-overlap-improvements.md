@@ -3,11 +3,13 @@
 Status checked 2026-10-25. Project: `symforge`.
 
 The three concrete advantages in the owner's quoted Differential assessment are
-implemented in branch `fix/change-impact-parity`, commit
-`3565e46bdd2aef42b6aa17f4f7f5504642c3e1ae`. They are **not yet on main** at this
-checkpoint. Main remains `e09b88ed9883322f8f5dd69559e9256552f6764b`.
-The remaining integration work is landing and releasing these implementations,
-not implementing the same three mechanisms again.
+implemented and verified at `3565e46bdd2aef42b6aa17f4f7f5504642c3e1ae`, then
+landed on main through PR #826 at
+`113cc66978f487dabeb1d2bfad00d336bd916555` (2026-10-25 18:07 UTC).
+The merge tree exactly matches reviewed branch tip
+`276c627034c8dc8b7d6208c08d9547880780e52c`; its product source and Cargo/npm
+inputs are unchanged from the verified implementation. The remaining delivery
+work is publishing a new version, not implementing these mechanisms again.
 
 Delivery: [PR #826](https://github.com/special-place-ai-heaven/symforge/pull/826).
 Verification: [CI run 40207500654, attempt 2](https://github.com/special-place-ai-heaven/symforge/actions/runs/40207500654),
@@ -18,17 +20,17 @@ completion; a green branch is not a merged or released product.
 
 ## Status and execution order
 
-`VERIFIED_BRANCH` means implemented, reviewed and verified on the named commit.
+`LANDED` means implemented, reviewed, verified and integrated into main.
 `OPEN` means its acceptance criteria have not been demonstrated. Close delivery
 items only with actual merge, tag and package evidence.
 
 | ID | Priority | Work item | State | Owner / dependency |
 | --- | --- | --- | --- | --- |
-| D01 | P1 | Isolate dependency matching by language family | VERIFIED_BRANCH | Rust graph engineer; shared by both adapters |
-| D02 | P1 | Use one immutable Git comparison baseline | VERIFIED_BRANCH | Rust Git/change engineer; both adapters |
-| D03 | P1 | Expose inspectable dependency evidence | VERIFIED_BRANCH | Rust graph/impact engineer; D01, D02 |
-| D04 | P1 | Verify server/embed parity for every fix | VERIFIED_BRANCH | Independent verifier; D01-D03 |
-| D05 | P1 | Consolidate unique branch work into main | OPEN | Integration lead; D01-D04 |
+| D01 | P1 | Isolate dependency matching by language family | LANDED | Rust graph engineer; shared by both adapters |
+| D02 | P1 | Use one immutable Git comparison baseline | LANDED | Rust Git/change engineer; both adapters |
+| D03 | P1 | Expose inspectable dependency evidence | LANDED | Rust graph/impact engineer; D01, D02 |
+| D04 | P1 | Verify server/embed parity for every fix | LANDED | Independent verifier; D01-D03 |
+| D05 | P1 | Consolidate unique branch work into main | CLOSED | Integration lead; D01-D04 |
 | D06 | P1 | Release an installable version with Release Please | OPEN | Release lead; D05 |
 
 ## D01 — prevent cross-language false dependencies
@@ -133,11 +135,11 @@ the repaired behaviors, not universal performance superiority over Differential.
 
 - [x] Reconcile every local/remote branch against fresh main: already merged,
   patch-equivalent, or genuinely unique work; preserve dirty worktrees.
-- [ ] Land PR #826's reviewed implementation on main using current passing
+- [x] Land PR #826's reviewed implementation on main using current passing
   evidence and repository merge rules.
-- [ ] Verify the landed source against the tested implementation; independently
+- [x] Verify the landed source against the tested implementation; independently
   review any conflict resolution and rerun affected checks if code changes.
-- [ ] Record landed commit and prune only proven superseded branches/worktrees.
+- [x] Record landed commit and prune only proven superseded branches/worktrees.
 
 Do not replay an abandoned intermediate implementation solely because its
 branch still exists. Preserve unique intended work and record its disposition.
@@ -149,7 +151,10 @@ by the current typed outcomes, lease/census behavior, native Windows release
 matrix and tested AAP implementation. The README refresh is byte-identical to
 the current README; its two remaining contract-claim corrections were ported
 to `docs/contracts/embed-parity-v1-coverage.md`. Stale remote tracking refs were
-pruned. Archive refs will preserve historical tips during branch cleanup.
+pruned. All 11 old local branch tips were preserved as identical-tree local tags
+under `archive/2026-10-25/<original-branch>` before removing their branch refs;
+main was the only local branch at that consolidation checkpoint. The merged
+remote feature branch was deleted.
 The detached `symforge-release-1186` worktree has no unique tracked code but
 contains untracked release artifacts, so it is preserved.
 
@@ -160,14 +165,36 @@ workflow fingerprint passed; publishing execution verifies the runner path.
 
 ## D06 — publish the new version
 
-- [ ] Let the repository's Release Please configuration generate the version,
+- [x] Let the repository's Release Please configuration generate the version,
   changelog, Cargo and npm package updates after D05.
-- [ ] Verify the generated release PR and required checks, then land it.
+- [x] Verify the generated release PR and required checks, then land it.
 - [ ] Verify the release tag points to main and contains D01-D04.
 - [ ] Verify required platform artifacts and npm packages publish successfully.
 - [ ] Record the exact version and a Windows installation command, then verify
   the published executable reports that version. Do not replace or restart the
   owner's active daemon implicitly.
+
+Release Please generated and auto-merged
+[PR #827](https://github.com/special-place-ai-heaven/symforge/pull/827), version
+`11.10.2`, at main commit `686bcbe907afaa844e47958a8eafe0daded1a530`.
+Its seven-file diff is restricted to release metadata, changelog, Cargo and npm
+versions. Main ancestry confirms that it contains the landed improvements.
+[Publication run 40222515232](https://github.com/special-place-ai-heaven/symforge/actions/runs/40222515232)
+is the remaining execution gate; version metadata alone is not proof of
+published installable artifacts.
+
+Publication run 40222515232 stopped before tag/package creation because its
+embed compilation exhausted runner disk space. Two separate main-CI runners
+failed with ENOSPC within the same seconds (2026-10-25 19:15 UTC), supporting
+shared backing-storage pressure under concurrent builds. Native tests, benchmark
+smoke and the release binary build had already passed. The same release workflow
+had passed on the pre-version commit.
+
+The bounded CI mitigation disables incremental artifacts and dev/test debug
+symbols, retains debug assertions and the release profile, and adds disk/inode
+observations before heavy Cargo work. It does not remove test gates, delete
+system caches, reduce the five-runner pool or move Windows off hosted runners.
+Publishing remains open until a successful retry/new workflow and registry proof.
 
 ## Scope boundaries and separate follow-ups
 
