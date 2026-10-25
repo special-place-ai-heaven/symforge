@@ -80,7 +80,8 @@ nextest's matching filter with `--no-tests=fail`. These tests would otherwise
 not run in the separate default-server and embed-only cells.
 
 Independent review confirmed the normalized CI fingerprint
-`0f8775a4aa267280:18326` and unchanged release-workflow fingerprint. The command
-census deliberately grows from 45 lines/36 distinct commands to 47/38, across
-the same two workflows, solely for these two parity gates. Guard assertions,
+`5c94f633876b0552:18448` and unchanged release-workflow fingerprint. The command
+census deliberately grows from 45 lines/36 distinct commands to 48/39, across
+the same two workflows, for these two parity gates and the combined-feature
+Clippy gate on Linux. Guard assertions,
 source seals, excluded paths, and lifecycle caller rosters remain in place.

@@ -1463,7 +1463,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "0f8775a4aa267280:18326"),
+    ("ci.yml", "5c94f633876b0552:18448"),
     ("release.yml", "0b3131b900d0f34d:114385"),
 ];
 
@@ -1562,6 +1562,7 @@ const CARGO_LINES: &[(&str, usize)] = &[
         1,
     ),
     ("run: cargo clippy --all-targets -- -D warnings", 2),
+    ("run: cargo clippy --all-targets --all-features -- -D warnings", 1),
     (
         "run: cargo clippy --no-default-features --features embed,__test-internals --lib -- -D warnings",
         1,
@@ -2486,8 +2487,8 @@ fn no_gate_builds_doctests() {
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(
         (seen.len(), distinct.len(), files),
-        (47, 38, 2),
-        "the CI workflows hold forty-seven cargo-mentioning lines, thirty-eight \
+        (48, 39, 2),
+        "the CI workflows hold forty-eight cargo-mentioning lines, thirty-nine \
          of them distinct, across two workflow files; this walk saw {:?}. A gate \
          added, removed, reworded, or a workflow file added — reconcile \
          CARGO_LINES with the workflows deliberately, never by loosening this \

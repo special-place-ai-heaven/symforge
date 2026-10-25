@@ -255,6 +255,9 @@ jobs:
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: bash execution/ensure_rustup.sh
 
+      - name: Run all-targets, all-features Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
       - name: Run server and embed parity tests
         run: |
           set -euo pipefail
