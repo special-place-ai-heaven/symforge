@@ -1,4 +1,187 @@
-# Differential comparison improvements
+# Differential overlap implementation ledger
+
+Status checked 2026-10-25. Project: `symforge`.
+
+The three concrete advantages in the owner's quoted Differential assessment are
+implemented in branch `fix/change-impact-parity`, commit
+`3565e46bdd2aef42b6aa17f4f7f5504642c3e1ae`. They are **not yet on main** at this
+checkpoint. Main remains `e09b88ed9883322f8f5dd69559e9256552f6764b`.
+The remaining integration work is landing and releasing these implementations,
+not implementing the same three mechanisms again.
+
+Delivery: [PR #826](https://github.com/special-place-ai-heaven/symforge/pull/826).
+Verification: [CI run 40207500654, attempt 2](https://github.com/special-place-ai-heaven/symforge/actions/runs/40207500654),
+completed successfully on the implementation commit above. The owner subsequently
+authorized consolidating branches into main and issuing an installable version
+through Release Please. This ledger records that delivery separately from code
+completion; a green branch is not a merged or released product.
+
+## Status and execution order
+
+`VERIFIED_BRANCH` means implemented, reviewed and verified on the named commit.
+`OPEN` means its acceptance criteria have not been demonstrated. Close delivery
+items only with actual merge, tag and package evidence.
+
+| ID | Priority | Work item | State | Owner / dependency |
+| --- | --- | --- | --- | --- |
+| D01 | P1 | Isolate dependency matching by language family | VERIFIED_BRANCH | Rust graph engineer; shared by both adapters |
+| D02 | P1 | Use one immutable Git comparison baseline | VERIFIED_BRANCH | Rust Git/change engineer; both adapters |
+| D03 | P1 | Expose inspectable dependency evidence | VERIFIED_BRANCH | Rust graph/impact engineer; D01, D02 |
+| D04 | P1 | Verify server/embed parity for every fix | VERIFIED_BRANCH | Independent verifier; D01-D03 |
+| D05 | P1 | Consolidate unique branch work into main | OPEN | Integration lead; D01-D04 |
+| D06 | P1 | Release an installable version with Release Please | OPEN | Release lead; D05 |
+
+## D01 — prevent cross-language false dependencies
+
+Problem: an unrelated JavaScript `read_to_string` definition could make a Rust
+`std::fs::read_to_string` caller appear affected, or make a real match ambiguous.
+
+Implementation: `graph_language_family` and `(family, name)` definition buckets
+in [graph.rs](../src/live_index/graph.rs). Rust and C# remain isolated;
+JavaScript/TypeScript, C/C++, and Java/Kotlin use their respective compatible
+families. This does not infer FFI relationships or add Kotlin parser work.
+
+Acceptance evidence:
+
+- [x] The reproduced Rust/JavaScript false edge is absent.
+- [x] Unrelated definitions do not suppress a valid Rust match.
+- [x] Compatible-family controls remain valid.
+- [x] Regressions include `rust_std_call_does_not_resolve_to_unrelated_javascript_definition`
+  and `same_name_definitions_resolve_within_compatible_language_family`.
+
+Remaining implementation gap for the quoted finding: none established on the
+verified branch. This is an accuracy correction, not complete compiler resolution.
+
+## D02 — compare the same pinned endpoints throughout
+
+Problem: changed paths used a merge base while symbol comparison used the base
+branch tip, incorrectly including a base-only `beta` edit beside a feature's
+`alpha` edit in the same file.
+
+Implementation: `GitComparisonRange`, `comparison_range_between_refs`, and
+`resolve_ref_tree_reference` in [git.rs](../src/git.rs), consumed by shared
+[change guidance](../src/index_lifecycle/guidance/changes.rs),
+[embed changes](../src/index_lifecycle/embed_changes.rs), and
+[MCP handlers](../src/protocol/tools.rs). Ref-to-worktree reports read the actual
+worktree against one pinned tree; provenance distinguishes tree and commit IDs.
+
+Acceptance evidence:
+
+- [x] Divergent branches report feature `alpha`, excluding base-only `beta`.
+- [x] Changed-path selection and blob comparison use the same effective baseline.
+- [x] Dirty worktree content is compared instead of substituting HEAD content.
+- [x] Requested labels remain visible; actual endpoints are disclosed.
+- [x] Commit refs, annotated tags and tree-only refs have explicit provenance.
+- [x] `diff_comparison_server_uses_resolved_merge_base` and direct paired
+  regressions cover the repaired behavior; the full default golden also passes.
+
+Remaining implementation gap for the quoted finding: none established on the
+verified branch. Unresolvable refs are refused; they do not silently change scope.
+
+## D03 — retain the explanation for an affected result
+
+Problem: impact output retained symbol, hop and risk while dropping the call site
+and resolution explanation already available during graph construction.
+
+Implementation: `CallEdgeEvidence` and `ResolutionReason` in
+[graph.rs](../src/live_index/graph.rs), shared shortest-chain traversal and
+256 KiB evidence cap in [impact guidance](../src/index_lifecycle/guidance/impact.rs),
+and additive typed results in [the embed parity API](../src/embed/parity/detect_impact.rs).
+Contract: [detect-impact addendum](../specs/015-cbm-capability-ports/contracts/detect-impact.md).
+
+Acceptance evidence:
+
+- [x] Returned evidence includes caller/callee identities, source path, raw
+  half-open byte spans, zero-based half-open line spans and resolution reason.
+- [x] Each available explanation is one deterministic shortest chain from the
+  changed symbol, subject to the existing depth bound.
+- [x] File scope retains its selected representative's chain.
+- [x] Evidence uses the admitted captured publication and contains no source text.
+- [x] Bounded output uses explicit `available`, `unavailable`, or `truncated`
+  status; truncating evidence preserves impact rows and risk totals.
+- [x] Legacy typed payloads deserialize without fabricated evidence.
+- [x] `graph_edges_keep_each_call_site_with_resolution_reason` and the paired
+  cap/budget regressions cover these behaviors.
+
+The implementation also corrects same-line C# caller attribution using byte
+containment. Ambiguous unqualified calls can still be omitted deliberately;
+`unavailable` is not proof that no dependency exists. No new resolver project is
+justified by the quoted comparison alone.
+
+## D04 — parity and verification gate
+
+- [x] Actual MCP handler output equals public embed output for the changed Git
+  and Rust/C#/C++ impact behaviors, in symbol and file scopes.
+- [x] Shared-cap output matches exactly with all 150 ordered impact rows.
+- [x] Constrained embed budgets disclose truncation without losing rows/totals.
+- [x] Linux and Windows explicitly run both `server_and_embed_` tests; empty
+  selection fails their gates. These tests are in [tools.rs](../src/protocol/tools.rs):
+  `server_and_embed_match_git_and_multilanguage_impact_payloads` and
+  `server_and_embed_disclose_evidence_truncation_without_dropping_rows`.
+- [x] Final CI: full Linux native suite including 3,749 library tests, benchmark
+  smoke, release build and both live tool-correctness fixtures; Windows 4,785
+  tests plus 2 paired tests; embed 1,838 library tests plus 25/11/31/32 contract
+  tests; downstream consumer, musl, Darwin, npm, format and lint gates.
+
+The existing parser timing-ratio test failed once during concurrent CI and
+passed a targeted job retry with its assertion unchanged. A Windows lifecycle
+test passed Nextest's configured retry. Scheduled/manual performance-smoke was
+skipped by its PR condition; native benchmark smoke ran. These results establish
+the repaired behaviors, not universal performance superiority over Differential.
+
+## D05 — land and consolidate
+
+- [x] Reconcile every local/remote branch against fresh main: already merged,
+  patch-equivalent, or genuinely unique work; preserve dirty worktrees.
+- [ ] Land PR #826's reviewed implementation on main using current passing
+  evidence and repository merge rules.
+- [ ] Verify the landed source against the tested implementation; independently
+  review any conflict resolution and rerun affected checks if code changes.
+- [ ] Record landed commit and prune only proven superseded branches/worktrees.
+
+Do not replay an abandoned intermediate implementation solely because its
+branch still exists. Preserve unique intended work and record its disposition.
+
+Branch audit: the AAP surface and LLVM-tarball branches are ancestors; clang-cl
+and xwin-clang patches are equivalent to integrated work. The old Windows/Linux
+release, resource-outcome, AAP WIP, and pre-reset backup branches are superseded
+by the current typed outcomes, lease/census behavior, native Windows release
+matrix and tested AAP implementation. The README refresh is byte-identical to
+the current README; its two remaining contract-claim corrections were ported
+to `docs/contracts/embed-parity-v1-coverage.md`. Stale remote tracking refs were
+pruned. Archive refs will preserve historical tips during branch cleanup.
+The detached `symforge-release-1186` worktree has no unique tracked code but
+contains untracked release artifacts, so it is preserved.
+
+The release workflow also now routes Linux jobs and the Linux build matrix
+entry to the owner's `fresh` pool while keeping Windows on `windows-latest`.
+YAML parsing, semantic before/after comparison and the narrowly refreshed
+workflow fingerprint passed; publishing execution verifies the runner path.
+
+## D06 — publish the new version
+
+- [ ] Let the repository's Release Please configuration generate the version,
+  changelog, Cargo and npm package updates after D05.
+- [ ] Verify the generated release PR and required checks, then land it.
+- [ ] Verify the release tag points to main and contains D01-D04.
+- [ ] Verify required platform artifacts and npm packages publish successfully.
+- [ ] Record the exact version and a Windows installation command, then verify
+  the published executable reports that version. Do not replace or restart the
+  owner's active daemon implicitly.
+
+## Scope boundaries and separate follow-ups
+
+No further unimplemented Differential advantage among the three quoted findings
+was established by the source check. A wider comparison needs new reproductions
+and a pinned competitor revision before adding implementation work. General
+parser/index superiority and complete semantic resolution remain unproven.
+The Malwarebytes detection and upstream standalone SCSS/MSVC build limitation
+remain separately tracked issues, not unfinished Differential integrations.
+
+## Historical execution record
+
+The entries below describe the original implementation and interim handoff;
+the status table and final CI evidence above supersede their pending-check notes.
 
 Requested 2026-10-25. Starting checkout: `main`, `e09b88ed`, SymForge 11.10.1.
 Scope: improve existing change/impact tools; no new tool, dependency, or reviewer UI.

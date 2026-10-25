@@ -106,3 +106,15 @@ replacement. The MCP normalizer now mirrors embed's existing HEAD-tree folding.
 All 16 captured case strings match byte-for-byte after this normalization; no
 golden expectation or production body changed. Lead review and formatting passed,
 and the full-source seal above includes this test-only adjustment.
+
+## Release delivery runner alignment
+
+After the owner authorized main integration and a Release Please version, the
+release workflow's nine standalone Linux jobs and its Linux matrix entry were
+aligned to `[self-hosted, linux, fresh]`. The Windows matrix entry remains
+`windows-latest`. Lead verification parsed the before/after YAML and confirmed
+that these ten runner values are the only semantic changes; action pins,
+commands, triggers, permissions and publishing conditions are unchanged.
+The independently recalculated release fingerprint is
+`59c56876e87374bc:114505`. CI's fingerprint and both source seals above remain
+unchanged. Actual release execution remains the runtime verification gate.
