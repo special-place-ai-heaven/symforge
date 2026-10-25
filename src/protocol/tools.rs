@@ -5246,19 +5246,47 @@ impl SymForgeServer {
                                     "No uncommitted changes detected.",
                                 );
                                 if include_symbol_diff {
+                                    let resolved_head =
+                                        match repo.resolve_ref_tree_reference("HEAD") {
+                                            Ok(resolved) => resolved,
+                                            Err(error) => {
+                                                return format!("Invalid git ref: {error}");
+                                            }
+                                        };
+                                    let base_tree_oid = resolved_head.tree_oid.to_string();
                                     let changed_refs: Vec<&str> =
                                         filtered.iter().map(|s| s.as_str()).collect();
-                                    let sym_diff = format::diff_symbols_result_view(
+                                    let view = crate::index_lifecycle::guidance::changes::capture_symbol_diff(
                                         "HEAD",
                                         "",
                                         &changed_refs,
-                                        &repo,
-                                        &self.index.data_plane().read(),
+                                        |reference, path| {
+                                            if reference.is_empty() {
+                                                crate::protocol::read_gate::admit_worktree_text(
+                                                    &self.index.data_plane().read(),
+                                                    &repo,
+                                                    path,
+                                                )
+                                            } else {
+                                                crate::protocol::read_gate::admit_git_text(
+                                                    &self.index.data_plane().read(),
+                                                    &repo,
+                                                    &base_tree_oid,
+                                                    path,
+                                                )
+                                            }
+                                        },
+                                    );
+                                    let sym_diff = crate::index_lifecycle::guidance::changes::render_symbol_diff(
+                                        &view,
                                         true,
                                         false,
                                     );
                                     output.push_str("\n\n");
                                     output.push_str(&sym_diff);
+                                    output.push_str(&format!(
+                                        "\nCompared `HEAD` at tree {base_tree_oid} to the working tree."
+                                    ));
                                 }
                                 let result = format!("{envelope}\n\n{output}");
                                 self.session_context.record_summary_output(
@@ -18786,6 +18814,17 @@ mod tests {
         assert!(
             result.contains("Symbol diff: HEAD...working tree"),
             "symbol diff section missing: {result}"
+        );
+        let head_tree = crate::git::GitRepo::open(repo.path())
+            .unwrap()
+            .resolve_ref_tree_reference("HEAD")
+            .unwrap()
+            .tree_oid;
+        assert!(
+            result.contains(&format!(
+                "Compared `HEAD` at tree {head_tree} to the working tree."
+            )),
+            "uncommitted symbol diff should disclose its pinned base tree: {result}"
         );
         assert!(
             result.contains("src/lib.rs (+1: added_symbol)"),

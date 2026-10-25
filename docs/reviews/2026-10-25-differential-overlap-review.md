@@ -51,7 +51,7 @@ length framing:
 
 | Set | SHA-256 | Files | Normalized bytes |
 | --- | --- | ---: | ---: |
-| Full source | `78de25e2bba53bf6d8c3eb08bed55b3bc546806a82bcf2fcf9560373fc7a38bc` | 312 | 12309149 |
+| Full source | `e099130d822e49d4d73ee4ec1610a0799625c3be174ac2eb1120a8c0e6473aaa` | 312 | 12311462 |
 | Excluded runtime source | `6014f89238cb76cdbe061e91e7ef8a693b1cefbd06a149069aea92aaa690cb9a` | 89 | 2266500 |
 
 Only those two source pins were refreshed. Source rosters, excluded paths,
@@ -93,3 +93,10 @@ Clippy gate on Linux. Guard assertions,
 source seals, excluded paths, and lifecycle caller rosters remain in place.
 The Clippy invocation uses Cargo's `--keep-going` to collect diagnostics across
 independent targets while retaining `-D warnings` and nonzero failure.
+
+The full default-feature suite then caught a missing provenance footer in the
+uncommitted MCP symbol-diff branch (3748 passed, one failed). That branch now
+pins the HEAD tree once and uses the shared gated capture/render path, matching
+embed. A focused assertion checks the resolved tree; the shared golden stays
+unchanged. Independent review approved the repair and recomputed the full-source
+seal above; the excluded-source seal did not change.
