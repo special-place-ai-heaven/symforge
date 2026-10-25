@@ -196,6 +196,14 @@ observations before heavy Cargo work. It does not remove test gates, delete
 system caches, reduce the five-runner pool or move Windows off hosted runners.
 Publishing remains open until a successful retry/new workflow and registry proof.
 
+[PR #828](https://github.com/special-place-ai-heaven/symforge/pull/828) landed
+the storage mitigation at `cebb2ecc3f1178750c7a53df46771a340ff5a734`.
+Its publication verification run reported 181 GB available at startup and
+compiled the native suite without ENOSPC, then stopped at the strict workflow
+line census: the new Cargo environment settings also require explicit review.
+The follow-up adds exactly three settings with count two each (54 lines/42
+distinct values), preserving the closed roster and every doctest guard.
+
 ## Scope boundaries and separate follow-ups
 
 No further unimplemented Differential advantage among the three quoted findings
