@@ -1148,7 +1148,7 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Same 89 paths; no new lifecycle/server-API bridge. Review and dual-surface proof:
 // docs/reviews/2026-10-25-differential-overlap-review.md.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "007b19e34241344f49248d6394e5a7833ed27e43c1bbe43462d7d9e8448d9f1e",
+    "6014f89238cb76cdbe061e91e7ef8a693b1cefbd06a149069aea92aaa690cb9a",
     89,
     2266500,
 );
@@ -1326,9 +1326,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Same 312 files; independently reviewed and recomputed; no new boundary bridge.
 // docs/reviews/2026-10-25-differential-overlap-review.md.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "0d2b729a72c710593e94cdf14acd3b2d0a26f0a5969d4b413a74d59b0d9bb0ef",
+    "78de25e2bba53bf6d8c3eb08bed55b3bc546806a82bcf2fcf9560373fc7a38bc",
     312,
-    12309273,
+    12309149,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

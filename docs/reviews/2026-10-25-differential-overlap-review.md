@@ -26,7 +26,7 @@ parity for every fix. No new MCP tool or dependency was added.
 An independent read-only reviewer checked the complete changed `src/` diff,
 including direct/aliased calls, macros, traits, inherent methods, registration,
 and re-exports. No new bridge into dark lifecycle/runtime/server API was found.
-The nine modified source paths are:
+The nine core source paths are:
 
 - `src/embed/parity/changes.rs`
 - `src/embed/parity/detect_impact.rs`
@@ -38,6 +38,12 @@ The nine modified source paths are:
 - `src/live_index/graph.rs`
 - `src/protocol/tools.rs`
 
+The combined-feature lint gate also required test-only cleanup in
+`src/embed/parity/host.rs`, `src/index_lifecycle/embed_query.rs`, and
+`src/index_lifecycle/embed_remediation.rs`. The reviewer verified that the two
+moved test modules retained their contents and that error/default assertions
+retained their behavior. No production body changed in that cleanup.
+
 The lead verified the old HEAD seals before recomputing the working tree. The
 reviewer independently reproduced the final values using the gate's domain
 prefix, sorted UTF-8 relative paths, CRLF-to-LF normalization, and little-endian
@@ -45,8 +51,8 @@ length framing:
 
 | Set | SHA-256 | Files | Normalized bytes |
 | --- | --- | ---: | ---: |
-| Full source | `0d2b729a72c710593e94cdf14acd3b2d0a26f0a5969d4b413a74d59b0d9bb0ef` | 312 | 12309273 |
-| Excluded runtime source | `007b19e34241344f49248d6394e5a7833ed27e43c1bbe43462d7d9e8448d9f1e` | 89 | 2266500 |
+| Full source | `78de25e2bba53bf6d8c3eb08bed55b3bc546806a82bcf2fcf9560373fc7a38bc` | 312 | 12309149 |
+| Excluded runtime source | `6014f89238cb76cdbe061e91e7ef8a693b1cefbd06a149069aea92aaa690cb9a` | 89 | 2266500 |
 
 Only those two source pins were refreshed. Source rosters, excluded paths,
 hash domains, and gate assertions were preserved. CI routing and the explicit

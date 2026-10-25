@@ -873,212 +873,6 @@ pub(super) struct Budget {
     pub(super) stel_event: Option<crate::stel::types::StelLedgerEvent>,
 }
 
-#[cfg(test)]
-mod admission_tests {
-    use super::*;
-    use crate::embed::{EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase};
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn child_persistent_commitment_root_replacement() {
-        if std::env::var_os("SYMFORGE_PRECOMMIT_ROOT_CHILD").is_none() {
-            return;
-        }
-        assert_eq!(
-            crate::live_index::frecency::collection_policy_from_env(),
-            crate::capability::FrecencyCollectionPolicy::Persistent
-        );
-        let parent = tempfile::tempdir().unwrap();
-        let root = parent.path().join("source");
-        let moved = parent.path().join("original");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("lib.rs"), "pub fn loaded() {}\n").unwrap();
-        let runtime = ProcessIndexRuntime::acquire().unwrap();
-        let handle = runtime
-            .open_embedded_source(EmbeddedSourceSpec::current_worktree(root.clone()))
-            .unwrap();
-        let until = Instant::now() + Duration::from_secs(20);
-        while handle.runtime_view().phase != SourceRuntimePhase::Current {
-            assert!(Instant::now() < until);
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let snapshot = handle.capture_query_snapshot(b"fresh-store-check").unwrap();
-        let state = snapshot
-            .project_state
-            .as_ref()
-            .expect("persistent source state");
-        let db = crate::live_index::frecency::frecency_db_path(state);
-        assert!(
-            !db.exists(),
-            "fixture must exercise the first persistent store open"
-        );
-        let session = handle.new_query_session().unwrap();
-        let before = session.cache_status();
-        let request = QueryRequest::FileContent(crate::embed::parity::read::FileContentRequest {
-            path: "lib.rs".into(),
-            ..Default::default()
-        });
-        let mut prospective_handle = None;
-        let result = handle.query_with_policy_admitted(
-            &request,
-            QueryLimits::default(),
-            QueryPolicy::default(),
-            Some(&session),
-            None,
-            |claim| {
-                prospective_handle = claim.retrieve_handle().map(str::to_owned);
-                std::fs::rename(&root, &moved).unwrap();
-                std::fs::create_dir(&root).unwrap();
-                std::fs::write(root.join("lib.rs"), "pub fn replacement() {}\n").unwrap();
-                true
-            },
-        );
-        assert!(
-            !db.exists(),
-            "a rejected source must not open a persistent store beneath its replacement"
-        );
-        let refusal = result.unwrap_err();
-        assert!(matches!(
-            refusal.kind(),
-            QueryRefusalKind::SourceUnavailable | QueryRefusalKind::StalePublication
-        ));
-        assert!(prospective_handle.is_some());
-        assert_eq!(session.revision(), 0);
-        assert_eq!(session.cache_status(), before);
-        handle.close().unwrap();
-    }
-
-    #[test]
-    fn root_replacement_after_admission_cannot_commit_persistent_ranking_or_session_state() {
-        let child = crate::process_util::hidden_command(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "internals::index_lifecycle::embed_query::admission_tests::child_persistent_commitment_root_replacement",
-                "--nocapture",
-            ])
-            .env("SYMFORGE_PRECOMMIT_ROOT_CHILD", "1")
-            .env("SYMFORGE_FRECENCY", "persistent")
-            .output()
-            .unwrap();
-        assert!(
-            child.status.success(),
-            "persistent commitment child failed: {} {}",
-            String::from_utf8_lossy(&child.stdout),
-            String::from_utf8_lossy(&child.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&child.stdout).contains("running 1 test"),
-            "persistent commitment child must execute its exact fixture"
-        );
-    }
-
-    #[test]
-    fn cancellation_after_output_admission_does_not_commit_prepared_session() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("lib.rs"), "pub fn loaded() {}\n").unwrap();
-        let runtime = ProcessIndexRuntime::acquire().unwrap();
-        let handle = runtime
-            .open_embedded_source(EmbeddedSourceSpec::current_worktree(
-                root.path().to_path_buf(),
-            ))
-            .unwrap();
-        let until = Instant::now() + Duration::from_secs(20);
-        while handle.runtime_view().phase != SourceRuntimePhase::Current {
-            assert!(Instant::now() < until);
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let session = handle.new_query_session().unwrap();
-        let before = session.cache_status();
-        let control = OperationControl::new(Duration::from_secs(20)).unwrap();
-        let request = QueryRequest::FileContent(crate::embed::parity::read::FileContentRequest {
-            path: "lib.rs".into(),
-            ..Default::default()
-        });
-        let mut prospective_handle = None;
-        let refusal = handle
-            .query_with_policy_admitted(
-                &request,
-                QueryLimits::default(),
-                QueryPolicy::default(),
-                Some(&session),
-                Some(&control),
-                |claim| {
-                    assert_eq!(claim.session_evidence().unwrap().revision_before, 0);
-                    assert_eq!(claim.session_evidence().unwrap().revision_after, 1);
-                    prospective_handle = claim.retrieve_handle().map(str::to_owned);
-                    control.cancel();
-                    true
-                },
-            )
-            .unwrap_err();
-        assert_eq!(refusal.kind(), QueryRefusalKind::Cancelled);
-        assert_eq!(session.revision(), 0);
-        assert_eq!(session.cache_status(), before);
-        let rejected = handle
-            .query_with_session(
-                &QueryRequest::Retrieve {
-                    handle: prospective_handle.unwrap(),
-                    offset: 0,
-                },
-                QueryLimits::default(),
-                &session,
-                None,
-            )
-            .unwrap_err();
-        assert_eq!(rejected.kind(), QueryRefusalKind::StaleHandle);
-        assert_eq!(session.revision(), 0);
-        let delivered = handle
-            .query_with_session(&request, QueryLimits::default(), &session, None)
-            .unwrap();
-        assert_eq!(delivered.session_evidence().unwrap().revision_after, 1);
-        assert_eq!(session.revision(), 1);
-        assert_eq!(session.cache_status().resident_entries, 1);
-    }
-
-    #[test]
-    fn closing_during_refresh_output_admission_never_retries() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("lib.rs"), "pub fn loaded() {}\n").unwrap();
-        let runtime = ProcessIndexRuntime::acquire().unwrap();
-        let handle = runtime
-            .open_embedded_source(EmbeddedSourceSpec::current_worktree(
-                root.path().to_path_buf(),
-            ))
-            .unwrap();
-        let started = Instant::now();
-        loop {
-            let since = handle.change_version();
-            if handle.runtime_view().phase == SourceRuntimePhase::Current {
-                break;
-            }
-            let remaining = Duration::from_secs(20).saturating_sub(started.elapsed());
-            assert!(!remaining.is_zero());
-            handle.wait_for_change(since, remaining).unwrap();
-        }
-        let request = QueryRequest::Graph {
-            path_prefix: None,
-            offset: 0,
-            expected_publication: None,
-        };
-        let refusal = execute_inner(
-            &handle,
-            &request,
-            QueryLimits::default(),
-            None,
-            None,
-            QueryPolicy::default(),
-            SnapshotMode::AllowRefreshing,
-            |_| {
-                let _ = handle.begin_close();
-                true
-            },
-        )
-        .unwrap_err();
-        assert_eq!(refusal.kind(), QueryRefusalKind::SourceUnavailable);
-        assert_eq!(refusal.retry(), RetryAdvice::Never);
-    }
-}
-
 impl Budget {
     pub(super) fn projection_budget(&self) -> Self {
         Self {
@@ -2545,5 +2339,211 @@ fn file_search_outcome(
         OutcomeClass::NotFound
     } else {
         OutcomeClass::Found
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use crate::embed::{EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn child_persistent_commitment_root_replacement() {
+        if std::env::var_os("SYMFORGE_PRECOMMIT_ROOT_CHILD").is_none() {
+            return;
+        }
+        assert_eq!(
+            crate::live_index::frecency::collection_policy_from_env(),
+            crate::capability::FrecencyCollectionPolicy::Persistent
+        );
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("source");
+        let moved = parent.path().join("original");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn loaded() {}\n").unwrap();
+        let runtime = ProcessIndexRuntime::acquire().unwrap();
+        let handle = runtime
+            .open_embedded_source(EmbeddedSourceSpec::current_worktree(root.clone()))
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(20);
+        while handle.runtime_view().phase != SourceRuntimePhase::Current {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let snapshot = handle.capture_query_snapshot(b"fresh-store-check").unwrap();
+        let state = snapshot
+            .project_state
+            .as_ref()
+            .expect("persistent source state");
+        let db = crate::live_index::frecency::frecency_db_path(state);
+        assert!(
+            !db.exists(),
+            "fixture must exercise the first persistent store open"
+        );
+        let session = handle.new_query_session().unwrap();
+        let before = session.cache_status();
+        let request = QueryRequest::FileContent(crate::embed::parity::read::FileContentRequest {
+            path: "lib.rs".into(),
+            ..Default::default()
+        });
+        let mut prospective_handle = None;
+        let result = handle.query_with_policy_admitted(
+            &request,
+            QueryLimits::default(),
+            QueryPolicy::default(),
+            Some(&session),
+            None,
+            |claim| {
+                prospective_handle = claim.retrieve_handle().map(str::to_owned);
+                std::fs::rename(&root, &moved).unwrap();
+                std::fs::create_dir(&root).unwrap();
+                std::fs::write(root.join("lib.rs"), "pub fn replacement() {}\n").unwrap();
+                true
+            },
+        );
+        assert!(
+            !db.exists(),
+            "a rejected source must not open a persistent store beneath its replacement"
+        );
+        let refusal = result.unwrap_err();
+        assert!(matches!(
+            refusal.kind(),
+            QueryRefusalKind::SourceUnavailable | QueryRefusalKind::StalePublication
+        ));
+        assert!(prospective_handle.is_some());
+        assert_eq!(session.revision(), 0);
+        assert_eq!(session.cache_status(), before);
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn root_replacement_after_admission_cannot_commit_persistent_ranking_or_session_state() {
+        let child = crate::process_util::hidden_command(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "internals::index_lifecycle::embed_query::admission_tests::child_persistent_commitment_root_replacement",
+                "--nocapture",
+            ])
+            .env("SYMFORGE_PRECOMMIT_ROOT_CHILD", "1")
+            .env("SYMFORGE_FRECENCY", "persistent")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "persistent commitment child failed: {} {}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&child.stdout).contains("running 1 test"),
+            "persistent commitment child must execute its exact fixture"
+        );
+    }
+
+    #[test]
+    fn cancellation_after_output_admission_does_not_commit_prepared_session() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("lib.rs"), "pub fn loaded() {}\n").unwrap();
+        let runtime = ProcessIndexRuntime::acquire().unwrap();
+        let handle = runtime
+            .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+                root.path().to_path_buf(),
+            ))
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(20);
+        while handle.runtime_view().phase != SourceRuntimePhase::Current {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let session = handle.new_query_session().unwrap();
+        let before = session.cache_status();
+        let control = OperationControl::new(Duration::from_secs(20)).unwrap();
+        let request = QueryRequest::FileContent(crate::embed::parity::read::FileContentRequest {
+            path: "lib.rs".into(),
+            ..Default::default()
+        });
+        let mut prospective_handle = None;
+        let refusal = handle
+            .query_with_policy_admitted(
+                &request,
+                QueryLimits::default(),
+                QueryPolicy::default(),
+                Some(&session),
+                Some(&control),
+                |claim| {
+                    assert_eq!(claim.session_evidence().unwrap().revision_before, 0);
+                    assert_eq!(claim.session_evidence().unwrap().revision_after, 1);
+                    prospective_handle = claim.retrieve_handle().map(str::to_owned);
+                    control.cancel();
+                    true
+                },
+            )
+            .unwrap_err();
+        assert_eq!(refusal.kind(), QueryRefusalKind::Cancelled);
+        assert_eq!(session.revision(), 0);
+        assert_eq!(session.cache_status(), before);
+        let rejected = handle
+            .query_with_session(
+                &QueryRequest::Retrieve {
+                    handle: prospective_handle.unwrap(),
+                    offset: 0,
+                },
+                QueryLimits::default(),
+                &session,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(rejected.kind(), QueryRefusalKind::StaleHandle);
+        assert_eq!(session.revision(), 0);
+        let delivered = handle
+            .query_with_session(&request, QueryLimits::default(), &session, None)
+            .unwrap();
+        assert_eq!(delivered.session_evidence().unwrap().revision_after, 1);
+        assert_eq!(session.revision(), 1);
+        assert_eq!(session.cache_status().resident_entries, 1);
+    }
+
+    #[test]
+    fn closing_during_refresh_output_admission_never_retries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("lib.rs"), "pub fn loaded() {}\n").unwrap();
+        let runtime = ProcessIndexRuntime::acquire().unwrap();
+        let handle = runtime
+            .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+                root.path().to_path_buf(),
+            ))
+            .unwrap();
+        let started = Instant::now();
+        loop {
+            let since = handle.change_version();
+            if handle.runtime_view().phase == SourceRuntimePhase::Current {
+                break;
+            }
+            let remaining = Duration::from_secs(20).saturating_sub(started.elapsed());
+            assert!(!remaining.is_zero());
+            handle.wait_for_change(since, remaining).unwrap();
+        }
+        let request = QueryRequest::Graph {
+            path_prefix: None,
+            offset: 0,
+            expected_publication: None,
+        };
+        let refusal = execute_inner(
+            &handle,
+            &request,
+            QueryLimits::default(),
+            None,
+            None,
+            QueryPolicy::default(),
+            SnapshotMode::AllowRefreshing,
+            |_| {
+                let _ = handle.begin_close();
+                true
+            },
+        )
+        .unwrap_err();
+        assert_eq!(refusal.kind(), QueryRefusalKind::SourceUnavailable);
+        assert_eq!(refusal.retry(), RetryAdvice::Never);
     }
 }
