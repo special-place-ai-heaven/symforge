@@ -13,6 +13,10 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   CARGO_BUILD_JOBS: "2"
+  # Reduce disposable Rust artifacts; assertions and release settings stay unchanged.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -106,6 +110,11 @@ jobs:
       - name: Free disk space for Rust builds
         if: runner.environment == 'github-hosted'
         run: bash execution/free_runner_disk.sh
+
+      - name: Report Rust build storage
+        run: |
+          df -B1 "$GITHUB_WORKSPACE"
+          df -i "$GITHUB_WORKSPACE"
 
       # rust-toolchain.toml is the single source of truth for the toolchain
       # version; rustup resolves it natively (channel + components).
@@ -210,6 +219,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Report Rust build storage
+        run: |
+          df -B1 "$GITHUB_WORKSPACE"
+          df -i "$GITHUB_WORKSPACE"
+
       # rust-toolchain.toml is the single source of truth for the toolchain
       # version; rustup resolves it natively (channel + components).
       - name: Install Rust toolchain (rust-toolchain.toml)
@@ -251,6 +265,11 @@ jobs:
     runs-on: [self-hosted, linux, fresh]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Report Rust build storage
+        run: |
+          df -B1 "$GITHUB_WORKSPACE"
+          df -i "$GITHUB_WORKSPACE"
 
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: bash execution/ensure_rustup.sh
