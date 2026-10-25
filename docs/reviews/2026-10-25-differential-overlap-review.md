@@ -136,5 +136,10 @@ Lead comparison of the parsed before/after workflows confirmed that only the
 three requested environment values and four telemetry steps changed. The new
 normalized UTF-8 fingerprints were independently reproduced: CI
 `825a15648b584f41:19022`; release `85e2c04d7611de03:114808`.
-Source seals and the Cargo command census are unchanged. Runtime storage
-headroom and successful publication remain verification gates.
+Source seals are unchanged. The follow-up verification exposed that the strict
+Cargo/rustdoc line census also includes environment settings. Its reviewed
+roster must therefore include the three nonexecuting settings twice each,
+growing from 48 lines/39 distinct values to 54/42 across the same two workflows.
+No command, doctest prohibition or guard assertion is removed. The mitigated
+run reported 181 GB available at startup; it passed compilation and reached
+this census assertion without ENOSPC. Successful publication remains open.

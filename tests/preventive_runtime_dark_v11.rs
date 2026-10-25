@@ -1532,6 +1532,11 @@ const CARGO_LINES: &[(&str, usize)] = &[
     ),
     ("- name: Run cargo check", 1),
     ("CARGO_BUILD_JOBS: \"2\"", 2),
+    // These workflow-level settings only control Cargo build artifacts; they
+    // cannot start Cargo commands or enable doctest compilation.
+    ("CARGO_INCREMENTAL: \"0\"", 2),
+    ("CARGO_PROFILE_DEV_DEBUG: \"0\"", 2),
+    ("CARGO_PROFILE_TEST_DEBUG: \"0\"", 2),
     (
         "CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}",
         1,
@@ -2490,8 +2495,8 @@ fn no_gate_builds_doctests() {
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(
         (seen.len(), distinct.len(), files),
-        (48, 39, 2),
-        "the CI workflows hold forty-eight cargo-mentioning lines, thirty-nine \
+        (54, 42, 2),
+        "the CI workflows hold fifty-four cargo-mentioning lines, forty-two \
          of them distinct, across two workflow files; this walk saw {:?}. A gate \
          added, removed, reworded, or a workflow file added — reconcile \
          CARGO_LINES with the workflows deliberately, never by loosening this \
