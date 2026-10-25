@@ -6,7 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use symforge::embed::parity::detect_impact::{DetectImpactRequest, ImpactScope};
+use symforge::embed::parity::detect_impact::{
+    DetectImpactRequest, ImpactEvidenceStatus, ImpactResolution, ImpactScope,
+};
 use symforge::embed::parity::host::OperationControl;
 use symforge::embed::parity::source_options::GitPreparationOptions;
 use symforge::embed::parity::{QueryLimits, QueryOutput, QueryRefusalKind, QueryRequest};
@@ -99,9 +101,106 @@ fn bound_detect_impact_preserves_body_delta_blast_and_full_risk_counts() {
     assert_eq!(impact.blast_radius[0].symbol, "src/main.rs::main");
     assert_eq!(impact.blast_radius[0].hop, 1);
     assert_eq!(impact.blast_radius[0].risk, "critical");
+    assert_eq!(
+        impact.blast_radius[0].evidence_status,
+        ImpactEvidenceStatus::Available
+    );
+    let evidence = impact.blast_radius[0]
+        .evidence
+        .as_ref()
+        .expect("blast row has its call chain");
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].caller.name, "main");
+    assert_eq!(evidence[0].callee.name, "call_a");
+    assert_eq!(evidence[0].call_site.path, "src/main.rs");
+    assert!(evidence[0].call_site.byte_range[0] < evidence[0].call_site.byte_range[1]);
+    assert_eq!(evidence[0].call_site.line_range, [7, 8]);
+    assert_eq!(evidence[0].resolution, ImpactResolution::UniqueName);
     assert_eq!(impact.risk_summary.critical, 1);
     assert_eq!(impact.pagination.blast_radius.total, 1);
     assert!(!impact.pagination.blast_radius.truncated);
+
+    let budget_probe = QueryRequest::DetectImpact(DetectImpactRequest {
+        since: Some("HEAD~1".to_owned()),
+        depth: 2,
+        scope: ImpactScope::Symbols,
+        ..Default::default()
+    });
+    let mut lower_bytes = 1u32;
+    let mut upper_bytes = 2_048u32;
+    let mut truncated_probe = None;
+    while lower_bytes <= upper_bytes {
+        let max_bytes = lower_bytes + (upper_bytes - lower_bytes) / 2;
+        match handle.query(
+            &budget_probe,
+            QueryLimits {
+                max_results: QueryLimits::default().max_results,
+                max_bytes,
+            },
+        ) {
+            Ok(candidate) => {
+                let is_truncated = match candidate.value() {
+                    QueryOutput::DetectImpact(impact) => impact
+                        .blast_radius
+                        .first()
+                        .is_some_and(|row| row.evidence_status == ImpactEvidenceStatus::Truncated),
+                    _ => false,
+                };
+                if is_truncated {
+                    truncated_probe = Some((candidate, max_bytes));
+                }
+                if max_bytes == 1 {
+                    break;
+                }
+                upper_bytes = max_bytes - 1;
+            }
+            Err(_) => lower_bytes = max_bytes + 1,
+        }
+    }
+    let (low_budget_result, max_bytes) = truncated_probe
+        .expect("a constrained budget fits the report while omitting its optional evidence chain");
+    let QueryOutput::DetectImpact(low_budget_impact) = low_budget_result.value() else {
+        panic!("typed detect-impact result expected with a constrained byte budget")
+    };
+    assert_eq!(
+        low_budget_impact.blast_radius.len(),
+        impact.blast_radius.len()
+    );
+    assert_eq!(low_budget_impact.risk_summary, impact.risk_summary);
+    assert_eq!(
+        low_budget_impact.pagination.blast_radius.total,
+        impact.pagination.blast_radius.total
+    );
+    assert!(!low_budget_impact.pagination.blast_radius.truncated);
+    assert_eq!(
+        low_budget_impact.blast_radius[0].evidence_status,
+        ImpactEvidenceStatus::Truncated
+    );
+    assert!(low_budget_impact.blast_radius[0].evidence.is_none());
+    assert!(low_budget_result.usage().decoded_bytes <= u64::from(max_bytes));
+
+    let files_result = handle
+        .query(
+            &QueryRequest::DetectImpact(DetectImpactRequest {
+                since: Some("HEAD~1".to_owned()),
+                depth: 2,
+                scope: ImpactScope::Files,
+                ..Default::default()
+            }),
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::DetectImpact(files_impact) = files_result.value() else {
+        panic!("typed file-scope detect-impact result expected")
+    };
+    assert_eq!(files_impact.blast_radius.len(), 1);
+    assert_eq!(files_impact.blast_radius[0].symbol, "src/main.rs");
+    let file_evidence = files_impact.blast_radius[0]
+        .evidence
+        .as_ref()
+        .expect("file-scope representative retains its chain");
+    assert_eq!(file_evidence.last().unwrap().caller.path, "src/main.rs");
+    assert_eq!(file_evidence.last().unwrap().caller.name, "main");
     handle.close().unwrap();
 }
 

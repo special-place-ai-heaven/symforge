@@ -63,6 +63,26 @@ pub(crate) fn index_folder_reset_requested() -> bool {
     std::env::var(INDEX_FOLDER_RESET_ENV).as_deref() == Ok("1")
 }
 
+fn attach_bounded_impact_evidence(
+    row: &mut serde_json::Value,
+    evidence: Vec<serde_json::Value>,
+    accumulated_bytes: &mut usize,
+) {
+    let evidence_size = serde_json::to_vec(&evidence).map_or(usize::MAX, |json| json.len());
+    if accumulated_bytes
+        .checked_add(evidence_size)
+        .is_some_and(|total| {
+            total <= crate::index_lifecycle::guidance::impact::DETECT_IMPACT_MAX_EVIDENCE_BYTES
+        })
+    {
+        *accumulated_bytes += evidence_size;
+        row["evidence_status"] = serde_json::json!("available");
+        row["evidence"] = serde_json::json!(evidence);
+    } else {
+        row["evidence_status"] = serde_json::json!("truncated");
+    }
+}
+
 fn statused_tool_result(
     text: String,
     outcome_class: OutcomeClass,
@@ -982,6 +1002,7 @@ use crate::index_lifecycle::guidance::exploration::{
 fn render_diff_symbols_output(
     base: &str,
     target: &str,
+    range: &crate::git::GitComparisonRange,
     all_changed_files: usize,
     changed_files: &[&str],
     repo: &crate::git::GitRepo,
@@ -1003,16 +1024,27 @@ fn render_diff_symbols_output(
         language,
         code_only,
     );
-    let output = format::diff_symbols_result_view(
+    let base_commit = range.base_commit.to_string();
+    let target_commit = range.target_commit.to_string();
+    let view = crate::index_lifecycle::guidance::changes::capture_symbol_diff(
         base,
         target,
         changed_files,
-        repo,
-        live,
-        compact,
-        summary_only,
+        |reference, path| {
+            let commit = if reference == base {
+                &base_commit
+            } else {
+                &target_commit
+            };
+            crate::protocol::read_gate::admit_git_text(live, repo, commit, path)
+        },
     );
-    format!("{envelope}\n\n{output}")
+    let output =
+        crate::index_lifecycle::guidance::changes::render_symbol_diff(&view, compact, summary_only);
+    format!(
+        "{envelope}\n\n{output}\n\n{}",
+        crate::index_lifecycle::guidance::changes::git_comparison_provenance(range)
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5264,7 +5296,21 @@ impl SymForgeServer {
                         return format!("Git change detection failed: {e}");
                     }
                 };
-                match repo.changed_paths_from_ref(git_ref) {
+                let include_symbol_diff = params.0.include_symbol_diff.unwrap_or(false);
+                let resolved_ref = if include_symbol_diff {
+                    let ref_name = git_ref.strip_prefix("branch:").unwrap_or(git_ref);
+                    match repo.resolve_ref_tree_reference(ref_name) {
+                        Ok(resolved) => Some(resolved),
+                        Err(error) => return format!("Invalid git ref: {error}"),
+                    }
+                } else {
+                    None
+                };
+                let changed_paths = match resolved_ref {
+                    Some(resolved) => repo.changed_paths_from_tree_oid(resolved.tree_oid),
+                    None => repo.changed_paths_from_ref(git_ref),
+                };
+                match changed_paths {
                     Ok(paths) => {
                         let total_paths = paths.len();
                         match filter_paths_by_prefix_and_language(
@@ -5285,8 +5331,6 @@ impl SymForgeServer {
                                         )
                                     };
                                 }
-                                let include_symbol_diff =
-                                    params.0.include_symbol_diff.unwrap_or(false);
                                 let envelope = search_format::format_search_envelope(
                                     "exact (git ref diff)",
                                     what_changed_source_authority(
@@ -5307,21 +5351,42 @@ impl SymForgeServer {
                                     ),
                                 );
                                 if include_symbol_diff {
-                                    let base =
-                                        git_ref.strip_prefix("branch:").unwrap_or(git_ref.as_str());
+                                    let resolved = resolved_ref
+                                        .expect("include flag resolves ref before diff");
+                                    let base_tree_oid = resolved.tree_oid.to_string();
                                     let changed_refs: Vec<&str> =
                                         filtered.iter().map(|s| s.as_str()).collect();
-                                    let sym_diff = format::diff_symbols_result_view(
-                                        base,
-                                        "HEAD",
+                                    let view = crate::index_lifecycle::guidance::changes::capture_symbol_diff(
+                                        git_ref,
+                                        "",
                                         &changed_refs,
-                                        &repo,
-                                        &self.index.data_plane().read(),
+                                        |reference, path| {
+                                            if reference.is_empty() {
+                                                crate::protocol::read_gate::admit_worktree_text(
+                                                    &self.index.data_plane().read(),
+                                                    &repo,
+                                                    path,
+                                                )
+                                            } else {
+                                                crate::protocol::read_gate::admit_git_text(
+                                                    &self.index.data_plane().read(),
+                                                    &repo,
+                                                    &base_tree_oid,
+                                                    path,
+                                                )
+                                            }
+                                        },
+                                    );
+                                    let sym_diff = crate::index_lifecycle::guidance::changes::render_symbol_diff(
+                                        &view,
                                         true,
                                         false,
                                     );
                                     output.push_str("\n\n");
                                     output.push_str(&sym_diff);
+                                    output.push_str(&format!(
+                                        "\nCompared `{git_ref}` at tree {base_tree_oid} to the working tree."
+                                    ));
                                 }
                                 let result = format!("{envelope}\n\n{output}");
                                 self.session_context.record_summary_output(
@@ -5456,10 +5521,58 @@ impl SymForgeServer {
             .collect();
 
         let blast_total = blast_entries.len();
+        let mut blast_evidence_bytes = 0usize;
         let blast_radius_json: Vec<serde_json::Value> = blast_entries
             .iter()
             .take(cap)
-            .map(|(symbol, hop, risk)| serde_json::json!({"symbol": symbol, "hop": hop, "risk": risk.as_str()}))
+            .map(|entry| {
+                let mut row = serde_json::json!({
+                    "symbol": entry.symbol,
+                    "hop": entry.hop,
+                    "risk": entry.risk.as_str(),
+                    "evidence_status": "unavailable",
+                });
+                if let Some(steps) = &entry.evidence {
+                    let evidence = steps
+                        .iter()
+                        .map(|step| {
+                            let line_range = crate::index_lifecycle::guidance::impact::
+                                impact_evidence_line_range(step.line_range);
+                            let resolution = match step.resolution {
+                                crate::live_index::graph::ResolutionReason::UniqueName => {
+                                    "unique_name"
+                                }
+                                crate::live_index::graph::ResolutionReason::QualifiedModule => {
+                                    "qualified_module"
+                                }
+                                crate::live_index::graph::ResolutionReason::QualifiedOwner => {
+                                    "qualified_owner"
+                                }
+                            };
+                            serde_json::json!({
+                                "caller": {
+                                    "name": step.caller.name,
+                                    "path": step.caller.path,
+                                    "kind": step.caller.kind.to_string(),
+                                },
+                                "callee": {
+                                    "name": step.callee.name,
+                                    "path": step.callee.path,
+                                    "kind": step.callee.kind.to_string(),
+                                },
+                                "call_site": {
+                                    "path": step.call_site_path,
+                                    "byte_range": [step.byte_range.0, step.byte_range.1],
+                                    "line_range": line_range,
+                                },
+                                "resolution": resolution,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    attach_bounded_impact_evidence(&mut row, evidence, &mut blast_evidence_bytes);
+                }
+                row
+            })
             .collect();
 
         let changed_files_returned = changed_files_json.len();
@@ -8392,7 +8505,11 @@ impl SymForgeServer {
             Ok(r) => r,
             Err(e) => return format!("Failed to open repository: {e}"),
         };
-        let changed_files_owned = match repo.changed_paths_between_refs(base, target) {
+        let range = match repo.comparison_range_between_refs(base, target) {
+            Ok(range) => range,
+            Err(e) => return format!("Failed to run git diff: {e}"),
+        };
+        let changed_files_owned = match repo.changed_paths_for_comparison(&range) {
             Ok(paths) => paths,
             Err(e) => return format!("Failed to run git diff: {e}"),
         };
@@ -8411,12 +8528,16 @@ impl SymForgeServer {
             };
 
         if changed_files.is_empty() {
-            return format!("No file changes found between {base} and {target}.");
+            return format!(
+                "No file changes found between {base} and {target}.\n\n{}",
+                crate::index_lifecycle::guidance::changes::git_comparison_provenance(&range)
+            );
         }
 
         let output = render_diff_symbols_output(
             base,
             target,
+            &range,
             changed_files_owned.len(),
             &changed_files,
             &repo,
@@ -8490,6 +8611,35 @@ mod tests {
             !super::path_is_within_bound_project("missing/../../outside.rs", root.path()),
             "an unresolved prefix must not hide a later parent traversal"
         );
+    }
+
+    #[test]
+    fn impact_evidence_over_server_cap_is_omitted_as_one_chain() {
+        let mut row = serde_json::json!({
+            "symbol": "src/lib.rs::caller",
+            "hop": 1,
+            "risk": "medium",
+            "evidence_status": "truncated",
+        });
+        let mut accumulated = 0;
+        let oversized_chain = vec![serde_json::json!({
+            "caller": { "name": "caller", "path": "src/lib.rs", "kind": "function" },
+            "callee": { "name": "callee", "path": "src/lib.rs", "kind": "function" },
+            "call_site": {
+                "path": "p".repeat(
+                    crate::index_lifecycle::guidance::impact::DETECT_IMPACT_MAX_EVIDENCE_BYTES,
+                ),
+                "byte_range": [0, 1],
+                "line_range": [0, 1],
+            },
+            "resolution": "unique_name",
+        })];
+
+        super::attach_bounded_impact_evidence(&mut row, oversized_chain, &mut accumulated);
+
+        assert_eq!(row["evidence_status"], "truncated");
+        assert!(row.get("evidence").is_none());
+        assert_eq!(accumulated, 0);
     }
 
     #[tokio::test]
@@ -18648,6 +18798,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn what_changed_symbol_diff_accepts_annotated_tag_treeish() {
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+        fs::write(repo.path().join("src/lib.rs"), "fn existing() {}\n")
+            .expect("write initial file");
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init", "-q"]);
+        run_git(
+            repo.path(),
+            &[
+                "tag",
+                "-a",
+                "annotated-base",
+                "-m",
+                "annotated base",
+                "HEAD",
+            ],
+        );
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            "fn existing() {}\nfn added_symbol() {}\n",
+        )
+        .expect("modify tracked code file");
+
+        let treeish = "refs/tags/annotated-base^{tree}";
+        let base_tree = crate::git::GitRepo::open(repo.path())
+            .expect("open test repo")
+            .resolve_ref_tree_reference(treeish)
+            .expect("annotated tag tree-ish resolves")
+            .tree_oid;
+        let (key, file) = make_file(
+            "src/lib.rs",
+            b"fn existing() {}\nfn added_symbol() {}\n",
+            vec![],
+        );
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(repo.path().to_path_buf()),
+        );
+        let result = server
+            .what_changed(Parameters(super::WhatChangedInput {
+                project: None,
+                since: None,
+                git_ref: Some(treeish.to_string()),
+                uncommitted: None,
+                path_prefix: None,
+                language: None,
+                code_only: Some(true),
+                include_symbol_diff: Some(true),
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+
+        assert!(result.contains("src/lib.rs (+1: added_symbol)"), "{result}");
+        assert!(
+            result.contains(&format!("at tree {base_tree}")),
+            "symbol diff should disclose the pinned annotated-tag tree: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_what_changed_recovers_repo_root_from_cwd_when_missing() {
         let repo = init_git_repo();
         fs::create_dir_all(repo.path().join("src")).expect("create src dir");
@@ -19285,6 +19497,495 @@ mod tests {
             result.contains("0 changed symbol(s)"),
             "a comment/whitespace-only shift must seed zero changed symbols: {result}"
         );
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn server_and_embed_match_git_and_multilanguage_impact_payloads() {
+        use crate::embed::parity::changes::{DiffSymbolsRequest, WhatChangedRequest};
+        use crate::embed::parity::detect_impact::{
+            DetectImpactRequest, ImpactEvidenceStatus, ImpactResolution,
+        };
+        use crate::embed::parity::{QueryLimits, QueryOutput, QueryRequest};
+        use crate::embed::{EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase};
+
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("create src");
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn alpha() -> i32 { 1 }\npub fn beta() -> i32 { 1 }\n",
+        )
+        .expect("write Rust definitions");
+        fs::write(
+            repo.path().join("src/caller.rs"),
+            "use crate::alpha;\npub fn caller() -> i32 { alpha() }\npub fn outer() -> i32 { caller() }\npub fn rust_reader() { std::fs::read_to_string(\"x\").unwrap(); }\n",
+        )
+        .expect("write Rust callers");
+        fs::write(
+            repo.path().join("src/helper.js"),
+            "function read_to_string() {}\n",
+        )
+        .expect("write unrelated JavaScript symbol");
+        fs::write(
+            repo.path().join("src/Target.cs"),
+            "public class Target { public static int Read() { return 1; } }\npublic class Caller { public static int Run() { return Target.Read(); } }\n",
+        )
+        .expect("write C# caller");
+        fs::write(
+            repo.path().join("src/Foo.cpp"),
+            "namespace Foo { int create() { return 1; } }\n",
+        )
+        .expect("write C++ target");
+        fs::write(
+            repo.path().join("src/Other.cpp"),
+            "namespace Other { int create() { return 9; } }\n",
+        )
+        .expect("write same-named C++ control");
+        fs::write(
+            repo.path().join("src/caller.cpp"),
+            "namespace Foo { int create(); }\nint cpp_caller() { return Foo::create(); }\n",
+        )
+        .expect("write qualified C++ caller");
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "ancestor", "-q"]);
+        run_git(repo.path(), &["branch", "-M", "main"]);
+
+        run_git(repo.path(), &["switch", "-c", "base"]);
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn alpha() -> i32 { 1 }\npub fn beta() -> i32 { 2 }\n",
+        )
+        .expect("change divergent base symbol");
+        run_git(repo.path(), &["commit", "-am", "base beta", "-q"]);
+        run_git(
+            repo.path(),
+            &["tag", "-a", "annotated-base", "-m", "base snapshot"],
+        );
+        run_git(repo.path(), &["switch", "main"]);
+
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn alpha() -> i32 { 2 }\npub fn beta() -> i32 { 1 }\n",
+        )
+        .expect("change Rust seed");
+        fs::write(
+            repo.path().join("src/Target.cs"),
+            "public class Target { public static int Read() { return 2; } }\npublic class Caller { public static int Run() { return Target.Read(); } }\n",
+        )
+        .expect("change C# seed");
+        fs::write(
+            repo.path().join("src/Foo.cpp"),
+            "namespace Foo { int create() { return 2; } }\n",
+        )
+        .expect("change C++ seed");
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "feature alpha", "-q"]);
+
+        // Keep a dirty worktree as well as the divergent committed history.
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn alpha() -> i32 { 3 }\npub fn beta() -> i32 { 1 }\n",
+        )
+        .expect("dirty Rust seed");
+        fs::write(
+            repo.path().join("src/Target.cs"),
+            "public class Target { public static int Read() { return 3; } }\npublic class Caller { public static int Run() { return Target.Read(); } }\n",
+        )
+        .expect("dirty C# seed");
+        fs::write(
+            repo.path().join("src/Foo.cpp"),
+            "namespace Foo { int create() { return 3; } }\n",
+        )
+        .expect("dirty C++ seed");
+
+        let loaded = LiveIndex::load(repo.path()).expect("load live fixture");
+        let server = make_server_with_root(
+            loaded.read().as_ref().clone(),
+            Some(repo.path().to_path_buf()),
+        );
+        let runtime = ProcessIndexRuntime::acquire().expect("embed runtime");
+        let handle = runtime
+            .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+                repo.path().to_path_buf(),
+            ))
+            .expect("open embedded fixture");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while handle.runtime_view().phase != SourceRuntimePhase::Current {
+            assert!(
+                Instant::now() < deadline,
+                "embedded fixture did not become Current"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let server_diff = server
+            .diff_symbols(Parameters(super::DiffSymbolsInput {
+                project: None,
+                base: Some("base".into()),
+                target: Some("HEAD".into()),
+                path_prefix: None,
+                language: None,
+                code_only: Some(true),
+                compact: None,
+                summary_only: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        let embed_diff = handle
+            .query(
+                &QueryRequest::DiffSymbols(DiffSymbolsRequest {
+                    base: Some("base".into()),
+                    target: Some("HEAD".into()),
+                    code_only: Some(true),
+                    ..DiffSymbolsRequest::default()
+                }),
+                QueryLimits::default(),
+            )
+            .expect("embedded divergent diff");
+        let QueryOutput::DiffSymbols(embed_diff) = embed_diff.value() else {
+            panic!("embedded diff symbols result");
+        };
+        assert_eq!(server_diff, embed_diff.rendered);
+        assert!(
+            server_diff.contains("alpha") && !server_diff.contains("beta"),
+            "{server_diff}"
+        );
+
+        for reference in ["base", "refs/tags/annotated-base^{tree}"] {
+            let server_changes = server
+                .what_changed(Parameters(super::WhatChangedInput {
+                    project: None,
+                    since: None,
+                    git_ref: Some(reference.into()),
+                    uncommitted: None,
+                    path_prefix: None,
+                    language: None,
+                    code_only: Some(true),
+                    include_symbol_diff: Some(true),
+                    estimate: None,
+                    max_tokens: None,
+                }))
+                .await;
+            let embed_changes = handle
+                .query(
+                    &QueryRequest::WhatChanged(WhatChangedRequest {
+                        git_ref: Some(reference.into()),
+                        code_only: Some(true),
+                        include_symbol_diff: Some(true),
+                        ..WhatChangedRequest::default()
+                    }),
+                    QueryLimits::default(),
+                )
+                .expect("embedded ref changes");
+            let QueryOutput::WhatChanged(embed_changes) = embed_changes.value() else {
+                panic!("embedded what changed result");
+            };
+            assert_eq!(server_changes, embed_changes.rendered, "ref={reference}");
+        }
+
+        let server_impact = server
+            .detect_impact(Parameters(super::DetectImpactInput {
+                base_branch: None,
+                since: Some("base".into()),
+                depth: 3,
+                scope: super::ImpactScope::Symbols,
+                include_untracked: true,
+                include_data: Some(false),
+            }))
+            .await;
+        let embed_impact = handle
+            .query(
+                &QueryRequest::DetectImpact(DetectImpactRequest {
+                    since: Some("base".into()),
+                    depth: 3,
+                    ..DetectImpactRequest::default()
+                }),
+                QueryLimits::default(),
+            )
+            .expect("embedded divergent impact");
+        let QueryOutput::DetectImpact(embed_impact) = embed_impact.value() else {
+            panic!("embedded detect impact result");
+        };
+        assert_eq!(server_impact, embed_impact.rendered);
+        assert!(
+            embed_impact
+                .changed_files
+                .iter()
+                .any(|path| path.ends_with("src/lib.rs"))
+        );
+        assert!(
+            embed_impact
+                .changed_files
+                .iter()
+                .any(|path| path.ends_with("src/Target.cs"))
+        );
+        assert!(
+            embed_impact
+                .changed_files
+                .iter()
+                .any(|path| path.ends_with("src/Foo.cpp"))
+        );
+        assert!(
+            embed_impact
+                .changed_symbols
+                .iter()
+                .any(|symbol| symbol.name == "alpha")
+        );
+        assert!(
+            !embed_impact
+                .changed_symbols
+                .iter()
+                .any(|symbol| symbol.name == "beta")
+        );
+        assert!(embed_impact.blast_radius.iter().all(|entry| {
+            entry.evidence_status != ImpactEvidenceStatus::Available || entry.evidence.is_some()
+        }));
+        let find_entry = |suffix: &str| {
+            embed_impact
+                .blast_radius
+                .iter()
+                .find(|entry| entry.symbol.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing {suffix}: {:?}", embed_impact.blast_radius))
+        };
+        let rust_caller = find_entry("::caller");
+        assert_eq!(rust_caller.evidence_status, ImpactEvidenceStatus::Available);
+        let caller_step = rust_caller
+            .evidence
+            .as_ref()
+            .expect("caller evidence")
+            .iter()
+            .find(|step| step.caller.name == "caller")
+            .expect("caller to alpha step");
+        assert_eq!(caller_step.call_site.line_range, [1, 2]);
+        let caller_bytes = fs::read(repo.path().join("src/caller.rs")).expect("read caller bytes");
+        assert_eq!(
+            &caller_bytes[caller_step.call_site.byte_range[0]..caller_step.call_site.byte_range[1]],
+            b"alpha"
+        );
+        let rust_outer = find_entry("::outer");
+        let outer_steps = rust_outer.evidence.as_ref().expect("outer evidence");
+        assert_eq!(outer_steps.len(), 2);
+        assert_eq!(outer_steps[0].caller.name, "caller");
+        assert_eq!(outer_steps[0].callee.name, "alpha");
+        assert_eq!(outer_steps[1].caller.name, "outer");
+        assert_eq!(outer_steps[1].callee.name, "caller");
+        let csharp_run = find_entry("::Run");
+        assert_eq!(csharp_run.evidence_status, ImpactEvidenceStatus::Available);
+        let cpp_caller = find_entry("::cpp_caller");
+        assert_eq!(cpp_caller.evidence_status, ImpactEvidenceStatus::Available);
+        assert!(cpp_caller.evidence.as_ref().is_some_and(|steps| {
+            steps.iter().any(|step| {
+                step.resolution == ImpactResolution::QualifiedModule
+                    && step.callee.path.ends_with("src/Foo.cpp")
+            })
+        }));
+        assert!(
+            !embed_impact
+                .blast_radius
+                .iter()
+                .any(|entry| entry.symbol.ends_with("::rust_reader"))
+        );
+
+        let server_files = server
+            .detect_impact(Parameters(super::DetectImpactInput {
+                base_branch: None,
+                since: Some("base".into()),
+                depth: 3,
+                scope: super::ImpactScope::Files,
+                include_untracked: true,
+                include_data: Some(false),
+            }))
+            .await;
+        let embed_files = handle
+            .query(
+                &QueryRequest::DetectImpact(DetectImpactRequest {
+                    since: Some("base".into()),
+                    depth: 3,
+                    scope: crate::embed::parity::detect_impact::ImpactScope::Files,
+                    ..DetectImpactRequest::default()
+                }),
+                QueryLimits::default(),
+            )
+            .expect("embedded file-scope impact");
+        let QueryOutput::DetectImpact(embed_files) = embed_files.value() else {
+            panic!("embedded file-scope detect impact result");
+        };
+        assert_eq!(server_files, embed_files.rendered);
+        let caller_file = embed_files
+            .blast_radius
+            .iter()
+            .find(|entry| entry.symbol.ends_with("src/caller.rs"))
+            .expect("file-scope caller row");
+        assert_eq!(caller_file.evidence_status, ImpactEvidenceStatus::Available);
+        assert!(caller_file.evidence.as_ref().is_some_and(|steps| {
+            steps
+                .iter()
+                .any(|step| step.caller.path.ends_with("src/caller.rs"))
+        }));
+    }
+
+    #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn server_and_embed_disclose_evidence_truncation_without_dropping_rows() {
+        use crate::embed::parity::detect_impact::{DetectImpactRequest, ImpactEvidenceStatus};
+        use crate::embed::parity::{QueryLimits, QueryOutput, QueryRequest};
+        use crate::embed::{EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase};
+
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("create src");
+        fs::write(
+            repo.path().join("src/impact.rs"),
+            "pub fn seed() -> i32 { 1 }\n",
+        )
+        .expect("write changed seed");
+        for index in 0..150 {
+            let source = format!(
+                "pub fn caller_{index:03}_{}() -> i32 {{ seed() }}\n",
+                "n".repeat(1800),
+            );
+            fs::write(
+                repo.path().join(format!("src/caller_{index:03}.rs")),
+                source,
+            )
+            .expect("write caller file");
+        }
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "base", "-q"]);
+        fs::write(
+            repo.path().join("src/impact.rs"),
+            "pub fn seed() -> i32 { 2 }\n",
+        )
+        .expect("change seed body");
+
+        let loaded = LiveIndex::load(repo.path()).expect("load live fixture");
+        let server = make_server_with_root(
+            loaded.read().as_ref().clone(),
+            Some(repo.path().to_path_buf()),
+        );
+        let runtime = ProcessIndexRuntime::acquire().expect("embed runtime");
+        let handle = runtime
+            .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+                repo.path().to_path_buf(),
+            ))
+            .expect("open embedded fixture");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while handle.runtime_view().phase != SourceRuntimePhase::Current {
+            assert!(
+                Instant::now() < deadline,
+                "embedded fixture did not become Current"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let server_output = server
+            .detect_impact(Parameters(super::DetectImpactInput {
+                base_branch: None,
+                since: Some("WORKTREE".into()),
+                depth: 1,
+                scope: super::ImpactScope::Files,
+                include_untracked: true,
+                include_data: Some(false),
+            }))
+            .await;
+        let limits = QueryLimits {
+            max_results: 10_000,
+            max_bytes: 1_048_576,
+        };
+        let claim = handle
+            .query(
+                &QueryRequest::DetectImpact(DetectImpactRequest {
+                    since: Some("WORKTREE".into()),
+                    depth: 1,
+                    scope: crate::embed::parity::detect_impact::ImpactScope::Files,
+                    ..DetectImpactRequest::default()
+                }),
+                limits,
+            )
+            .expect("embedded impact under explicit ample output budget");
+        let QueryOutput::DetectImpact(embed_output) = claim.value() else {
+            panic!("embedded detect impact result");
+        };
+        assert_eq!(server_output, embed_output.rendered);
+
+        let server_marks_truncation = server_output.contains("\"evidence_status\": \"truncated\"");
+        let embed_marks_truncation = embed_output
+            .blast_radius
+            .iter()
+            .any(|entry| entry.evidence_status == ImpactEvidenceStatus::Truncated);
+        assert!(
+            server_marks_truncation,
+            "server must disclose omitted evidence"
+        );
+        assert!(
+            embed_marks_truncation,
+            "embed must disclose omitted evidence"
+        );
+        fn mcp_blast_rows(text: &str) -> Vec<serde_json::Value> {
+            let marker = "\"blast_radius\": [";
+            let start = text.find(marker).expect("MCP blast_radius payload") + marker.len() - 1;
+            let mut depth = 0usize;
+            let mut in_string = false;
+            let mut escaped = false;
+            for (offset, byte) in text.as_bytes()[start..].iter().copied().enumerate() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match byte {
+                    b'"' => in_string = true,
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return serde_json::from_slice(
+                                &text.as_bytes()[start..=start + offset],
+                            )
+                            .expect("MCP blast rows JSON");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unterminated MCP blast_radius payload");
+        }
+        let server_rows = mcp_blast_rows(&server_output);
+        assert_eq!(server_rows.len(), 150, "MCP returned all blast rows");
+        assert!(
+            embed_output
+                .blast_radius
+                .iter()
+                .any(|entry| entry.evidence_status == ImpactEvidenceStatus::Available)
+        );
+        assert_eq!(embed_output.pagination.blast_radius.total, 150);
+        assert_eq!(embed_output.pagination.blast_radius.returned, 150);
+        assert!(!embed_output.pagination.blast_radius.truncated);
+        assert_eq!(
+            server_rows
+                .iter()
+                .map(|row| row["symbol"].as_str().expect("MCP row symbol"))
+                .collect::<Vec<_>>(),
+            embed_output
+                .blast_radius
+                .iter()
+                .map(|entry| entry.symbol.as_str())
+                .collect::<Vec<_>>(),
+            "MCP and embed preserve the same ordered blast rows"
+        );
+        for (server_row, embed_row) in server_rows.iter().zip(&embed_output.blast_radius) {
+            assert_eq!(server_row["hop"].as_u64(), Some(u64::from(embed_row.hop)));
+            assert_eq!(server_row["risk"].as_str(), Some(embed_row.risk.as_str()));
+            assert!(matches!(
+                server_row["evidence_status"].as_str(),
+                Some("available" | "truncated" | "unavailable")
+            ));
+        }
     }
 
     /// Task 7: a statused local tool result carries the bound project's trust
@@ -29475,6 +30176,136 @@ mod tests {
         assert!(
             result.contains("Scope: git diff `HEAD~1`...`HEAD`; compact output"),
             "diff_symbols should report scope: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_comparison_server_uses_resolved_merge_base() {
+        let repo = init_git_repo();
+        let root = repo.path();
+        let file_path = root.join("src/lib.rs");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            &file_path,
+            "pub fn alpha() -> u32 { 1 }\npub fn beta() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "diff-comparison-ancestor"]);
+        let ancestor = git2::Repository::open(root)
+            .unwrap()
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id()
+            .to_string();
+
+        run_git(root, &["checkout", "-b", "base"]);
+        std::fs::write(
+            &file_path,
+            "pub fn alpha() -> u32 { 1 }\npub fn beta() -> u64 { 2 }\n",
+        )
+        .unwrap();
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "diff-comparison-base-beta"]);
+        let base_commit = git2::Repository::open(root)
+            .unwrap()
+            .find_branch("base", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id()
+            .to_string();
+        let base_tree = git2::Repository::open(root)
+            .unwrap()
+            .find_branch("base", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .tree_id()
+            .to_string();
+
+        run_git(root, &["checkout", "-b", "feature", &ancestor]);
+        std::fs::write(
+            &file_path,
+            "pub fn alpha() -> u16 { 2 }\npub fn beta() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "diff-comparison-feature-alpha"]);
+        let feature = git2::Repository::open(root)
+            .unwrap()
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id()
+            .to_string();
+
+        let server = make_server_with_root(make_live_index_ready(vec![]), Some(root.to_path_buf()));
+        let result = server
+            .diff_symbols(Parameters(super::DiffSymbolsInput {
+                project: None,
+                base: Some("base".to_string()),
+                target: Some("feature".to_string()),
+                path_prefix: None,
+                language: None,
+                code_only: None,
+                compact: Some(true),
+                summary_only: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+
+        assert!(result.contains("git diff `base`...`feature`"), "{result}");
+        assert!(result.contains("~1: alpha"), "{result}");
+        assert!(!result.contains("beta"), "{result}");
+        assert!(
+            result.contains(&format!("Effective comparison base: {ancestor}")),
+            "{result}"
+        );
+        assert!(
+            result.contains(&format!("target commit: {feature}.")),
+            "{result}"
+        );
+
+        std::fs::write(
+            &file_path,
+            "pub fn alpha() -> u16 { 2 }\npub fn beta() -> u32 { 1 }\npub fn delta() {}\n",
+        )
+        .unwrap();
+        let changed = server
+            .what_changed(Parameters(super::WhatChangedInput {
+                project: None,
+                since: None,
+                git_ref: Some("base".to_string()),
+                uncommitted: None,
+                path_prefix: None,
+                language: None,
+                code_only: Some(true),
+                include_symbol_diff: Some(true),
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        assert!(
+            changed.contains("Symbol diff: base...working tree"),
+            "{changed}"
+        );
+        assert!(changed.contains("+1: delta"), "{changed}");
+        assert!(
+            changed.contains(&format!(
+                "Compared `base` at tree {base_tree} to the working tree."
+            )),
+            "{changed}"
+        );
+        assert!(
+            !changed.contains(&base_commit),
+            "commit oid should not be labeled as tree provenance: {changed}"
         );
     }
 

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use crate::live_index::LiveIndex;
-use crate::live_index::graph::{RiskTier, SymbolId};
+use crate::live_index::graph::{CallEdgeEvidence, RiskTier, SymbolId};
 
 /// Maximum depth accepted before `detect_impact` clamps + warns
 /// (contracts/detect-impact.md § Risk tiers / error catalog: "depth capped").
@@ -18,6 +18,7 @@ pub(crate) const DETECT_IMPACT_MAX_DEPTH: u8 = 5;
 /// `offset`/`limit` input field to page past it — add one if a real need for
 /// deeper paging shows up. `risk_summary` is always counted over the full set.
 pub(crate) const DETECT_IMPACT_MAX_RETURNED: usize = 200;
+pub(crate) const DETECT_IMPACT_MAX_EVIDENCE_BYTES: usize = 256 * 1024;
 
 /// The interpreted `detect_impact` options.
 pub(crate) struct ImpactRequest<'a> {
@@ -36,7 +37,7 @@ pub(crate) struct ImpactRequest<'a> {
 pub(crate) struct ImpactReport {
     pub changed_files: Vec<String>,
     pub changed_symbols: Vec<SymbolId>,
-    pub blast_entries: Vec<(String, u32, RiskTier)>,
+    pub blast_entries: Vec<ImpactBlastEntry>,
     pub include_data: bool,
     pub source_filtered_out: usize,
     pub requested_depth: u8,
@@ -45,12 +46,26 @@ pub(crate) struct ImpactReport {
     pub staleness_note: Option<String>,
 }
 
+pub(crate) struct ImpactBlastEntry {
+    pub symbol: String,
+    pub hop: u32,
+    pub risk: RiskTier,
+    /// A complete shortest chain when every selected edge has source evidence.
+    pub evidence: Option<Vec<CallEdgeEvidence>>,
+}
+
+/// Convert the graph index's inclusive source rows to a half-open, zero-based
+/// public line span.
+pub(crate) fn impact_evidence_line_range(range: (u32, u32)) -> [usize; 2] {
+    [range.0 as usize, range.1.saturating_add(1) as usize]
+}
+
 impl ImpactReport {
     /// Risk counts over the FULL blast set, never the capped list.
     pub(crate) fn risk_counts(&self) -> HashMap<&'static str, u32> {
         let mut risk_counts: HashMap<&'static str, u32> = HashMap::new();
-        for (_, _, risk) in &self.blast_entries {
-            *risk_counts.entry(risk.as_str()).or_insert(0) += 1;
+        for entry in &self.blast_entries {
+            *risk_counts.entry(entry.risk.as_str()).or_insert(0) += 1;
         }
         risk_counts
     }
@@ -144,17 +159,59 @@ pub(crate) fn compute_detect_impact(
     // the explicit caller value; `None` when only `since` was supplied.
     let base_disclosure: Option<String> = base_branch.clone();
 
-    let changed_files = if let Some(explicit_paths) = request.paths {
-        explicit_paths.to_vec()
+    let since_trimmed = request.since.map(str::trim).filter(|s| !s.is_empty());
+    let (changed_files, seed_base_ref) = if let Some(explicit_paths) = request.paths {
+        let seed_base_ref = match since_trimmed {
+            Some("WORKTREE") => "HEAD".to_string(),
+            Some(since_ref) => since_ref.to_string(),
+            None => base_branch.as_deref().unwrap_or("HEAD").to_string(),
+        };
+        (explicit_paths.to_vec(), seed_base_ref)
     } else {
-        match repo.merge_git_changed_paths(
-            base_branch.as_deref(),
-            request.since,
-            request.include_untracked,
-        ) {
-            Ok(paths) => paths,
-            Err(e) => return Err(format!("Error: Invalid git ref: {e}")),
-        }
+        let (mut paths, seed_base_ref) = match since_trimmed {
+            Some("WORKTREE") => (
+                repo.merge_git_changed_paths(None, Some("WORKTREE"), request.include_untracked)
+                    .map_err(|e| format!("Error: Invalid git ref: {e}"))?,
+                "HEAD".to_string(),
+            ),
+            Some(since_ref) => {
+                let range = repo
+                    .comparison_range_between_refs(since_ref, "HEAD")
+                    .map_err(|e| format!("Error: Invalid git ref: {e}"))?;
+                let mut paths = repo
+                    .changed_paths_for_comparison(&range)
+                    .map_err(|e| format!("Error: Invalid git ref: {e}"))?;
+                if request.include_untracked {
+                    paths.extend(
+                        repo.uncommitted_paths()
+                            .map_err(|e| format!("Error: Invalid git ref: {e}"))?,
+                    );
+                }
+                (paths, range.base_commit.to_string())
+            }
+            None => {
+                if let Some(base) = base_branch.as_deref() {
+                    let range = repo
+                        .comparison_range_between_refs(base, "HEAD")
+                        .map_err(|e| format!("Error: Invalid git ref: {e}"))?;
+                    let mut paths = repo
+                        .changed_paths_for_comparison(&range)
+                        .map_err(|e| format!("Error: Invalid git ref: {e}"))?;
+                    if request.include_untracked {
+                        paths.extend(
+                            repo.uncommitted_paths()
+                                .map_err(|e| format!("Error: Invalid git ref: {e}"))?,
+                        );
+                    }
+                    (paths, range.base_commit.to_string())
+                } else {
+                    (Vec::new(), "HEAD".to_string())
+                }
+            }
+        };
+        paths.sort();
+        paths.dedup();
+        (paths, seed_base_ref)
     };
 
     // US1 (018) FR-001/FR-002: source-focus the impact seed by default so
@@ -182,18 +239,10 @@ pub(crate) fn compute_detect_impact(
     // in a 20-symbol file now seeds 1 symbol, not 20; a comment/whitespace
     // shift that leaves every body byte-identical seeds 0.
     //
-    // Base ref: mirror `merge_git_changed_paths`'s OWN base selection so the
-    // body-delta compares against the same base the changed-file set came
-    // from. `since=<ref>` diffs `<ref>...HEAD`; the `WORKTREE` sentinel and
-    // `base_branch` both diff against the committed tip / branch, with the
-    // working tree as the current side. A mismatched base (e.g. always HEAD)
-    // would find zero deltas for a committed `since` range on a clean tree.
-    let since_trimmed = request.since.map(str::trim).filter(|s| !s.is_empty());
-    let seed_base_ref = match since_trimmed {
-        Some("WORKTREE") => "HEAD",
-        Some(since_ref) => since_ref,
-        None => base_branch.as_deref().unwrap_or("HEAD"),
-    };
+    // Base ref: use the same resolved merge base as the three-dot changed-path
+    // set above. This matters for divergent `since`/base refs: comparing file
+    // bodies against the supplied ref tip could disagree with the reported
+    // changed paths. `WORKTREE` compares from `HEAD`, then reads the worktree.
     let (changed_symbols, blast_radius) = {
         // Render from the SAME captured bundle the receipt names (D16).
         let guard = live;
@@ -218,7 +267,7 @@ pub(crate) fn compute_detect_impact(
             // exactly like the working tree below. A refusal collapses to
             // "no base content", the same conservative seed as the worktree
             // arm — withheld beats disclosed for a demoted file's symbols.
-            let base_content = read_git(seed_base_ref, path)
+            let base_content = read_git(&seed_base_ref, path)
                 .unwrap_or_default()
                 .unwrap_or_default();
             // Gated: a refusal collapses to "no current content", which
@@ -308,7 +357,7 @@ pub(crate) fn compute_detect_impact(
             }
         }
         let graph = crate::live_index::graph::GraphProjection::from_index(guard);
-        let blast_radius = crate::live_index::graph::compute_impact(
+        let blast_radius = crate::live_index::graph::compute_impact_with_evidence(
             &graph,
             &changed_symbols,
             effective_depth as u32,
@@ -319,52 +368,47 @@ pub(crate) fn compute_detect_impact(
     // scope=files aggregates per-symbol blast nodes to file granularity
     // (nearest hop / matching risk wins per file); scope=symbols (default)
     // keeps one entry per symbol.
-    let mut blast_entries: Vec<(String, u32, crate::live_index::graph::RiskTier)> =
-        match request.files_scope {
-            false => blast_radius
-                .iter()
-                // PART C (019): carry disambiguating identity. Two blast
-                // nodes that share a bare name (e.g. `main` in different
-                // files, or two `run`s the graph kept distinct) must render
-                // as distinct `path::name` entries, not collapse into one
-                // indistinguishable `"main"`. The path already disambiguates
-                // same-name defs across files; kind is folded into the node
-                // identity by the graph, so `path::name` is sufficient here.
-                .map(|node| {
-                    (
-                        format!("{}::{}", node.symbol.path, node.symbol.name),
-                        node.hop,
-                        node.risk,
-                    )
-                })
-                .collect(),
-            true => {
-                let mut by_file: HashMap<String, (u32, crate::live_index::graph::RiskTier)> =
-                    HashMap::new();
-                for node in &blast_radius {
-                    by_file
-                        .entry(node.symbol.path.clone())
-                        .and_modify(|(hop, risk)| {
-                            if node.hop < *hop {
-                                *hop = node.hop;
-                                *risk = node.risk;
-                            }
-                        })
-                        .or_insert((node.hop, node.risk));
+    let mut blast_entries: Vec<ImpactBlastEntry> = match request.files_scope {
+        false => blast_radius
+            .into_iter()
+            // PART C (019): carry disambiguating identity. Two blast nodes
+            // that share a bare name remain distinct `path::name` entries.
+            .map(|entry| ImpactBlastEntry {
+                symbol: format!("{}::{}", entry.node.symbol.path, entry.node.symbol.name),
+                hop: entry.node.hop,
+                risk: entry.node.risk,
+                evidence: Some(entry.steps),
+            })
+            .collect(),
+        true => {
+            let mut by_file: HashMap<String, ImpactBlastEntry> = HashMap::new();
+            for entry in blast_radius {
+                let path = entry.node.symbol.path.clone();
+                let candidate = ImpactBlastEntry {
+                    symbol: path.clone(),
+                    hop: entry.node.hop,
+                    risk: entry.node.risk,
+                    evidence: Some(entry.steps),
+                };
+                let replace = match by_file.get(&path) {
+                    Some(current) => candidate.hop < current.hop,
+                    None => true,
+                };
+                if replace {
+                    by_file.insert(path, candidate);
                 }
-                by_file
-                    .into_iter()
-                    .map(|(path, (hop, risk))| (path, hop, risk))
-                    .collect()
             }
-        };
+            by_file.into_values().collect()
+        }
+    };
     // Fix 1 (Wave 1, 2026-07-02): keep the most severe blast nodes when the
     // list is capped — sort by risk severity desc, then hop asc, then name.
     blast_entries.sort_by(|a, b| {
-        b.2.severity_rank()
-            .cmp(&a.2.severity_rank())
-            .then(a.1.cmp(&b.1))
-            .then_with(|| a.0.cmp(&b.0))
+        b.risk
+            .severity_rank()
+            .cmp(&a.risk.severity_rank())
+            .then(a.hop.cmp(&b.hop))
+            .then_with(|| a.symbol.cmp(&b.symbol))
     });
 
     Ok(ImpactReport {
@@ -378,4 +422,15 @@ pub(crate) fn compute_detect_impact(
         base_disclosure,
         staleness_note,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::impact_evidence_line_range;
+
+    #[test]
+    fn impact_evidence_line_range_is_zero_based_and_half_open() {
+        assert_eq!(impact_evidence_line_range((3, 3)), [3, 4]);
+        assert_eq!(impact_evidence_line_range((3, 5)), [3, 6]);
+    }
 }

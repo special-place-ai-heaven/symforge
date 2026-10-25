@@ -556,8 +556,10 @@ fn room_grant_and_resource_policy_are_checked_before_open_or_write() {
     );
     assert_eq!(mismatch.err().unwrap().kind, HostRefusalKind::Denied);
 
-    let mut limits = HostLimits::default();
-    limits.max_indexed_bytes = 1;
+    let limits = HostLimits {
+        max_indexed_bytes: 1,
+        ..HostLimits::default()
+    };
     let room = open_room(
         root.path(),
         "room-a",

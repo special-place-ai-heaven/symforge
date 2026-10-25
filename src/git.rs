@@ -10,6 +10,24 @@ pub struct GitRepo {
     repo: git2::Repository,
 }
 
+/// Immutable commits selected by the repository's three-dot comparison rule.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitComparisonRange {
+    /// The refs supplied by the caller, retained for display.
+    pub base_ref: String,
+    pub target_ref: String,
+    /// The commits whose trees are actually compared: merge-base to target tip.
+    pub base_commit: git2::Oid,
+    pub target_commit: git2::Oid,
+}
+
+/// One ref resolution pinned to both its tree and, when it names a commit, its commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedTreeReference {
+    pub commit_oid: Option<git2::Oid>,
+    pub tree_oid: git2::Oid,
+}
+
 /// A single commit from the log, with the list of files it touched.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
@@ -133,34 +151,60 @@ impl GitRepo {
         base: &str,
         target: &str,
     ) -> Result<Vec<String>, String> {
-        let base_obj = self
+        let range = self.comparison_range_between_refs(base, target)?;
+        self.changed_paths_for_comparison(&range)
+    }
+
+    /// Resolve the immutable endpoints for `git diff base...target` semantics.
+    pub fn comparison_range_between_refs(
+        &self,
+        base: &str,
+        target: &str,
+    ) -> Result<GitComparisonRange, String> {
+        let base_commit = self
             .repo
             .revparse_single(base)
-            .map_err(|e| format!("cannot resolve ref '{base}': {e}"))?;
-        let target_obj = self
+            .map_err(|e| format!("cannot resolve ref '{base}': {e}"))?
+            .peel_to_commit()
+            .map_err(|e| format!("cannot peel base to commit: {e}"))?;
+        let target_commit = self
             .repo
             .revparse_single(target)
-            .map_err(|e| format!("cannot resolve ref '{target}': {e}"))?;
-
-        // Use merge-base for 3-dot diff semantics (matches `git diff base...target`).
-        let merge_base_oid = self
+            .map_err(|e| format!("cannot resolve ref '{target}': {e}"))?
+            .peel_to_commit()
+            .map_err(|e| format!("cannot peel target to commit: {e}"))?;
+        let merge_base = self
             .repo
-            .merge_base(base_obj.id(), target_obj.id())
+            .merge_base(base_commit.id(), target_commit.id())
             .map_err(|e| format!("cannot find merge base: {e}"))?;
-        let merge_base_tree = self
+        Ok(GitComparisonRange {
+            base_ref: base.to_string(),
+            target_ref: target.to_string(),
+            base_commit: merge_base,
+            target_commit: target_commit.id(),
+        })
+    }
+
+    /// Return paths changed between a previously resolved comparison range.
+    pub fn changed_paths_for_comparison(
+        &self,
+        range: &GitComparisonRange,
+    ) -> Result<Vec<String>, String> {
+        let base_tree = self
             .repo
-            .find_commit(merge_base_oid)
-            .map_err(|e| format!("cannot find merge base commit: {e}"))?
+            .find_commit(range.base_commit)
+            .map_err(|e| format!("cannot find comparison base commit: {e}"))?
             .tree()
-            .map_err(|e| format!("cannot get merge base tree: {e}"))?;
-
-        let target_tree = target_obj
-            .peel_to_tree()
-            .map_err(|e| format!("cannot peel target to tree: {e}"))?;
-
+            .map_err(|e| format!("cannot get comparison base tree: {e}"))?;
+        let target_tree = self
+            .repo
+            .find_commit(range.target_commit)
+            .map_err(|e| format!("cannot find comparison target commit: {e}"))?
+            .tree()
+            .map_err(|e| format!("cannot get comparison target tree: {e}"))?;
         let diff = self
             .repo
-            .diff_tree_to_tree(Some(&merge_base_tree), Some(&target_tree), None)
+            .diff_tree_to_tree(Some(&base_tree), Some(&target_tree), None)
             .map_err(|e| format!("diff failed: {e}"))?;
 
         Ok(collect_diff_paths(&diff))
@@ -170,13 +214,19 @@ impl GitRepo {
     ///
     /// Replaces: `git diff --name-only <ref> --`
     pub fn changed_paths_from_ref(&self, reference: &str) -> Result<Vec<String>, String> {
-        let obj = self
+        let resolved = self.resolve_ref_tree_reference(reference)?;
+        self.changed_paths_from_tree_oid(resolved.tree_oid)
+    }
+
+    /// Return paths changed between a pinned tree and the working tree.
+    pub(crate) fn changed_paths_from_tree_oid(
+        &self,
+        tree_oid: git2::Oid,
+    ) -> Result<Vec<String>, String> {
+        let tree = self
             .repo
-            .revparse_single(reference)
-            .map_err(|e| format!("cannot resolve ref '{reference}': {e}"))?;
-        let tree = obj
-            .peel_to_tree()
-            .map_err(|e| format!("cannot peel to tree: {e}"))?;
+            .find_tree(tree_oid)
+            .map_err(|e| format!("cannot load pinned tree: {e}"))?;
 
         let diff = self
             .repo
@@ -241,6 +291,33 @@ impl GitRepo {
     pub fn resolve_ref_commit(&self, reference: &str) -> Option<git2::Oid> {
         let obj = self.repo.revparse_single(reference).ok()?;
         obj.peel_to_commit().ok().map(|commit| commit.id())
+    }
+
+    /// Resolve a ref once to its tree and optional commit, preserving the same
+    /// immutable object for path comparisons, source reads, and provenance.
+    pub(crate) fn resolve_ref_tree_reference(
+        &self,
+        reference: &str,
+    ) -> Result<ResolvedTreeReference, String> {
+        let object = self
+            .repo
+            .revparse_single(reference)
+            .map_err(|error| format!("cannot resolve ref '{reference}': {error}"))?;
+        let commit = object.peel_to_commit().ok();
+        let tree_oid = match &commit {
+            Some(commit) => commit
+                .tree()
+                .map_err(|error| format!("cannot read tree for ref '{reference}': {error}"))?
+                .id(),
+            None => object
+                .peel_to_tree()
+                .map_err(|error| format!("cannot peel ref '{reference}' to tree: {error}"))?
+                .id(),
+        };
+        Ok(ResolvedTreeReference {
+            commit_oid: commit.map(|commit| commit.id()),
+            tree_oid,
+        })
     }
 
     /// Ahead/behind commit counts of `local` relative to `upstream`, as
@@ -639,6 +716,112 @@ mod tests {
         assert!(paths.contains(&"file2.rs".to_string()));
         assert!(paths.contains(&"README.md".to_string()));
         assert!(!paths.contains(&"file1.rs".to_string()));
+    }
+
+    #[test]
+    fn diff_comparison_ancestor_range_uses_the_ancestor_commit() {
+        let (_dir, repo) = make_test_repo();
+        let base = repo.resolve_ref_commit("HEAD~1").unwrap();
+        let target = repo.resolve_ref_commit("HEAD").unwrap();
+        let range = repo
+            .comparison_range_between_refs("HEAD~1", "HEAD")
+            .unwrap();
+
+        assert_eq!(range.base_commit, base);
+        assert_eq!(range.target_commit, target);
+        assert_eq!(range.base_ref, "HEAD~1");
+        assert_eq!(range.target_ref, "HEAD");
+        let paths = repo.changed_paths_for_comparison(&range).unwrap();
+        assert!(paths.contains(&"file2.rs".to_string()));
+        assert!(paths.contains(&"README.md".to_string()));
+        assert!(!paths.contains(&"file1.rs".to_string()));
+    }
+
+    #[test]
+    fn diff_comparison_equal_refs_are_empty() {
+        let (_dir, repo) = make_test_repo();
+        let range = repo.comparison_range_between_refs("HEAD", "HEAD").unwrap();
+
+        assert_eq!(range.base_commit, range.target_commit);
+        assert!(
+            repo.changed_paths_for_comparison(&range)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn diff_comparison_tag_refs_resolve_to_commits() {
+        let (dir, repo) = make_test_repo();
+        crate::process_util::hidden_command("git")
+            .args(["tag", "diff-comparison-target", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .expect("create tag");
+        let range = repo
+            .comparison_range_between_refs("HEAD~1", "diff-comparison-target")
+            .unwrap();
+
+        assert_eq!(
+            range.target_commit,
+            repo.resolve_ref_commit("HEAD").unwrap()
+        );
+    }
+
+    #[test]
+    fn ref_tree_oid_resolves_annotated_tag_treeish() {
+        let (dir, repo) = make_test_repo();
+        crate::process_util::hidden_command("git")
+            .args([
+                "tag",
+                "-a",
+                "annotated-tree",
+                "-m",
+                "annotated tree",
+                "HEAD",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .expect("create annotated tag");
+
+        let annotated_tree = repo
+            .resolve_ref_tree_reference("refs/tags/annotated-tree^{tree}")
+            .expect("annotated tag tree-ish resolves")
+            .tree_oid;
+        assert_eq!(
+            annotated_tree,
+            repo.resolve_ref_tree_reference("HEAD").unwrap().tree_oid
+        );
+        let range = repo
+            .comparison_range_between_refs("refs/tags/annotated-tree", "HEAD")
+            .expect("annotated tag is accepted as a comparison ref");
+        assert_eq!(range.base_commit, repo.resolve_ref_commit("HEAD").unwrap());
+        assert_eq!(
+            range.target_commit,
+            repo.resolve_ref_commit("HEAD").unwrap()
+        );
+        let resolved_tag = repo
+            .resolve_ref_tree_reference("refs/tags/annotated-tree")
+            .expect("annotated tag resolves once to its commit and tree");
+        assert_eq!(resolved_tag.commit_oid, repo.resolve_ref_commit("HEAD"));
+        assert_eq!(resolved_tag.tree_oid, annotated_tree);
+        assert!(
+            repo.resolve_ref_commit("refs/tags/annotated-tree^{tree}")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn diff_comparison_invalid_refs_are_rejected() {
+        let (_dir, repo) = make_test_repo();
+        assert!(
+            repo.comparison_range_between_refs("no_such_ref", "HEAD")
+                .is_err()
+        );
+        assert!(
+            repo.comparison_range_between_refs("HEAD", "no_such_ref")
+                .is_err()
+        );
     }
 
     #[test]

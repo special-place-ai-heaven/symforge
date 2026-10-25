@@ -47,6 +47,44 @@ pub struct ImpactBlastEntry {
     pub symbol: String,
     pub hop: u32,
     pub risk: String,
+    #[serde(default)]
+    pub evidence_status: ImpactEvidenceStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Vec<ImpactPathStep>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImpactEvidenceStatus {
+    Available,
+    Truncated,
+    #[default]
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ImpactPathStep {
+    pub caller: ImpactChangedSymbol,
+    pub callee: ImpactChangedSymbol,
+    pub call_site: ImpactCallSite,
+    pub resolution: ImpactResolution,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ImpactCallSite {
+    pub path: String,
+    /// Half-open raw byte range `[start, end)` into the source file.
+    pub byte_range: [usize; 2],
+    /// Half-open, zero-based line range `[start, end)`.
+    pub line_range: [usize; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImpactResolution {
+    UniqueName,
+    QualifiedModule,
+    QualifiedOwner,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -93,4 +131,22 @@ pub struct DetectImpactResult {
     /// MCP `detect_impact`'s text: the summary and the impact payload.
     #[serde(default)]
     pub rendered: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ImpactBlastEntry, ImpactEvidenceStatus};
+
+    #[test]
+    fn blast_entry_deserializes_legacy_payload_without_evidence() {
+        let entry: ImpactBlastEntry = serde_json::from_value(serde_json::json!({
+            "symbol": "src/lib.rs::caller",
+            "hop": 1,
+            "risk": "medium"
+        }))
+        .expect("legacy impact row remains readable");
+
+        assert_eq!(entry.evidence_status, ImpactEvidenceStatus::Unavailable);
+        assert!(entry.evidence.is_none());
+    }
 }

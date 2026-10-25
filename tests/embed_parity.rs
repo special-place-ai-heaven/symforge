@@ -3,7 +3,7 @@
 use std::fs;
 use std::time::{Duration, Instant};
 
-use symforge::embed::parity::changes::DiffSymbolsRequest;
+use symforge::embed::parity::changes::{DiffSymbolsRequest, WhatChangedRequest};
 use symforge::embed::parity::detect_impact::DetectImpactRequest;
 use symforge::embed::parity::file_impact::FileImpactRequest;
 use symforge::embed::parity::knowledge::KnowledgeSourceScope;
@@ -1206,6 +1206,147 @@ fn parity_audit_symbol_diff_ref_to_ref() {
         panic!("symbol diff");
     };
     assert!(diff.total_changed_files >= 1);
+}
+
+#[test]
+fn diff_comparison_uses_one_canonical_three_dot_range() {
+    let root = fixture();
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "pub fn alpha() -> u32 { 1 }\npub fn beta() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    let ancestor = commit_all(root.path(), "diff-comparison-ancestor");
+
+    let run_git = |args: &[&str]| {
+        let output = symforge::process_util::hidden_command("git")
+            .args(args)
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+    };
+    run_git(&["checkout", "-b", "base"]);
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "pub fn alpha() -> u32 { 1 }\npub fn beta() -> u64 { 2 }\n",
+    )
+    .unwrap();
+    let base = commit_all(root.path(), "diff-comparison-base-beta");
+
+    run_git(&["checkout", "-b", "feature", &ancestor]);
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "pub fn alpha() -> u16 { 2 }\npub fn beta() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    let feature = commit_all(root.path(), "diff-comparison-feature-alpha");
+
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let claim = handle
+        .query(
+            &QueryRequest::DiffSymbols(DiffSymbolsRequest {
+                base: Some("base".into()),
+                target: Some("feature".into()),
+                ..DiffSymbolsRequest::default()
+            }),
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::DiffSymbols(diff) = claim.value() else {
+        panic!("symbol diff");
+    };
+
+    assert_eq!(diff.total_changed_files, 1);
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].path, "src/lib.rs");
+    assert_eq!(diff.files[0].modified, vec!["alpha"]);
+    assert_eq!(diff.base, "base");
+    assert_eq!(diff.target, "feature");
+    assert_eq!(diff.base_commit.as_deref(), Some(ancestor.as_str()));
+    assert_eq!(diff.target_commit.as_deref(), Some(feature.as_str()));
+    assert!(diff.rendered.contains("Effective comparison base"));
+    assert_ne!(diff.base_commit.as_deref(), Some(base.as_str()));
+}
+
+#[test]
+fn what_changed_diff_comparison_uses_worktree_endpoint() {
+    let root = fixture();
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "pub fn alpha() -> u32 { 1 }\npub fn beta() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    let base = commit_all(root.path(), "what-changed-diff-comparison-base");
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "pub fn alpha() -> u32 { 1 }\npub fn beta() -> u32 { 1 }\npub fn gamma() {}\n",
+    )
+    .unwrap();
+    commit_all(root.path(), "what-changed-diff-comparison-head");
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "pub fn alpha() -> u32 { 1 }\npub fn beta() -> u32 { 1 }\npub fn delta() {}\n",
+    )
+    .unwrap();
+
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let claim = handle
+        .query(
+            &QueryRequest::WhatChanged(WhatChangedRequest {
+                git_ref: Some(base.clone()),
+                include_symbol_diff: Some(true),
+                ..WhatChangedRequest::default()
+            }),
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::WhatChanged(changed) = claim.value() else {
+        panic!("what changed");
+    };
+    let symbol_diff = changed.symbol_diff.as_ref().expect("symbol diff");
+    assert_eq!(symbol_diff.files.len(), 1);
+    assert_eq!(symbol_diff.files[0].added, vec!["delta"]);
+    assert_eq!(symbol_diff.base_commit.as_deref(), Some(base.as_str()));
+    assert!(symbol_diff.target_commit.is_none());
+    assert!(changed.rendered.contains(&base));
+
+    let tree_ref = format!("{base}^{{tree}}");
+    let tree_oid = git2::Repository::open(root.path())
+        .unwrap()
+        .revparse_single(&tree_ref)
+        .unwrap()
+        .peel_to_tree()
+        .unwrap()
+        .id()
+        .to_string();
+    let tree_result = handle
+        .query(
+            &QueryRequest::WhatChanged(WhatChangedRequest {
+                git_ref: Some(tree_ref.clone()),
+                include_symbol_diff: Some(true),
+                ..WhatChangedRequest::default()
+            }),
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::WhatChanged(tree_changed) = tree_result.value() else {
+        panic!("what changed for a tree-ish ref");
+    };
+    let tree_diff = tree_changed
+        .symbol_diff
+        .as_ref()
+        .expect("tree-ish symbol diff");
+    assert_eq!(tree_diff.base, tree_ref);
+    assert!(tree_diff.base_commit.is_none());
+    assert_eq!(tree_diff.files[0].added, vec!["delta"]);
+    assert!(
+        tree_changed
+            .rendered
+            .contains(&format!("at tree {tree_oid}"))
+    );
 }
 
 #[test]

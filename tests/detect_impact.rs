@@ -139,6 +139,23 @@ async fn detect_impact_fixture_blast_matches_expected() {
     assert_eq!(blast[0]["symbol"], json!("src/main.rs::main"));
     assert_eq!(blast[0]["hop"], json!(1));
     assert_eq!(blast[0]["risk"], json!("critical"));
+    assert_eq!(blast[0]["evidence_status"], json!("available"));
+    let evidence = blast[0]["evidence"]
+        .as_array()
+        .expect("blast row has a complete explanation chain");
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0]["caller"]["name"], json!("main"));
+    assert_eq!(evidence[0]["callee"]["name"], json!("call_a"));
+    assert_eq!(evidence[0]["call_site"]["path"], json!("src/main.rs"));
+    let byte_range = evidence[0]["call_site"]["byte_range"]
+        .as_array()
+        .expect("half-open call-site byte range");
+    assert!(byte_range[0].as_u64().unwrap() < byte_range[1].as_u64().unwrap());
+    let line_range = evidence[0]["call_site"]["line_range"]
+        .as_array()
+        .expect("zero-based half-open call-site line range");
+    assert!(line_range[0].as_u64().unwrap() < line_range[1].as_u64().unwrap());
+    assert_eq!(evidence[0]["resolution"], json!("unique_name"));
 
     assert_eq!(payload["risk_summary"]["critical"], json!(1));
     assert_eq!(payload["risk_summary"]["high"], json!(0));
@@ -150,6 +167,72 @@ async fn detect_impact_fixture_blast_matches_expected() {
     assert_eq!(
         payload["pagination"]["blast_radius"]["truncated"],
         json!(false)
+    );
+}
+
+#[tokio::test]
+async fn detect_impact_since_uses_the_same_merge_base_for_paths_and_body_seeds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).expect("create src dir");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"impact_range_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write manifest");
+    let lib = root.join("src/lib.rs");
+    fs::write(
+        &lib,
+        "pub fn alpha() -> u32 { 1 }\npub fn beta() -> u32 { 1 }\n",
+    )
+    .expect("write ancestor source");
+    git(&["init"], root);
+    git(&["config", "user.email", "test@test.com"], root);
+    git(&["config", "user.name", "Test"], root);
+    git(&["add", "."], root);
+    git(&["commit", "-m", "ancestor"], root);
+    git(&["branch", "-M", "main"], root);
+    let ancestor = git2::Repository::open(root)
+        .unwrap()
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    git(&["checkout", "-b", "base"], root);
+    fs::write(
+        &lib,
+        "pub fn alpha() -> u32 { 1 }\npub fn beta() -> u64 { 2 }\n",
+    )
+    .expect("change beta on base only");
+    git(&["commit", "-am", "base changes beta"], root);
+
+    git(&["checkout", "-b", "feature", &ancestor], root);
+    fs::write(
+        &lib,
+        "pub fn alpha() -> u16 { 2 }\npub fn beta() -> u32 { 1 }\n",
+    )
+    .expect("change alpha on feature only");
+    git(&["commit", "-am", "feature changes alpha"], root);
+
+    let server = server_over(root);
+    let body = server
+        .dispatch_tool_for_tests("detect_impact", json!({ "since": "base" }))
+        .await;
+    let payload = impact_payload(&body);
+    assert_eq!(payload["changed_files"], json!(["src/lib.rs"]), "{body}");
+    let changed_names: Vec<&str> = payload["changed_symbols"]
+        .as_array()
+        .expect("changed_symbols array")
+        .iter()
+        .map(|symbol| symbol["name"].as_str().expect("symbol name"))
+        .collect();
+    assert_eq!(
+        changed_names,
+        ["alpha"],
+        "body seeds must use the same merge base as the three-dot paths: {body}"
     );
 }
 
