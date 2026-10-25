@@ -118,3 +118,37 @@ a **per-list** shape (a documented, honest widening of the looser frozen shape):
   "blast_radius":    {"total": N, "returned": M, "truncated": bool}
 }
 ```
+
+## Addendum — 2026-10-25: dependency precision and supporting evidence
+
+Dependency matching is scoped to compatible language families: JavaScript/TypeScript,
+C/C++, and Java/Kotlin share their respective namespaces; other supported languages
+match within their own namespace. This is a static name-resolution heuristic, not a
+compiler or a runtime dependency proof.
+
+Three-dot change selection and symbol-delta seeding use the same resolved merge-base
+commit. The `WORKTREE` source compares against `HEAD`. Existing changed-file unions,
+scope selection, risk tiers, depth clamp, and output pagination continue to apply.
+
+Each returned `blast_radius` entry adds:
+
+- `evidence_status`: `available`, `unavailable`, or `truncated`.
+- `evidence`: an optional array of supporting call steps. Each step contains `caller`
+  and `callee` (`name`, `path`, `kind`), `call_site` (`path`, `byte_range`, `line_range`),
+  and `resolution` (`unique_name`, `qualified_module`, or `qualified_owner`).
+
+`byte_range` contains half-open offsets into the indexed raw file bytes. `line_range`
+is zero-based and half-open. Evidence contains no source snippets. It comes from the
+same captured admitted index publication as the impact calculation.
+
+An available explanation is one complete shortest chain, ordered from the changed
+symbol outwards: the first step's caller calls the changed callee, and each subsequent
+step's caller calls the preceding caller. Equal-length alternatives use deterministic
+symbol and call-site ordering. File scope uses the explanation of its selected
+representative symbol. The chain is bounded by the tool's effective depth (at most 5).
+
+Output limits account for the explanation bytes. If an explanation cannot be included
+within the response budget, the entry uses `truncated` and omits `evidence`; a partial
+chain must not be presented as complete. `unavailable` does not mean no dependency.
+Legacy serialized entries without these fields deserialize as unavailable evidence.
+The additive parity API is versioned separately from the frozen V11 base API.

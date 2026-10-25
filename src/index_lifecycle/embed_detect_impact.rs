@@ -9,8 +9,9 @@ use super::embed_changes::{gated_text, open_repository};
 use super::embed_query::{Budget, EmbeddedQuerySnapshot};
 use super::guidance::impact::{DETECT_IMPACT_MAX_RETURNED, ImpactRequest, compute_detect_impact};
 use crate::embed::parity::detect_impact::{
-    DetectImpactRequest, DetectImpactResult, ImpactBlastEntry, ImpactChangedSymbol, ImpactPage,
-    ImpactPagination, ImpactRiskSummary, ImpactScope, ImpactSourceFilter,
+    DetectImpactRequest, DetectImpactResult, ImpactBlastEntry, ImpactCallSite, ImpactChangedSymbol,
+    ImpactEvidenceStatus, ImpactPage, ImpactPagination, ImpactPathStep, ImpactResolution,
+    ImpactRiskSummary, ImpactScope, ImpactSourceFilter,
 };
 use crate::embed::parity::{QueryOutput, QueryRefusalKind};
 
@@ -125,16 +126,61 @@ pub(super) fn project(
         });
     }
     let mut blast_radius = Vec::new();
-    for (symbol, hop, risk) in report.blast_entries.iter().take(DETECT_IMPACT_MAX_RETURNED) {
-        let risk = risk.as_str();
-        if !budget.row(symbol.len() + risk.len()) {
+    let mut evidence_candidates = Vec::new();
+    for entry in report.blast_entries.iter().take(DETECT_IMPACT_MAX_RETURNED) {
+        let evidence: Option<Vec<ImpactPathStep>> = entry.evidence.as_ref().map(|steps| {
+            steps
+                .iter()
+                .map(|step| ImpactPathStep {
+                    caller: ImpactChangedSymbol {
+                        name: step.caller.name.clone(),
+                        path: step.caller.path.clone(),
+                        kind: step.caller.kind.to_string(),
+                    },
+                    callee: ImpactChangedSymbol {
+                        name: step.callee.name.clone(),
+                        path: step.callee.path.clone(),
+                        kind: step.callee.kind.to_string(),
+                    },
+                    call_site: ImpactCallSite {
+                        path: step.call_site_path.clone(),
+                        byte_range: [step.byte_range.0 as usize, step.byte_range.1 as usize],
+                        line_range: super::guidance::impact::impact_evidence_line_range(
+                            step.line_range,
+                        ),
+                    },
+                    resolution: match step.resolution {
+                        crate::live_index::graph::ResolutionReason::UniqueName => {
+                            ImpactResolution::UniqueName
+                        }
+                        crate::live_index::graph::ResolutionReason::QualifiedModule => {
+                            ImpactResolution::QualifiedModule
+                        }
+                        crate::live_index::graph::ResolutionReason::QualifiedOwner => {
+                            ImpactResolution::QualifiedOwner
+                        }
+                    },
+                })
+                .collect()
+        });
+        let has_evidence = evidence.is_some();
+        let row = ImpactBlastEntry {
+            symbol: entry.symbol.clone(),
+            hop: entry.hop,
+            risk: entry.risk.as_str().to_owned(),
+            evidence_status: if has_evidence {
+                ImpactEvidenceStatus::Truncated
+            } else {
+                ImpactEvidenceStatus::Unavailable
+            },
+            evidence: None,
+        };
+        let base_size = serde_json::to_vec(&row).map_or(usize::MAX, |json| json.len());
+        if !budget.row(base_size) {
             break;
         }
-        blast_radius.push(ImpactBlastEntry {
-            symbol: symbol.clone(),
-            hop: *hop,
-            risk: risk.to_owned(),
-        });
+        blast_radius.push(row);
+        evidence_candidates.push(evidence);
     }
     let pagination = ImpactPagination {
         changed_files: page(report.changed_files.len(), changed_files.len()),
@@ -169,7 +215,62 @@ pub(super) fn project(
         rendered: String::new(),
     };
     result.rendered = detect_impact_text(&result);
+    let base_rendered_bytes = result.rendered.len();
+    budget.charge_bytes(base_rendered_bytes)?;
+
+    let mut used_serialized_evidence_bytes = 0usize;
+    let mut included_evidence_bytes = 0usize;
+    for (row, candidate) in result.blast_radius.iter_mut().zip(&evidence_candidates) {
+        let Some(evidence) = candidate.as_ref() else {
+            continue;
+        };
+        let serialized_bytes = serde_json::to_vec(&evidence).map_or(usize::MAX, |json| json.len());
+        let decoded_string_bytes = impact_evidence_string_bytes(evidence);
+        let total_serialized = used_serialized_evidence_bytes.checked_add(serialized_bytes);
+        let within_evidence_cap = total_serialized.is_some_and(|total| {
+            total <= super::guidance::impact::DETECT_IMPACT_MAX_EVIDENCE_BYTES
+        });
+        if within_evidence_cap {
+            row.evidence_status = ImpactEvidenceStatus::Available;
+            row.evidence = Some(evidence.clone());
+            used_serialized_evidence_bytes =
+                total_serialized.unwrap_or(used_serialized_evidence_bytes);
+            included_evidence_bytes = included_evidence_bytes.saturating_add(decoded_string_bytes);
+        } else {
+            budget.truncated = true;
+        }
+    }
+    result.rendered = detect_impact_text(&result);
+    let rendered_evidence_bytes = result.rendered.len().saturating_sub(base_rendered_bytes);
+    let evidence_output_bytes = included_evidence_bytes.saturating_add(rendered_evidence_bytes);
+    if evidence_output_bytes > budget.remaining_bytes() {
+        // Match MCP's shared-cap selection when the reply fits. If the caller's
+        // own output limit is smaller, omit complete chains and disclose that
+        // evidence was truncated without dropping blast rows or totals.
+        for (row, candidate) in result.blast_radius.iter_mut().zip(&evidence_candidates) {
+            if candidate.is_some() {
+                row.evidence = None;
+                row.evidence_status = ImpactEvidenceStatus::Truncated;
+            }
+        }
+        budget.truncated = true;
+        result.rendered = detect_impact_text(&result);
+        let rendered_evidence_bytes = result.rendered.len().saturating_sub(base_rendered_bytes);
+        let remaining_evidence_bytes = result
+            .blast_radius
+            .iter()
+            .filter_map(|row| row.evidence.as_deref())
+            .map(impact_evidence_string_bytes)
+            .fold(0usize, usize::saturating_add);
+        budget.charge_bytes(remaining_evidence_bytes.saturating_add(rendered_evidence_bytes))?;
+    } else {
+        budget.charge_bytes(evidence_output_bytes)?;
+    }
     Ok(QueryOutput::DetectImpact(result))
+}
+
+fn impact_evidence_string_bytes(steps: &[ImpactPathStep]) -> usize {
+    usize::try_from(super::embed_usage::decoded_bytes(steps)).unwrap_or(usize::MAX)
 }
 
 /// MCP `detect_impact`'s text: the shared summary over the same payload the
@@ -194,7 +295,18 @@ pub(super) fn detect_impact_text(
         "blast_radius": value
             .blast_radius
             .iter()
-            .map(|b| serde_json::json!({"symbol": b.symbol, "hop": b.hop, "risk": b.risk}))
+            .map(|b| {
+                let mut entry = serde_json::json!({
+                    "symbol": b.symbol,
+                    "hop": b.hop,
+                    "risk": b.risk,
+                    "evidence_status": b.evidence_status,
+                });
+                if let Some(evidence) = &b.evidence {
+                    entry["evidence"] = serde_json::json!(evidence);
+                }
+                entry
+            })
             .collect::<Vec<_>>(),
         "risk_summary": {
             "critical": value.risk_summary.critical,

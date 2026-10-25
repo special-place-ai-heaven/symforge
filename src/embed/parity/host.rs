@@ -2587,20 +2587,19 @@ mod resource_contract_tests {
         }
         // MCP answers an invalid request with invalid params; the room refuses it
         // with the matching typed invalid-request kind.
-        let refusal = room
-            .dispatch(
-                &HostRequest::Resource(HostResourceRequest::FileContentOptions(
-                    crate::embed::parity::read::FileContentRequest {
-                        path: "src/a.rs".into(),
-                        start_line: Some(5),
-                        end_line: Some(2),
-                        ..Default::default()
-                    },
-                )),
-                &control,
-            )
-            .err()
-            .expect("an invalid request must not read as success");
+        let Err(refusal) = room.dispatch(
+            &HostRequest::Resource(HostResourceRequest::FileContentOptions(
+                crate::embed::parity::read::FileContentRequest {
+                    path: "src/a.rs".into(),
+                    start_line: Some(5),
+                    end_line: Some(2),
+                    ..Default::default()
+                },
+            )),
+            &control,
+        ) else {
+            panic!("an invalid request must not read as success");
+        };
         assert_eq!(refusal.kind, HostRefusalKind::InvalidRequest);
         assert_eq!(refusal.query_kind, Some(QueryRefusalKind::InvalidRequest));
         // `file` filters which references are shown, as on MCP: `a` is defined
@@ -2653,19 +2652,18 @@ mod resource_contract_tests {
             "{}",
             context.rendered
         );
-        let refusal = room
-            .dispatch(
-                &HostRequest::Resource(HostResourceRequest::SymbolContextOptions(
-                    crate::embed::parity::symbol_context::SymbolContextRequest {
-                        name: "defined_nowhere".into(),
-                        file: Some("src/b.rs".into()),
-                        ..Default::default()
-                    },
-                )),
-                &control,
-            )
-            .err()
-            .expect("a name defined nowhere is a miss");
+        let Err(refusal) = room.dispatch(
+            &HostRequest::Resource(HostResourceRequest::SymbolContextOptions(
+                crate::embed::parity::symbol_context::SymbolContextRequest {
+                    name: "defined_nowhere".into(),
+                    file: Some("src/b.rs".into()),
+                    ..Default::default()
+                },
+            )),
+            &control,
+        ) else {
+            panic!("a name defined nowhere is a miss");
+        };
         assert_eq!(refusal.query_kind, Some(QueryRefusalKind::NotFound));
         // Name-only, as on MCP: a name defined nowhere is the miss through the
         // query outcome and the resource; an existing unreferenced symbol is not.
@@ -2689,15 +2687,14 @@ mod resource_contract_tests {
             panic!("symbol context output");
         };
         assert_eq!(context.refusal, Some(QueryRefusalKind::NotFound));
-        let refusal = room
-            .dispatch(
-                &HostRequest::Resource(HostResourceRequest::SymbolContextOptions(name_only(
-                    "defined_nowhere",
-                ))),
-                &control,
-            )
-            .err()
-            .expect("a name-only name defined nowhere is a miss");
+        let Err(refusal) = room.dispatch(
+            &HostRequest::Resource(HostResourceRequest::SymbolContextOptions(name_only(
+                "defined_nowhere",
+            ))),
+            &control,
+        ) else {
+            panic!("a name-only name defined nowhere is a miss");
+        };
         assert_eq!(refusal.query_kind, Some(QueryRefusalKind::NotFound));
         let HostResponse::Resource(reply) = room
             .dispatch(
@@ -3097,17 +3094,16 @@ mod resource_loading_tests {
             gate.wait_until_blocked(Duration::from_secs(5)),
             "reload did not reach the parse hold"
         );
-        let refusal = room
-            .dispatch(
-                &HostRequest::Resource(HostResourceRequest::FileContent {
-                    path: "src/f0.rs".into(),
-                    start_line: None,
-                    end_line: None,
-                }),
-                &room.control().unwrap(),
-            )
-            .err()
-            .expect("a read before Current must not succeed");
+        let Err(refusal) = room.dispatch(
+            &HostRequest::Resource(HostResourceRequest::FileContent {
+                path: "src/f0.rs".into(),
+                start_line: None,
+                end_line: None,
+            }),
+            &room.control().unwrap(),
+        ) else {
+            panic!("a read before Current must not succeed");
+        };
         assert_eq!(refusal.kind, HostRefusalKind::SourceUnavailable);
         assert_eq!(
             refusal.query_kind,
@@ -3130,9 +3126,11 @@ mod frame_admission_tests {
         std::fs::create_dir(repository.path().join("docs")).unwrap();
         let escaped = "é\\\"\t".repeat(1_200);
         std::fs::write(repository.path().join("docs/escaped.txt"), escaped).unwrap();
-        let mut limits = HostLimits::default();
-        limits.max_response_bytes = 4_096;
-        limits.max_query_bytes = 16_384;
+        let limits = HostLimits {
+            max_response_bytes: 4_096,
+            max_query_bytes: 16_384,
+            ..HostLimits::default()
+        };
         let grant = HostRoomGrant::new(
             "frame-room".into(),
             repository.path().to_path_buf(),
@@ -3216,9 +3214,11 @@ mod frame_admission_tests {
         let file = repository.path().join("docs/clip.txt");
         let mut content_bytes = 2_500usize;
         std::fs::write(&file, "a".repeat(content_bytes)).unwrap();
-        let mut room_limits = HostLimits::default();
-        room_limits.max_response_bytes = 16_384;
-        room_limits.max_query_bytes = 16_384;
+        let room_limits = HostLimits {
+            max_response_bytes: 16_384,
+            max_query_bytes: 16_384,
+            ..HostLimits::default()
+        };
         let mut room = HostRoom::open(
             ProcessIndexRuntime::acquire().unwrap(),
             HostRoomGrant::new(

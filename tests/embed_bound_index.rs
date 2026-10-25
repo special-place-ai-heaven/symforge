@@ -496,19 +496,12 @@ fn stopping_is_never_overwritten_by_blocked_or_current() {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let recorded = phases.lock().expect("phase log").clone();
-            if recorded
-                .iter()
-                .any(|phase| *phase == SourceRuntimePhase::Stopped)
-                && !recorded
-                    .iter()
-                    .any(|phase| *phase == SourceRuntimePhase::Stopping)
+            if recorded.contains(&SourceRuntimePhase::Stopped)
+                && !recorded.contains(&SourceRuntimePhase::Stopping)
             {
                 panic!("close reached Stopped before Stopping was observed");
             }
-            if recorded
-                .iter()
-                .any(|phase| *phase == SourceRuntimePhase::Stopping)
-            {
+            if recorded.contains(&SourceRuntimePhase::Stopping) {
                 break;
             }
             assert!(

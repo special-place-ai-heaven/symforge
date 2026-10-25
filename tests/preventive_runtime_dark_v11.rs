@@ -1144,10 +1144,13 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Refreshed 2026-10-23 for insertion-prefix adapters and M03 publication ordering.
 // Same 89 paths; no new inbound lifecycle/server-API bridge. Agent review:
 // docs/reviews/2026-10-23-reliability-darkness-pin-review.md (owner review pending).
+// Refreshed 2026-10-25 after independent review of the comparison/impact changes.
+// Same 89 paths; no new lifecycle/server-API bridge. Review and dual-surface proof:
+// docs/reviews/2026-10-25-differential-overlap-review.md.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "3a07d1fa97037ed41b8a0c8c11a0b8b6693fd691995729561ae36ad2c589b63f",
+    "6014f89238cb76cdbe061e91e7ef8a693b1cefbd06a149069aea92aaa690cb9a",
     89,
-    2256251,
+    2266500,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1318,10 +1321,14 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Exact constructor substitution adds 9 LF-normalized bytes; same 312 files.
 // HEAD seals were verified before computing the working seal; excluded unchanged.
 // Follow-up evidence: docs/reviews/2026-10-23-reliability-darkness-pin-review.md.
+// Refreshed 2026-10-25 for canonical Git endpoints, language-scoped impact,
+// byte-precise callers, bounded evidence, and paired server/embed regressions.
+// Same 312 files; independently reviewed and recomputed; no new boundary bridge.
+// docs/reviews/2026-10-25-differential-overlap-review.md.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "49bb61f511bd5e14100cbda2408d7888f6fe333c1ff286236f45e7a96ad7c202",
+    "9a4ec2edf8a2562bfff070f5c50fcb499f00d57805eb36890e91c094a17149c7",
     312,
-    12238211,
+    12311922,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
@@ -1456,8 +1463,8 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "5b0a8d2def6e8c63:17377"),
-    ("release.yml", "0b3131b900d0f34d:114385"),
+    ("ci.yml", "b2a549dab71ee282:18461"),
+    ("release.yml", "59c56876e87374bc:114505"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an
@@ -1556,6 +1563,10 @@ const CARGO_LINES: &[(&str, usize)] = &[
     ),
     ("run: cargo clippy --all-targets -- -D warnings", 2),
     (
+        "run: cargo clippy --all-targets --all-features --keep-going -- -D warnings",
+        1,
+    ),
+    (
         "run: cargo clippy --no-default-features --features embed,__test-internals --lib -- -D warnings",
         1,
     ),
@@ -1564,7 +1575,7 @@ const CARGO_LINES: &[(&str, usize)] = &[
         1,
     ),
     ("run: cargo fmt --check", 2),
-    // The seven test gates, five distinct — two run in both workflows.
+    // The nine test gates, seven distinct — two run in both workflows.
     // Each carries a doctest-excluding target selector before its bare
     // `--`, which is why the doctest lane stays shut; drop one and the
     // line no longer matches this pin, and drop one COPY and its count
@@ -1594,6 +1605,14 @@ const CARGO_LINES: &[(&str, usize)] = &[
     ),
     (
         "cargo test --no-default-features --features embed,__test-internals --test embed_parity --test embed_replay_v1 --test embed_aap_refresh_s14_s16 -- --test-threads=1 2>&1 | tee /tmp/embed-parity-replay.log",
+        1,
+    ),
+    (
+        "cargo test --features embed,__test-internals --lib server_and_embed_ -- --test-threads=1 2>&1 | tee /tmp/server-embed-parity.log",
+        1,
+    ),
+    (
+        "run: cargo nextest run --features embed,__test-internals --lib --no-tests=fail -E 'test(server_and_embed_)'",
         1,
     ),
     // Release CI retains the parity and replay binaries without the focused refresh target.
@@ -2471,8 +2490,8 @@ fn no_gate_builds_doctests() {
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(
         (seen.len(), distinct.len(), files),
-        (45, 36, 2),
-        "the CI workflows hold forty-five cargo-mentioning lines, thirty-six \
+        (48, 39, 2),
+        "the CI workflows hold forty-eight cargo-mentioning lines, thirty-nine \
          of them distinct, across two workflow files; this walk saw {:?}. A gate \
          added, removed, reworded, or a workflow file added — reconcile \
          CARGO_LINES with the workflows deliberately, never by loosening this \

@@ -2,10 +2,9 @@
 //!
 //! Started as the SP-0A spike falsifier (p95 < 200ms at depth 5 — GO, see
 //! `research.md` § Spike Results) and is now `detect_impact`'s (C-S1A-003)
-//! real blast-radius engine. Edges are still **name-based syntactic** Call
-//! references (no resolver yet), confidence implicitly 1.0 — the
-//! resolver-weighted, incrementally-patched `GraphProjection` lands at
-//! C-S2-001; this stays the over-approximating v1 in the meantime.
+//! real blast-radius engine. Edges are **language-family-scoped, name-based
+//! syntactic** Call references (no compiler resolver yet). Each edge retains
+//! source spans and the syntactic resolution rationale for its explanation.
 //!
 //! BFS shape follows `data-model.md` Appendix A (`cbm_store_bfs`): inbound uses
 //! `in_edges`, depth-capped, node-capped, deterministic ordering.
@@ -15,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use super::store::LiveIndex;
-use crate::domain::{ReferenceKind, SymbolKind};
+use crate::domain::{LanguageId, ReferenceKind, SymbolKind};
 
 /// Stable graph node key derived from the LiveIndex (see `data-model.md`
 /// Appendix A). Equality over all three fields; hash/order fold the `SymbolKind`
@@ -51,11 +50,49 @@ impl PartialOrd for SymbolId {
 }
 
 /// Inbound adjacency over Call edges: `in_edges[callee]` = sorted, deduped
-/// callers. Outbound is not needed for SP-0A (inbound BFS only).
+/// callers. `edge_evidence` retains each source call site for that edge.
 pub struct GraphProjection {
     in_edges: HashMap<SymbolId, Vec<SymbolId>>,
+    edge_evidence: HashMap<(SymbolId, SymbolId), Vec<CallEdgeEvidence>>,
     node_count: usize,
     edge_count: usize,
+}
+
+/// Why the graph linked a syntactic call to this definition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ResolutionReason {
+    UniqueName,
+    QualifiedModule,
+    QualifiedOwner,
+}
+
+/// Source-only evidence for one call edge. Byte ranges are half-open; line
+/// ranges retain the zero-based inclusive rows stored by `ReferenceRecord`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CallEdgeEvidence {
+    pub caller: SymbolId,
+    pub callee: SymbolId,
+    pub call_site_path: String,
+    pub byte_range: (u32, u32),
+    pub line_range: (u32, u32),
+    pub resolution: ResolutionReason,
+}
+
+/// A blast-radius row and one complete, shortest call chain explaining it.
+#[derive(Clone, Debug)]
+pub(crate) struct BlastNodeEvidence {
+    pub node: BlastNode,
+    /// Ordered from the changed seed to `node.symbol`; never contains snippets.
+    pub steps: Vec<CallEdgeEvidence>,
+}
+
+fn graph_language_family(language: LanguageId) -> LanguageId {
+    match language {
+        LanguageId::JavaScript | LanguageId::TypeScript => LanguageId::JavaScript,
+        LanguageId::C | LanguageId::Cpp => LanguageId::C,
+        LanguageId::Java | LanguageId::Kotlin => LanguageId::Java,
+        other => other,
+    }
 }
 
 impl GraphProjection {
@@ -72,14 +109,14 @@ impl GraphProjection {
     /// `qualified_name` module segment; if that does not pick exactly one def,
     /// the edge is dropped rather than inventing N wrong edges.
     pub fn from_index(index: &LiveIndex) -> Self {
-        // Pass 1: collect every definition keyed by name.
-        let mut defs_by_name: HashMap<&str, Vec<SymbolId>> = HashMap::new();
+        // Pass 1: collect definitions by compatible language family and name.
+        let mut defs_by_name: HashMap<(LanguageId, &str), Vec<SymbolId>> = HashMap::new();
         let mut node_count = 0usize;
         for (path, file) in &index.files {
             for sym in &file.symbols {
                 node_count += 1;
                 defs_by_name
-                    .entry(sym.name.as_str())
+                    .entry((graph_language_family(file.language), sym.name.as_str()))
                     .or_default()
                     .push(SymbolId {
                         path: path.clone(),
@@ -91,7 +128,16 @@ impl GraphProjection {
 
         // Pass 2: build inbound adjacency from Call references.
         let mut in_edges: HashMap<SymbolId, Vec<SymbolId>> = HashMap::new();
+        let mut edge_evidence: HashMap<(SymbolId, SymbolId), Vec<CallEdgeEvidence>> =
+            HashMap::new();
         for (path, file) in &index.files {
+            let mut symbols_by_start: HashMap<u32, Vec<usize>> = HashMap::new();
+            for (idx, sym) in file.symbols.iter().enumerate() {
+                symbols_by_start
+                    .entry(sym.line_range.0)
+                    .or_default()
+                    .push(idx);
+            }
             for r in &file.references {
                 if r.kind != ReferenceKind::Call {
                     continue;
@@ -105,22 +151,39 @@ impl GraphProjection {
                 let Some(caller_sym) = file.symbols.get(enc_idx as usize) else {
                     continue;
                 };
+                // The stored enclosing index uses line ranges. A class and its
+                // method can begin on the same line, making that index choose
+                // the outer class. Resolve the tie using the exact call bytes.
+                let caller_sym = symbols_by_start
+                    .get(&caller_sym.line_range.0)
+                    .and_then(|candidates| {
+                        candidates
+                            .iter()
+                            .map(|&idx| &file.symbols[idx])
+                            .filter(|sym| {
+                                sym.byte_range.0 <= r.byte_range.0
+                                    && r.byte_range.1 <= sym.byte_range.1
+                            })
+                            .min_by_key(|sym| (sym.byte_range.1 - sym.byte_range.0, sym.sort_order))
+                    })
+                    .unwrap_or(caller_sym);
                 let caller = SymbolId {
                     path: path.clone(),
                     name: caller_sym.name.clone(),
                     kind: caller_sym.kind,
                 };
-                let Some(callees) = defs_by_name.get(r.name.as_str()) else {
+                let language = graph_language_family(file.language);
+                let Some(callees) = defs_by_name.get(&(language, r.name.as_str())) else {
                     continue;
                 };
-                // Ambiguity-scoped callee resolution (SAME principle as Item 1's
-                // ambiguity gate): one def -> link it; many defs -> disambiguate
-                // by the call site's module qualifier, else drop the edge.
-                let resolved: Option<&SymbolId> = match callees.as_slice() {
-                    [only] => Some(only),
+                // Ambiguity-scoped callee resolution: one def in the compatible
+                // language family links directly; many defs require a unique
+                // qualified match or the edge is dropped.
+                let resolved: Option<(&SymbolId, ResolutionReason)> = match callees.as_slice() {
+                    [only] => Some((only, ResolutionReason::UniqueName)),
                     many => resolve_ambiguous_callee(many, r.qualified_name.as_deref(), index),
                 };
-                let Some(callee) = resolved else {
+                let Some((callee, resolution)) = resolved else {
                     // ponytail: an ambiguous bare-name call with no resolving
                     // qualifier is dropped (0 edges) rather than fanned out to
                     // all N same-name defs. A real name resolver (C-S2-001)
@@ -137,6 +200,17 @@ impl GraphProjection {
                     .entry(callee.clone())
                     .or_default()
                     .push(caller.clone());
+                edge_evidence
+                    .entry((caller.clone(), callee.clone()))
+                    .or_default()
+                    .push(CallEdgeEvidence {
+                        caller,
+                        callee: callee.clone(),
+                        call_site_path: path.clone(),
+                        byte_range: r.byte_range,
+                        line_range: r.line_range,
+                        resolution,
+                    });
             }
         }
 
@@ -147,12 +221,33 @@ impl GraphProjection {
             callers.dedup();
             edge_count += callers.len();
         }
+        for evidence in edge_evidence.values_mut() {
+            evidence.sort_by(|a, b| {
+                a.call_site_path
+                    .cmp(&b.call_site_path)
+                    .then(a.byte_range.cmp(&b.byte_range))
+                    .then(a.line_range.cmp(&b.line_range))
+                    .then(a.resolution.cmp(&b.resolution))
+            });
+            evidence.dedup();
+        }
 
         Self {
             in_edges,
+            edge_evidence,
             node_count,
             edge_count,
         }
+    }
+
+    fn canonical_edge_evidence(
+        &self,
+        caller: &SymbolId,
+        callee: &SymbolId,
+    ) -> Option<&CallEdgeEvidence> {
+        self.edge_evidence
+            .get(&(caller.clone(), callee.clone()))
+            .and_then(|evidence| evidence.first())
     }
 
     pub fn node_count(&self) -> usize {
@@ -220,12 +315,6 @@ impl GraphProjection {
         results
     }
 }
-
-/// Safety cap on per-seed BFS traversal size, matching the SP-0A spike's own
-/// exercised bound. Not caller-tunable — `detect_impact`'s frozen contract has
-/// no such input; this only guards against a pathological in-degree blowup on
-/// a single seed. Response-size pagination is the tool layer's job.
-const INBOUND_BFS_SAFETY_CAP: usize = 100_000;
 
 /// Risk tier assigned to a blast-radius node, by hop distance from the
 /// nearest changed symbol (contracts/detect-impact.md § Risk tiers).
@@ -314,7 +403,7 @@ fn resolve_ambiguous_callee<'a>(
     candidates: &'a [SymbolId],
     qualified_name: Option<&str>,
     index: &LiveIndex,
-) -> Option<&'a SymbolId> {
+) -> Option<(&'a SymbolId, ResolutionReason)> {
     // Immediate qualifier = the segment before the last `::` (last `::`
     // separates the qualifier from the called leaf name). No `::` -> no hint.
     let qn = qualified_name?;
@@ -350,7 +439,7 @@ fn resolve_ambiguous_callee<'a>(
         return None; // hint matched more than one candidate path -> ambiguous
     }
     if matched.is_some() {
-        return matched;
+        return matched.map(|candidate| (candidate, ResolutionReason::QualifiedModule));
     }
 
     // Signal 2: owner-name match. For each physical def of the callee leaf name,
@@ -387,7 +476,7 @@ fn resolve_ambiguous_callee<'a>(
         }
         owner_matched = Some(cand);
     }
-    owner_matched
+    owner_matched.map(|candidate| (candidate, ResolutionReason::QualifiedOwner))
 }
 
 /// A `fn main` is the conventional program entry point across every language
@@ -412,30 +501,79 @@ pub fn compute_impact(
     changed: &[SymbolId],
     max_depth: u32,
 ) -> Vec<BlastNode> {
-    let changed_set: HashSet<&SymbolId> = changed.iter().collect();
+    compute_impact_with_evidence(graph, changed, max_depth)
+        .into_iter()
+        .map(|entry| entry.node)
+        .collect()
+}
+
+/// Compute the blast radius and one canonical shortest call chain for every
+/// returned node. A single multi-source BFS visits each reachable graph node
+/// once; sorted seeds and sorted inbound adjacency make equal-length choices
+/// deterministic. The caller bounds depth, and the finite graph bounds nodes.
+pub(crate) fn compute_impact_with_evidence(
+    graph: &GraphProjection,
+    changed: &[SymbolId],
+    max_depth: u32,
+) -> Vec<BlastNodeEvidence> {
+    let mut starts = changed.to_vec();
+    starts.sort();
+    starts.dedup();
+
+    let changed_set: HashSet<SymbolId> = changed.iter().cloned().collect();
+    let mut visited: HashSet<SymbolId> = starts.iter().cloned().collect();
+    let mut queue: VecDeque<(SymbolId, u32)> = starts.into_iter().map(|start| (start, 0)).collect();
+    let mut parent: HashMap<SymbolId, (SymbolId, CallEdgeEvidence)> = HashMap::new();
     let mut best_hop: HashMap<SymbolId, u32> = HashMap::new();
 
-    for start in changed {
-        for (reached, hop) in graph.inbound_bfs(start, max_depth, INBOUND_BFS_SAFETY_CAP) {
-            if changed_set.contains(&reached) {
-                continue; // hop 0 (itself changed) never appears in the blast list
+    while let Some((node, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        let Some(callers) = graph.in_edges.get(&node) else {
+            continue;
+        };
+        for caller in callers {
+            if visited.contains(caller) {
+                continue;
             }
-            best_hop
-                .entry(reached)
-                .and_modify(|existing| *existing = (*existing).min(hop))
-                .or_insert(hop);
+            let Some(edge) = graph.canonical_edge_evidence(caller, &node) else {
+                continue;
+            };
+            visited.insert(caller.clone());
+            parent.insert(caller.clone(), (node.clone(), edge.clone()));
+            let hop = depth + 1;
+            queue.push_back((caller.clone(), hop));
+            if !changed_set.contains(caller) {
+                best_hop.insert(caller.clone(), hop);
+            }
         }
     }
 
-    let mut nodes: Vec<BlastNode> = best_hop
+    let mut entries: Vec<BlastNodeEvidence> = best_hop
         .into_iter()
         .map(|(symbol, hop)| {
+            let mut steps = Vec::new();
+            let mut current = symbol.clone();
+            while let Some((next, edge)) = parent.get(&current) {
+                steps.push(edge.clone());
+                current = next.clone();
+            }
+            steps.reverse();
             let risk = RiskTier::for_hop(hop, is_entry_point(&symbol));
-            BlastNode { symbol, hop, risk }
+            BlastNodeEvidence {
+                node: BlastNode { symbol, hop, risk },
+                steps,
+            }
         })
         .collect();
-    nodes.sort_by(|a, b| a.hop.cmp(&b.hop).then_with(|| a.symbol.cmp(&b.symbol)));
-    nodes
+    entries.sort_by(|a, b| {
+        a.node
+            .hop
+            .cmp(&b.node.hop)
+            .then_with(|| a.node.symbol.cmp(&b.node.symbol))
+    });
+    entries
 }
 
 #[cfg(test)]
@@ -643,6 +781,12 @@ mod tests {
             !reaches_other,
             "Target::m() must NOT edge to Other's m (wrong owner)"
         );
+        let evidence = graph
+            .edge_evidence
+            .get(&(drive, target_m))
+            .and_then(|evidence| evidence.first())
+            .expect("owner-qualified edge retains its source evidence");
+        assert_eq!(evidence.resolution, ResolutionReason::QualifiedOwner);
     }
 
     // 019 recall-recovery soundness: TWIN OWNERS. Two `impl Target` in distinct
@@ -686,6 +830,353 @@ mod tests {
             hits, 0,
             "twin `impl Target` owners cannot disambiguate Target::m() -> \
              edge must be dropped (reaches_a={reaches_a} reaches_c={reaches_c})"
+        );
+    }
+
+    #[test]
+    fn same_name_definitions_resolve_within_compatible_language_family() {
+        let graph = build_graph(&[
+            ("js.js", "function read_to_string() { return 0; }\n"),
+            ("lib.rs", "pub fn read_to_string() -> u32 { 1 }\n"),
+            ("caller.rs", "fn drive() -> u32 { read_to_string() }\n"),
+        ]);
+        let drive = sym("caller.rs", "drive");
+        let rust_target = sym("lib.rs", "read_to_string");
+        let js_target = sym("js.js", "read_to_string");
+
+        assert!(
+            graph
+                .inbound_bfs(&rust_target, 1, 100)
+                .iter()
+                .any(|(id, _)| *id == drive),
+            "the Rust caller should resolve to the same-named Rust definition"
+        );
+        assert!(
+            !graph
+                .inbound_bfs(&js_target, 1, 100)
+                .iter()
+                .any(|(id, _)| *id == drive),
+            "an unrelated JavaScript definition must not receive the Rust caller edge"
+        );
+    }
+
+    #[test]
+    fn rust_std_call_does_not_resolve_to_unrelated_javascript_definition() {
+        let graph = build_graph(&[
+            ("js.js", "function read_to_string() { return 0; }\n"),
+            (
+                "caller.rs",
+                "fn load() { std::fs::read_to_string(\"input.txt\"); }\n",
+            ),
+        ]);
+        let caller = sym("caller.rs", "load");
+        let js_target = sym("js.js", "read_to_string");
+
+        assert!(
+            !graph
+                .inbound_bfs(&js_target, 1, 100)
+                .iter()
+                .any(|(id, _)| *id == caller),
+            "Rust's std::fs::read_to_string call must not change JavaScript impact"
+        );
+    }
+
+    #[test]
+    fn javascript_and_typescript_remain_a_compatible_graph_family() {
+        let graph = build_graph(&[
+            ("library.js", "export function shared() { return 7; }\n"),
+            (
+                "caller.ts",
+                "function drive(): number { return shared(); }\n",
+            ),
+        ]);
+        let caller = sym("caller.ts", "drive");
+        let target = sym("library.js", "shared");
+
+        assert!(
+            graph
+                .inbound_bfs(&target, 1, 100)
+                .iter()
+                .any(|(id, _)| *id == caller),
+            "TypeScript callers should continue to connect to JavaScript definitions"
+        );
+    }
+
+    #[test]
+    fn c_and_cpp_remain_a_compatible_graph_family() {
+        let graph = build_graph(&[
+            ("library.c", "int shared(void) { return 7; }\n"),
+            ("caller.cpp", "int drive() { return shared(); }\n"),
+        ]);
+        let caller = sym("caller.cpp", "drive");
+        let target = sym("library.c", "shared");
+
+        assert!(
+            graph
+                .inbound_bfs(&target, 1, 100)
+                .iter()
+                .any(|(id, _)| *id == caller),
+            "C++ callers should continue to connect to C definitions"
+        );
+    }
+
+    #[test]
+    fn cpp_qualified_call_keeps_its_disambiguating_evidence() {
+        let graph = build_graph(&[
+            ("Foo.cpp", "int create() { return 1; }\n"),
+            ("Other.cpp", "int create() { return 2; }\n"),
+            ("caller.cpp", "int drive() { return Foo::create(); }\n"),
+        ]);
+        let caller = sym("caller.cpp", "drive");
+        let target = sym("Foo.cpp", "create");
+        let other = sym("Other.cpp", "create");
+
+        assert!(
+            graph
+                .inbound_bfs(&target, 1, 100)
+                .iter()
+                .any(|(id, _)| *id == caller),
+            "Foo::create should resolve to the Foo.cpp definition"
+        );
+        assert!(
+            !graph
+                .inbound_bfs(&other, 1, 100)
+                .iter()
+                .any(|(id, _)| *id == caller),
+            "the same-named definition in Other.cpp should not receive the call"
+        );
+        let evidence = graph
+            .edge_evidence
+            .get(&(caller, target))
+            .and_then(|entries| entries.first())
+            .expect("qualified C++ edge retains source evidence");
+        assert_eq!(evidence.resolution, ResolutionReason::QualifiedModule);
+        assert!(evidence.byte_range.0 < evidence.byte_range.1);
+    }
+
+    #[test]
+    fn csharp_calls_stay_in_the_csharp_namespace() {
+        let graph = build_graph(&[
+            (
+                "Target.cs",
+                "public class Target {\n    public void Read() {}\n}\n",
+            ),
+            (
+                "Caller.cs",
+                "public class Caller {\n    public void Run() {\n        new Target().Read();\n    }\n}\n",
+            ),
+            ("rust.rs", "fn Read() {}\nfn rust_caller() { Read(); }\n"),
+            (
+                "helper.js",
+                "function Read() {}\nfunction js_caller() { Read(); }\n",
+            ),
+        ]);
+        let csharp_caller = SymbolId {
+            path: "Caller.cs".to_string(),
+            name: "Run".to_string(),
+            kind: SymbolKind::Method,
+        };
+        let csharp_target = SymbolId {
+            path: "Target.cs".to_string(),
+            name: "Read".to_string(),
+            kind: SymbolKind::Method,
+        };
+        let rust_caller = sym("rust.rs", "rust_caller");
+        let js_caller = sym("helper.js", "js_caller");
+
+        let inbound = graph.inbound_bfs(&csharp_target, 1, 100);
+        assert!(
+            inbound.iter().any(|(id, _)| *id == csharp_caller),
+            "C# callers should resolve to their C# definition"
+        );
+        assert!(
+            !inbound
+                .iter()
+                .any(|(id, _)| *id == rust_caller || *id == js_caller),
+            "same-named Rust and JavaScript callers must stay in their own namespaces"
+        );
+    }
+
+    #[test]
+    fn same_line_csharp_call_is_attributed_to_the_enclosing_method() {
+        let caller_source = "public class Caller { public void Run() { new Target().Read(); } }\n";
+        let graph = build_graph(&[
+            (
+                "Target.cs",
+                "public class Target { public void Read() {} }\n",
+            ),
+            ("Caller.cs", caller_source),
+        ]);
+        let caller = SymbolId {
+            path: "Caller.cs".to_string(),
+            name: "Run".to_string(),
+            kind: SymbolKind::Method,
+        };
+        let callee = SymbolId {
+            path: "Target.cs".to_string(),
+            name: "Read".to_string(),
+            kind: SymbolKind::Method,
+        };
+
+        assert!(
+            graph
+                .inbound_bfs(&callee, 1, 100)
+                .iter()
+                .any(|(id, _)| *id == caller),
+            "a same-line method call must belong to Run, not its enclosing class"
+        );
+        let evidence = graph
+            .edge_evidence
+            .get(&(caller, callee))
+            .and_then(|entries| entries.first())
+            .expect("same-line method edge retains the call-site span");
+        let (start, end) = evidence.byte_range;
+        assert_eq!(&caller_source[start as usize..end as usize], "Read");
+    }
+
+    #[test]
+    fn java_and_kotlin_remain_a_compatible_graph_family_in_both_directions() {
+        let graph = build_graph(&[
+            (
+                "JavaLibrary.java",
+                "public class JavaLibrary {\n    public static int fromJava() { return 1; }\n}\n",
+            ),
+            (
+                "KotlinApi.kt",
+                "class KotlinApi {\n    fun fromKotlin(): Int = 2\n}\n",
+            ),
+            (
+                "KotlinCaller.kt",
+                "import JavaLibrary.fromJava\nfun callJava(): Int = fromJava()\n",
+            ),
+            (
+                "JavaCaller.java",
+                "public class JavaCaller {\n    public static int callKotlin() {\n        return new KotlinApi().fromKotlin();\n    }\n}\n",
+            ),
+        ]);
+        let kotlin_caller = sym("KotlinCaller.kt", "callJava");
+        let java_target = SymbolId {
+            path: "JavaLibrary.java".to_string(),
+            name: "fromJava".to_string(),
+            kind: SymbolKind::Method,
+        };
+        let java_caller = SymbolId {
+            path: "JavaCaller.java".to_string(),
+            name: "callKotlin".to_string(),
+            kind: SymbolKind::Method,
+        };
+        let kotlin_target = SymbolId {
+            path: "KotlinApi.kt".to_string(),
+            name: "fromKotlin".to_string(),
+            kind: SymbolKind::Function,
+        };
+
+        assert!(
+            graph
+                .inbound_bfs(&java_target, 1, 100)
+                .iter()
+                .any(|(id, _)| *id == kotlin_caller),
+            "Kotlin callers should continue to connect to Java definitions"
+        );
+        assert!(
+            graph
+                .inbound_bfs(&kotlin_target, 1, 100)
+                .iter()
+                .any(|(id, _)| *id == java_caller),
+            "Java callers should continue to connect to Kotlin definitions"
+        );
+    }
+
+    #[test]
+    fn graph_edges_keep_each_call_site_with_resolution_reason() {
+        let graph = build_graph(&[
+            ("lib.rs", "pub fn shared() {}\n"),
+            (
+                "caller.rs",
+                "fn drive() {\n    shared();\n    shared();\n}\n",
+            ),
+        ]);
+        let caller = sym("caller.rs", "drive");
+        let callee = sym("lib.rs", "shared");
+        let evidence = graph
+            .edge_evidence
+            .get(&(caller, callee))
+            .expect("resolved call edge retains evidence");
+
+        assert_eq!(evidence.len(), 2, "distinct call sites remain distinct");
+        assert!(evidence.windows(2).all(|pair| {
+            pair[0].call_site_path < pair[1].call_site_path
+                || pair[0].byte_range < pair[1].byte_range
+        }));
+        assert!(evidence.iter().all(|edge| {
+            edge.call_site_path == "caller.rs"
+                && edge.byte_range.0 < edge.byte_range.1
+                && edge.resolution == ResolutionReason::UniqueName
+        }));
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|edge| edge.line_range.0)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "line spans preserve zero-based source rows"
+        );
+    }
+
+    #[test]
+    fn qualified_module_edge_records_resolution_and_source_site() {
+        let graph = build_graph(&[
+            ("a.rs", "pub fn run() {}\n"),
+            ("b.rs", "pub fn run() {}\n"),
+            ("caller.rs", "fn drive() {\n    a::run();\n}\n"),
+        ]);
+        let caller = sym("caller.rs", "drive");
+        let callee = sym("a.rs", "run");
+        let evidence = graph
+            .edge_evidence
+            .get(&(caller, callee))
+            .and_then(|evidence| evidence.first())
+            .expect("module qualifier selects one same-family definition");
+
+        assert_eq!(evidence.call_site_path, "caller.rs");
+        assert_eq!(evidence.line_range.0, 1);
+        assert_eq!(evidence.resolution, ResolutionReason::QualifiedModule);
+    }
+
+    #[test]
+    fn impact_explanation_is_shortest_bounded_and_stable() {
+        let files = [
+            ("lib.rs", "pub fn core() {}\n"),
+            ("a.rs", "pub fn left() { core(); }\n"),
+            ("z.rs", "pub fn right() { core(); }\n"),
+            ("main.rs", "fn main() { z::right(); a::left(); }\n"),
+        ];
+        let graph = build_graph(&files);
+        let reversed = build_graph(&[files[3], files[2], files[1], files[0]]);
+        let changed = [sym("lib.rs", "core")];
+        let impact = compute_impact_with_evidence(&graph, &changed, 3);
+        let reversed_impact = compute_impact_with_evidence(&reversed, &changed, 3);
+        let main = impact
+            .iter()
+            .find(|entry| entry.node.symbol.name == "main")
+            .expect("main is reached through either direct caller");
+        let reversed_main = reversed_impact
+            .iter()
+            .find(|entry| entry.node.symbol.name == "main")
+            .expect("reversed fixture still reaches main");
+
+        assert_eq!(main.node.hop, 2);
+        assert_eq!(main.steps.len(), 2);
+        assert_eq!(main.steps[0].caller.path, "a.rs");
+        assert_eq!(main.steps[0].callee.path, "lib.rs");
+        assert_eq!(main.steps[1].caller.path, "main.rs");
+        assert_eq!(main.steps[1].callee.path, "a.rs");
+        assert_eq!(main.steps, reversed_main.steps);
+        assert!(
+            compute_impact_with_evidence(&graph, &changed, 1)
+                .iter()
+                .all(|entry| entry.node.symbol.name != "main"),
+            "maximum depth bounds both impact rows and explanations"
         );
     }
 }

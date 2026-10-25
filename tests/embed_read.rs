@@ -312,19 +312,18 @@ fn exact_source_pages_reconstruct_a_large_single_line_and_refuse_stale_resume() 
     handle.request_refresh().unwrap();
     let until = Instant::now() + Duration::from_secs(20);
     loop {
-        if handle.runtime_view().phase == SourceRuntimePhase::Current {
-            if let Ok(claim) = handle.query(
+        if handle.runtime_view().phase == SourceRuntimePhase::Current
+            && let Ok(claim) = handle.query(
                 &QueryRequest::SourcePage(SourcePageRequest {
                     path: "large.rs".into(),
                     offset: 0,
                     expected_publication: None,
                 }),
                 limits,
-            ) {
-                if claim.publication_identity() != publication.as_deref().unwrap() {
-                    break;
-                }
-            }
+            )
+            && claim.publication_identity() != publication.as_deref().unwrap()
+        {
+            break;
         }
         assert!(Instant::now() < until);
         std::thread::sleep(Duration::from_millis(5));

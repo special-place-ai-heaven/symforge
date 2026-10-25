@@ -58,9 +58,14 @@ pub struct SymbolFileDelta {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DiffSymbolsResult {
+    /// Requested base-ref label, preserved for the caller.
     pub base: String,
+    /// Requested target-ref label; empty when the target is the working tree.
     pub target: String,
+    /// Commit read on the base side: the effective merge-base for three-dot
+    /// comparisons, or the resolved ref tip for ref-to-working-tree reports.
     pub base_commit: Option<String>,
+    /// Commit read on the target side, or `None` when the target is the working tree.
     pub target_commit: Option<String>,
     pub total_changed_files: u64,
     pub filtered_changed_files: u64,

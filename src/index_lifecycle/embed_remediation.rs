@@ -82,78 +82,6 @@ mod encrypt_input_tests {
     }
 }
 
-#[cfg(test)]
-mod real_sops_tests {
-    use super::*;
-    use std::process::Stdio;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-    use std::time::Duration;
-
-    #[test]
-    fn real_sops_encrypts_only_admitted_selected_bytes_when_configured() {
-        let Some(binary) = std::env::var_os("SYMFORGE_TEST_SOPS_BIN") else {
-            return;
-        };
-        let Some(recipient) = std::env::var_os("SYMFORGE_TEST_AGE_RECIPIENT") else {
-            return;
-        };
-        let Some(identity_file) = std::env::var_os("SYMFORGE_TEST_AGE_IDENTITY_FILE") else {
-            return;
-        };
-        let recipient = recipient.to_string_lossy().into_owned();
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let path = "config.json";
-        let selected_bytes = b"{\"marker\":\"selected\"}\n".to_vec();
-        let later_bytes = b"{\"marker\":\"later\"}\n";
-        std::fs::write(root.join(path), later_bytes).unwrap();
-        let tool =
-            SecretExternalTool::new(PathBuf::from(binary), recipient, Duration::from_secs(20))
-                .expect("admitted SOPS descriptor");
-        let authority = SecretApplyAuthority::for_source_root(
-            root.to_path_buf(),
-            "live-sops-test".to_string(),
-            Arc::new(AtomicBool::new(false)),
-            SecretScanLimits::default(),
-            None,
-            Some(tool),
-        )
-        .unwrap();
-        let staged = stage_encrypt(
-            root,
-            vec![SelectedFile {
-                path: path.to_string(),
-                original: selected_bytes,
-                findings: Vec::new(),
-            }],
-            &authority,
-        )
-        .expect("SOPS encrypted selected bytes");
-        assert!(std::fs::read(root.join(path)).is_ok_and(|bytes| bytes.as_slice() == later_bytes));
-        let ciphertext = root.join("ciphertext.json");
-        std::fs::write(&ciphertext, &staged[0].replacement).unwrap();
-        let output = crate::process_util::hidden_command(
-            std::env::var_os("SYMFORGE_TEST_SOPS_BIN").unwrap(),
-        )
-        .env_clear()
-        .env("SOPS_AGE_KEY_FILE", identity_file)
-        .args(["decrypt", "--input-type", "json", "--output-type", "json"])
-        .arg(&ciphertext)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .expect("SOPS decrypt child started");
-        assert!(output.status.success(), "SOPS decrypt refused ciphertext");
-        let plaintext: serde_json::Value =
-            serde_json::from_slice(&output.stdout).expect("SOPS decrypted JSON");
-        assert!(
-            plaintext["marker"] == "selected",
-            "encrypted later path bytes"
-        );
-    }
-}
-
 fn refusal(kind: SecretRemediationRefusalKind) -> SecretRemediationError {
     SecretRemediationError::Refused(kind)
 }
@@ -920,5 +848,77 @@ impl EmbeddedSourceHandle {
             would_write,
             masked_summary,
         })
+    }
+}
+
+#[cfg(test)]
+mod real_sops_tests {
+    use super::*;
+    use std::process::Stdio;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    #[test]
+    fn real_sops_encrypts_only_admitted_selected_bytes_when_configured() {
+        let Some(binary) = std::env::var_os("SYMFORGE_TEST_SOPS_BIN") else {
+            return;
+        };
+        let Some(recipient) = std::env::var_os("SYMFORGE_TEST_AGE_RECIPIENT") else {
+            return;
+        };
+        let Some(identity_file) = std::env::var_os("SYMFORGE_TEST_AGE_IDENTITY_FILE") else {
+            return;
+        };
+        let recipient = recipient.to_string_lossy().into_owned();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = "config.json";
+        let selected_bytes = b"{\"marker\":\"selected\"}\n".to_vec();
+        let later_bytes = b"{\"marker\":\"later\"}\n";
+        std::fs::write(root.join(path), later_bytes).unwrap();
+        let tool =
+            SecretExternalTool::new(PathBuf::from(binary), recipient, Duration::from_secs(20))
+                .expect("admitted SOPS descriptor");
+        let authority = SecretApplyAuthority::for_source_root(
+            root.to_path_buf(),
+            "live-sops-test".to_string(),
+            Arc::new(AtomicBool::new(false)),
+            SecretScanLimits::default(),
+            None,
+            Some(tool),
+        )
+        .unwrap();
+        let staged = stage_encrypt(
+            root,
+            vec![SelectedFile {
+                path: path.to_string(),
+                original: selected_bytes,
+                findings: Vec::new(),
+            }],
+            &authority,
+        )
+        .expect("SOPS encrypted selected bytes");
+        assert!(std::fs::read(root.join(path)).is_ok_and(|bytes| bytes.as_slice() == later_bytes));
+        let ciphertext = root.join("ciphertext.json");
+        std::fs::write(&ciphertext, &staged[0].replacement).unwrap();
+        let output = crate::process_util::hidden_command(
+            std::env::var_os("SYMFORGE_TEST_SOPS_BIN").unwrap(),
+        )
+        .env_clear()
+        .env("SOPS_AGE_KEY_FILE", identity_file)
+        .args(["decrypt", "--input-type", "json", "--output-type", "json"])
+        .arg(&ciphertext)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .expect("SOPS decrypt child started");
+        assert!(output.status.success(), "SOPS decrypt refused ciphertext");
+        let plaintext: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("SOPS decrypted JSON");
+        assert!(
+            plaintext["marker"] == "selected",
+            "encrypted later path bytes"
+        );
     }
 }

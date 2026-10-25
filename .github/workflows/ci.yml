@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   conventional-commits:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, fresh]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -46,7 +46,7 @@ jobs:
 
   release-version:
     needs: conventional-commits
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, fresh]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -98,7 +98,7 @@ jobs:
 
   rust:
     needs: release-version
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, fresh]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -206,7 +206,7 @@ jobs:
 
   embed-build:
     needs: release-version
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, fresh]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -246,9 +246,27 @@ jobs:
           matches=$(grep -cE 'test result: ok\. [1-9][0-9]* passed' /tmp/embed-parity-replay.log || true)
           test "$matches" -ge 3
 
+  server-embed-parity:
+    needs: release-version
+    runs-on: [self-hosted, linux, fresh]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: bash execution/ensure_rustup.sh
+
+      - name: Run all-targets, all-features Clippy
+        run: cargo clippy --all-targets --all-features --keep-going -- -D warnings
+
+      - name: Run server and embed parity tests
+        run: |
+          set -euo pipefail
+          cargo test --features embed,__test-internals --lib server_and_embed_ -- --test-threads=1 2>&1 | tee /tmp/server-embed-parity.log
+          grep -q '^test result: ok\. 2 passed; 0 failed;' /tmp/server-embed-parity.log
+
   embed-musl:
     needs: release-version
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, fresh]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -319,7 +337,7 @@ jobs:
   performance-smoke:
     needs: release-version
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, fresh]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -337,7 +355,7 @@ jobs:
 
   npm:
     needs: release-version
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, fresh]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -393,3 +411,7 @@ jobs:
 
       - name: Run Rust tests (process-per-test)
         run: cargo nextest run --no-fail-fast
+
+      - name: Run server and embed parity tests
+        # --no-tests=fail makes a stale or misconfigured test filter fail CI.
+        run: cargo nextest run --features embed,__test-internals --lib --no-tests=fail -E 'test(server_and_embed_)'

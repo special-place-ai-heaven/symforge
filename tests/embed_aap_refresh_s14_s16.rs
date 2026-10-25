@@ -518,10 +518,9 @@ fn graph_lease_capacity_releases_on_drop() {
 
     let before_drop = handle.runtime_view();
     let since_drop = handle.change_version();
-    let refused = handle
-        .begin_graph_publication_lease(Duration::from_secs(20))
-        .err()
-        .expect("the ninth live lease must be refused");
+    let Err(refused) = handle.begin_graph_publication_lease(Duration::from_secs(20)) else {
+        panic!("the ninth live lease must be refused");
+    };
     assert_eq!(refused.kind(), SourceRefusalKind::AdmissionUnavailable);
     assert_eq!(refused.retry(), symforge::embed::RetryAdvice::OnEvent);
 
@@ -590,10 +589,9 @@ fn graph_lease_capacity_expiry_wakes_while_refresh_is_held() {
     let before_expiry = handle.runtime_view();
     assert_eq!(before_expiry.phase, SourceRuntimePhase::Refreshing);
     let since_expiry = handle.change_version();
-    let refused = handle
-        .begin_graph_publication_lease(Duration::from_secs(20))
-        .err()
-        .expect("all eight leases must still be live before waiting for expiry");
+    let Err(refused) = handle.begin_graph_publication_lease(Duration::from_secs(20)) else {
+        panic!("all eight leases must still be live before waiting for expiry");
+    };
     assert_eq!(refused.kind(), SourceRefusalKind::AdmissionUnavailable);
     assert_eq!(refused.retry(), symforge::embed::RetryAdvice::OnEvent);
 

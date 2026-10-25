@@ -32,7 +32,7 @@
         "uncommitted": true,
         "include_symbol_diff": true
       },
-      "expected": "Match type: exact (uncommitted working tree)\nSource authority: git working tree\nParse state: degraded (git path diff + lexical symbol diff — regex extraction may miss nested symbols)\nCompleteness: full for filtered scope (1 of 2 path(s) shown)\nScope: uncommitted working tree; code-only filter; symbol diff appended\nEvidence: paths `src/lib.rs`\n\nsrc/lib.rs\n\nSymbol diff: HEAD...working tree\n1 files changed\n\n  src/lib.rs (+1: working, -1: added, ~1: changed)\nSummary: +1 added, -1 removed, ~1 modified"
+      "expected": "Match type: exact (uncommitted working tree)\nSource authority: git working tree\nParse state: degraded (git path diff + lexical symbol diff — regex extraction may miss nested symbols)\nCompleteness: full for filtered scope (1 of 2 path(s) shown)\nScope: uncommitted working tree; code-only filter; symbol diff appended\nEvidence: paths `src/lib.rs`\n\nsrc/lib.rs\n\nSymbol diff: HEAD...working tree\n1 files changed\n\n  src/lib.rs (+1: working, -1: added, ~1: changed)\nSummary: +1 added, -1 removed, ~1 modified\nCompared `HEAD` at tree {target_tree} to the working tree."
     },
     {
       "name": "what_changed uncommitted including non-code files",
@@ -53,7 +53,7 @@
         "path_prefix": "src/",
         "language": "Rust"
       },
-      "expected": "Match type: exact (git ref diff)\nSource authority: git ref diff\nParse state: not-applicable (git path diff)\nCompleteness: full for filtered scope (1 of 2 path(s) shown)\nScope: git diff from `{base}` to `HEAD`; path prefix `src`; language `Rust`\nEvidence: paths `src/lib.rs`\n\nsrc/lib.rs"
+      "expected": "Match type: exact (git ref diff)\nSource authority: git ref diff\nParse state: not-applicable (git path diff)\nCompleteness: full for filtered scope (1 of 2 path(s) shown)\nScope: git diff from `{base}` to the working tree; path prefix `src`; language `Rust`\nEvidence: paths `src/lib.rs`\n\nsrc/lib.rs"
     },
     {
       "name": "what_changed estimate",
@@ -79,7 +79,7 @@
         "base": "{base}",
         "target": "{target}"
       },
-      "expected": "Match type: exact (git ref diff)\nSource authority: git ref diff\nParse state: high (tree-sitter AST extraction for supported languages, regex fallback for others)\nCompleteness: full for filtered git delta\nScope: git diff `{base}`...`{target}`\nEvidence: paths `README.md`, `src/lib.rs`\n\nSymbol diff: {base}...{target}\n2 files changed\n\n── src/lib.rs ──\n  + added\n  - old\n  ~ changed\n\nSummary: +1 added, -1 removed, ~1 modified"
+      "expected": "Match type: exact (git ref diff)\nSource authority: git ref diff\nParse state: high (tree-sitter AST extraction for supported languages, regex fallback for others)\nCompleteness: full for filtered git delta\nScope: git diff `{base}`...`{target}`\nEvidence: paths `README.md`, `src/lib.rs`\n\nSymbol diff: {base}...{target}\n2 files changed\n\n── src/lib.rs ──\n  + added\n  - old\n  ~ changed\n\nSummary: +1 added, -1 removed, ~1 modified\n\nEffective comparison base: {base} (merge base of `{base}` and `{target}`); target commit: {target}."
     },
     {
       "name": "diff_symbols compact",
@@ -90,7 +90,7 @@
         "target": "{target}",
         "compact": true
       },
-      "expected": "Match type: exact (git ref diff)\nSource authority: git ref diff\nParse state: high (tree-sitter AST extraction for supported languages, regex fallback for others)\nCompleteness: full for filtered git delta\nScope: git diff `{base}`...`{target}`; compact output\nEvidence: paths `README.md`, `src/lib.rs`\n\nSymbol diff: {base}...{target}\n2 files changed\n\n  src/lib.rs (+1: added, -1: old, ~1: changed)\nSummary: +1 added, -1 removed, ~1 modified\n(1 file(s) with only non-symbol changes omitted)"
+      "expected": "Match type: exact (git ref diff)\nSource authority: git ref diff\nParse state: high (tree-sitter AST extraction for supported languages, regex fallback for others)\nCompleteness: full for filtered git delta\nScope: git diff `{base}`...`{target}`; compact output\nEvidence: paths `README.md`, `src/lib.rs`\n\nSymbol diff: {base}...{target}\n2 files changed\n\n  src/lib.rs (+1: added, -1: old, ~1: changed)\nSummary: +1 added, -1 removed, ~1 modified\n(1 file(s) with only non-symbol changes omitted)\n\nEffective comparison base: {base} (merge base of `{base}` and `{target}`); target commit: {target}."
     },
     {
       "name": "diff_symbols summary only",
@@ -101,7 +101,7 @@
         "target": "{target}",
         "summary_only": true
       },
-      "expected": "Match type: exact (git ref diff)\nSource authority: git ref diff\nParse state: high (tree-sitter AST extraction for supported languages, regex fallback for others)\nCompleteness: full for filtered git delta\nScope: git diff `{base}`...`{target}`; summary-only output\nEvidence: paths `README.md`, `src/lib.rs`\n\nSymbol diff: {base}...{target}\n2 files changed\n\nSummary: +1 added, -1 removed, ~1 modified"
+      "expected": "Match type: exact (git ref diff)\nSource authority: git ref diff\nParse state: high (tree-sitter AST extraction for supported languages, regex fallback for others)\nCompleteness: full for filtered git delta\nScope: git diff `{base}`...`{target}`; summary-only output\nEvidence: paths `README.md`, `src/lib.rs`\n\nSymbol diff: {base}...{target}\n2 files changed\n\nSummary: +1 added, -1 removed, ~1 modified\n\nEffective comparison base: {base} (merge base of `{base}` and `{target}`); target commit: {target}."
     },
     {
       "name": "diff_symbols filtered to Rust under src",
@@ -114,7 +114,7 @@
         "language": "Rust",
         "code_only": true
       },
-      "expected": "Match type: exact (git ref diff)\nSource authority: git ref diff\nParse state: high (tree-sitter AST extraction for supported languages, regex fallback for others)\nCompleteness: full for filtered git delta (1 of 2 changed file(s) shown)\nScope: git diff `{base}`...`{target}`; path prefix `src`; language `Rust`; code-only filter\nEvidence: paths `src/lib.rs`\n\nSymbol diff: {base}...{target}\n1 files changed\n\n── src/lib.rs ──\n  + added\n  - old\n  ~ changed\n\nSummary: +1 added, -1 removed, ~1 modified"
+      "expected": "Match type: exact (git ref diff)\nSource authority: git ref diff\nParse state: high (tree-sitter AST extraction for supported languages, regex fallback for others)\nCompleteness: full for filtered git delta (1 of 2 changed file(s) shown)\nScope: git diff `{base}`...`{target}`; path prefix `src`; language `Rust`; code-only filter\nEvidence: paths `src/lib.rs`\n\nSymbol diff: {base}...{target}\n1 files changed\n\n── src/lib.rs ──\n  + added\n  - old\n  ~ changed\n\nSummary: +1 added, -1 removed, ~1 modified\n\nEffective comparison base: {base} (merge base of `{base}` and `{target}`); target commit: {target}."
     },
     {
       "name": "detect_impact since the previous commit",
@@ -125,7 +125,7 @@
         "depth": 2,
         "scope": "symbols"
       },
-      "expected": "Impact analysis: 1 changed file(s), 3 changed symbol(s), 1 blast-radius node(s) (0 critical / 1 high / 0 medium / 0 low)\n\n--- impact payload ---\n{\n  \"blast_radius\": [\n    {\n      \"hop\": 1,\n      \"risk\": \"high\",\n      \"symbol\": \"src/caller.rs::call\"\n    }\n  ],\n  \"changed_files\": [\n    \"src/lib.rs\"\n  ],\n  \"changed_symbols\": [\n    {\n      \"kind\": \"fn\",\n      \"name\": \"working\",\n      \"path\": \"src/lib.rs\"\n    },\n    {\n      \"kind\": \"fn\",\n      \"name\": \"changed\",\n      \"path\": \"src/lib.rs\"\n    },\n    {\n      \"kind\": \"fn\",\n      \"name\": \"old\",\n      \"path\": \"src/lib.rs\"\n    }\n  ],\n  \"pagination\": {\n    \"blast_radius\": {\n      \"returned\": 1,\n      \"total\": 1,\n      \"truncated\": false\n    },\n    \"changed_files\": {\n      \"returned\": 1,\n      \"total\": 1,\n      \"truncated\": false\n    },\n    \"changed_symbols\": {\n      \"returned\": 3,\n      \"total\": 3,\n      \"truncated\": false\n    }\n  },\n  \"risk_summary\": {\n    \"critical\": 0,\n    \"high\": 1,\n    \"low\": 0,\n    \"medium\": 0\n  },\n  \"source_filter\": {\n    \"applied\": true,\n    \"excluded_paths\": 2,\n    \"hint\": \"non-source changed paths are excluded by default; pass include_data=true to include them\"\n  }\n}"
+      "expected": "Impact analysis: 1 changed file(s), 3 changed symbol(s), 1 blast-radius node(s) (0 critical / 1 high / 0 medium / 0 low)\n\n--- impact payload ---\n{\n  \"blast_radius\": [\n    {\n      \"evidence\": [\n        {\n          \"call_site\": {\n            \"byte_range\": [\n              47,\n              54\n            ],\n            \"line_range\": [\n              3,\n              4\n            ],\n            \"path\": \"src/caller.rs\"\n          },\n          \"callee\": {\n            \"kind\": \"fn\",\n            \"name\": \"changed\",\n            \"path\": \"src/lib.rs\"\n          },\n          \"caller\": {\n            \"kind\": \"fn\",\n            \"name\": \"call\",\n            \"path\": \"src/caller.rs\"\n          },\n          \"resolution\": \"unique_name\"\n        }\n      ],\n      \"evidence_status\": \"available\",\n      \"hop\": 1,\n      \"risk\": \"high\",\n      \"symbol\": \"src/caller.rs::call\"\n    }\n  ],\n  \"changed_files\": [\n    \"src/lib.rs\"\n  ],\n  \"changed_symbols\": [\n    {\n      \"kind\": \"fn\",\n      \"name\": \"working\",\n      \"path\": \"src/lib.rs\"\n    },\n    {\n      \"kind\": \"fn\",\n      \"name\": \"changed\",\n      \"path\": \"src/lib.rs\"\n    },\n    {\n      \"kind\": \"fn\",\n      \"name\": \"old\",\n      \"path\": \"src/lib.rs\"\n    }\n  ],\n  \"pagination\": {\n    \"blast_radius\": {\n      \"returned\": 1,\n      \"total\": 1,\n      \"truncated\": false\n    },\n    \"changed_files\": {\n      \"returned\": 1,\n      \"total\": 1,\n      \"truncated\": false\n    },\n    \"changed_symbols\": {\n      \"returned\": 3,\n      \"total\": 3,\n      \"truncated\": false\n    }\n  },\n  \"risk_summary\": {\n    \"critical\": 0,\n    \"high\": 1,\n    \"low\": 0,\n    \"medium\": 0\n  },\n  \"source_filter\": {\n    \"applied\": true,\n    \"excluded_paths\": 2,\n    \"hint\": \"non-source changed paths are excluded by default; pass include_data=true to include them\"\n  }\n}"
     },
     {
       "name": "detect_impact by file",
@@ -136,7 +136,7 @@
         "depth": 1,
         "scope": "files"
       },
-      "expected": "Impact analysis: 1 changed file(s), 3 changed symbol(s), 1 blast-radius node(s) (0 critical / 1 high / 0 medium / 0 low)\n\n--- impact payload ---\n{\n  \"blast_radius\": [\n    {\n      \"hop\": 1,\n      \"risk\": \"high\",\n      \"symbol\": \"src/caller.rs\"\n    }\n  ],\n  \"changed_files\": [\n    \"src/lib.rs\"\n  ],\n  \"changed_symbols\": [\n    {\n      \"kind\": \"fn\",\n      \"name\": \"working\",\n      \"path\": \"src/lib.rs\"\n    },\n    {\n      \"kind\": \"fn\",\n      \"name\": \"changed\",\n      \"path\": \"src/lib.rs\"\n    },\n    {\n      \"kind\": \"fn\",\n      \"name\": \"old\",\n      \"path\": \"src/lib.rs\"\n    }\n  ],\n  \"pagination\": {\n    \"blast_radius\": {\n      \"returned\": 1,\n      \"total\": 1,\n      \"truncated\": false\n    },\n    \"changed_files\": {\n      \"returned\": 1,\n      \"total\": 1,\n      \"truncated\": false\n    },\n    \"changed_symbols\": {\n      \"returned\": 3,\n      \"total\": 3,\n      \"truncated\": false\n    }\n  },\n  \"risk_summary\": {\n    \"critical\": 0,\n    \"high\": 1,\n    \"low\": 0,\n    \"medium\": 0\n  },\n  \"source_filter\": {\n    \"applied\": true,\n    \"excluded_paths\": 2,\n    \"hint\": \"non-source changed paths are excluded by default; pass include_data=true to include them\"\n  }\n}"
+      "expected": "Impact analysis: 1 changed file(s), 3 changed symbol(s), 1 blast-radius node(s) (0 critical / 1 high / 0 medium / 0 low)\n\n--- impact payload ---\n{\n  \"blast_radius\": [\n    {\n      \"evidence\": [\n        {\n          \"call_site\": {\n            \"byte_range\": [\n              47,\n              54\n            ],\n            \"line_range\": [\n              3,\n              4\n            ],\n            \"path\": \"src/caller.rs\"\n          },\n          \"callee\": {\n            \"kind\": \"fn\",\n            \"name\": \"changed\",\n            \"path\": \"src/lib.rs\"\n          },\n          \"caller\": {\n            \"kind\": \"fn\",\n            \"name\": \"call\",\n            \"path\": \"src/caller.rs\"\n          },\n          \"resolution\": \"unique_name\"\n        }\n      ],\n      \"evidence_status\": \"available\",\n      \"hop\": 1,\n      \"risk\": \"high\",\n      \"symbol\": \"src/caller.rs\"\n    }\n  ],\n  \"changed_files\": [\n    \"src/lib.rs\"\n  ],\n  \"changed_symbols\": [\n    {\n      \"kind\": \"fn\",\n      \"name\": \"working\",\n      \"path\": \"src/lib.rs\"\n    },\n    {\n      \"kind\": \"fn\",\n      \"name\": \"changed\",\n      \"path\": \"src/lib.rs\"\n    },\n    {\n      \"kind\": \"fn\",\n      \"name\": \"old\",\n      \"path\": \"src/lib.rs\"\n    }\n  ],\n  \"pagination\": {\n    \"blast_radius\": {\n      \"returned\": 1,\n      \"total\": 1,\n      \"truncated\": false\n    },\n    \"changed_files\": {\n      \"returned\": 1,\n      \"total\": 1,\n      \"truncated\": false\n    },\n    \"changed_symbols\": {\n      \"returned\": 3,\n      \"total\": 3,\n      \"truncated\": false\n    }\n  },\n  \"risk_summary\": {\n    \"critical\": 0,\n    \"high\": 1,\n    \"low\": 0,\n    \"medium\": 0\n  },\n  \"source_filter\": {\n    \"applied\": true,\n    \"excluded_paths\": 2,\n    \"hint\": \"non-source changed paths are excluded by default; pass include_data=true to include them\"\n  }\n}"
     },
     {
       "name": "explore a concept",

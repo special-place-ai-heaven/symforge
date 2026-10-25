@@ -77,13 +77,12 @@ fn check_local_config_preserved(root: &Path) {
     let scratch = tempfile::tempdir().unwrap();
     let (_runtime, source) = prepared_source(root, scratch.path());
     let isolated = source.prepared_git_repository_for_test().unwrap();
-    assert_eq!(
-        isolated
+    assert!(
+        !isolated
             .config()
             .unwrap()
             .get_bool("core.filemode")
-            .unwrap(),
-        false
+            .unwrap()
     );
     let commit = isolated.head().unwrap().peel_to_commit().unwrap();
     let entry = commit

@@ -129,6 +129,7 @@ struct WhatChangedReport {
     paths: Vec<String>,
     total_paths: u64,
     symbol_diff: Option<(shared::SymbolDiffView, String)>,
+    symbol_diff_commits: Option<(Option<String>, Option<String>, u64)>,
     rendered: String,
 }
 
@@ -184,7 +185,12 @@ pub(super) fn what_changed(
         let rendered = budget.text(&report.rendered)?;
         let paths = strings(&report.paths, budget);
         let symbol_diff = match &report.symbol_diff {
-            Some((view, rendered)) => Some(project_symbol_diff(view, rendered, None, budget)?),
+            Some((view, rendered)) => Some(project_symbol_diff(
+                view,
+                rendered,
+                report.symbol_diff_commits.clone(),
+                budget,
+            )?),
             None => None,
         };
         Ok(QueryOutput::WhatChanged(WhatChangedResult {
@@ -231,6 +237,7 @@ fn what_changed_report(
         paths: Vec::new(),
         total_paths: total_paths as u64,
         symbol_diff: None,
+        symbol_diff_commits: None,
         rendered,
     };
     let include_symbol_diff = options.include_symbol_diff.unwrap_or(false);
@@ -275,20 +282,38 @@ fn what_changed_report(
                 total_paths: view.paths.len() as u64,
                 paths: filtered,
                 symbol_diff: None,
+                symbol_diff_commits: None,
                 rendered: format!("{envelope}\n\n{output}"),
             })
         }
         WhatChangedMode::Uncommitted | WhatChangedMode::GitRef(_) => {
             let repo = repo.ok_or(QueryRefusalKind::GitUnavailable)?;
-            let (paths, code_only, match_type, empty, base, target) = match mode {
-                WhatChangedMode::GitRef(git_ref) => (
-                    repo.changed_paths_from_ref(git_ref),
-                    options.code_only.unwrap_or(false),
-                    "exact (git ref diff)",
-                    format!("No changes detected relative to git ref '{git_ref}'."),
-                    git_ref.as_str(),
-                    "HEAD",
+            let resolved_ref = match mode {
+                WhatChangedMode::GitRef(git_ref) if include_symbol_diff => Some(
+                    repo.resolve_ref_tree_reference(git_ref)
+                        .map_err(|_| QueryRefusalKind::GitUnavailable)?,
                 ),
+                WhatChangedMode::Uncommitted if include_symbol_diff => Some(
+                    repo.resolve_ref_tree_reference("HEAD")
+                        .map_err(|_| QueryRefusalKind::GitUnavailable)?,
+                ),
+                _ => None,
+            };
+            let (paths, code_only, match_type, empty, base, target) = match mode {
+                WhatChangedMode::GitRef(git_ref) => {
+                    let paths = match resolved_ref {
+                        Some(resolved) => repo.changed_paths_from_tree_oid(resolved.tree_oid),
+                        None => repo.changed_paths_from_ref(git_ref),
+                    };
+                    (
+                        paths,
+                        options.code_only.unwrap_or(false),
+                        "exact (git ref diff)",
+                        format!("No changes detected relative to git ref '{git_ref}'."),
+                        git_ref.as_str(),
+                        "",
+                    )
+                }
                 _ => (
                     repo.uncommitted_paths(),
                     // US1 (018) FR-001/SC-001: uncommitted mode defaults to
@@ -333,21 +358,37 @@ fn what_changed_report(
                 &filtered,
             );
             let mut output = shared::what_changed_paths_result(&filtered, &empty);
-            let symbol_diff = include_symbol_diff.then(|| {
+            let mut symbol_diff_commits = None;
+            let base_tree_oid = resolved_ref.map(|resolved| resolved.tree_oid.to_string());
+            let base_commit = resolved_ref
+                .and_then(|resolved| resolved.commit_oid)
+                .map(|commit| commit.to_string());
+            let symbol_diff = if let Some(base_tree_oid) = base_tree_oid {
                 let refs: Vec<&str> = filtered.iter().map(String::as_str).collect();
+                symbol_diff_commits = Some((base_commit, None, total_paths as u64));
                 let view = shared::capture_symbol_diff(base, target, &refs, |reference, path| {
-                    gated_text(live, repo, reference, path)
+                    if reference.is_empty() {
+                        gated_text(live, repo, reference, path)
+                    } else {
+                        gated_text(live, repo, &base_tree_oid, path)
+                    }
                 });
-                let rendered = shared::render_symbol_diff(&view, true, false);
+                let mut rendered = shared::render_symbol_diff(&view, true, false);
+                rendered.push_str(&format!(
+                    "\nCompared `{base}` at tree {base_tree_oid} to the working tree."
+                ));
                 output.push_str("\n\n");
                 output.push_str(&rendered);
-                (view, rendered)
-            });
+                Some((view, rendered))
+            } else {
+                None
+            };
             Ok(WhatChangedReport {
                 mode: change_mode,
                 total_paths: total_paths as u64,
                 paths: filtered,
                 symbol_diff,
+                symbol_diff_commits,
                 rendered: format!("{envelope}\n\n{output}"),
             })
         }
@@ -432,8 +473,11 @@ pub(super) fn diff_symbols(
     }
     let live = snapshot.generation.live.as_ref();
     let repo = open_repository(&snapshot.root).ok_or(QueryRefusalKind::GitUnavailable)?;
+    let range = repo
+        .comparison_range_between_refs(base, target)
+        .map_err(|_| QueryRefusalKind::GitUnavailable)?;
     let changed = repo
-        .changed_paths_between_refs(base, target)
+        .changed_paths_for_comparison(&range)
         .map_err(|_| QueryRefusalKind::GitUnavailable)?;
     let code_only = request.code_only.unwrap_or(false);
     let filtered = shared::filter_diff_symbol_paths(
@@ -444,18 +488,28 @@ pub(super) fn diff_symbols(
     )
     .map_err(|_| QueryRefusalKind::UnsupportedOption)?;
     let commits = Some((
-        repo.resolve_ref_commit(base).map(|oid| oid.to_string()),
-        repo.resolve_ref_commit(target).map(|oid| oid.to_string()),
+        Some(range.base_commit.to_string()),
+        Some(range.target_commit.to_string()),
         changed.len() as u64,
     ));
+    let base_commit = range.base_commit.to_string();
+    let target_commit = range.target_commit.to_string();
     let (view, rendered) = if filtered.is_empty() {
         (
             shared::capture_symbol_diff(base, target, &[], |_, _| Ok(None)),
-            format!("No file changes found between {base} and {target}."),
+            format!(
+                "No file changes found between {base} and {target}.\n\n{}",
+                shared::git_comparison_provenance(&range)
+            ),
         )
     } else {
         let view = shared::capture_symbol_diff(base, target, &filtered, |reference, path| {
-            gated_text(live, &repo, reference, path)
+            let commit = if reference == base {
+                &base_commit
+            } else {
+                &target_commit
+            };
+            gated_text(live, &repo, commit, path)
         });
         let envelope = shared::diff_symbols_envelope(
             base,
@@ -469,7 +523,13 @@ pub(super) fn diff_symbols(
             code_only,
         );
         let body = shared::render_symbol_diff(&view, compact, summary_only);
-        (view, format!("{envelope}\n\n{body}"))
+        (
+            view,
+            format!(
+                "{envelope}\n\n{body}\n\n{}",
+                shared::git_comparison_provenance(&range)
+            ),
+        )
     };
     budget.check()?;
     cache_before_token_cap(budget, request.max_tokens, |budget| {

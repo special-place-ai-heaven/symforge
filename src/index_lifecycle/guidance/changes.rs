@@ -23,6 +23,13 @@ pub(crate) struct SymbolDiffView {
     pub withheld_count: usize,
 }
 
+pub(crate) fn git_comparison_provenance(range: &crate::git::GitComparisonRange) -> String {
+    format!(
+        "Effective comparison base: {} (merge base of `{}` and `{}`); target commit: {}.",
+        range.base_commit, range.base_ref, range.target_ref, range.target_commit
+    )
+}
+
 pub(crate) fn capture_symbol_diff(
     base: &str,
     target: &str,
@@ -421,7 +428,7 @@ pub(crate) fn what_changed_scope_summary(
         WhatChangedMode::Timestamp(since_ts) => parts.push(format!("timestamp since `{since_ts}`")),
         WhatChangedMode::Uncommitted => parts.push("uncommitted working tree".to_string()),
         WhatChangedMode::GitRef(git_ref) => {
-            parts.push(format!("git diff from `{git_ref}` to `HEAD`"))
+            parts.push(format!("git diff from `{git_ref}` to the working tree"))
         }
     }
     if let Some(path_prefix) = input.path_prefix.filter(|prefix| !prefix.trim().is_empty()) {
