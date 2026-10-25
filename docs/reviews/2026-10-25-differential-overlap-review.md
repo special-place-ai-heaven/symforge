@@ -51,7 +51,7 @@ length framing:
 
 | Set | SHA-256 | Files | Normalized bytes |
 | --- | --- | ---: | ---: |
-| Full source | `e099130d822e49d4d73ee4ec1610a0799625c3be174ac2eb1120a8c0e6473aaa` | 312 | 12311462 |
+| Full source | `9a4ec2edf8a2562bfff070f5c50fcb499f00d57805eb36890e91c094a17149c7` | 312 | 12311922 |
 | Excluded runtime source | `6014f89238cb76cdbe061e91e7ef8a693b1cefbd06a149069aea92aaa690cb9a` | 89 | 2266500 |
 
 Only those two source pins were refreshed. Source rosters, excluded paths,
@@ -100,3 +100,9 @@ pins the HEAD tree once and uses the shared gated capture/render path, matching
 embed. A focused assertion checks the resolved tree; the shared golden stays
 unchanged. Independent review approved the repair and recomputed the full-source
 seal above; the excluded-source seal did not change.
+
+The follow-up default run exposed the test normalizer's missing `{target_tree}`
+replacement. The MCP normalizer now mirrors embed's existing HEAD-tree folding.
+All 16 captured case strings match byte-for-byte after this normalization; no
+golden expectation or production body changed. Lead review and formatting passed,
+and the full-source seal above includes this test-only adjustment.

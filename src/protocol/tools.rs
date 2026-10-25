@@ -14212,6 +14212,17 @@ mod tests {
                 folded = folded.replace(&id[..short], placeholder);
             }
         }
+        if let Ok(repository) = git2::Repository::open(root)
+            && let Ok(head) = repository.head()
+            && let Ok(commit) = head.peel_to_commit()
+            && let Ok(tree) = commit.tree()
+        {
+            let tree = tree.id().to_string();
+            folded = folded.replace(&tree, "{target_tree}");
+            for short in [12, 8, 7] {
+                folded = folded.replace(&tree[..short], "{target_tree}");
+            }
+        }
         let mut roots = vec![root.display().to_string()];
         if let Ok(canonical) = dunce::canonicalize(root) {
             roots.push(canonical.display().to_string());
