@@ -24,12 +24,12 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  actions: read
   contents: read
 
 jobs:
   resolve-release-ref:
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       release_ref: ${{ steps.resolve.outputs.release_ref }}
       tag_name: ${{ steps.resolve.outputs.tag_name }}
@@ -237,7 +237,12 @@ jobs:
 
   verify-release-ref:
     needs: resolve-release-ref
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # `gh run list` (last successful Release run) needs actions: read.
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -486,7 +491,8 @@ jobs:
       - resolve-release-ref
       - verify-release-ref
     if: needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     environment: feature-020-v11-release-approval
     permissions:
       actions: read
@@ -1970,7 +1976,8 @@ jobs:
       - verify-release-ref
       - feature-020-v11-gate
     if: ${{ always() }}
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       release_ref: ${{ steps.gate.outputs.release_ref }}
     steps:
@@ -2022,7 +2029,8 @@ jobs:
     # below it must name a status function to stop inheriting that skip, and must
     # then restate the success it would otherwise have got implicitly.
     if: ${{ !cancelled() && needs.resolve-release-ref.result == 'success' && needs.gate-release-ref.result == 'success' }}
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       actions: write
       contents: write
@@ -2332,7 +2340,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: [self-hosted, linux, fresh]
+          - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: symforge-linux-x64
             binary: target/x86_64-unknown-linux-gnu/release/symforge
@@ -2343,9 +2351,10 @@ jobs:
             binary: target/x86_64-pc-windows-msvc/release/symforge.exe
             builder: cargo
 
-    # Linux uses the fresh self-hosted pool; Windows uses windows-latest.
+    # Linux uses GitHub-hosted ubuntu-latest; Windows uses windows-latest.
     # macOS is not built.
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2386,7 +2395,8 @@ jobs:
       - gate-release-ref
       - build
     if: ${{ !cancelled() && needs.gate-release-ref.result == 'success' && needs.prepare-release.result == 'success' && needs.build.result == 'success' && needs.prepare-release.outputs.release_created == 'true' }}
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2492,7 +2502,8 @@ jobs:
       - build
       - build-npm-package
     if: ${{ !cancelled() && needs.gate-release-ref.result == 'success' && needs.prepare-release.result == 'success' && needs.build.result == 'success' && needs.build-npm-package.result == 'success' && needs.prepare-release.outputs.release_created == 'true' }}
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       actions: read
       contents: write
@@ -2531,7 +2542,8 @@ jobs:
       - build-npm-package
       - upload-release-assets
     if: ${{ !cancelled() && needs.gate-release-ref.result == 'success' && needs.prepare-release.result == 'success' && needs.build.result == 'success' && needs.build-npm-package.result == 'success' && needs.upload-release-assets.result == 'success' && needs.prepare-release.outputs.release_created == 'true' }}
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: cargo-publish
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2563,7 +2575,8 @@ jobs:
       - build-npm-package
       - upload-release-assets
     if: ${{ !cancelled() && needs.gate-release-ref.result == 'success' && needs.prepare-release.result == 'success' && needs.build-npm-package.result == 'success' && needs.upload-release-assets.result == 'success' && needs.prepare-release.outputs.release_created == 'true' }}
-    runs-on: [self-hosted, linux, fresh]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment: npm-publish
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
