@@ -196,7 +196,7 @@ Details: [Benchmarks and Token Savings, What is recorded](https://github.com/spe
 
 ## Development
 
-SymForge parses 19 languages with tree-sitter grammars plus 6 text and config formats with native parsers. The toolchain is pinned by [`rust-toolchain.toml`](./rust-toolchain.toml) (Rust 1.96.0, edition 2024).
+SymForge parses 19 languages with tree-sitter grammars plus 6 text and config formats with native parsers. The toolchain is pinned by [`rust-toolchain.toml`](./rust-toolchain.toml) (Rust 1.99.1, edition 2024).
 
 ```bash
 cargo fmt --check
