@@ -115,7 +115,7 @@ arc-swap = "1"
 ast-grep-core = "0.45"
 automod = "1"
 sha2 = "0.11"
-parking_lot = "0.12"
+parking_lot = "0.13"
 rayon = "1.10"
 schemars = "1"
 # REVIEW P3-C (deferred): version requirement is "1.1.0" but the lockfile
