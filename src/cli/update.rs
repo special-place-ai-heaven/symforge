@@ -2856,11 +2856,16 @@ mod tests {
         #[cfg(windows)]
         let (source, args): (&str, &[&str]) =
             (r"C:\Windows\System32\PING.EXE", &["-n", "60", "127.0.0.1"]);
+        // Not /bin/sleep: on Ubuntu 26.04 it is rust-coreutils, a multicall
+        // binary that dispatches on its file name, so a copy named `symforge`
+        // exits at once ("unknown program"). The shell blocks on `read` from
+        // the piped stdin, which this Child holds open until it is killed.
         #[cfg(not(windows))]
-        let (source, args): (&str, &[&str]) = ("/bin/sleep", &["60"]);
+        let (source, args): (&str, &[&str]) = ("/bin/sh", &["-c", "read x"]);
         std::fs::copy(source, path).expect("copy holder binary");
         crate::process_util::hidden_command(path)
             .args(args)
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
