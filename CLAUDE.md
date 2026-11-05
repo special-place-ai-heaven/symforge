@@ -99,22 +99,18 @@ missing-crate error as a code defect until the build directory is known clean.
   a `cargo check` pass, so running both compiled the graph twice for one answer.
 - `cargo build --release` is NOT droppable from PR CI: the tool-correctness
   harness runs `verify-tools.cjs --bin target/release/symforge`.
-- **`ci.yml` runs on every branch push AND on `pull_request` (as_of 2026-11-05).**
-  `aaab84e1` (2026-10-22) added `branches: ["**"]` beside `tags-ignore: ["v*"]`,
-  so the push trigger is live: every merge to `main` gets a push CI run, and the
+- **`ci.yml` push trigger is `branches: [main]` plus `pull_request` (as_of
+  2026-11-05).** Every merge to `main` gets a push CI run, so the
   `Validate pushed commit subjects` step (`conventional_commits.py
-  check-push-range`) is now armed. Verify with
-  `gh api "repos/:owner/:repo/actions/workflows/ci.yml/runs?event=push"`
-  (`total_count` was 86 on 2026-11-05; it was 0 before `aaab84e1`, when a
-  tag-filter-only push trigger made it unreachable).
+  check-push-range`) is armed. Feature branches get CI only through their PR
+  (or `workflow_dispatch`); a branch pushed without a PR gets no CI run.
 
-  **Cost:** a push to a PR branch now runs the full CI twice, once as `push`
-  (concurrency group `refs/heads/<branch>`) and once as `pull_request`
-  (`refs/pull/<N>/merge`). The groups differ, so neither cancels the other — that
-  is why PR checks list `rust` and `windows-native` twice. Narrowing the push
-  trigger to `branches: [main]` would keep the main-branch gate and drop the
-  duplicate; that is a workflow edit (fingerprint re-pin, see below) and a
-  deliberate cost call, not yet made.
+  History: before `aaab84e1` (2026-10-22) a tag-filter-only push trigger made
+  push CI unreachable (0 push runs). `aaab84e1` armed it with `branches: ["**"]`,
+  which ran the full CI twice per PR push — `push` (group `refs/heads/<branch>`)
+  and `pull_request` (`refs/pull/<N>/merge`) never cancel each other. Narrowed to
+  `[main]` on 2026-11-05 to drop that duplicate. A PR should therefore show ONE
+  `rust` / `windows-native` set; two means the trigger regressed.
 - Scheduled and manual CI additionally run ignored performance smoke coverage:
   `test_load_perf_1000_files` and `calibrate_current_repo_smoke`.
 - Full real-repo coupling calibration is operator-triggered with
