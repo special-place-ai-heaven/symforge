@@ -317,7 +317,20 @@ fn child_replay_process() {
     let reserved = match std::env::var("SYMFORGE_REPLAY_TEST_LEASE_MS") {
         Ok(raw) => {
             let millis: u64 = raw.parse().expect("lease milliseconds");
-            store.reserve_with_lease(&key, &request, Duration::from_millis(millis))
+            let lease = Duration::from_millis(millis);
+            match std::env::var("SYMFORGE_REPLAY_TEST_NOW_MS") {
+                // Pinned reservation time: immune to wall-clock steps.
+                Ok(now) => {
+                    let now_ms: u64 = now.parse().expect("now milliseconds");
+                    store.reserve_with_lease_at(
+                        &key,
+                        &request,
+                        lease,
+                        UNIX_EPOCH + Duration::from_millis(now_ms),
+                    )
+                }
+                Err(_) => store.reserve_with_lease(&key, &request, lease),
+            }
         }
         Err(_) => store.reserve(&key, &request),
     };
@@ -520,6 +533,11 @@ fn copied_replay_state_cannot_rebind_to_replaced_physical_root_after_restart() {
     assert_eq!(fs::read(&second).unwrap(), b"wrong_physical_root");
 }
 
+/// Original reservation time (Unix ms, Nov 2023), far in the past so its lease is
+/// expired under any wall-clock step; children still judge expiry with real now.
+#[cfg(feature = "__test-internals")]
+const PINNED_PAST_MS: u64 = 1_700_000_000_000;
+
 #[cfg(feature = "__test-internals")]
 fn child_lease(mode: &str, root: &Path, state: &Path, result: &Path, lease_ms: u64) -> Command {
     let mut command = child(mode, root, state, result);
@@ -535,13 +553,17 @@ fn reservation_lease_expiry_allows_exactly_one_takeover() {
     let setup = store(dir.path(), &state);
     let held = acquired(
         setup
-            .reserve_with_lease(&key(), &request(), Duration::from_millis(50))
+            .reserve_with_lease_at(
+                &key(),
+                &request(),
+                Duration::from_millis(50),
+                UNIX_EPOCH + Duration::from_millis(PINNED_PAST_MS),
+            )
             .unwrap(),
     );
     assert!(!held.took_over());
     drop(held);
     drop(setup);
-    std::thread::sleep(Duration::from_millis(400));
 
     let mut children = Vec::new();
     for index in 0..8 {
@@ -640,12 +662,12 @@ fn crash_between_reserve_and_mark_started_recovers_after_lease() {
     let result = dir.path().join("result");
     assert!(
         child_lease("crash_unstarted", dir.path(), &state, &result, 200)
+            .env("SYMFORGE_REPLAY_TEST_NOW_MS", PINNED_PAST_MS.to_string())
             .status()
             .unwrap()
             .success()
     );
     assert_eq!(fs::read(&result).unwrap(), b"acquired");
-    std::thread::sleep(Duration::from_millis(500));
     let store = store(dir.path(), &state);
     let lease = acquired(
         store
