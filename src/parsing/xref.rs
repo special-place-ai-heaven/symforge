@@ -347,7 +347,7 @@ const KOTLIN_XREF_QUERY: &str = r#"
 "#;
 
 const DART_XREF_QUERY: &str = r#"
-; nielsenko tree-sitter-dart (0.2.0) call shapes, mirroring upstream
+; nielsenko tree-sitter-dart (version pinned in Cargo.toml) call shapes, mirroring upstream
 ; tags.scm reference queries.
 
 ; Plain function calls: print(x), Circle(2.0)

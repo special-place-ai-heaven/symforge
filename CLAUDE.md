@@ -99,29 +99,18 @@ missing-crate error as a code defect until the build directory is known clean.
   a `cargo check` pass, so running both compiled the graph twice for one answer.
 - `cargo build --release` is NOT droppable from PR CI: the tool-correctness
   harness runs `verify-tools.cjs --bin target/release/symforge`.
-- One CI run per PR (`pull_request`). **`push` never triggers `ci.yml` at all** —
-  not on branches, not on `main` (as_of 2026-08-22). All-time counts:
-  `gh api "repos/:owner/:repo/actions/workflows/ci.yml/runs?event=push"` returns
-  `total_count` **0**, against **666** for `event=pull_request`. The earlier note
-  here said push runs "fire only on `main` after a merge"; that was wrong. The 37
-  push runs visible in `gh run list` all belong to `release.yml`, which declares
-  `on: push: branches: [main]`.
+- **`ci.yml` push trigger is `branches: [main]` plus `pull_request` (as_of
+  2026-11-05).** Every merge to `main` gets a push CI run, so the
+  `Validate pushed commit subjects` step (`conventional_commits.py
+  check-push-range`) is armed. Feature branches get CI only through their PR
+  (or `workflow_dispatch`); a branch pushed without a PR gets no CI run.
 
-  **The cause is `ci.yml`'s own trigger.** It declares `push:` with only
-  `tags-ignore: ["v*"]`. When a push trigger carries *only* tag filters, GitHub
-  does not run it for branch pushes at all — so this filter means "non-`v*` tag
-  pushes only", and the only tags this repo pushes are `v*`. The trigger is
-  therefore unreachable in both directions.
-
-  **What that costs:** `ci.yml`'s `Validate pushed commit subjects` step
-  (`conventional_commits.py check-push-range`) has never executed, ever. It is
-  the gate meant to stop a non-conventional subject reaching `main` outside a PR
-  — the exact failure that reddened Release run #938. Adding `branches: ['**']`
-  to the push trigger would arm it, at the cost of a full CI run on every merge
-  to `main`. That is a live cost/benefit call, not a typo fix; do not flip it
-  casually. Note also that arming it is what would make a per-run concurrency
-  group for `main` meaningful — while push CI stays unreachable, any such change
-  guards a queue that has no entrants.
+  History: before `aaab84e1` (2026-10-22) a tag-filter-only push trigger made
+  push CI unreachable (0 push runs). `aaab84e1` armed it with `branches: ["**"]`,
+  which ran the full CI twice per PR push — `push` (group `refs/heads/<branch>`)
+  and `pull_request` (`refs/pull/<N>/merge`) never cancel each other. Narrowed to
+  `[main]` on 2026-11-05 to drop that duplicate. A PR should therefore show ONE
+  `rust` / `windows-native` set; two means the trigger regressed.
 - Scheduled and manual CI additionally run ignored performance smoke coverage:
   `test_load_perf_1000_files` and `calibrate_current_repo_smoke`.
 - Full real-repo coupling calibration is operator-triggered with

@@ -1326,9 +1326,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Same 312 files; independently reviewed and recomputed; no new boundary bridge.
 // docs/reviews/2026-10-25-differential-overlap-review.md.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "9a4ec2edf8a2562bfff070f5c50fcb499f00d57805eb36890e91c094a17149c7",
+    "8b681cfbf4999b7707934c0d58d3b44157fdcaa3ca7034823fb3d905ab5b23b1",
     312,
-    12311922,
+    12313878,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
@@ -1463,8 +1463,8 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "825a15648b584f41:19022"),
-    ("release.yml", "85e2c04d7611de03:114808"),
+    ("ci.yml", "a8540fc41ce4708c:19022"),
+    ("release.yml", "67d78acea1b85de7:114808"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an
@@ -1647,7 +1647,7 @@ const CARGO_LINES: &[(&str, usize)] = &[
 /// readable basis, not a Gitignore parser. The whole-file fingerprint catches
 /// a later negation or other semantic drift elsewhere in the file.
 const CARGO_CONFIG_SKIP_GITIGNORE_LINES: &[&str] = &["/target", "node_modules/"];
-const GITIGNORE_FINGERPRINT: &str = "9683e3a684f4a11e:1492";
+const GITIGNORE_FINGERPRINT: &str = "1a161b70de79b3cf:1505";
 const PRODUCTION_TARGET_TOPOLOGY: &[(&str, &str)] =
     &[("lib", "src/lib.rs"), ("bin:symforge", "src/main.rs")];
 

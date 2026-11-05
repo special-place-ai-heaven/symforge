@@ -1,6 +1,6 @@
 [package]
 name = "symforge"
-version = "11.10.2"
+version = "11.10.3"
 edition = "2024"
 description = "SymForge — in-memory code intelligence MCP server for Claude Code, Codex, and Gemini CLI"
 license-file = "LICENSE"
@@ -115,7 +115,7 @@ arc-swap = "1"
 ast-grep-core = "0.45"
 automod = "1"
 sha2 = "0.11"
-parking_lot = "0.12"
+parking_lot = "0.13"
 rayon = "1.10"
 schemars = "1"
 # REVIEW P3-C (deferred): version requirement is "1.1.0" but the lockfile
@@ -165,7 +165,7 @@ tree-sitter-kotlin-sg = "0.4.0"
 # docs/dart-parser-investigation.md: 100% clean on 2,805 real Flutter files
 # and all Dart 3.0-3.12 syntax; the abandoned 0.0.4 fails every Dart 3
 # construct and the orchard crate fails 2.6% of the same corpus.
-tree-sitter-dart = "=0.2.0"
+tree-sitter-dart = "=0.3.0"
 tree-sitter-elixir = "0.3.5"
 tree-sitter-html = "0.23.2"
 tree-sitter-css = "0.25.0"
