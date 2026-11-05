@@ -1326,9 +1326,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Same 312 files; independently reviewed and recomputed; no new boundary bridge.
 // docs/reviews/2026-10-25-differential-overlap-review.md.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "8b681cfbf4999b7707934c0d58d3b44157fdcaa3ca7034823fb3d905ab5b23b1",
+    "93428b1235cb9541c197078eccfad3d7f727be1a7ec03dae7207d8a327740660",
     312,
-    12313878,
+    12314230,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
@@ -1463,8 +1463,8 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "a8540fc41ce4708c:19022"),
-    ("release.yml", "67d78acea1b85de7:114808"),
+    ("ci.yml", "f58c558e6e5002df:28962"),
+    ("release.yml", "b174946ff2c434bb:115022"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an
@@ -1548,6 +1548,41 @@ const CARGO_LINES: &[(&str, usize)] = &[
     ("builder: cargo", 2),
     ("cargo-publish:", 1),
     ("environment: cargo-publish", 1),
+    // zccache cache keys and restore-key prefixes (#831). They name
+    // `Cargo.lock` only as a `hashFiles` input to an actions/cache key; a
+    // cache key starts no process and cannot select a doctest lane.
+    (
+        "key: zccache-1.15.6-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}",
+        2,
+    ),
+    (
+        "zccache-1.15.6-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-",
+        1,
+    ),
+    (
+        "key: zccache-1.15.6-${{ runner.os }}-embed-build-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}",
+        2,
+    ),
+    (
+        "zccache-1.15.6-${{ runner.os }}-embed-build-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-",
+        1,
+    ),
+    (
+        "key: zccache-1.15.6-${{ runner.os }}-server-embed-parity-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}",
+        2,
+    ),
+    (
+        "zccache-1.15.6-${{ runner.os }}-server-embed-parity-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-",
+        1,
+    ),
+    (
+        "key: zccache-1.15.6-${{ runner.os }}-embed-musl-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}",
+        2,
+    ),
+    (
+        "zccache-1.15.6-${{ runner.os }}-embed-musl-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-",
+        1,
+    ),
     // Commands that invoke no test harness at all.
     ("[\"cargo\", \"metadata\", \"--format-version\", \"1\"],", 1),
     (
@@ -1633,7 +1668,6 @@ const CARGO_LINES: &[(&str, usize)] = &[
         "run: cargo test --release --test live_index_integration test_load_perf_1000_files -- --ignored --test-threads=1",
         1,
     ),
-    ("run: cargo test --test serve_port -- --test-threads=1", 1),
     // Windows-native job. No test harness: nextest never builds or runs
     // doctests, the install line is a binary fetch, and the fmt/clippy
     // gates cannot reach the doctest lane.
@@ -2495,8 +2529,8 @@ fn no_gate_builds_doctests() {
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(
         (seen.len(), distinct.len(), files),
-        (54, 42, 2),
-        "the CI workflows hold fifty-four cargo-mentioning lines, forty-two \
+        (65, 49, 2),
+        "the CI workflows hold sixty-five cargo-mentioning lines, forty-nine \
          of them distinct, across two workflow files; this walk saw {:?}. A gate \
          added, removed, reworded, or a workflow file added — reconcile \
          CARGO_LINES with the workflows deliberately, never by loosening this \
