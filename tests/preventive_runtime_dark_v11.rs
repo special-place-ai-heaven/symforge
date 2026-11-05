@@ -1326,9 +1326,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Same 312 files; independently reviewed and recomputed; no new boundary bridge.
 // docs/reviews/2026-10-25-differential-overlap-review.md.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "71733ddceb3f12d26916868556bba8847eb5dde0bb807631d4db3e1ae5c9336a",
+    "8b681cfbf4999b7707934c0d58d3b44157fdcaa3ca7034823fb3d905ab5b23b1",
     312,
-    12311968,
+    12313878,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
