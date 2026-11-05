@@ -17,7 +17,7 @@ fn walk_node(
     sort_order: &mut u32,
     symbols: &mut Vec<SymbolRecord>,
 ) {
-    // Node kinds for the nielsenko tree-sitter-dart grammar (0.2.0).
+    // Node kinds for the nielsenko tree-sitter-dart grammar (version pinned in Cargo.toml).
     // Class-likes carry a `name` field; methods are `method_signature`
     // wrappers around function/getter/setter/operator signatures, so the
     // inner signature kinds only count as top-level functions when NOT
