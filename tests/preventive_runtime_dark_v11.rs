@@ -1647,7 +1647,7 @@ const CARGO_LINES: &[(&str, usize)] = &[
 /// readable basis, not a Gitignore parser. The whole-file fingerprint catches
 /// a later negation or other semantic drift elsewhere in the file.
 const CARGO_CONFIG_SKIP_GITIGNORE_LINES: &[&str] = &["/target", "node_modules/"];
-const GITIGNORE_FINGERPRINT: &str = "9683e3a684f4a11e:1492";
+const GITIGNORE_FINGERPRINT: &str = "1a161b70de79b3cf:1505";
 const PRODUCTION_TARGET_TOPOLOGY: &[(&str, &str)] =
     &[("lib", "src/lib.rs"), ("bin:symforge", "src/main.rs")];
 
