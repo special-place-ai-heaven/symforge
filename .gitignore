@@ -52,3 +52,4 @@ nul
 
 # Local analysis reports produced during sessions (e.g. Grok token analysis)
 grok-symforge-analysis-report.md
+.supervisor/
