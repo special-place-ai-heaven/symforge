@@ -338,6 +338,23 @@ fn select_descriptor_status(
     bind_host: &str,
     expected_project_root: Option<&Path>,
 ) -> Option<SelectedSidecar> {
+    select_descriptor_status_with_budget(
+        dir,
+        bind_host,
+        expected_project_root,
+        DESCRIPTOR_SCAN_TIMEOUT,
+    )
+}
+
+/// `select_descriptor_status` with an explicit scan budget. Production always
+/// passes `DESCRIPTOR_SCAN_TIMEOUT`; tests pass a generous budget so runner
+/// load cannot starve the probe loop into `Unknown`.
+fn select_descriptor_status_with_budget(
+    dir: &Path,
+    bind_host: &str,
+    expected_project_root: Option<&Path>,
+    budget: Duration,
+) -> Option<SelectedSidecar> {
     let scan_started = Instant::now();
     prune_dead_descriptor_files_at(dir);
     let expected_project_root = expected_project_root.map(crate::live_index::store::normalize_root);
@@ -427,7 +444,7 @@ fn select_descriptor_status(
     let mut probed = 0usize;
     let mut epoch_rejected = 0usize;
     for candidate in &candidates {
-        let remaining = DESCRIPTOR_SCAN_TIMEOUT.saturating_sub(scan_started.elapsed());
+        let remaining = budget.saturating_sub(scan_started.elapsed());
         if remaining.is_zero() {
             break;
         }
@@ -441,7 +458,7 @@ fn select_descriptor_status(
             // `session-N` ids from 1, so a stale descriptor would otherwise
             // alias an unrelated session. The boot-epoch probe is that proof.
             if candidate.session_id.is_some() {
-                let remaining = DESCRIPTOR_SCAN_TIMEOUT.saturating_sub(scan_started.elapsed());
+                let remaining = budget.saturating_sub(scan_started.elapsed());
                 if remaining.is_zero() {
                     break;
                 }
@@ -1049,6 +1066,16 @@ mod tests {
         }
     }
 
+    /// Generous scan budget for tests that assert selection outcomes, so runner
+    /// load cannot turn "not yet probed" into `Unknown`. Latency-limit tests keep
+    /// the production `DESCRIPTOR_SCAN_TIMEOUT`.
+    const TEST_SCAN_BUDGET: Duration = Duration::from_secs(10);
+
+    fn status_with_test_budget(dir: &Path, project_root: &Path) -> SidecarStatus {
+        select_descriptor_status_with_budget(dir, "127.0.0.1", Some(project_root), TEST_SCAN_BUDGET)
+            .expect("descriptors present")
+            .status
+    }
     #[test]
     fn test_reader_removes_dead_pid_descriptors_before_socket_probe() {
         let tmp = TempDir::new().unwrap();
@@ -1112,19 +1139,35 @@ mod tests {
                 l.local_addr().expect("dead addr").port()
             };
             let live_pid = std::process::id();
-            let dead_pid = u32::MAX;
+            // A pid that passes `process_may_be_alive` (so the descriptor
+            // survives pruning and reaches the freshness sort) but is not us;
+            // its port has no listener, so it loses on liveness.
+            let dead_pid = if cfg!(unix) { 1 } else { 4 };
 
             write_descriptor_for_pid_at(dir, live_pid, live_port, None, Some(project_root), None)
                 .expect("write live descriptor");
             write_descriptor_for_pid_at(dir, dead_pid, dead_port, None, Some(project_root), None)
                 .expect("write dead descriptor");
-            // The dead one is FRESHER (rewrite bumps updated_at); force order by
-            // rewriting it after the live one.
-            std::thread::sleep(std::time::Duration::from_millis(1100));
-            write_descriptor_for_pid_at(dir, dead_pid, dead_port, None, Some(project_root), None)
-                .expect("refresh dead descriptor");
+            // Make the dead descriptor strictly FRESHER by an explicit timestamp.
+            let mut dead = read_descriptors_at(dir)
+                .into_iter()
+                .find(|d| d.pid == dead_pid)
+                .expect("dead descriptor present");
+            dead.updated_at_unix_secs += 60;
+            std::fs::write(
+                dir.join(SESSIONS_DIR).join(descriptor_file_name(dead_pid)),
+                serde_json::to_vec(&dead).expect("serialize dead descriptor"),
+            )
+            .expect("rewrite dead descriptor with later timestamp");
 
-            let status = read_sidecar_status_at(dir, "127.0.0.1");
+            let status = select_descriptor_status_with_budget(
+                dir,
+                "127.0.0.1",
+                Some(project_root),
+                TEST_SCAN_BUDGET,
+            )
+            .expect("descriptors present")
+            .status;
             assert_eq!(status.liveness, SidecarLiveness::Alive);
             assert_eq!(
                 status.pid,
@@ -1146,7 +1189,14 @@ mod tests {
                 None,
             )
             .expect("write foreign descriptor");
-            let status = read_sidecar_status_at(dir, "127.0.0.1");
+            let status = select_descriptor_status_with_budget(
+                dir,
+                "127.0.0.1",
+                Some(project_root),
+                TEST_SCAN_BUDGET,
+            )
+            .expect("foreign descriptor yields a rejection status")
+            .status;
             assert_ne!(
                 status.pid,
                 Some(live_pid),
@@ -1211,7 +1261,7 @@ mod tests {
             Some(1_700_000_000),
         )
         .expect("write matching descriptor");
-        let status = read_sidecar_status_at(dir, "127.0.0.1");
+        let status = status_with_test_budget(dir, project_root);
         assert_eq!(status.liveness, SidecarLiveness::Alive);
         assert_eq!(status.port, Some(port), "matching epoch must select");
 
@@ -1226,7 +1276,7 @@ mod tests {
             Some(1_600_000_000),
         )
         .expect("write stale-epoch descriptor");
-        let status = read_sidecar_status_at(dir, "127.0.0.1");
+        let status = status_with_test_budget(dir, project_root);
         assert_ne!(
             status.liveness,
             SidecarLiveness::Alive,
@@ -1245,7 +1295,7 @@ mod tests {
         // rejected — this is the exact aliasing case from the incident.
         write_descriptor_for_pid_at(dir, pid, port, Some("session-7"), Some(project_root), None)
             .expect("write legacy descriptor");
-        let status = read_sidecar_status_at(dir, "127.0.0.1");
+        let status = status_with_test_budget(dir, project_root);
         assert_ne!(
             status.liveness,
             SidecarLiveness::Alive,
