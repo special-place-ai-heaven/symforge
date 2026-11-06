@@ -33,7 +33,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use symforge::daemon::{DaemonState, OpenProjectRequest, ProjectHealth, spawn_daemon};
+use symforge::daemon::{DaemonState, OpenProjectRequest, ProjectHealth, spawn_daemon_at};
+use symforge::domain::ControlStateDir;
 use symforge::domain::{FreshnessReason, FreshnessStatus};
 use symforge::live_index::LiveIndex;
 use symforge::live_index::index_lifecycle::candidate::{
@@ -52,28 +53,29 @@ use symforge::protocol::format::claim_provenance::{
 use symforge::watcher::{WatcherInfo, run_watcher_with_stop};
 use tempfile::TempDir;
 
-/// Serialized process-env mutation. Capacity limits are read from the
-/// environment, and the suite runs `--test-threads=1`, so a scoped guard is
-/// enough to keep one control's limit out of another's.
+/// Scoped process-env mutation. Capacity limits are read from the environment.
+/// Mutation is safe because nextest runs each test in its own process, and under
+/// plain `cargo test` the project mandates `--test-threads=1`; the guard only
+/// keeps one test's limit out of the next test in the same process.
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
 }
 
-#[allow(unsafe_code)] // test-only env guard; the suite is single-threaded.
+#[allow(unsafe_code)] // test-only env guard; one test per process (nextest) or --test-threads=1.
 impl EnvVarGuard {
     fn set(key: &'static str, value: &str) -> Self {
         let previous = std::env::var_os(key);
-        // SAFETY: these tests run under the project-mandated `--test-threads=1`.
+        // SAFETY: one test per process under nextest; `--test-threads=1` under cargo test.
         unsafe { std::env::set_var(key, value) };
         Self { key, previous }
     }
 }
 
-#[allow(unsafe_code)] // test-only env guard; the suite is single-threaded.
+#[allow(unsafe_code)] // test-only env guard; one test per process (nextest) or --test-threads=1.
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
-        // SAFETY: these tests run under the project-mandated `--test-threads=1`.
+        // SAFETY: one test per process under nextest; `--test-threads=1` under cargo test.
         unsafe {
             match &self.previous {
                 Some(previous) => std::env::set_var(self.key, previous),
@@ -169,7 +171,12 @@ fn capacity_refused_open_creates_no_slot_and_no_watcher() {
         let auth_token = [pfx, "auth", "token"].concat();
         let _auth = EnvVarGuard::set("SYMFORGE_DAEMON_AUTH_TOKEN", &auth_token);
 
-        let daemon = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        // Private control-state dir: the shared SYMFORGE_HOME is raced by sibling test processes.
+        let control_home = TempDir::new().expect("control-state temp dir");
+        let control_state = ControlStateDir::new(control_home.path().to_path_buf());
+        let daemon = spawn_daemon_at("127.0.0.1", &control_state)
+            .await
+            .expect("spawn daemon");
         let opened = daemon
             .state
             .open_project_session(OpenProjectRequest {
@@ -409,7 +416,12 @@ fn failed_reload_retains_the_recovery_observer() {
         let auth_token = [pfx, "to", "ken"].concat();
         let _auth = EnvVarGuard::set("SYMFORGE_DAEMON_AUTH_TOKEN", &auth_token);
 
-        let daemon = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        // Private control-state dir: the shared SYMFORGE_HOME is raced by sibling test processes.
+        let control_home = TempDir::new().expect("control-state temp dir");
+        let control_state = ControlStateDir::new(control_home.path().to_path_buf());
+        let daemon = spawn_daemon_at("127.0.0.1", &control_state)
+            .await
+            .expect("spawn daemon");
         let opened = daemon
             .state
             .open_project_session(OpenProjectRequest {
@@ -868,7 +880,12 @@ fn snapshot_seed_is_not_queryable_before_verification() {
         let pfx = "slice0-snapshot-";
         let auth_token = [pfx, "to", "ken"].concat();
         let _auth = EnvVarGuard::set("SYMFORGE_DAEMON_AUTH_TOKEN", &auth_token);
-        let daemon = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        // Private control-state dir: the shared SYMFORGE_HOME is raced by sibling test processes.
+        let control_home = TempDir::new().expect("control-state temp dir");
+        let control_state = ControlStateDir::new(control_home.path().to_path_buf());
+        let daemon = spawn_daemon_at("127.0.0.1", &control_state)
+            .await
+            .expect("spawn daemon");
         let opened = daemon
             .state
             .open_project_session(OpenProjectRequest {
@@ -994,7 +1011,12 @@ fn configured_capacity_bounds_the_process_not_each_load() {
         write_project_files(second.path(), "cap_b", CEILING);
         let _cap = EnvVarGuard::set("SYMFORGE_MAX_INDEX_FILES", &CEILING.to_string());
 
-        let daemon = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        // Private control-state dir: the shared SYMFORGE_HOME is raced by sibling test processes.
+        let control_home = TempDir::new().expect("control-state temp dir");
+        let control_state = ControlStateDir::new(control_home.path().to_path_buf());
+        let daemon = spawn_daemon_at("127.0.0.1", &control_state)
+            .await
+            .expect("spawn daemon");
         let opened: Vec<_> = [first.path(), second.path()]
             .into_iter()
             .enumerate()
