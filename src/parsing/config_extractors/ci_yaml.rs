@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::domain::{SymbolKind, SymbolRecord};
 
-use super::{MAX_ARRAY_ITEMS, byte_to_line, join_array_index, join_key_path};
+use super::{MAX_ARRAY_ITEMS, byte_to_line, join_array_index, join_key_path, yaml_value};
 
 const FACT_PREFIX: &str = "ci.workflow";
 const MAX_FACT_VALUE_CHARS: usize = 160;
@@ -10,11 +10,11 @@ const MAX_FACT_VALUE_CHARS: usize = 160;
 pub(super) fn append_ci_yaml_facts(
     content: &[u8],
     line_starts: &[u32],
-    root: &serde_yml::Value,
+    root: &yaml_value::Value,
     symbols: &mut Vec<SymbolRecord>,
     sort_order: &mut u32,
 ) {
-    let serde_yml::Value::Mapping(root_map) = root else {
+    let yaml_value::Value::Mapping(root_map) = root else {
         return;
     };
     if !is_github_actions_workflow(root_map) {
@@ -56,9 +56,9 @@ pub(super) fn append_ci_yaml_facts(
     }
 }
 
-fn append_trigger_facts(builder: &mut FactBuilder<'_>, on_value: &serde_yml::Value) {
+fn append_trigger_facts(builder: &mut FactBuilder<'_>, on_value: &yaml_value::Value) {
     match on_value {
-        serde_yml::Value::Mapping(triggers) => {
+        yaml_value::Value::Mapping(triggers) => {
             for (trigger, _value) in string_entries(triggers).into_iter().take(MAX_ARRAY_ITEMS) {
                 let source_path = join_key_path("on", &trigger);
                 builder.push_from_path(
@@ -67,7 +67,7 @@ fn append_trigger_facts(builder: &mut FactBuilder<'_>, on_value: &serde_yml::Val
                 );
             }
         }
-        serde_yml::Value::Sequence(triggers) => {
+        yaml_value::Value::Sequence(triggers) => {
             for (index, trigger) in triggers.iter().take(MAX_ARRAY_ITEMS).enumerate() {
                 let Some(trigger) = scalar_fact_value(trigger) else {
                     continue;
@@ -92,7 +92,7 @@ fn append_trigger_facts(builder: &mut FactBuilder<'_>, on_value: &serde_yml::Val
 
 fn append_scalar_map_facts(
     builder: &mut FactBuilder<'_>,
-    map: &serde_yml::Mapping,
+    map: &yaml_value::Mapping,
     source_parent: &str,
     fact_parent: &str,
 ) {
@@ -108,7 +108,7 @@ fn append_scalar_map_facts(
     }
 }
 
-fn append_job_facts(builder: &mut FactBuilder<'_>, jobs: &serde_yml::Mapping) {
+fn append_job_facts(builder: &mut FactBuilder<'_>, jobs: &yaml_value::Mapping) {
     for (job_name, job_value) in string_entries(jobs).into_iter().take(MAX_ARRAY_ITEMS) {
         let Some(job) = as_mapping(job_value) else {
             continue;
@@ -140,7 +140,7 @@ fn append_job_facts(builder: &mut FactBuilder<'_>, jobs: &serde_yml::Mapping) {
 
 fn append_job_scalar_or_sequence_fact(
     builder: &mut FactBuilder<'_>,
-    job: &serde_yml::Mapping,
+    job: &yaml_value::Mapping,
     job_path: &str,
     job_fact: &str,
     key: &str,
@@ -151,7 +151,7 @@ fn append_job_scalar_or_sequence_fact(
     };
     let source_path = join_key_path(job_path, key);
     match value {
-        serde_yml::Value::Sequence(values) => {
+        yaml_value::Value::Sequence(values) => {
             for (index, value) in values.iter().take(MAX_ARRAY_ITEMS).enumerate() {
                 let Some(value) = scalar_fact_value(value) else {
                     continue;
@@ -174,7 +174,7 @@ fn append_job_scalar_or_sequence_fact(
 
 fn append_strategy_facts(
     builder: &mut FactBuilder<'_>,
-    job: &serde_yml::Mapping,
+    job: &yaml_value::Mapping,
     job_path: &str,
     job_fact: &str,
 ) {
@@ -223,7 +223,7 @@ fn append_strategy_facts(
 
 fn append_step_facts(
     builder: &mut FactBuilder<'_>,
-    job: &serde_yml::Mapping,
+    job: &yaml_value::Mapping,
     job_path: &str,
     job_fact: &str,
 ) {
@@ -347,38 +347,38 @@ fn find_child_key_line_range(
     None
 }
 
-fn is_github_actions_workflow(map: &serde_yml::Mapping) -> bool {
-    mapping_get(map, "jobs").is_some_and(|value| matches!(value, serde_yml::Value::Mapping(_)))
+fn is_github_actions_workflow(map: &yaml_value::Mapping) -> bool {
+    mapping_get(map, "jobs").is_some_and(|value| matches!(value, yaml_value::Value::Mapping(_)))
         && mapping_get(map, "on").is_some()
 }
 
-fn mapping_get<'a>(map: &'a serde_yml::Mapping, key: &str) -> Option<&'a serde_yml::Value> {
-    // serde_yaml_ng's `Mapping::get` accepts a `&str` index and matches scalar
+fn mapping_get<'a>(map: &'a yaml_value::Mapping, key: &str) -> Option<&'a yaml_value::Value> {
+    // `Mapping::get` matches scalar
     // string keys, so the native string-keyed lookup is exactly what we want.
     map.get(key)
 }
 
-fn string_entries(map: &serde_yml::Mapping) -> Vec<(String, &serde_yml::Value)> {
-    // serde_yaml_ng keys mappings by `Value`; keep only scalar string keys,
+fn string_entries(map: &yaml_value::Mapping) -> Vec<(String, &yaml_value::Value)> {
+    // YAML mappings are keyed by `Value`; keep only scalar string keys,
     // which is what every CI-fact lookup here expects.
     map.iter()
         .filter_map(|(key, value)| match key {
-            serde_yml::Value::String(key) => Some((key.clone(), value)),
+            yaml_value::Value::String(key) => Some((key.clone(), value)),
             _ => None,
         })
         .collect()
 }
 
-fn value_as_string(value: &serde_yml::Value) -> Option<String> {
+fn value_as_string(value: &yaml_value::Value) -> Option<String> {
     match value {
-        serde_yml::Value::String(value) => Some(value.clone()),
-        serde_yml::Value::Number(value) => Some(value.to_string()),
-        serde_yml::Value::Bool(value) => Some(value.to_string()),
+        yaml_value::Value::String(value) => Some(value.clone()),
+        yaml_value::Value::Number(value) => Some(value.to_string()),
+        yaml_value::Value::Bool(value) => Some(value.to_string()),
         _ => None,
     }
 }
 
-fn scalar_fact_value(value: &serde_yml::Value) -> Option<String> {
+fn scalar_fact_value(value: &yaml_value::Value) -> Option<String> {
     let value = value_as_string(value)?;
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
@@ -401,16 +401,16 @@ fn fact_segment(segment: &str) -> String {
     join_key_path("", segment)
 }
 
-fn as_mapping(value: &serde_yml::Value) -> Option<&serde_yml::Mapping> {
+fn as_mapping(value: &yaml_value::Value) -> Option<&yaml_value::Mapping> {
     match value {
-        serde_yml::Value::Mapping(map) => Some(map),
+        yaml_value::Value::Mapping(map) => Some(map),
         _ => None,
     }
 }
 
-fn as_sequence(value: &serde_yml::Value) -> Option<&Vec<serde_yml::Value>> {
+fn as_sequence(value: &yaml_value::Value) -> Option<&Vec<yaml_value::Value>> {
     match value {
-        serde_yml::Value::Sequence(sequence) => Some(sequence),
+        yaml_value::Value::Sequence(sequence) => Some(sequence),
         _ => None,
     }
 }
