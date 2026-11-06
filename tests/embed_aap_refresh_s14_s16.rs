@@ -7,13 +7,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use symforge::embed::parity::host::OperationControl;
+use symforge::embed::parity::read::SourcePageRequest;
 use symforge::embed::parity::search::SymbolSearchRequest;
 use symforge::embed::parity::{
-    QueryLimits, QueryOutput, QueryRefusalKind, QueryRequest, QuerySymbolSelector,
+    QueryLimits, QueryOutput, QueryRefusal, QueryRefusalKind, QueryRequest, QuerySymbolSelector,
 };
 use symforge::embed::{
-    EmbeddedSourceHandle, EmbeddedSourceSpec, ProcessIndexRuntime, SourceRefusalKind,
-    SourceRuntimePhase, SourceRuntimeView,
+    EmbeddedSourceHandle, EmbeddedSourceSpec, GraphPublicationLease, ProcessIndexRuntime,
+    SourceRefusalKind, SourceRuntimePhase, SourceRuntimeView,
 };
 
 fn fixture(extra_files: usize) -> tempfile::TempDir {
@@ -439,6 +440,119 @@ fn graph_publication_lease_keeps_pages_on_the_original_content() {
     );
 }
 
+fn source_page(path: &str, offset: u64, expected_publication: Option<&str>) -> QueryRequest {
+    QueryRequest::SourcePage(SourcePageRequest {
+        path: path.into(),
+        offset,
+        expected_publication: expected_publication.map(str::to_owned),
+    })
+}
+
+/// Reads every page of `path`, returning the bytes and the one publication that served them.
+fn read_all_pages(
+    handle: &EmbeddedSourceHandle,
+    lease: Option<&GraphPublicationLease>,
+    path: &str,
+    expected_publication: Option<&str>,
+) -> Result<(Vec<u8>, String), QueryRefusal> {
+    let limits = QueryLimits {
+        max_results: 100,
+        max_bytes: 1024 * 1024,
+    };
+    let mut bytes = Vec::new();
+    let mut offset = 0;
+    let mut publication = None::<String>;
+    loop {
+        let request = source_page(path, offset, expected_publication);
+        let claim = match lease {
+            Some(lease) => handle.query_with_graph_lease(&request, limits, lease)?,
+            None => handle.query(&request, limits)?,
+        };
+        let served = claim.publication_identity().to_owned();
+        assert_eq!(publication.get_or_insert_with(|| served.clone()), &served);
+        let QueryOutput::SourcePage(page) = claim.value() else {
+            panic!("source page query returned a non-source-page result")
+        };
+        bytes.extend_from_slice(&page.bytes);
+        match page.next_offset {
+            Some(next) => offset = next,
+            None => return Ok((bytes, served)),
+        }
+    }
+}
+
+#[test]
+fn graph_lease_serves_source_pages_and_syntax_from_the_leased_publication() {
+    let root = fixture(8);
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let initial = handle.runtime_view();
+    let lease = handle
+        .begin_graph_publication_lease(Duration::from_secs(20))
+        .unwrap();
+    let publication = handle
+        .query_with_graph_lease(&graph(0), QueryLimits::default(), &lease)
+        .unwrap()
+        .publication_identity()
+        .to_owned();
+    let original = fs::read(root.path().join("src/lib.rs")).unwrap();
+
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "pub fn rewritten_after_lease() -> u32 { 99 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("src/fresh.rs"),
+        "pub fn fresh_after_refresh() -> u32 { 7 }\n",
+    )
+    .unwrap();
+    handle.request_refresh().unwrap();
+
+    let assert_leased_reads = || {
+        let (bytes, served) =
+            read_all_pages(&handle, Some(&lease), "src/lib.rs", Some(&publication)).unwrap();
+        assert_eq!(served, publication);
+        assert_eq!(bytes, original);
+        let syntax = handle
+            .query_with_graph_lease(
+                &QueryRequest::Syntax {
+                    path: "src/lib.rs".into(),
+                },
+                QueryLimits::default(),
+                &lease,
+            )
+            .unwrap();
+        assert_eq!(syntax.publication_identity(), publication);
+        assert!(matches!(syntax.value(), QueryOutput::Syntax(_)));
+    };
+    assert_leased_reads();
+
+    wait_for_view(&handle, Duration::from_secs(30), |view| {
+        view.phase == SourceRuntimePhase::Current && view.source_version > initial.source_version
+    });
+    assert_leased_reads();
+    assert_eq!(
+        handle
+            .query_with_graph_lease(
+                &source_page("src/fresh.rs", 0, Some(&publication)),
+                QueryLimits::default(),
+                &lease,
+            )
+            .unwrap_err()
+            .kind(),
+        QueryRefusalKind::NotFound
+    );
+
+    let (fresh_bytes, fresh_publication) =
+        read_all_pages(&handle, None, "src/lib.rs", None).unwrap();
+    assert_ne!(fresh_publication, publication);
+    assert_eq!(
+        fresh_bytes,
+        b"pub fn rewritten_after_lease() -> u32 { 99 }\n"
+    );
+}
+
 #[test]
 fn graph_leases_refuse_expiry_foreign_sources_close_and_non_graph_queries() {
     let first_root = fixture(4);
@@ -473,6 +587,17 @@ fn graph_leases_refuse_expiry_foreign_sources_close_and_non_graph_queries() {
             .unwrap_err()
             .kind(),
         QueryRefusalKind::UnsupportedOption
+    );
+    assert_eq!(
+        first
+            .query_with_graph_lease(
+                &source_page("src/lib.rs", 0, None),
+                QueryLimits::default(),
+                &expired,
+            )
+            .unwrap_err()
+            .kind(),
+        QueryRefusalKind::GraphPublicationLeaseExpired
     );
 
     let cancelled = OperationControl::new(Duration::from_secs(5)).unwrap();
