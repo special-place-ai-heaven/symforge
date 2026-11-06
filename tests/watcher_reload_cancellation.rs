@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
-use symforge::daemon::{OpenProjectRequest, spawn_daemon};
+use symforge::daemon::{OpenProjectRequest, spawn_daemon_at};
+use symforge::domain::ControlStateDir;
 use symforge::live_index::{LiveIndex, SharedIndex};
 use symforge::watcher::{WatcherInfo, run_watcher_with_stop};
 use tempfile::TempDir;
@@ -241,7 +242,12 @@ fn index_folder_for_session_signals_token_before_drop() {
         let _a_paths = write_project_files(project_a.path(), "a_file", 40);
         let b_paths = write_project_files(project_b.path(), "b_file", 25);
 
-        let daemon = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        // Private control-state dir: the shared SYMFORGE_HOME is raced by sibling test processes.
+        let control_home = TempDir::new().expect("control-state temp dir");
+        let control_state = ControlStateDir::new(control_home.path().to_path_buf());
+        let daemon = spawn_daemon_at("127.0.0.1", &control_state)
+            .await
+            .expect("spawn daemon");
         let open = daemon
             .state
             .open_project_session(OpenProjectRequest {
