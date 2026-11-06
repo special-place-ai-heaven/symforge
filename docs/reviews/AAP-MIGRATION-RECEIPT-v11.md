@@ -237,3 +237,13 @@ does not read them.
   fail with a nonzero check exit; restored, the run is clean.
 
 All mutants restored; the committed tree is the accepting state.
+
+## Addendum, 2026-11-06 (appended; the receipt above is unchanged)
+
+The pre-activation status above was true when this receipt was written. V11
+shipped in symforge 11.0.0 (2026-08-20), and AAP has since migrated onto the
+live `symforge::embed` and `symforge::embed::parity` facade: as of AAP
+`origin/main` it depends on symforge 11.10.x with `default-features = false,
+features = ["embed"]` and imports nothing outside those two modules. Ongoing
+AAP asks are tracked in AAP's
+`02_analysis/2026-10-20-symforge-embed-coverage/symforge-ledger.md`.

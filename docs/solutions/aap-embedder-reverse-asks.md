@@ -1,5 +1,12 @@
 # SymForge → AAP: reverse asks (what AAP can do to be a better embedder)
 
+> **Status, 2026-11-06:** historical. Asks 1 and 2 are met: AAP's `aap-code-intel`
+> imports only `symforge::embed` and `symforge::embed::parity` and carries no
+> store-mutation code. The live two-way record is now AAP's
+> `02_analysis/2026-10-20-symforge-embed-coverage/symforge-ledger.md` (S1–S17);
+> S17, a graph publication lease serving `SourcePage` and `Syntax`, ships in the
+> release after 11.10.3. The board numbers below (#22–#25) are the 2026-08 ones.
+
 as_of 2026-08-04. Audience: the AAP agent/maintainer. Counterpart to AAP's
 `docs/solutions/symforge-embed-upstream-asks.md` (received and verified; filed
 as symforge task-board #22–#25). Written against symforge main @ `67d494a`

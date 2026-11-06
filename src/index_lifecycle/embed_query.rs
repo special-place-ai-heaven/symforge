@@ -487,7 +487,13 @@ fn execute_inner(
                     | QueryRequest::SymbolSearch(_)
                     | QueryRequest::References { .. }
             ) => {}
-        SnapshotMode::GraphLease(_) if matches!(request, QueryRequest::Graph { .. }) => {}
+        SnapshotMode::GraphLease(_)
+            if matches!(
+                request,
+                QueryRequest::Graph { .. }
+                    | QueryRequest::SourcePage(_)
+                    | QueryRequest::Syntax { .. }
+            ) => {}
         _ => {
             return Err(refuse(
                 QueryRefusalKind::UnsupportedOption,
@@ -498,7 +504,10 @@ fn execute_inner(
     budget
         .check()
         .map_err(|kind| refuse(kind, RetryAdvice::Never))?;
-    if let Some(path) = request.freshen_path() {
+    // A lease read is bound to its leased snapshot; it never freshens from disk.
+    if !matches!(snapshot_mode, SnapshotMode::GraphLease(_))
+        && let Some(path) = request.freshen_path()
+    {
         match handle.freshen_exact_path(path) {
             Ok(()) => {}
             Err(refusal)
@@ -770,6 +779,8 @@ fn execute_inner(
     // An Ask commits what its routed query returned, exactly as that query
     // would have committed it when called directly.
     // A facade commits what each of its executed primitives returned.
+    // AllowRefreshing and GraphLease reads record no commitment: the refresh
+    // snapshot or lease, not the current publication, is what binds them.
     if matches!(snapshot_mode, SnapshotMode::Strict) {
         let committed_values: Vec<Option<&QueryOutput>> = match result.value() {
             QueryOutput::Ask(ask) => vec![ask.output.as_deref()],

@@ -29,7 +29,7 @@
       "EmbeddedSourceHandle::query_with_graph_lease",
       "EmbeddedSourceHandle::query_with_graph_lease_and_control"
     ],
-    "request": "Graph only",
+    "request": "Graph, SourcePage, Syntax; served from the leased publication with no exact-path freshen. A lease binds indexed content only: Syntax on a withheld file still observes current disk, labelled DiskObservation",
     "max_live_per_source": 8,
     "max_ttl_seconds": 30,
     "zero_timeout": "immediately expired lease",
