@@ -125,12 +125,13 @@ schemars = "1"
 rmcp = { version = "3.5", features = ["transport-io", "transport-streamable-http-server"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# Maintained libyaml-lineage YAML backend. The previous `serde_yml 0.0.13` fork
-# enforced a spec-strict flow-indent rule that mainstream parsers (PyYAML/libyaml,
-# dtolnay serde-yaml) relax, hard-failing real production CI configs (SF-STRESS-016).
-# `serde_yaml_ng` is the maintained continuation of dtolnay's serde-yaml and exposes
-# the same `Value`/`Mapping`/`Sequence` API; aliased to `serde_yml` to keep call sites stable.
-serde_yml = { package = "serde_yaml_ng", version = "0.10" }
+# Pure-Rust YAML backend. `serde_yaml_ng` was dropped because it pulls
+# `unsafe-libyaml` (RUSTSEC-2024-0449, unmaintained, no patch). serde-saphyr has no
+# libyaml in its tree and, with its default `strict_indentation: false`, keeps the
+# PyYAML/libyaml-style lenient flow-collection indentation real CI configs rely on
+# (SF-STRESS-016). It ships no dynamic `Value`, so the small one the extractors walk
+# lives in `src/parsing/config_extractors/yaml_value.rs`.
+serde-saphyr = { version = "2.1", default-features = false, features = ["deserialize"] }
 toml_edit = "0.25"
 thiserror = "2.0"
 # `net` and `io-util` are NOT here: they are server-only and are declared on the

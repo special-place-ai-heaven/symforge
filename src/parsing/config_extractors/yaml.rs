@@ -4,7 +4,7 @@ use super::{
 };
 use crate::domain::{SymbolKind, SymbolRecord};
 
-use super::{optional_u32, parse_diagnostic};
+use super::{optional_u32, parse_diagnostic, yaml_value};
 
 pub struct YamlExtractor;
 
@@ -17,17 +17,17 @@ impl ConfigExtractor for YamlExtractor {
             };
         }
 
-        let value: serde_yml::Value = match serde_yml::from_slice(content) {
+        let value: yaml_value::Value = match yaml_value::from_slice(content) {
             Ok(v) => v,
             Err(e) => {
                 let location = e.location();
                 return ExtractionResult {
                     symbols: vec![],
                     outcome: ExtractionOutcome::Failed(parse_diagnostic(
-                        "serde_yml",
+                        "serde-saphyr",
                         e.to_string(),
-                        location.as_ref().and_then(|loc| optional_u32(loc.line())),
-                        location.as_ref().and_then(|loc| optional_u32(loc.column())),
+                        location.as_ref().and_then(|loc| optional_u32(usize::try_from(loc.line()).unwrap_or(0))),
+                        location.as_ref().and_then(|loc| optional_u32(usize::try_from(loc.column()).unwrap_or(0))),
                         None,
                         false,
                     )),
@@ -48,10 +48,10 @@ impl ConfigExtractor for YamlExtractor {
         };
 
         match &value {
-            serde_yml::Value::Mapping(map) => {
+            yaml_value::Value::Mapping(map) => {
                 walker.walk_mapping(map, "", (0, content.len() as u32), 0);
             }
-            serde_yml::Value::Sequence(seq) => {
+            yaml_value::Value::Sequence(seq) => {
                 walker.walk_sequence(seq, "", (0, content.len() as u32), 0);
             }
             _ => {}
@@ -82,16 +82,16 @@ impl ConfigExtractor for YamlExtractor {
 
 /// Coerce a YAML mapping KEY `Value` to its string form for path building.
 ///
-/// `serde_yaml_ng` represents mapping keys as `Value` (unlike the previous
+/// YAML mapping keys are `Value`s (unlike the old `serde_yml`
 /// fork's plain-`String` keys). YAML keys are almost always scalar strings;
 /// numeric and boolean scalar keys are rendered to their text form. Non-scalar
 /// keys (sequences/mappings, which are exotic and not path-addressable here)
 /// yield `None` so the caller skips them.
-fn yaml_key_to_string(key: &serde_yml::Value) -> Option<String> {
+fn yaml_key_to_string(key: &yaml_value::Value) -> Option<String> {
     match key {
-        serde_yml::Value::String(s) => Some(s.clone()),
-        serde_yml::Value::Number(n) => Some(n.to_string()),
-        serde_yml::Value::Bool(b) => Some(b.to_string()),
+        yaml_value::Value::String(s) => Some(s.clone()),
+        yaml_value::Value::Number(n) => Some(n.to_string()),
+        yaml_value::Value::Bool(b) => Some(b.to_string()),
         _ => None,
     }
 }
@@ -263,7 +263,7 @@ impl YamlWalker<'_> {
 
     fn walk_mapping(
         &mut self,
-        map: &serde_yml::Mapping,
+        map: &yaml_value::Mapping,
         parent_path: &str,
         parent_byte_range: (u32, u32),
         depth: u32,
@@ -272,7 +272,7 @@ impl YamlWalker<'_> {
         let search_end = parent_byte_range.1 as usize;
 
         for (k, v) in map.iter() {
-            // serde_yaml_ng's `Mapping` keys are `Value`. The overwhelmingly
+            // `Mapping` keys are `Value`s. The overwhelmingly
             // common case is a scalar string key; coerce non-string scalar keys
             // (numbers/bools) to their text form and skip non-scalar keys.
             let Some(key_str) = yaml_key_to_string(k) else {
@@ -287,10 +287,10 @@ impl YamlWalker<'_> {
 
             if depth + 1 < MAX_DEPTH {
                 match v {
-                    serde_yml::Value::Mapping(child_map) => {
+                    yaml_value::Value::Mapping(child_map) => {
                         self.walk_mapping(child_map, &key_path, byte_range, depth + 1);
                     }
-                    serde_yml::Value::Sequence(child_seq) => {
+                    yaml_value::Value::Sequence(child_seq) => {
                         self.walk_sequence(child_seq, &key_path, byte_range, depth + 1);
                     }
                     _ => {}
@@ -301,7 +301,7 @@ impl YamlWalker<'_> {
 
     fn walk_sequence(
         &mut self,
-        seq: &[serde_yml::Value],
+        seq: &[yaml_value::Value],
         parent_path: &str,
         parent_byte_range: (u32, u32),
         depth: u32,
@@ -318,10 +318,10 @@ impl YamlWalker<'_> {
 
             if depth + 1 < MAX_DEPTH {
                 match v {
-                    serde_yml::Value::Mapping(child_map) => {
+                    yaml_value::Value::Mapping(child_map) => {
                         self.walk_mapping(child_map, &elem_path, byte_range, depth + 1);
                     }
-                    serde_yml::Value::Sequence(child_seq) => {
+                    yaml_value::Value::Sequence(child_seq) => {
                         self.walk_sequence(child_seq, &elem_path, byte_range, depth + 1);
                     }
                     _ => {}
@@ -439,7 +439,7 @@ mod tests {
     /// sit at the SAME indentation as the surrounding block mapping. The old
     /// `serde_yml 0.0.13` fork rejected this with "flow content must be indented
     /// more than the surrounding block", while PyYAML/libyaml accept it — and so
-    /// must the maintained `serde_yaml_ng` backend. Shape mirrors the live
+    /// must the serde-saphyr backend (`strict_indentation: false`). Shape mirrors the live
     /// flutter-packages `.ci/targets/*.yaml` production CI configs.
     #[test]
     fn test_flow_sequence_indented_like_block_parses() {
