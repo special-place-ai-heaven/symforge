@@ -134,6 +134,18 @@ test('loader fixes the URL, forbids redirects and bounds its request lifetime', 
   }}));
   assert.equal(calls, 1);
 });
+test('loader authenticates every pinned download against the Contents API only', async () => {
+  const urls = [];
+  await assert.rejects(loadAction({token: 'synthetic-token', fetchImpl: async (url, options) => {
+    urls.push(url);
+    assert.equal(new URL(url).origin, 'https://api.github.com');
+    assert.equal(options.headers.authorization, 'Bearer synthetic-token');
+    assert.equal(options.headers.accept, 'application/vnd.github.raw+json');
+    return new Response('unavailable', {status: 429});
+  }}), error => error.message === 'action download failed' && error.status === 429 && error.asset === 'index.js');
+  assert.deepEqual(urls, [PINS.bundleUrl]);
+  assert.match(PINS.bundleUrl, /\/contents\/dist\/index\.js\?ref=45996ed1f6d02564a971a2fa1b5860e934307cf7$/);
+});
 test('main is invoked once, uses upstream outputs, and always cleans its owned dependency', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'symforge-release-test-'));
   const output = path.join(directory, 'output'); let calls = 0, cleanups = 0;
@@ -170,6 +182,16 @@ test('fatal reporting names this file\'s own failures', () => {
   try {reportFailure(new TypeError('x'), value => typed.push(value));}
   finally {process.exitCode = undefined;}
   assert.equal(typed[1], '::error::failure cause: TypeError');
+  const download = Object.assign(new Error('action download failed'), {status: 429, asset: 'index.js'});
+  const http = [];
+  try {reportFailure(download, value => http.push(value));}
+  finally {process.exitCode = undefined;}
+  assert.equal(http[2], '::error::http status: 429 (index.js)');
+  const foreign = Object.assign(new Error('synthetic-sensitive-value'), {status: 500, asset: 'index.js'});
+  const quiet = [];
+  try {reportFailure(foreign, value => quiet.push(value));}
+  finally {process.exitCode = undefined;}
+  assert.equal(quiet.length, 2);
 });
 test('workflow preserves every action input and downstream PR gates', () => {
   const {workflow, block} = releaseBlock();

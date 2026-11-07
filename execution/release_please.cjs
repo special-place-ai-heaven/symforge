@@ -5,8 +5,15 @@ const os = require('node:os');
 const path = require('node:path');
 const {setTimeout: sleep} = require('node:timers/promises');
 
+// The action is read through the authenticated Contents API: anonymous
+// raw.githubusercontent.com downloads from shared hosted-runner IPs started
+// failing on 2026-11-06. The sha256 pins below still gate every byte.
+const ACTION_DIST = 'https://api.github.com/repos/googleapis/release-please-action/contents/dist/';
+const ACTION_REF = '45996ed1f6d02564a971a2fa1b5860e934307cf7';
+const assetUrl = name => `${ACTION_DIST}${name}?ref=${ACTION_REF}`;
+
 const PINS = Object.freeze({
-  bundleUrl: 'https://raw.githubusercontent.com/googleapis/release-please-action/45996ed1f6d02564a971a2fa1b5860e934307cf7/dist/index.js',
+  bundleUrl: assetUrl('index.js'),
   bundleSha256: '4fa35877a1c166013f0ecd7add1e6cf63ab44cf9082523dc96ce39212ae6a574',
   bundleBytes: 4303242,
   assets: Object.freeze({
@@ -99,18 +106,31 @@ function createRetryFetch(fetchImpl, {repository, signal, sleep: wait = sleep}) 
   };
 }
 
-async function readPinnedAsset(fetchImpl, url, pin, signal) {
-  const response = await fetchImpl(url, {redirect: 'error', signal});
-  if (!response.ok) throw new Error('action download failed');
+async function readPinnedAsset(fetchImpl, url, pin, signal, headers) {
+  const response = await fetchImpl(url, {redirect: 'error', signal, ...(headers && {headers})});
+  if (!response.ok) {
+    void response.body?.cancel().catch(() => {});
+    const error = new Error('action download failed');
+    // Both values are safe to print: a number, and a file name from our own pins.
+    error.status = response.status;
+    error.asset = path.basename(new URL(url).pathname);
+    throw error;
+  }
   const bytes = await readBounded(response, pin.bytes);
   if (bytes.length !== pin.bytes || sha256(bytes) !== pin.sha256) throw new Error('action integrity check failed');
   return bytes;
 }
 
-async function loadAction({fetchImpl = globalThis.fetch, signal} = {}) {
+async function loadAction({fetchImpl = globalThis.fetch, signal, token = process.env.INPUT_TOKEN} = {}) {
   const downloadSignal = AbortSignal.any([AbortSignal.timeout(30000), ...(signal ? [signal] : [])]);
+  // The token only ever goes to the fixed api.github.com URLs above; redirects are refused.
+  const headers = {
+    accept: 'application/vnd.github.raw+json',
+    'x-github-api-version': '2022-11-28',
+    ...(token && {authorization: `Bearer ${token}`}),
+  };
   const bytes = await readPinnedAsset(fetchImpl, PINS.bundleUrl,
-    {bytes: PINS.bundleBytes, sha256: PINS.bundleSha256}, downloadSignal);
+    {bytes: PINS.bundleBytes, sha256: PINS.bundleSha256}, downloadSignal, headers);
   const directory = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'symforge-release-please-'));
   const filename = path.join(directory, 'action.cjs');
   const ownedFiles = [];
@@ -127,7 +147,7 @@ async function loadAction({fetchImpl = globalThis.fetch, signal} = {}) {
     write(filename, bytes);
     // The upstream bundle reads its pinned changelog templates beside itself.
     for (const [name, pin] of Object.entries(PINS.assets)) {
-      const asset = await readPinnedAsset(fetchImpl, new URL(name, PINS.bundleUrl).href, pin, downloadSignal);
+      const asset = await readPinnedAsset(fetchImpl, assetUrl(name), pin, downloadSignal, headers);
       write(path.join(directory, name), asset);
     }
     const action = require(filename);
@@ -159,6 +179,9 @@ function reportFailure(error, log = console.error) {
   const own = error instanceof Error && OWN_FAILURES.has(error.message);
   const name = error instanceof Error && /^[A-Za-z]+$/.test(error.name) ? error.name : typeof error;
   log(`::error::failure cause: ${own ? error.message : name}`);
+  if (own && Number.isInteger(error.status) && /^[\w.-]+$/.test(error.asset ?? '')) {
+    log(`::error::http status: ${error.status} (${error.asset})`);
+  }
   process.exitCode = 1;
 }
 
