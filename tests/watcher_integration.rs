@@ -78,8 +78,33 @@ async fn spawn_watcher(
 }
 
 /// Wait for the debounce window + processing margin.
+///
+/// Only for tests asserting that nothing changes; a test waiting for a change
+/// uses `wait_for_index`, because a fixed sleep loses the race under suite load.
 async fn wait_debounce() {
     tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+/// Poll until `done` holds on the index, or 10 s pass. The caller's
+/// assertions still run afterwards and report the actual state on timeout.
+async fn wait_for_index(
+    shared: &symforge::live_index::SharedIndex,
+    done: impl Fn(&LiveIndex) -> bool,
+) {
+    let _ = tokio::time::timeout(Duration::from_secs(10), async {
+        while !done(&shared.read()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+}
+
+/// Symbol names of `path`, empty when the file is not indexed.
+fn symbol_names(index: &LiveIndex, path: &str) -> Vec<String> {
+    index
+        .get_file(path)
+        .map(|f| f.symbols.iter().map(|s| s.name.clone()).collect())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +145,10 @@ async fn test_watcher_detects_modify_and_updates_index() {
     // Overwrite with fn hello_world()
     write_file(dir.path(), "src/hello.rs", "fn hello_world() {}");
 
-    wait_debounce().await;
+    wait_for_index(&shared, |i| {
+        symbol_names(i, "src/hello.rs") == ["hello_world"]
+    })
+    .await;
 
     // Verify index reflects the updated symbol
     {
@@ -164,7 +192,12 @@ async fn test_watcher_indexes_new_file() {
     // Create a brand-new file
     write_file(dir.path(), "src/new_file.rs", "fn new_function() {}");
 
-    wait_debounce().await;
+    wait_for_index(&shared, |i| {
+        symbol_names(i, "src/new_file.rs")
+            .iter()
+            .any(|n| n == "new_function")
+    })
+    .await;
 
     // Verify the new file is now in the index
     {
@@ -220,7 +253,7 @@ async fn test_watcher_removes_deleted_file() {
     // Delete the file
     fs::remove_file(dir.path().join("src/to_delete.rs")).unwrap();
 
-    wait_debounce().await;
+    wait_for_index(&shared, |i| i.get_file("src/to_delete.rs").is_none()).await;
 
     // Verify the file has been removed from the index
     {
@@ -320,7 +353,7 @@ async fn test_watcher_enoent_handled_gracefully() {
     // Delete fragile.rs — triggers ENOENT path in maybe_reindex
     fs::remove_file(dir.path().join("src/fragile.rs")).unwrap();
 
-    wait_debounce().await;
+    wait_for_index(&shared, |i| i.get_file("src/fragile.rs").is_none()).await;
 
     // Verify no panic (if we reach here, no panic occurred)
     // Verify file removed from index
@@ -527,7 +560,10 @@ async fn test_watcher_atomic_save_via_rename_replace() {
     fs::write(&tmp, "fn replaced() {}").unwrap();
     fs::rename(&tmp, &target).unwrap();
 
-    wait_debounce().await;
+    wait_for_index(&shared, |i| {
+        symbol_names(i, "src/atomic.rs") == ["replaced"]
+    })
+    .await;
 
     // Index MUST reflect the new content: rename-replace is a legitimate
     // content change and the watcher must not lose track of the file.
