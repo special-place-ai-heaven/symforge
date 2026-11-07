@@ -46,6 +46,21 @@ Embedders keep their own response bytes and check them with `ReplayOutcome::resp
 
 AAP S14-S16 add opt-in refresh-safe snapshot reads for Graph, File, SymbolSearch, and References via `EmbeddedSourceHandle::query_allowing_refresh`; the claim keeps the prior publication identity and reports `Refreshing`. Strict `query` remains Current-only, and mutating/mixed-disk variants are refused before freshening. `change_version` plus blocking `wait_for_change` provide lossless phase/publication event waits. `begin_graph_publication_lease` pins one Graph snapshot across pages for at most 30 seconds; no more than eight leases are live per source, and expired leases return `GraphPublicationLeaseExpired`.
 
+## [11.11.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.10.3...v11.11.0) (2026-11-07)
+
+
+### Features
+
+* **embed:** serve SourcePage and Syntax under a graph publication lease ([#846](https://github.com/special-place-ai-heaven/symforge/issues/846)) ([5cb285d](https://github.com/special-place-ai-heaven/symforge/commit/5cb285d1cb9ed45b64a781e53a90dd834084f2de))
+
+
+### Bug Fixes
+
+* **deps:** replace serde_yaml_ng with serde-saphyr ([#848](https://github.com/special-place-ai-heaven/symforge/issues/848)) ([ff06f38](https://github.com/special-place-ai-heaven/symforge/commit/ff06f38a51d38e7a3f78532e253affeb2b48cc09))
+* **deps:** update dependencies to clear cargo-deny advisories ([#849](https://github.com/special-place-ai-heaven/symforge/issues/849)) ([76d1085](https://github.com/special-place-ai-heaven/symforge/commit/76d1085fdf663dfa40afa0513fd1473dfd7d8815))
+* **release:** fetch the pinned action via the authenticated Contents API ([#852](https://github.com/special-place-ai-heaven/symforge/issues/852)) ([a7a39c8](https://github.com/special-place-ai-heaven/symforge/commit/a7a39c85f1ba95dcee9f7c95d16272abaea03c44))
+* **release:** name the cause when release-please fails ([#850](https://github.com/special-place-ai-heaven/symforge/issues/850)) ([17980dc](https://github.com/special-place-ai-heaven/symforge/commit/17980dc00e237a9e4c076240cb0217c94475f187))
+
 ## [11.10.3](https://github.com/special-place-ai-heaven/symforge/compare/v11.10.2...v11.10.3) (2026-11-05)
 
 
