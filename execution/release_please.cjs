@@ -146,8 +146,19 @@ async function runReleasePlease({fetchImpl = globalThis.fetch, signal, repositor
   } finally {action.cleanup();}
 }
 
-function reportFailure(_error, log = console.error) {
+// Fixed messages this file throws itself. They carry no external data, so they
+// are safe to print; any other error's message may hold upstream text and only
+// its constructor name is reported.
+const OWN_FAILURES = new Set([
+  'action download failed', 'action integrity check failed', 'action main export missing',
+  'action import failed', 'action reported failure',
+]);
+
+function reportFailure(error, log = console.error) {
   log('::error::release-please failed; no action replay was attempted.');
+  const own = error instanceof Error && OWN_FAILURES.has(error.message);
+  const name = error instanceof Error && /^[A-Za-z]+$/.test(error.name) ? error.name : typeof error;
+  log(`::error::failure cause: ${own ? error.message : name}`);
   process.exitCode = 1;
 }
 

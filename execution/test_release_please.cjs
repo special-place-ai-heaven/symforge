@@ -158,7 +158,18 @@ test('fatal reporting never prints an error value', () => {
   const logs = [];
   try {reportFailure(new Error('synthetic-sensitive-value'), value => logs.push(value)); assert.equal(process.exitCode, 1);}
   finally {process.exitCode = undefined;}
-  assert.deepEqual(logs, ['::error::release-please failed; no action replay was attempted.']);
+  assert.deepEqual(logs, ['::error::release-please failed; no action replay was attempted.', '::error::failure cause: Error']);
+  assert.ok(!logs.join('\n').includes('synthetic-sensitive-value'));
+});
+test('fatal reporting names this file\'s own failures', () => {
+  const logs = [];
+  try {reportFailure(new Error('action reported failure'), value => logs.push(value));}
+  finally {process.exitCode = undefined;}
+  assert.equal(logs[1], '::error::failure cause: action reported failure');
+  const typed = [];
+  try {reportFailure(new TypeError('x'), value => typed.push(value));}
+  finally {process.exitCode = undefined;}
+  assert.equal(typed[1], '::error::failure cause: TypeError');
 });
 test('workflow preserves every action input and downstream PR gates', () => {
   const {workflow, block} = releaseBlock();
