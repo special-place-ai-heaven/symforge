@@ -27,7 +27,7 @@ concurrency:
 
 jobs:
   conventional-commits:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'ci-hosted'))) && fromJSON('["self-hosted","Linux","X64","fresh","light"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -54,7 +54,7 @@ jobs:
 
   release-version:
     needs: conventional-commits
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'ci-hosted'))) && fromJSON('["self-hosted","Linux","X64","fresh","light"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -107,7 +107,7 @@ jobs:
 
   rust:
     needs: release-version
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'ci-hosted'))) && fromJSON('["self-hosted","Linux","X64","fresh","heavy"]') || 'ubuntu-latest' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -276,7 +276,7 @@ jobs:
 
   embed-build:
     needs: release-version
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'ci-hosted'))) && fromJSON('["self-hosted","Linux","X64","fresh","heavy"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -379,7 +379,7 @@ jobs:
 
   server-embed-parity:
     needs: release-version
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'ci-hosted'))) && fromJSON('["self-hosted","Linux","X64","fresh","heavy"]') || 'ubuntu-latest' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -464,7 +464,7 @@ jobs:
 
   embed-musl:
     needs: release-version
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'ci-hosted'))) && fromJSON('["self-hosted","Linux","X64","fresh","heavy"]') || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -564,7 +564,7 @@ jobs:
   performance-smoke:
     needs: release-version
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'ci-hosted'))) && fromJSON('["self-hosted","Linux","X64","fresh","heavy"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -582,7 +582,7 @@ jobs:
 
   npm:
     needs: release-version
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'ci-hosted'))) && fromJSON('["self-hosted","Linux","X64","fresh","light"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -597,8 +597,9 @@ jobs:
 
   windows-native:
     needs: release-version
-    # Runs on GitHub-hosted Windows: the repo is public, so hosted minutes are free.
-    runs-on: windows-latest
+    # Push and same-repo PRs use the interim Windows runner (CI runner plan, Rob 2026-11-08);
+    # fork PRs and ci-hosted-labelled PRs use GitHub-hosted windows-latest.
+    runs-on: ${{ (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'ci-hosted'))) && fromJSON('["self-hosted","Windows","X64","windows-host-interim"]') || 'windows-latest' }}
     timeout-minutes: 90
     steps:
       # Keep test runs off the runner's real control-state home; live daemons
