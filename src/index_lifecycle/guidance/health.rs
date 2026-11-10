@@ -698,6 +698,25 @@ pub fn health_report_from_published_state_windowed(
     rejected_stale_mutations: u64,
     quarantine_window: QuarantineWindow,
 ) -> String {
+    health_report_with_status_label(
+        published,
+        published.status_label(),
+        watcher,
+        rejected_stale_mutations,
+        quarantine_window,
+    )
+}
+
+/// The full health block with the given `Status:` label. The served report
+/// passes the [`TrustHeadline`](crate::live_index::store::TrustHeadline)
+/// label, so a Ready index with degraded freshness reads `Ready (stale)`.
+fn health_report_with_status_label(
+    published: &PublishedIndexState,
+    status_label: &str,
+    watcher: &crate::watcher_state::WatcherInfo,
+    rejected_stale_mutations: u64,
+    quarantine_window: QuarantineWindow,
+) -> String {
     let mut stats = HealthStats {
         file_count: published.file_count,
         symbol_count: published.symbol_count,
@@ -751,7 +770,7 @@ pub fn health_report_from_published_state_windowed(
         stats.last_event_at = None;
     }
     let mut report = health_report_from_stats_windowed(
-        published.status_label(),
+        status_label,
         &stats,
         rejected_stale_mutations,
         quarantine_window,
@@ -765,6 +784,20 @@ pub fn health_report_from_published_state_windowed(
 
 pub fn health_report_compact_from_published_state(
     published: &PublishedIndexState,
+    watcher: &crate::watcher_state::WatcherInfo,
+    rejected_stale_mutations: u64,
+) -> String {
+    health_compact_with_status_label(
+        published,
+        published.status_label(),
+        watcher,
+        rejected_stale_mutations,
+    )
+}
+
+fn health_compact_with_status_label(
+    published: &PublishedIndexState,
+    status_label: &str,
     watcher: &crate::watcher_state::WatcherInfo,
     rejected_stale_mutations: u64,
 ) -> String {
@@ -797,7 +830,7 @@ pub fn health_report_compact_from_published_state(
     let (tier1, tier2, tier3) = published.tier_counts;
     let mut output = format!(
         "Status: {} | Files: {} indexed ({} parsed, {} partial, {} failed) | Symbols: {} | Loaded: {}ms\nWatcher: {} | Stale-mutation rejections: {} | Admission tiers: {}/{}/{} (indexed/metadata/skipped)",
-        published.status_label(),
+        status_label,
         published.file_count,
         published.parsed_count,
         published.partial_parse_count,
@@ -2097,8 +2130,11 @@ pub(crate) fn render_health_report(
 ) -> String {
     let generation = inputs.source_set.current_generation();
     let published = &generation.health;
-    let mut result = health_report_from_published_state_windowed(
+    let headline =
+        crate::live_index::store::TrustHeadline::derive(&published.status, &generation.freshness);
+    let mut result = health_report_with_status_label(
         published,
+        headline.label(),
         inputs.watcher,
         inputs.rejected_stale_mutations,
         quarantine_window,
@@ -2167,8 +2203,11 @@ pub(crate) fn render_health_compact(
 ) -> String {
     let generation = inputs.source_set.current_generation();
     let published = &generation.health;
-    let mut result = health_report_compact_from_published_state(
+    let headline =
+        crate::live_index::store::TrustHeadline::derive(&published.status, &generation.freshness);
+    let mut result = health_compact_with_status_label(
         published,
+        headline.label(),
         inputs.watcher,
         inputs.rejected_stale_mutations,
     );

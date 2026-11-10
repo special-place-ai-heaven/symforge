@@ -99,6 +99,9 @@ pub struct KnowledgeRetrieveRequest {
     pub path_prefix: Option<String>,
     pub authority_scope: KnowledgeRetrieveAuthorityScope,
     pub limit: usize,
+    /// SF-ARC-07: include archive/archived and date-named research/review
+    /// folders, which the default knowledge scope excludes.
+    pub include_archived: bool,
 }
 
 impl KnowledgeRetrieveRequest {
@@ -123,6 +126,7 @@ impl KnowledgeRetrieveRequest {
             path_prefix,
             authority_scope,
             limit: limit.clamp(1, MAX_LIMIT),
+            include_archived: false,
         })
     }
 }
@@ -144,6 +148,8 @@ pub struct KnowledgeRetrieveFilteredCounts {
     pub suppressed: usize,
     pub review_required: usize,
     pub unknown: usize,
+    /// Matching units outside the default scope (archived or dated records).
+    pub archived: usize,
 }
 
 impl KnowledgeRetrieveFilteredCounts {
@@ -154,6 +160,7 @@ impl KnowledgeRetrieveFilteredCounts {
         self.suppressed = self.suppressed.saturating_add(other.suppressed);
         self.review_required = self.review_required.saturating_add(other.review_required);
         self.unknown = self.unknown.saturating_add(other.unknown);
+        self.archived = self.archived.saturating_add(other.archived);
     }
 
     fn any(self) -> bool {
@@ -163,6 +170,7 @@ impl KnowledgeRetrieveFilteredCounts {
             || self.suppressed > 0
             || self.review_required > 0
             || self.unknown > 0
+            || self.archived > 0
     }
 }
 
@@ -564,6 +572,12 @@ fn extract_lane(
             continue;
         };
 
+        if !request.include_archived
+            && crate::live_index::knowledge_bridge::is_archival_knowledge_path(&record.unit.path)
+        {
+            filtered.archived = filtered.archived.saturating_add(1);
+            continue;
+        }
         if !voice_allowed(record.voice, request.authority_scope) {
             note_filtered_voice(&mut filtered, record.voice);
             continue;

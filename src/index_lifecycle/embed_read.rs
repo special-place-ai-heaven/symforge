@@ -354,7 +354,9 @@ pub(super) fn content(
             return Ok(QueryOutput::FileContent(FileContent {
                 path: input.path,
                 content_hash,
-                approximate_tokens: source::approx_tokens_from_bytes(rendered.len()),
+                approximate_tokens: crate::stel::handler::estimate_tokens_from_bytes(
+                    rendered.len() as u64,
+                ),
                 rendered,
                 cache_hit: true,
                 authority: ReadAuthority::PublishedGeneration,
@@ -446,7 +448,7 @@ pub(super) fn content(
     let full = FileContent {
         path: input.path,
         content_hash: hash,
-        approximate_tokens: source::approx_tokens_from_bytes(warned.len()),
+        approximate_tokens: crate::stel::handler::estimate_tokens_from_bytes(warned.len() as u64),
         rendered: warned,
         cache_hit: false,
         authority,
@@ -464,6 +466,7 @@ pub(super) fn content(
     budget.truncated |= file_capped || token_capped;
     let mut served = full;
     served.rendered = budget.text(&rendered)?;
-    served.approximate_tokens = source::approx_tokens_from_bytes(served.rendered.len());
+    served.approximate_tokens =
+        crate::stel::handler::estimate_tokens_from_bytes(served.rendered.len() as u64);
     Ok(QueryOutput::FileContent(served))
 }

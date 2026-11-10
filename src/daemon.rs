@@ -1047,6 +1047,10 @@ pub struct ProjectHealth {
     pub file_count: usize,
     pub symbol_count: usize,
     pub index_state: String,
+    /// SF-DOG-04 headline from the same publication as `index_state` and
+    /// `freshness` (`Ready (stale)` when freshness is degraded).
+    #[serde(default)]
+    pub trust: String,
     #[serde(default = "default_project_freshness")]
     pub freshness: FreshnessStatus,
     pub durability: CapabilityStatus,
@@ -1957,6 +1961,9 @@ impl DaemonState {
             file_count: published.file_count,
             symbol_count: published.symbol_count,
             index_state: published.status_label().to_string(),
+            trust: crate::live_index::store::TrustHeadline::of(&generation)
+                .label()
+                .to_string(),
             freshness: generation.freshness.as_ref().clone(),
             durability,
             capabilities: ProjectCapabilities {
@@ -2006,14 +2013,10 @@ impl DaemonState {
         session_id: &str,
         input: IndexFolderInput,
     ) -> anyhow::Result<String> {
-        let allow_protected_root = input.allow_protected_root == Some(true);
-        let binding = match crate::discovery::resolve_root_candidate(
-            Path::new(&input.path),
-            RootCandidateSource::ExplicitIndexFolder,
-            RootRequestMode::ExplicitIndexFolder {
-                allow_protected_root,
-            },
-        ) {
+        // Operator configuration, never the tool field, admits protected roots.
+        let binding = match crate::protocol::tools::resolve_explicit_index_folder_root(Path::new(
+            &input.path,
+        )) {
             RootResolution::Bound(binding) => binding,
             RootResolution::Unbound {
                 reason: UnboundReason::Refused(reason),
@@ -2064,7 +2067,7 @@ impl DaemonState {
                     target_root,
                     raw_key,
                     reset_requested,
-                    allow_protected_root,
+                    matches!(binding.access_mode, SourceAccessMode::ExplicitProtected),
                     activate,
                 ) {
                     Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => {
@@ -2502,7 +2505,16 @@ impl DaemonState {
                     continue;
                 };
                 let meta = slot.metadata.read();
-                let published = meta.index.data_plane().published_state();
+                // SF-DOG-04: one published generation for the row's index
+                // fields and its trust headline.
+                let generation = meta.index.data_plane().published_generation();
+                let published = &generation.health;
+                let headline = crate::live_index::store::TrustHeadline::of(&generation);
+                let trust = if headline == crate::live_index::store::TrustHeadline::Ready {
+                    String::new()
+                } else {
+                    format!(" trust=\"{}\"", headline.label())
+                };
                 // Home and active are DISTINCT identities since the
                 // worktree-routing fix: home is the immutable session
                 // identity; active is what unqualified reads serve.
@@ -2527,13 +2539,13 @@ impl DaemonState {
                     "absent"
                 };
                 lines.push(format!(
-                    "{id}{home}{active} name={} root={} files={} symbols={} index={} generation={} opened={} snapshot={}",
+                    "{id}{home}{active} name={} root={} files={} symbols={} index={}{trust} generation={} opened={} snapshot={}",
                     meta.project_name,
                     normalized_path_string(&meta.canonical_root),
                     published.file_count,
                     published.symbol_count,
                     published.status_label(),
-                    meta.index.data_plane().current_project_generation(),
+                    generation.project_generation,
                     unix_seconds(meta.opened_at),
                     snapshot,
                 ));
@@ -3568,7 +3580,11 @@ async fn stop_incompatible_recorded_daemon_at(
     // makes every later call re-walk the same dead end. We withhold cleanup
     // strictly for a daemon we tried to kill and failed, or deliberately
     // declined to kill; those are live, identified, and worth keeping visible.
-    let mut clear_record = true;
+    //
+    // A refusal is its own outcome: the caller must not spawn over a live
+    // daemon it declined (or failed) to stop, because the new daemon's start
+    // replaces these records and would orphan the old one.
+    let mut refusal: Option<(u32, &str)> = None;
     if let Ok(pid) = read_daemon_pid_file_at(control_state_dir) {
         if should_terminate_recorded_daemon(&health, identity, pid) {
             if let Err(error) = terminate_process(pid) {
@@ -3578,7 +3594,7 @@ async fn stop_incompatible_recorded_daemon_at(
                 );
             }
             if !wait_for_daemon_unhealthy(port).await {
-                clear_record = false;
+                refusal = Some((pid, "it is still answering after termination"));
                 tracing::warn!(
                     pid,
                     port,
@@ -3587,7 +3603,7 @@ async fn stop_incompatible_recorded_daemon_at(
                 );
             }
         } else if !daemon_health_matches_recorded_pid(&health, pid) {
-            clear_record = false;
+            refusal = Some((pid, "the pid file does not match the pid /health reports"));
             match health.pid {
                 Some(health_pid) => {
                     tracing::warn!(
@@ -3604,7 +3620,10 @@ async fn stop_incompatible_recorded_daemon_at(
                 }
             }
         } else {
-            clear_record = false;
+            refusal = Some((
+                pid,
+                "the OS did not confirm that the pid runs a symforge binary owned by this user",
+            ));
             tracing::warn!(
                 recorded_pid = pid,
                 daemon_pid = ?health.pid,
@@ -3615,9 +3634,13 @@ async fn stop_incompatible_recorded_daemon_at(
         }
     }
 
-    if clear_record {
-        cleanup_daemon_runtime_files_at(control_state_dir);
+    if let Some((pid, reason)) = refusal {
+        anyhow::bail!(
+            "an incompatible symforge daemon (pid {pid}, port {port}) was not stopped: {reason}. \
+             Its runtime records are kept and no new daemon was started; end that process, then retry."
+        );
     }
+    cleanup_daemon_runtime_files_at(control_state_dir);
     Ok(())
 }
 
@@ -4007,13 +4030,26 @@ fn should_terminate_recorded_daemon(
         if !recorded_pid_owner_matches_current_user(recorded_pid).unwrap_or(false) {
             return false;
         }
-
-        if !recorded_pid_executable_matches_health(recorded_pid, health).unwrap_or(false) {
-            return false;
-        }
     }
 
-    true
+    // /health is self-reported; only the OS can say what the pid really runs.
+    match recorded_pid_executable_matches_current(recorded_pid, identity) {
+        Some(true) => true,
+        Some(false) => {
+            tracing::warn!(
+                recorded_pid,
+                "not terminating: the OS-reported executable of the recorded pid is not a symforge binary"
+            );
+            false
+        }
+        None => {
+            tracing::warn!(
+                recorded_pid,
+                "not terminating: could not observe the recorded pid's executable through the OS"
+            );
+            false
+        }
+    }
 }
 
 fn daemon_executable_name_matches_current(
@@ -4057,17 +4093,79 @@ fn recorded_pid_owner_matches_current_user(pid: u32) -> Option<bool> {
     Some(effective_uid == current_uid)
 }
 
-#[cfg(target_os = "linux")]
-fn recorded_pid_executable_matches_health(pid: u32, health: &DaemonHealth) -> Option<bool> {
-    if health.executable_path == "unknown" {
-        return None;
-    }
+/// Whether the OS says `pid` runs a symforge daemon binary: the OS-observed
+/// executable's file name (case-insensitive on Windows) equals this binary's.
+/// The path `/health` reports is never consulted, and no local daemon record
+/// carries an executable path, so the file name is the whole test.
+///
+/// `None` when the OS cannot be asked (or will not answer) which executable
+/// the pid runs; callers must treat that as "do not terminate".
+fn recorded_pid_executable_matches_current(pid: u32, identity: &DaemonIdentity) -> Option<bool> {
+    let expected = daemon_executable_file_name(&identity.executable_path)?;
+    let actual = recorded_pid_executable_path(pid)?;
+    Some(daemon_executable_file_name(&normalized_path_string(&actual)) == Some(expected))
+}
 
-    let actual = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+#[cfg(target_os = "linux")]
+fn recorded_pid_executable_path(pid: u32) -> Option<PathBuf> {
+    let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    // An upgrade that replaced the binary in place leaves "<path> (deleted)".
     Some(
-        stable_path_identity(&normalized_path_string(&actual))
-            == stable_path_identity(&health.executable_path),
+        match path.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+            Some(original) => PathBuf::from(original),
+            None => path,
+        },
     )
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // Asking Windows for another process's image path needs Win32 FFI.
+fn recorded_pid_executable_path(pid: u32) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+
+    // SAFETY: OpenProcess takes a plain pid and requests query-only access;
+    // failure (no such pid, access denied) is reported as unobservable.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut buffer = vec![0u16; 32_768];
+    let mut len = buffer.len() as u32;
+    // SAFETY: `handle` is open with query access and `buffer` holds `len` u16s.
+    let queried = unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buffer.as_mut_ptr()),
+            &raw mut len,
+        )
+    };
+    // SAFETY: the single paired close for the handle opened above.
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    queried.ok()?;
+    buffer.truncate(len as usize);
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer)))
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)] // proc_pidpath is the libproc query for a pid's executable.
+fn recorded_pid_executable_path(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let pid = i32::try_from(pid).ok()?;
+    let mut buffer = vec![0u8; 4096];
+    // SAFETY: `buffer` is valid for `buffer.len()` bytes for the call.
+    let len = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    let len = usize::try_from(len).ok().filter(|len| *len > 0)?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..len])))
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+fn recorded_pid_executable_path(_pid: u32) -> Option<PathBuf> {
+    None
 }
 
 fn stable_path_identity_for_platform(path: &str, windows: bool) -> String {
@@ -5937,6 +6035,9 @@ async fn call_tool_handler(
             // content-only publishes.
             generation: generation.publication_generation,
             index_state: generation.health.status_label().to_string(),
+            trust: crate::live_index::store::TrustHeadline::of(&generation)
+                .label()
+                .to_string(),
             load_source: generation.live.load_source().label().to_string(),
             index_files: generation.health.file_count,
             index_symbols: generation.health.symbol_count,
@@ -6625,6 +6726,10 @@ fn reject_unsupported_cross_project_scoping(
         #[serde(default)]
         structural: Option<bool>,
         #[serde(default)]
+        group_by: Option<String>,
+        #[serde(default)]
+        include_body: Option<bool>,
+        #[serde(default)]
         resolve: Option<bool>,
         #[serde(default)]
         changed_with: Option<String>,
@@ -6642,6 +6747,13 @@ fn reject_unsupported_cross_project_scoping(
         "search_text" => {
             if peek.structural == Some(true) {
                 return refuse("structural");
+            }
+            // Count and body modes run in the single-project engine only.
+            if peek.group_by.as_deref() == Some("count") {
+                return refuse("group_by=\"count\"");
+            }
+            if peek.include_body == Some(true) {
+                return refuse("include_body");
             }
         }
         "find_references" => {
@@ -9982,6 +10094,7 @@ mod tests {
         let _guard = env_lock().await;
         let state_home = TempDir::new().expect("private user-local state base");
         let _home = EnvVarGuard::set("SYMFORGE_HOME", state_home.path());
+        let _no_operator = EnvVarGuard::unset(crate::protocol::tools::PROTECTED_ROOT_OVERRIDE_ENV);
         // Regression: the daemon path historically never called the sensitive
         // -path guard, so a daemon-routed `index_folder` on a system root could
         // index system files and drive a reload into a denial-of-service.
@@ -10028,6 +10141,26 @@ mod tests {
             "refusal must not create a project for the sensitive root"
         );
 
+        // The tool field alone must not lift the refusal on the daemon route.
+        let field_only = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: sensitive.display().to_string(),
+                    idempotency_key: None,
+                    add: None,
+                    allow_protected_root: Some(true),
+                },
+            )
+            .expect("refusal must be a clean Ok response");
+        assert!(
+            field_only.contains("protected_root_requires_explicit_override"),
+            "daemon must ignore the caller-supplied override: {field_only}"
+        );
+        assert_eq!(state.list_projects().len(), 1);
+
+        let _operator =
+            EnvVarGuard::set_str(crate::protocol::tools::PROTECTED_ROOT_OVERRIDE_ENV, "1");
         let indexed = state
             .index_folder_for_session(
                 &opened.session_id,
@@ -10060,6 +10193,8 @@ mod tests {
         let _guard = env_lock().await;
         let state_home = TempDir::new().expect("private user-local state base");
         let _home = EnvVarGuard::set("SYMFORGE_HOME", state_home.path());
+        let _operator =
+            EnvVarGuard::set_str(crate::protocol::tools::PROTECTED_ROOT_OVERRIDE_ENV, "1");
         let home_a = project_dir("symforge-protected-session-a");
         let home_b = project_dir("symforge-protected-session-b");
         let state = DaemonState::new();
@@ -10146,17 +10281,21 @@ mod tests {
             "a protected project alias must not address another session's membership"
         );
 
-        let refused_b = state
-            .index_folder_for_session(
-                &session_b.session_id,
-                IndexFolderInput {
-                    path: protected.display().to_string(),
-                    idempotency_key: None,
-                    add: Some(true),
-                    allow_protected_root: None,
-                },
-            )
-            .expect("missing override is a typed refusal");
+        let refused_b = {
+            // Without operator configuration the tool field alone is refused.
+            let _off = EnvVarGuard::unset(crate::protocol::tools::PROTECTED_ROOT_OVERRIDE_ENV);
+            state
+                .index_folder_for_session(
+                    &session_b.session_id,
+                    IndexFolderInput {
+                        path: protected.display().to_string(),
+                        idempotency_key: None,
+                        add: Some(true),
+                        allow_protected_root: Some(true),
+                    },
+                )
+                .expect("missing operator override is a typed refusal")
+        };
         assert!(
             refused_b.contains("protected_root_requires_explicit_override"),
             "{refused_b}"
@@ -10210,6 +10349,8 @@ mod tests {
         let _guard = env_lock().await;
         let state_home = TempDir::new().expect("private user-local state base");
         let _home = EnvVarGuard::set("SYMFORGE_HOME", state_home.path());
+        let _operator =
+            EnvVarGuard::set_str(crate::protocol::tools::PROTECTED_ROOT_OVERRIDE_ENV, "1");
         let home_a = project_dir("symforge-l-r11-session-a");
         let home_b = project_dir("symforge-l-r11-session-b");
         let state = DaemonState::new();
@@ -10264,6 +10405,7 @@ mod tests {
             projects: None,
             limit: None,
             max_tokens: None,
+            include_archived: None,
         };
 
         // Session B's runtime is the ONLY source a cross-project read resolves
@@ -10441,6 +10583,7 @@ mod tests {
             projects: None,
             limit: None,
             max_tokens: None,
+            include_archived: None,
         };
 
         // local_refs composes the P1 ref lane: the ref-only document is now visible.
@@ -10628,6 +10771,8 @@ mod tests {
         let _guard = env_lock().await;
         let state_home = TempDir::new().expect("private user-local state base");
         let _home = EnvVarGuard::set("SYMFORGE_HOME", state_home.path());
+        let _operator =
+            EnvVarGuard::set_str(crate::protocol::tools::PROTECTED_ROOT_OVERRIDE_ENV, "1");
         let home_a = project_dir("symforge-l-r11-dispatch-a");
         let home_b = project_dir("symforge-l-r11-dispatch-b");
         let state = DaemonState::new();
@@ -10742,6 +10887,8 @@ mod tests {
         let _guard = env_lock().await;
         let state_home = TempDir::new().expect("private user-local state base");
         let _home = EnvVarGuard::set("SYMFORGE_HOME", state_home.path());
+        let _operator =
+            EnvVarGuard::set_str(crate::protocol::tools::PROTECTED_ROOT_OVERRIDE_ENV, "1");
         let home = project_dir("symforge-protected-restart-home");
         let fixture = TempDir::new().expect("protected-root fixture parent");
         let protected = fixture.path().join("System32");
@@ -10845,17 +10992,20 @@ mod tests {
             "reconnect after restart must still refuse protected membership"
         );
 
-        let refused = restarted
-            .index_folder_for_session(
-                &fresh.session_id,
-                IndexFolderInput {
-                    path: protected.display().to_string(),
-                    idempotency_key: None,
-                    add: Some(true),
-                    allow_protected_root: None,
-                },
-            )
-            .expect("missing override is a typed refusal");
+        let refused = {
+            let _off = EnvVarGuard::unset(crate::protocol::tools::PROTECTED_ROOT_OVERRIDE_ENV);
+            restarted
+                .index_folder_for_session(
+                    &fresh.session_id,
+                    IndexFolderInput {
+                        path: protected.display().to_string(),
+                        idempotency_key: None,
+                        add: Some(true),
+                        allow_protected_root: Some(true),
+                    },
+                )
+                .expect("missing operator override is a typed refusal")
+        };
         assert!(
             refused.contains("protected_root_requires_explicit_override"),
             "{refused}"
@@ -10988,7 +11138,9 @@ mod tests {
         );
         assert!(state.remove_project_from_session(&session.session_id, &target_id));
 
-        let override_conflict = state
+        // The tool field grants nothing, so a request differing only by it is
+        // the same request and replays rather than conflicting.
+        let field_only = state
             .index_folder_for_session(
                 &session.session_id,
                 IndexFolderInput {
@@ -10998,17 +11150,9 @@ mod tests {
                     allow_protected_root: Some(true),
                 },
             )
-            .expect("override change is a deterministic tool-level conflict");
-        assert!(
-            override_conflict.contains("Idempotency conflict"),
-            "{override_conflict}"
-        );
-        assert!(
-            state
-                .runtime_for_target(&session.session_id, Some(&target_id))
-                .is_err(),
-            "override conflict must happen before live attachment"
-        );
+            .expect("field-only change replays");
+        assert_eq!(field_only, first_receipt);
+        assert!(state.remove_project_from_session(&session.session_id, &target_id));
 
         let path_conflict = state
             .index_folder_for_session(
@@ -11971,6 +12115,52 @@ mod tests {
         assert!(sessions.iter().any(|session| session.pid == Some(111)));
         assert!(sessions.iter().any(|session| session.pid == Some(222)));
         assert_ne!(first.session_id, second.session_id);
+    }
+
+    #[test]
+    fn project_health_and_inventory_qualify_a_stale_ready_index() {
+        let project = project_dir("symforge-daemon-stale-trust");
+        let state = DaemonState::new();
+        let session = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: Some(111),
+            })
+            .expect("session");
+        let health = state.project_health(&session.project_id).expect("health");
+        assert_eq!(
+            (health.index_state.as_str(), health.trust.as_str()),
+            ("Ready", "Ready")
+        );
+        let inventory = state
+            .render_session_project_inventory(&session.session_id)
+            .expect("inventory");
+        assert!(!inventory.contains("trust="), "{inventory}");
+
+        let slot = state
+            .projects
+            .read()
+            .get(&session.project_id)
+            .cloned()
+            .expect("slot");
+        let data_plane = slot.metadata.read().index.data_plane().clone();
+        let content_generation = data_plane.published_generation().content_generation;
+        data_plane.set_freshness_status(crate::domain::FreshnessStatus::Degraded {
+            last_valid_content_generation: content_generation,
+            reason_codes: vec![crate::domain::FreshnessReason::ObservationFailed],
+        });
+
+        let health = state.project_health(&session.project_id).expect("health");
+        assert_eq!(health.index_state, "Ready");
+        assert_eq!(health.trust, "Ready (stale)");
+        let inventory = state
+            .render_session_project_inventory(&session.session_id)
+            .expect("inventory");
+        assert!(
+            inventory.contains("index=Ready trust=\"Ready (stale)\""),
+            "{inventory}"
+        );
     }
 
     #[test]
@@ -14016,6 +14206,28 @@ mod tests {
                     .contains("query a single project for scoped results"),
             "structural refusal must name the param + corrective hint: {structural_err}"
         );
+        // SF-TE-07/08: count and body modes are refused, never silently dropped.
+        for (params, name) in [
+            (
+                json!({ "query": "x", "group_by": "count" }),
+                "group_by=\"count\"",
+            ),
+            (
+                json!({ "query": "x", "group_by": "symbol", "include_body": true }),
+                "include_body",
+            ),
+        ] {
+            let err = reject_unsupported_cross_project_scoping("search_text", &params)
+                .expect_err("mode must be refused cross-project");
+            assert!(err.to_string().starts_with(name), "{err}");
+        }
+        assert!(
+            reject_unsupported_cross_project_scoping(
+                "search_text",
+                &json!({ "query": "x", "group_by": "symbol", "include_body": false }),
+            )
+            .is_ok()
+        );
 
         // find_references: path / symbol_kind / direction still refused (no
         // cross-project meaning).
@@ -14617,12 +14829,14 @@ mod tests {
         )
         .expect("write daemon pid");
 
-        stop_incompatible_recorded_daemon_at(
+        let refused = stop_incompatible_recorded_daemon_at(
             &test_control_state(daemon_home.path()),
             &current_daemon_identity(),
         )
         .await
-        .expect("stop incompatible daemon");
+        .expect_err("a declined stop is a refusal, not success");
+        assert!(refused.to_string().contains(&format!("pid {child_pid}")));
+        assert!(test_daemon_path(daemon_home.path(), LEGACY_DAEMON_PID_FILE).exists());
 
         assert!(
             child.try_wait().expect("poll child").is_none(),
@@ -14632,6 +14846,257 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         let _ = shutdown_tx.send(());
+    }
+
+    /// A long-running stand-in process; idle unless the env var is set.
+    #[test]
+    fn daemon_test_sleeper() {
+        if std::env::var_os("SYMFORGE_TEST_DAEMON_SLEEPER").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+
+    fn spawn_non_symforge_sleeper() -> std::process::Child {
+        #[cfg(windows)]
+        let child = crate::process_util::hidden_command("powershell")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        #[cfg(not(windows))]
+        let child = crate::process_util::hidden_command("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        child.expect("spawn long-running child")
+    }
+
+    fn fake_health(executable_path: String, pid: u32, version: &str) -> DaemonHealth {
+        DaemonHealth {
+            project_count: 0,
+            session_count: 0,
+            stale_sessions: 0,
+            daemon_version: version.to_string(),
+            executable_path,
+            auth_required: false,
+            pid: Some(pid),
+            started_at_unix_secs: None,
+        }
+    }
+
+    fn write_daemon_records(home: &Path, port: u16, pid: u32) {
+        std::fs::write(
+            test_daemon_path(home, LEGACY_DAEMON_PORT_FILE),
+            port.to_string(),
+        )
+        .expect("write daemon port");
+        std::fs::write(
+            test_daemon_path(home, LEGACY_DAEMON_PID_FILE),
+            pid.to_string(),
+        )
+        .expect("write daemon pid");
+    }
+
+    #[tokio::test]
+    async fn old_daemon_at_another_install_path_is_terminated() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let identity = current_daemon_identity();
+
+        // The same binary name in a different install directory.
+        let own = std::env::current_exe().expect("current exe");
+        let install = TempDir::new().expect("other install dir");
+        let old_exe = install.path().join(own.file_name().expect("exe name"));
+        if std::fs::hard_link(&own, &old_exe).is_err() {
+            std::fs::copy(&own, &old_exe).expect("copy daemon binary");
+        }
+        let mut child = crate::process_util::hidden_command(&old_exe)
+            .args(["daemon_test_sleeper", "--test-threads=1"])
+            .env("SYMFORGE_TEST_DAEMON_SLEEPER", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn old daemon stand-in");
+        let child_pid = child.id();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(child.try_wait().expect("poll child").is_none());
+
+        let health = fake_health(normalized_path_string(&old_exe), child_pid, "0.0.0-old");
+        let (port, shutdown_tx) = spawn_fake_health_server(health).await;
+        write_daemon_records(daemon_home.path(), port, child_pid);
+        // The old daemon's /health goes away when its process does.
+        let exited = tokio::task::spawn_blocking(move || {
+            let status = child.wait();
+            let _ = shutdown_tx.send(());
+            status
+        });
+
+        stop_incompatible_recorded_daemon_at(&test_control_state(daemon_home.path()), &identity)
+            .await
+            .expect("the old symforge daemon is stopped");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), exited)
+            .await
+            .expect("old daemon exits")
+            .expect("join")
+            .expect("wait");
+        assert!(!status.success(), "terminated, not a natural exit");
+        assert!(!test_daemon_path(daemon_home.path(), LEGACY_DAEMON_PID_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn recorded_pid_running_a_different_executable_is_not_terminated() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+
+        #[cfg(windows)]
+        let mut child = crate::process_util::hidden_command("powershell")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn long-running child");
+        #[cfg(not(windows))]
+        let mut child = crate::process_util::hidden_command("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn long-running child");
+
+        // /health claims the child's pid and an executable with the daemon's
+        // own file name, so every self-reported check passes; only the OS
+        // query can see that the pid runs something else.
+        let identity = current_daemon_identity();
+        let name = Path::new(&identity.executable_path)
+            .file_name()
+            .expect("daemon executable file name");
+        let impostor_dir = TempDir::new().expect("impostor dir");
+        let impostor = impostor_dir.path().join(name);
+        std::fs::write(&impostor, b"not the daemon").expect("write impostor");
+        let child_pid = child.id();
+        let health = DaemonHealth {
+            project_count: 0,
+            session_count: 0,
+            stale_sessions: 0,
+            daemon_version: identity.version.clone(),
+            executable_path: normalized_path_string(&impostor),
+            auth_required: false,
+            pid: Some(child_pid),
+            started_at_unix_secs: None,
+        };
+        assert!(daemon_executable_name_matches_current(&health, &identity));
+        assert!(!should_terminate_recorded_daemon(
+            &health, &identity, child_pid
+        ));
+
+        let (port, shutdown_tx) = spawn_fake_health_server(health).await;
+        write_daemon_records(daemon_home.path(), port, child_pid);
+
+        // The start path must refuse instead of spawning over the live process.
+        let refused =
+            match guarded_daemon_start_at("127.0.0.1", &test_control_state(daemon_home.path()))
+                .await
+            {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("a refused stop must not start a new daemon"),
+            };
+        assert!(refused.contains(&format!("pid {child_pid}")), "{refused}");
+        assert!(refused.contains("symforge binary"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(test_daemon_path(
+                daemon_home.path(),
+                LEGACY_DAEMON_PORT_FILE
+            ))
+            .expect("port record kept"),
+            port.to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(test_daemon_path(daemon_home.path(), LEGACY_DAEMON_PID_FILE))
+                .expect("pid record kept"),
+            child_pid.to_string()
+        );
+        assert!(
+            child.try_wait().expect("poll child").is_none(),
+            "a pid whose OS-reported executable is not symforge must not be terminated"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = shutdown_tx.send(());
+    }
+
+    #[test]
+    fn recorded_pid_executable_is_observed_through_the_os() {
+        let identity = current_daemon_identity();
+        let own_pid = std::process::id();
+        let health = DaemonHealth {
+            project_count: 0,
+            session_count: 0,
+            stale_sessions: 0,
+            daemon_version: identity.version.clone(),
+            executable_path: identity.executable_path.clone(),
+            auth_required: false,
+            pid: Some(own_pid),
+            started_at_unix_secs: None,
+        };
+        #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+        {
+            assert_eq!(
+                recorded_pid_executable_matches_current(own_pid, &identity),
+                Some(true)
+            );
+            assert!(should_terminate_recorded_daemon(
+                &health, &identity, own_pid
+            ));
+        }
+        #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+        assert!(!should_terminate_recorded_daemon(
+            &health, &identity, own_pid
+        ));
+        // A pid that does not exist is unobservable, never a match.
+        assert_eq!(
+            recorded_pid_executable_matches_current(u32::MAX - 1, &identity),
+            None
+        );
+    }
+
+    #[test]
+    fn reported_link_path_to_the_pid_executable_is_not_trusted() {
+        // /health names a non-symforge pid and reports a path through a
+        // directory link that resolves to a real symforge binary. The reported
+        // path is never the reference, so the pid is still refused.
+        let identity = current_daemon_identity();
+        let mut child = spawn_non_symforge_sleeper();
+        let child_pid = child.id();
+        let exe = std::env::current_exe().expect("current exe");
+        let fixture = TempDir::new().expect("link fixture");
+        let link = fixture.path().join("linked-bin");
+        link_dir(exe.parent().expect("exe dir"), &link);
+        let reported = link.join(exe.file_name().expect("exe name"));
+        assert!(
+            reported.is_file(),
+            "the link must resolve to the executable"
+        );
+        let health = fake_health(normalized_path_string(&reported), child_pid, "0.0.0-old");
+        assert!(daemon_executable_name_matches_current(&health, &identity));
+        assert_eq!(
+            recorded_pid_executable_matches_current(child_pid, &identity),
+            Some(false)
+        );
+        assert!(!should_terminate_recorded_daemon(
+            &health, &identity, child_pid
+        ));
+        let _ = child.kill();
+        let _ = child.wait();
+        unlink_dir(&link);
     }
 
     #[tokio::test]

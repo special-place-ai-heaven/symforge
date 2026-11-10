@@ -212,8 +212,6 @@ async fn search_files_rankings_match_golden() {
 
 const GOLDEN_EXACT_PATH_HIT: &str = "\
 Trust: constrained (tiered path relevance) | current index | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
-Scope: ranked indexed file paths; filters: vendor filter active (heuristic); personal tooling filtered
-Evidence: paths `src/protocol/tools.rs`
 
 1 matching file
 ── Strong path matches ──
@@ -221,8 +219,6 @@ Evidence: paths `src/protocol/tools.rs`
 
 const GOLDEN_BASENAME_TOOLS_RS: &str = "\
 Trust: constrained (tiered path relevance) | current index | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
-Scope: ranked indexed file paths; filters: vendor filter active (heuristic); personal tooling filtered
-Evidence: paths `src/protocol/tools.rs`
 
 1 matching file
 ── Basename matches ──
@@ -230,8 +226,6 @@ Evidence: paths `src/protocol/tools.rs`
 
 const GOLDEN_LOOSE_PROTOCOL: &str = "\
 Trust: heuristic (loose path relevance) | current index | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
-Scope: ranked indexed file paths; filters: vendor filter active (heuristic); personal tooling filtered
-Evidence: paths `src/protocol/mod.rs`, `src/protocol/tools.rs`, `src/protocol/format.rs`
 
 3 matching files
 ── Loose path matches ──
@@ -241,8 +235,6 @@ Evidence: paths `src/protocol/mod.rs`, `src/protocol/tools.rs`, `src/protocol/fo
 
 const GOLDEN_MULTI_COMPONENT_LIVE_SEARCH: &str = "\
 Trust: constrained (tiered path relevance) | current index | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
-Scope: ranked indexed file paths; filters: vendor filter active (heuristic); personal tooling filtered
-Evidence: paths `src/live_index/search.rs`
 
 1 matching file
 ── Strong path matches ──
@@ -260,8 +252,6 @@ Evidence: paths `src/protocol/mod.rs`, `src/live_index/mod.rs`
 
 const GOLDEN_GLOB: &str = "\
 Trust: constrained (tiered path relevance) | current index | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
-Scope: ranked indexed file paths; filters: vendor filter active (heuristic); personal tooling filtered
-Evidence: paths `src/protocol/format.rs`, `src/protocol/mod.rs`, `src/protocol/tools.rs`
 
 3 matching files
 ── Strong path matches ──

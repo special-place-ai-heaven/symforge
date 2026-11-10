@@ -128,12 +128,19 @@ pub(crate) fn validate_input(
         .unwrap_or(MAX_LIMIT)
         .clamp(1, MAX_LIMIT);
 
+    // Archived records are history: an explicit history/all scope asks for them.
+    let include_archived = input.include_archived.unwrap_or(matches!(
+        authority_scope,
+        KnowledgeAuthorityScope::History | KnowledgeAuthorityScope::All
+    ));
+
     Ok(KnowledgeRetrieveRequest {
         phrase: phrase.to_lowercase(),
         terms,
         path_prefix,
         authority_scope: retrieve_authority_scope(authority_scope),
         limit,
+        include_archived,
     })
 }
 
@@ -496,6 +503,13 @@ fn render_response(
         retrieved.filtered.review_required,
         retrieved.filtered.unknown,
     ));
+    // SF-ARC-07: a measured count of matching units the default scope left out.
+    if retrieved.filtered.archived > 0 {
+        output.push_str(&format!(
+            "\nExcluded by default scope: {} matching unit(s) in archive or dated research/review folders; retry with include_archived=true to search them.",
+            retrieved.filtered.archived
+        ));
+    }
 
     if let Some(no_match) = retrieved.absence {
         output.push_str(&format!("\nNo match: {}", no_match.as_str()));
@@ -635,6 +649,7 @@ mod tests {
             projects: None,
             limit: Some(10),
             max_tokens: None,
+            include_archived: None,
         }
     }
 

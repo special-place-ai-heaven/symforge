@@ -674,6 +674,7 @@ mod tests {
             canonical_root: Some("C:/work/repeat".to_string()),
             generation,
             index_state: "Ready".to_string(),
+            trust: "Ready".to_string(),
             load_source: "memory".to_string(),
             index_files: 3,
             index_symbols: 4,

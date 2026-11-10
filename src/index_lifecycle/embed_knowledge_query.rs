@@ -20,6 +20,7 @@ fn counts(value: KnowledgeRetrieveFilteredCounts) -> SearchKnowledgeCounts {
         suppressed: value.suppressed as u64,
         review_required: value.review_required as u64,
         unknown: value.unknown as u64,
+        archived: value.archived as u64,
     }
 }
 

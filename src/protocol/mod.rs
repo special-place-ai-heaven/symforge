@@ -317,10 +317,6 @@ fn disabled_analytics_recorder(
     crate::analytics::AnalyticsRecorder::disabled(default_analytics_db_path(project_state_dir))
 }
 
-fn estimate_tokens(response_bytes: u64) -> u64 {
-    crate::stel::handler::estimate_tokens_from_bytes(response_bytes)
-}
-
 impl SymForgeServer {
     pub(crate) fn tool_router() -> ToolRouter<Self> {
         Self::core_tool_router() + Self::edit_tool_router() + Self::secret_remediate_tool_router()
@@ -1006,7 +1002,9 @@ impl SymForgeServer {
             crate::analytics::AnalyticsSurface::Tool,
             recorder.configured_scope(),
             response_bytes,
-            Some(estimate_tokens(response_bytes)),
+            Some(crate::stel::handler::estimate_tokens_from_bytes(
+                response_bytes,
+            )),
             duration,
             success,
             outcome_class,
@@ -2091,7 +2089,7 @@ impl ServerHandler for SymForgeServer {
         // `CARGO_CRATE_NAME`/`CARGO_PKG_VERSION` inside the rmcp crate and would
         // otherwise identify this server as "rmcp"/<rmcp version>. `env!` here
         // expands in the symforge crate, staying in sync with Cargo.toml.
-        ServerConfig::new(
+        let config = ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
@@ -2101,7 +2099,13 @@ impl ServerHandler for SymForgeServer {
         .with_server_info(rmcp::model::Implementation::new(
             "symforge",
             env!("CARGO_PKG_VERSION"),
-        ))
+        ));
+        // SF-ADOPT-04: same env-driven profile `list_tools` serves, so the
+        // instructions only name tools this connection can call.
+        match surface_probe::server_instructions(surface_probe::surface_profile_from_env()) {
+            Some(text) => config.with_instructions(text),
+            None => config,
+        }
     }
 
     /// FR-307 allow-list freeze (spec 025). rmcp 3.5.0's default already
@@ -2709,6 +2713,7 @@ mod tests {
                 7
             },
             index_state: "Ready".to_string(),
+            trust: "Ready".to_string(),
             load_source: "fake-daemon".to_string(),
             index_files: 11,
             index_symbols: 13,
@@ -3357,6 +3362,7 @@ mod tests {
             canonical_root: Some("C:/FOREIGN_ROOT/foreign-project".to_string()),
             generation: 7,
             index_state: "Ready".to_string(),
+            trust: "Ready".to_string(),
             load_source: "truncated-daemon".to_string(),
             index_files: 11,
             index_symbols: 13,
@@ -3375,6 +3381,7 @@ mod tests {
             canonical_root: Some("C:/HOME_ROOT/home-project".to_string()),
             generation: 3,
             index_state: "Ready".to_string(),
+            trust: "Ready".to_string(),
             load_source: "home-seed".to_string(),
             index_files: 5,
             index_symbols: 8,
@@ -3426,6 +3433,7 @@ mod tests {
             canonical_root: Some(home_canon),
             generation: 3,
             index_state: "Ready".to_string(),
+            trust: "Ready".to_string(),
             load_source: "home-seed".to_string(),
             index_files: 5,
             index_symbols: 8,
@@ -3556,6 +3564,7 @@ mod tests {
             canonical_root: Some("C:/HOME".to_string()),
             generation: 3,
             index_state: "Ready".to_string(),
+            trust: "Ready".to_string(),
             load_source: "home-seed".to_string(),
             index_files: 5,
             index_symbols: 8,
@@ -3893,6 +3902,7 @@ mod tests {
             canonical_root: Some("C:/seed".to_string()),
             generation: 1,
             index_state: "Ready".to_string(),
+            trust: "Ready".to_string(),
             load_source: "memory".to_string(),
             index_files: 1,
             index_symbols: 1,
@@ -4305,6 +4315,7 @@ mod tests {
             canonical_root: Some(home.clone()),
             generation: 3,
             index_state: "Ready".to_string(),
+            trust: "Ready".to_string(),
             load_source: "home-seed".to_string(),
             index_files: 5,
             index_symbols: 8,
@@ -4593,6 +4604,7 @@ mod tests {
             canonical_root: Some("C:/HOME".to_string()),
             generation: 3,
             index_state: "Ready".to_string(),
+            trust: "Ready".to_string(),
             load_source: "home-seed".to_string(),
             index_files: 5,
             index_symbols: 8,

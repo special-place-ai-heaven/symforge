@@ -256,7 +256,8 @@ pub(super) fn read(
         rendered.push(text);
     }
     let rendered = rendered.join("\n\n");
-    let estimated_tokens = estimate.then(|| source::approx_tokens_from_bytes(rendered.len()));
+    let estimated_tokens =
+        estimate.then(|| crate::stel::handler::estimate_tokens_from_bytes(rendered.len() as u64));
     let mut full = SymbolReadResult {
         entries,
         rendered,
@@ -332,7 +333,7 @@ pub(super) fn inspect(
         siblings_overflow: found.siblings_overflow as u64,
         rendered: String::new(),
         estimated_tokens: (request.estimate == Some(true))
-            .then(|| source::approx_tokens_from_bytes(rendered.len())),
+            .then(|| crate::stel::handler::estimate_tokens_from_bytes(rendered.len() as u64)),
     };
     if request.estimate == Some(true) {
         output.excerpt.clear();

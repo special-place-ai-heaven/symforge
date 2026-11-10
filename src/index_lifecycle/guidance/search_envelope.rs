@@ -18,24 +18,48 @@
 pub(crate) struct SourceAuthority {
     label: &'static str,
     collapsible: bool,
+    /// The measured freshness is degraded (SF-DOG-04): the Completeness line
+    /// must not read as a plain "full".
+    stale: bool,
 }
+
+/// The scope [`search_scope_summary`] renders for a search with every filter
+/// at its default. A collapsed envelope omits a scope equal to this.
+pub(crate) const DEFAULT_SEARCH_SCOPE: &str = "repo-wide; tests filter active (heuristic); generated filter active (heuristic); vendor filter active (heuristic); personal tooling filtered";
+
+/// The scope `search_files` renders for its default path ranking with default
+/// filters. Other ranking modes never collapse the envelope.
+pub(crate) const DEFAULT_SEARCH_FILES_SCOPE: &str = "ranked indexed file paths; filters: vendor filter active (heuristic); personal tooling filtered";
+
+/// Completeness fragment present exactly when a noise filter hid matches.
+const NOISE_SUPPRESSED_FRAGMENT: &str = "noise-filtered match(es) suppressed";
 
 impl SourceAuthority {
     /// The measured axis. Collapse is permitted exactly when the index itself
     /// reports `Current`; `Verifying` and `Degraded` stay loud and say so.
     pub(crate) fn from_freshness(freshness: &crate::domain::FreshnessStatus) -> Self {
+        use crate::live_index::store::TrustHeadline;
+        // Readiness is not visible at this seam, so this passes Ready and keeps
+        // only the freshness-derived qualifier of the headline.
+        let stale = matches!(
+            TrustHeadline::derive(&crate::live_index::PublishedIndexStatus::Ready, freshness),
+            TrustHeadline::ReadyStale | TrustHeadline::Stale
+        );
         match freshness {
             crate::domain::FreshnessStatus::Current => Self {
                 label: "current index",
                 collapsible: true,
+                stale,
             },
             crate::domain::FreshnessStatus::Verifying => Self {
                 label: "index (verifying against disk)",
                 collapsible: false,
+                stale,
             },
             crate::domain::FreshnessStatus::Degraded { .. } => Self {
                 label: "index (UNVERIFIED against disk)",
                 collapsible: false,
+                stale,
             },
         }
     }
@@ -47,6 +71,7 @@ impl SourceAuthority {
         Self {
             label,
             collapsible: false,
+            stale: false,
         }
     }
 
@@ -65,18 +90,34 @@ pub(crate) fn format_search_envelope(
 ) -> String {
     // "Silence is the happy path": on a fully-trusted result collapse the four
     // invariant status lines (match type / source authority / parse state /
-    // completeness) into one compact `Trust:` line, keeping Scope and Evidence
-    // (the differential fields). Any deviation — a non-collapsible authority,
-    // partial or degraded parse, or non-full completeness — keeps the full
-    // six-line envelope so degraded/stale/truncated results stay loud.
+    // completeness) into one compact `Trust:` line. A scope at the default
+    // search scope is omitted, and with it the evidence anchors, which repeat
+    // the hits listed below (SF-TE-06): a default search gets one line. Any
+    // other scope keeps its Scope and Evidence lines. Any deviation -- a
+    // non-collapsible authority, partial or degraded parse, or non-full
+    // completeness -- keeps the full six-line envelope so degraded/stale/
+    // truncated results stay loud.
     let label = source_authority.label();
     if source_authority.collapsible && parse_state == "parsed" && completeness.starts_with("full") {
-        format!(
-            "Trust: {match_type} | {label} | {parse_state} | {completeness}\nScope: {scope}\nEvidence: {evidence}"
-        )
+        let trust = format!("Trust: {match_type} | {label} | {parse_state} | {completeness}");
+        // A filter that hid matches is a non-default condition: the scope
+        // line names which filters were active.
+        let default_scope = (scope == DEFAULT_SEARCH_SCOPE || scope == DEFAULT_SEARCH_FILES_SCOPE)
+            && !completeness.contains(NOISE_SUPPRESSED_FRAGMENT);
+        if default_scope {
+            trust
+        } else {
+            format!("{trust}\nScope: {scope}\nEvidence: {evidence}")
+        }
     } else {
+        // SF-DOG-04: a "full" answer from a stale index says so.
+        let stale = if source_authority.stale {
+            "; index may be stale (freshness degraded; health names the cause)"
+        } else {
+            ""
+        };
         format!(
-            "Match type: {match_type}\nSource authority: {label}\nParse state: {parse_state}\nCompleteness: {completeness}\nScope: {scope}\nEvidence: {evidence}"
+            "Match type: {match_type}\nSource authority: {label}\nParse state: {parse_state}\nCompleteness: {completeness}{stale}\nScope: {scope}\nEvidence: {evidence}"
         )
     }
 }
@@ -377,6 +418,129 @@ mod tests {
         assert!(rendered.contains("Completeness: truncated by result cap (3 more omitted)"));
         assert!(rendered.contains("Scope: path `src/lib.rs`"));
         assert!(rendered.contains("Evidence: line anchors `src/lib.rs:7`"));
+    }
+
+    #[test]
+    fn default_search_envelope_is_one_line_and_non_default_fields_still_print() {
+        let noise = crate::live_index::search::NoisePolicy {
+            include_generated: false,
+            include_tests: false,
+            include_vendor: false,
+            include_ignored: false,
+        };
+        let default_scope = super::search_scope_summary(
+            &crate::live_index::search::PathScope::Any,
+            None,
+            &noise,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(default_scope, super::DEFAULT_SEARCH_SCOPE);
+        let completeness = super::search_completeness_label(0, 0);
+        let current = || SourceAuthority::from_freshness(&crate::domain::FreshnessStatus::Current);
+
+        let one = format_search_envelope(
+            "constrained (literal)",
+            current(),
+            "parsed",
+            &completeness,
+            &default_scope,
+            "line anchors `src/lib.rs:7`",
+        );
+        assert_eq!(one.lines().count(), 1, "{one}");
+        assert!(one.starts_with("Trust: constrained (literal) | current index | parsed | full"));
+
+        let scoped = format_search_envelope(
+            "constrained (literal)",
+            current(),
+            "parsed",
+            &completeness,
+            "path prefix `src/`",
+            "line anchors `src/lib.rs:7`",
+        );
+        assert!(scoped.contains("\nScope: path prefix `src/`"), "{scoped}");
+        assert!(scoped.contains("\nEvidence: line anchors `src/lib.rs:7`"));
+
+        let truncated = format_search_envelope(
+            "constrained (literal)",
+            current(),
+            "parsed",
+            &super::search_completeness_label(3, 0),
+            &default_scope,
+            "line anchors `src/lib.rs:7`",
+        );
+        assert!(truncated.contains("\nCompleteness: truncated by result cap (3 more omitted)"));
+
+        // A filter that hid matches is named, even at the default scope.
+        let suppressed = format_search_envelope(
+            "exact",
+            current(),
+            "parsed",
+            &super::search_completeness_label(0, 2),
+            &default_scope,
+            "symbol anchors `src/lib.rs:7`",
+        );
+        assert!(
+            suppressed.contains("\nScope: repo-wide; tests filter active (heuristic)"),
+            "{suppressed}"
+        );
+
+        // search_files: the default ranking is a default scope; a boost is not.
+        let files_scope =
+            super::search_files_scope_summary("ranked indexed file paths", false, false);
+        assert_eq!(files_scope, super::DEFAULT_SEARCH_FILES_SCOPE);
+        let files_one = format_search_envelope(
+            "constrained (tiered path relevance)",
+            current(),
+            "parsed",
+            &completeness,
+            &files_scope,
+            "paths `src/lib.rs`",
+        );
+        assert_eq!(files_one.lines().count(), 1, "{files_one}");
+        let boosted = format_search_envelope(
+            "constrained (tiered path relevance)",
+            current(),
+            "parsed",
+            &completeness,
+            &super::search_files_scope_summary(
+                "ranked indexed file paths; current file boost `src/a.rs`",
+                false,
+                false,
+            ),
+            "paths `src/lib.rs`",
+        );
+        assert!(boosted.contains("\nScope: ranked indexed file paths; current file boost"));
+    }
+
+    #[test]
+    fn stale_freshness_qualifies_a_full_completeness_line() {
+        let stale = format_search_envelope(
+            "exact",
+            SourceAuthority::from_freshness(&crate::domain::FreshnessStatus::Degraded {
+                last_valid_content_generation: 1,
+                reason_codes: vec![crate::domain::FreshnessReason::ObservationFailed],
+            }),
+            "parsed",
+            "full for indexed scope",
+            super::DEFAULT_SEARCH_SCOPE,
+            "line anchors `src/lib.rs:7`",
+        );
+        assert!(
+            stale.contains("\nCompleteness: full for indexed scope; index may be stale"),
+            "{stale}"
+        );
+        let verifying = format_search_envelope(
+            "exact",
+            SourceAuthority::from_freshness(&crate::domain::FreshnessStatus::Verifying),
+            "parsed",
+            "full for indexed scope",
+            super::DEFAULT_SEARCH_SCOPE,
+            "line anchors `src/lib.rs:7`",
+        );
+        assert!(!verifying.contains("index may be stale"), "{verifying}");
     }
 
     #[test]

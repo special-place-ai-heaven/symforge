@@ -82,6 +82,11 @@ pub struct StelStatusContext<'a> {
     /// LOUD signal so a stale or wrong binding can never read as a working one.
     pub project_root: Option<String>,
     pub index_ready: bool,
+    /// SF-DOG-04 headline label (readiness and freshness from one published
+    /// generation). Rendered as `index_trust:` whenever it is not plain
+    /// `Ready`, so a ready-but-stale index never reads as just `index_ready:
+    /// true`. `None` only for contexts that render no index lines.
+    pub index_trust: Option<&'static str>,
     pub index_files: usize,
     pub index_symbols: usize,
     pub ledger_events: usize,
@@ -157,6 +162,7 @@ impl<'a> StelStatusContext<'a> {
             project_name,
             project_root,
             index_ready,
+            index_trust: None,
             index_files,
             index_symbols,
             ledger_events: ledger.len(),
@@ -169,6 +175,18 @@ impl<'a> StelStatusContext<'a> {
             daemon_env_surface: None,
             orphaned_daemon_pid: None,
         }
+    }
+
+    /// Attach the headline trust label observed with the index counts.
+    pub fn with_index_trust(mut self, label: &'static str) -> Self {
+        self.index_trust = Some(label);
+        self
+    }
+
+    /// The `index_trust:` qualifier, present only when it says more than
+    /// `index_ready` already does.
+    fn index_trust_qualifier(&self) -> Option<&'static str> {
+        self.index_trust.filter(|label| *label != "Ready")
     }
 
     /// Attach the durable-ledger subsystem state (US3/T029 restart-survival view;
@@ -337,14 +355,18 @@ pub fn format_stel_status(request: &StelStatusRequest, ctx: &StelStatusContext<'
 /// session inventory (one row per open project, home marked) instead.
 fn format_projects_status(ctx: &StelStatusContext<'_>) -> String {
     let mut lines = vec!["── projects ──".to_string()];
-    lines.push(format!(
+    let mut row = format!(
         "name={} root={} home=yes files={} symbols={} index_ready={}",
         ctx.project_name,
         ctx.project_root.as_deref().unwrap_or("(unbound)"),
         ctx.index_files,
         ctx.index_symbols,
         ctx.index_ready,
-    ));
+    );
+    if let Some(trust) = ctx.index_trust_qualifier() {
+        row.push_str(&format!(" trust=\"{trust}\""));
+    }
+    lines.push(row);
     lines.join(
         "
 ",
@@ -383,6 +405,10 @@ fn format_compact_status(ctx: &StelStatusContext<'_>) -> String {
         format!("index_files: {}", ctx.index_files),
         "──".to_string(),
     ];
+    if let Some(trust) = ctx.index_trust_qualifier() {
+        let at = lines.len() - 2;
+        lines.insert(at, format!("index_trust: {trust}"));
+    }
     // Honest cross-process disclosure: when the surface served on this
     // connection (`ctx.surface`) differs from the daemon process's own env,
     // name the daemon's env right under the served surface. Set only in the
@@ -457,6 +483,7 @@ mod tests {
             project_name: "symforge-test",
             project_root: Some("E:/project/symforge-test".to_string()),
             index_ready: true,
+            index_trust: Some("Ready"),
             index_files: 12,
             index_symbols: 48,
             ledger_events: 2,
@@ -495,6 +522,37 @@ mod tests {
             "the disclosure must invalidate the figures below it, not merely \
              note the orphaning:\n{orphaned}"
         );
+    }
+
+    #[test]
+    fn stale_ready_index_is_qualified_on_every_status_detail() {
+        let mut ctx = sample_context();
+        for detail in [
+            StelStatusDetail::Compact,
+            StelStatusDetail::Full,
+            StelStatusDetail::Projects,
+        ] {
+            let request = StelStatusRequest {
+                detail: Some(detail),
+                ..StelStatusRequest::default()
+            };
+            let current = format_stel_status(&request, &ctx);
+            assert!(!current.contains("index_trust"), "{current}");
+            assert!(!current.contains("trust="), "{current}");
+        }
+        ctx.index_trust = Some("Ready (stale)");
+        for (detail, needle) in [
+            (StelStatusDetail::Compact, "index_trust: Ready (stale)"),
+            (StelStatusDetail::Full, "index_trust: Ready (stale)"),
+            (StelStatusDetail::Projects, "trust=\"Ready (stale)\""),
+        ] {
+            let request = StelStatusRequest {
+                detail: Some(detail),
+                ..StelStatusRequest::default()
+            };
+            let stale = format_stel_status(&request, &ctx);
+            assert!(stale.contains(needle), "{stale}");
+        }
     }
 
     #[test]

@@ -2598,6 +2598,36 @@ pub(crate) enum BoundRestoreRefusal {
     SourceReadRefused,
 }
 
+/// Read one restore candidate whose snapshot-time size is `expected_len`.
+/// `None` means absent or resized: either way the bytes cannot match, so the
+/// proof treats it as changed content. Only a genuine read failure (link,
+/// special file, escape, I/O error) refuses.
+#[cfg(any(feature = "server", feature = "embed"))]
+fn read_restore_candidate(
+    lease: &crate::index_lifecycle::physical_root::PhysicalRootLease,
+    relative: &Path,
+    expected_len: usize,
+) -> Result<Option<Vec<u8>>, crate::index_lifecycle::physical_root::RootRefusal> {
+    use crate::index_lifecycle::physical_root::{RootRefusal, open_regular_beneath};
+    use std::io::Read;
+
+    let Some((file, path)) = open_regular_beneath(lease, relative)? else {
+        return Ok(None);
+    };
+    let unreadable = |error: std::io::Error| RootRefusal::Unreadable {
+        path: path.clone(),
+        message: error.to_string(),
+    };
+    if file.metadata().map_err(unreadable)?.len() != expected_len as u64 {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    file.take((expected_len as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    Ok((bytes.len() == expected_len).then_some(bytes))
+}
+
 /// Prove snapshot entries against the source directory originally admitted by
 /// the embedded runtime. A path with the same spelling and bytes is not proof
 /// when its physical directory has changed.
@@ -2613,13 +2643,8 @@ fn run_snapshot_store_restore_proof_bound(
     let read_refused = std::cell::Cell::new(false);
     let proof =
         run_snapshot_store_restore_proof_with(snapshot, project_root, None, |path, file| {
-            let max_bytes = file.content.len();
             match authority.with_source_anchor_read(|lease| {
-                crate::index_lifecycle::physical_root::read_regular_beneath(
-                    lease,
-                    Path::new(path),
-                    max_bytes,
-                )
+                read_restore_candidate(lease, Path::new(path), file.content.len())
             }) {
                 Ok(Some(bytes)) => crate::hash::digest_hex(&bytes) == file.content_hash,
                 Ok(None) => false,
@@ -5263,6 +5288,57 @@ mod tests {
         std::fs::rename(&replacement, &root).unwrap();
         let proof = run_snapshot_store_restore_proof_bound(&snapshot, &root, &retained_authority);
         assert_eq!(proof, Err(BoundRestoreRefusal::SourceMoved));
+    }
+
+    /// A source that grew past its snapshot-time size is changed content, not
+    /// an unreadable source: the proof latches the rebuild instead of refusing
+    /// startup. A shrunk source takes the same path.
+    #[test]
+    fn snapshot_restore_proof_rebuilds_when_source_size_changed() {
+        for changed in [&b"fn main() {}\nfn grown() {}\n"[..], &b"fn m() {}\n"[..]] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().join("source");
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
+            let index = make_live_index_with_files(vec![("src/main.rs", b"fn main() {}\n")]);
+            serialize_index(&index, &root).unwrap();
+            let snapshot = load_snapshot(&root).unwrap();
+            let authority =
+                crate::live_index::index_lifecycle::activation::project_source_authority(&root);
+            let unchanged = run_snapshot_store_restore_proof_bound(&snapshot, &root, &authority)
+                .expect("unchanged source proves");
+            assert!(
+                !unchanged.rebuild_required,
+                "unchanged source needs no rebuild"
+            );
+
+            std::fs::write(root.join("src/main.rs"), changed).unwrap();
+            let proof = run_snapshot_store_restore_proof_bound(&snapshot, &root, &authority)
+                .expect("a resized source is a content mismatch, not a read refusal");
+            assert!(
+                proof.rebuild_required,
+                "a resized source must latch the rebuild"
+            );
+        }
+    }
+
+    /// A genuinely unreadable source (here no longer a regular file) still
+    /// refuses the restore rather than passing for changed content.
+    #[test]
+    fn snapshot_restore_proof_refuses_source_that_is_not_a_regular_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("source");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        let index = make_live_index_with_files(vec![("src/main.rs", b"fn main() {}\n")]);
+        serialize_index(&index, &root).unwrap();
+        let snapshot = load_snapshot(&root).unwrap();
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(&root);
+        std::fs::remove_file(root.join("src/main.rs")).unwrap();
+        std::fs::create_dir(root.join("src/main.rs")).unwrap();
+        let proof = run_snapshot_store_restore_proof_bound(&snapshot, &root, &authority);
+        assert_eq!(proof, Err(BoundRestoreRefusal::SourceReadRefused));
     }
 
     /// A dismissal store that cannot be read (here `.symforge` is a regular file,

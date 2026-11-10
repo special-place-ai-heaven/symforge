@@ -2,9 +2,7 @@
 //!
 //! Phase 2 P2-S3: normative admission states (`serve | degrade | bypass | cache_hit`).
 
-use crate::index_lifecycle::guidance::file_read::{
-    competent_manual_baseline_chars, estimate_tokens_from_chars,
-};
+use crate::index_lifecycle::guidance::file_read::competent_manual_baseline_chars;
 use crate::index_lifecycle::guidance::session::SessionContext;
 
 use super::ledger_store::TunedEstimateConstants;
@@ -502,7 +500,7 @@ fn grounded_step_tokens(step: &StelPlanStep) -> (u32, u32) {
 /// MANUAL baseline: editing a symbol by hand means reading its span and rewriting
 /// it; the new-body length is the plan-time proxy for that span (the old on-disk
 /// span is not resolved until apply). Flows through the SAME
-/// `competent_manual_baseline_chars` + `estimate_tokens_from_chars` estimator the
+/// `competent_manual_baseline_chars` + `estimate_tokens_from_bytes` estimator the
 /// read path uses, so there is one source of truth for the manual baseline.
 ///
 /// RESPONSE: scales with what the edit echoes back, which depends on preview vs
@@ -517,14 +515,15 @@ fn grounded_step_tokens(step: &StelPlanStep) -> (u32, u32) {
 /// honesty fix for the old flat 520/900 floor.
 fn grounded_edit_tokens(step: &StelPlanStep, body_chars: usize) -> (u32, u32) {
     let manual_chars = competent_manual_baseline_chars(body_chars);
-    let manual_tokens = estimate_tokens_from_chars(manual_chars);
+    let manual_tokens = crate::stel::handler::estimate_tokens_from_bytes(manual_chars as u64);
     let is_preview = step
         .args
         .get("dry_run")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
     let response_tokens = if is_preview {
-        estimate_tokens_from_chars(body_chars).saturating_add(EDIT_RESPONSE_FOOTER_TOKENS)
+        crate::stel::handler::estimate_tokens_from_bytes(body_chars as u64)
+            .saturating_add(EDIT_RESPONSE_FOOTER_TOKENS)
     } else {
         EDIT_RESPONSE_FOOTER_TOKENS
     };
@@ -539,7 +538,7 @@ fn grounded_edit_tokens(step: &StelPlanStep, body_chars: usize) -> (u32, u32) {
 /// single source of truth for the manual baseline (no duplicate estimator).
 fn grounded_tokens_from_raw_chars(raw_chars: usize) -> (u32, u32) {
     let manual_chars = competent_manual_baseline_chars(raw_chars);
-    let manual_tokens = estimate_tokens_from_chars(manual_chars);
+    let manual_tokens = crate::stel::handler::estimate_tokens_from_bytes(manual_chars as u64);
     let response_tokens = manual_tokens.saturating_mul(GROUNDED_RESPONSE_FRACTION_NUM)
         / GROUNDED_RESPONSE_FRACTION_DEN;
     (clamp_u32(response_tokens), clamp_u32(manual_tokens))

@@ -45,6 +45,20 @@ where
         );
         return ReindexResult::Skipped;
     }
+    #[cfg(test)]
+    if tests::FORCED_UNREADABLE.with(|paths| paths.borrow().contains(relative_path)) {
+        return read_and_index_with_stable_read(
+            relative_path,
+            abs_path,
+            shared,
+            language,
+            expected_gen,
+            |_, _| crate::live_index::store::StableReadOutcome::Unreadable {
+                stage: crate::domain::AccessStage::FullRead,
+                kind: crate::domain::AccessErrorKind::PermissionDenied,
+            },
+        );
+    }
     read_and_index(relative_path, abs_path, shared, language, expected_gen)
 }
 
@@ -650,8 +664,12 @@ where
     let active_generation = shared.current_project_generation();
     let effective_generation = effective_fence_generation(shared, repo_root, expected_gen);
     let batch_belongs_to_active_project = effective_generation == active_generation;
+    let previous_degraded_publication = watcher_info.lock().last_degraded_publication;
+    // All retry attempts below are one sweep for the unreadable settle count.
+    let _sweep = shared.begin_reconcile_sweep();
     let mut repaired = 0usize;
     let mut deferred = false;
+    let mut still_degraded = false;
     let mut delay = INITIAL_DEGRADED_DELAY;
     for attempt in 1..=MAX_DEGRADED_ATTEMPTS {
         let outcome: ReconciliationAttempt = reconcile_once().into();
@@ -667,7 +685,23 @@ where
         let coverage_degraded = shared
             .scout_plan()
             .is_some_and(|plan| plan.coverage == crate::domain::CoverageStatus::Degraded);
-        if !outcome.retry_degraded && !coverage_degraded {
+        still_degraded = outcome.retry_degraded || coverage_degraded;
+        if !still_degraded {
+            break;
+        }
+        // A periodic sweep that finds exactly the degraded publication the
+        // previous sweep ended on observed no change; retrying cannot produce
+        // one. Overflow and fresh-instance sweeps are new signals and keep
+        // the full ladder. Any real change publishes, so it still gets it.
+        // A deferred attempt observed nothing, so it cannot vouch for "no
+        // change" and never takes this shortcut.
+        if attempt == 1
+            && !outcome.deferred
+            && cause == ReconciliationCause::Periodic
+            && previous_degraded_publication
+                == Some(shared.published_generation().publication_generation)
+        {
+            debug!("watcher: degraded state unchanged since the previous sweep; not retrying");
             break;
         }
         if attempt == MAX_DEGRADED_ATTEMPTS {
@@ -689,6 +723,10 @@ where
             info.last_overflow_at = Some(now);
         }
         info.stale_files_found += repaired as u64;
+        // Only an observed sweep can anchor the next sweep's one-attempt
+        // shortcut; a deferred one saw nothing.
+        info.last_degraded_publication = (still_degraded && !deferred)
+            .then(|| shared.published_generation().publication_generation);
         // Reporting invariant: a sweep that deferred observed nothing.
         if !deferred {
             info.last_reconcile_at = Some(now);
@@ -3239,6 +3277,397 @@ mod tests {
         assert_eq!(watcher_info.lock().overflow_count, 1);
     }
 
+    #[test]
+    fn persistently_unreadable_file_does_not_republish_across_sweeps() {
+        let project = TempDir::new().unwrap();
+        let locked = project.path().join("locked.rs");
+        std::fs::write(project.path().join("main.rs"), b"fn main() {}\n").unwrap();
+        std::fs::write(&locked, b"fn locked() {}\n").unwrap();
+        let shared = crate::live_index::LiveIndex::load(project.path()).unwrap();
+        let expected_gen = shared.current_project_generation();
+        let _forced = force_unreadable("locked.rs");
+        assert!(matches!(
+            read_and_index_observed(
+                "locked.rs",
+                &locked,
+                &shared,
+                LanguageId::Rust,
+                expected_gen
+            ),
+            ReindexResult::ReadError(_)
+        ));
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let stop_token = AtomicBool::new(false);
+        let sweep = || {
+            reconcile_for_cause(
+                project.path(),
+                &shared,
+                &watcher_info,
+                &stop_token,
+                expected_gen,
+                ReconciliationCause::Periodic,
+                sweep_observer(project.path()),
+            )
+        };
+        let generations = || {
+            (
+                shared.published_generation().publication_generation,
+                shared.published_state().generation,
+            )
+        };
+
+        // Before the path settles, an unchanged sweep publishes nothing either.
+        sweep();
+        let unsettled = generations();
+        sweep();
+        assert_eq!(
+            generations(),
+            unsettled,
+            "unsettled sweep minted a generation"
+        );
+        // The settling sweep changes coverage, which is a real publication.
+        sweep();
+        assert!(!shared.settled_unreadable_paths().is_empty());
+        let settled = generations();
+        for round in 1..=3 {
+            sweep();
+            assert_eq!(
+                generations(),
+                settled,
+                "sweep {round}: an unchanged unreadable file must not mint a generation"
+            );
+        }
+        assert!(
+            shared
+                .terminal_dispositions()
+                .iter()
+                .any(|(path, disposition)| path == "locked.rs"
+                    && matches!(disposition, FileDisposition::Unreadable { .. }))
+        );
+        assert!(matches!(
+            shared.published_generation().freshness.as_ref(),
+            crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
+                if reason_codes.contains(&crate::domain::FreshnessReason::ObservationFailed)
+        ));
+    }
+
+    #[test]
+    fn unreadable_settle_counts_sweeps_not_retry_attempts() {
+        let project = TempDir::new().unwrap();
+        let locked = project.path().join("locked.rs");
+        std::fs::write(project.path().join("main.rs"), b"fn main() {}\n").unwrap();
+        std::fs::write(&locked, b"fn locked() {}\n").unwrap();
+        let shared = crate::live_index::LiveIndex::load(project.path()).unwrap();
+        let expected_gen = shared.current_project_generation();
+        let _forced = force_unreadable("locked.rs");
+        assert!(matches!(
+            read_and_index_observed(
+                "locked.rs",
+                &locked,
+                &shared,
+                LanguageId::Rust,
+                expected_gen
+            ),
+            ReindexResult::ReadError(_)
+        ));
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let stop_token = AtomicBool::new(false);
+        let sweep = || {
+            let mut attempts = 0usize;
+            reconcile_for_cause_with(
+                project.path(),
+                &shared,
+                &watcher_info,
+                &stop_token,
+                expected_gen,
+                ReconciliationCause::Periodic,
+                || {
+                    attempts += 1;
+                    reconcile_stale_files_with_stop_and_hook(
+                        project.path(),
+                        &shared,
+                        || false,
+                        expected_gen,
+                        sweep_observer(project.path()),
+                        || {
+                            crate::discovery::scout_repository_with_exclusions(
+                                project.path(),
+                                &shared.source_exclusions(),
+                            )
+                        },
+                        || {},
+                    )
+                },
+                |_| {},
+            );
+            attempts
+        };
+        let coverage = || shared.scout_plan().expect("plan").coverage;
+
+        assert_eq!(
+            sweep(),
+            5,
+            "an unsettled unreadable path keeps coverage degraded"
+        );
+        assert!(
+            shared.settled_unreadable_paths().is_empty(),
+            "five attempts in one sweep are one sweep"
+        );
+        assert_eq!(coverage(), crate::domain::CoverageStatus::Degraded);
+        sweep();
+        assert!(shared.settled_unreadable_paths().is_empty(), "second sweep");
+        assert_eq!(coverage(), crate::domain::CoverageStatus::Degraded);
+        sweep();
+        let settled: Vec<_> = shared
+            .settled_unreadable_paths()
+            .into_iter()
+            .filter_map(|path| path.normalized_utf8)
+            .collect();
+        assert_eq!(
+            settled,
+            vec!["locked.rs".to_string()],
+            "third sweep settles"
+        );
+        assert_eq!(coverage(), crate::domain::CoverageStatus::Complete);
+    }
+
+    #[test]
+    fn unchanged_degraded_periodic_sweep_makes_one_attempt_and_still_sees_changes() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("main.rs"), b"fn main() {}\n").unwrap();
+        let shared = crate::live_index::LiveIndex::load(project.path()).unwrap();
+        let expected_gen = shared.current_project_generation();
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let stop_token = AtomicBool::new(false);
+        let degraded_scout = || {
+            let mut plan = crate::discovery::scout_repository_with_exclusions(
+                project.path(),
+                &shared.source_exclusions(),
+            )?;
+            plan.issues.push(crate::domain::ScoutIssue {
+                path_id: Some("persistent-walk-entry".to_string()),
+                safe_path: Some("persistently-unavailable".to_string()),
+                kind: crate::domain::ScoutIssueKind::DirectoryEntryUnreadable {
+                    kind: crate::domain::AccessErrorKind::PermissionDenied,
+                },
+                safe_message: "directory entry unavailable".to_string(),
+            });
+            crate::discovery::refresh_scout_plan(&mut plan)?;
+            Ok(plan)
+        };
+        let sweep = |cause| {
+            let mut attempts = 0usize;
+            reconcile_for_cause_with(
+                project.path(),
+                &shared,
+                &watcher_info,
+                &stop_token,
+                expected_gen,
+                cause,
+                || {
+                    attempts += 1;
+                    reconcile_stale_files_with_stop_and_hook(
+                        project.path(),
+                        &shared,
+                        || false,
+                        expected_gen,
+                        sweep_observer(project.path()),
+                        degraded_scout,
+                        || {},
+                    )
+                },
+                |_| {},
+            );
+            attempts
+        };
+        let generation = || shared.published_generation().publication_generation;
+
+        assert_eq!(sweep(ReconciliationCause::Periodic), 5);
+        let degraded = generation();
+        for round in 1..=3 {
+            assert_eq!(
+                sweep(ReconciliationCause::Periodic),
+                1,
+                "sweep {round}: an unchanged degraded state needs one attempt"
+            );
+            assert_eq!(generation(), degraded, "sweep {round}");
+        }
+        assert_eq!(
+            sweep(ReconciliationCause::Overflow),
+            5,
+            "a new uncertainty signal keeps the full retry ladder"
+        );
+
+        std::fs::write(project.path().join("added.rs"), b"fn added() {}\n").unwrap();
+        sweep(ReconciliationCause::Periodic);
+        assert!(
+            shared.read().get_file("added.rs").is_some(),
+            "a real change during backoff is picked up by the next sweep"
+        );
+        assert_eq!(sweep(ReconciliationCause::Periodic), 1);
+    }
+
+    #[test]
+    fn one_attempt_mode_still_picks_up_an_edit_and_a_recovered_file_within_one_sweep() {
+        let project = TempDir::new().unwrap();
+        let main = project.path().join("main.rs");
+        let locked = project.path().join("locked.rs");
+        std::fs::write(&main, b"fn main() {}\n").unwrap();
+        std::fs::write(&locked, b"fn locked() {}\n").unwrap();
+        let shared = crate::live_index::LiveIndex::load(project.path()).unwrap();
+        let expected_gen = shared.current_project_generation();
+        let forced = force_unreadable("locked.rs");
+        assert!(matches!(
+            read_and_index_observed(
+                "locked.rs",
+                &locked,
+                &shared,
+                LanguageId::Rust,
+                expected_gen
+            ),
+            ReindexResult::ReadError(_)
+        ));
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let stop_token = AtomicBool::new(false);
+        // A persistently unreadable directory keeps coverage degraded throughout.
+        let degraded_scout = || {
+            let mut plan = crate::discovery::scout_repository_with_exclusions(
+                project.path(),
+                &shared.source_exclusions(),
+            )?;
+            plan.issues.push(crate::domain::ScoutIssue {
+                path_id: Some("persistent-walk-entry".to_string()),
+                safe_path: Some("persistently-unavailable".to_string()),
+                kind: crate::domain::ScoutIssueKind::DirectoryEntryUnreadable {
+                    kind: crate::domain::AccessErrorKind::PermissionDenied,
+                },
+                safe_message: "directory entry unavailable".to_string(),
+            });
+            crate::discovery::refresh_scout_plan(&mut plan)?;
+            Ok(plan)
+        };
+        let sweep = || {
+            let mut attempts = 0usize;
+            reconcile_for_cause_with(
+                project.path(),
+                &shared,
+                &watcher_info,
+                &stop_token,
+                expected_gen,
+                ReconciliationCause::Periodic,
+                || {
+                    attempts += 1;
+                    reconcile_stale_files_with_stop_and_hook(
+                        project.path(),
+                        &shared,
+                        || false,
+                        expected_gen,
+                        sweep_observer(project.path()),
+                        degraded_scout,
+                        || {},
+                    )
+                },
+                |_| {},
+            );
+            attempts
+        };
+        // Reach one-attempt mode.
+        let mut rounds = 0;
+        while sweep() != 1 {
+            rounds += 1;
+            assert!(rounds < 10, "never reached one-attempt mode");
+        }
+
+        std::fs::write(&main, b"fn main() {}\nfn edited_in_backoff() {}\n").unwrap();
+        sweep();
+        assert!(
+            shared
+                .read()
+                .get_file("main.rs")
+                .is_some_and(|file| file.symbols.iter().any(|s| s.name == "edited_in_backoff")),
+            "an edit during one-attempt mode is indexed by the next sweep"
+        );
+
+        drop(forced);
+        sweep();
+        assert!(
+            shared
+                .terminal_dispositions()
+                .iter()
+                .any(|(path, disposition)| path == "locked.rs"
+                    && matches!(disposition, FileDisposition::Indexed { .. })),
+            "a file that became readable is indexed by the next sweep"
+        );
+    }
+
+    #[test]
+    fn a_deferred_attempt_never_takes_the_one_attempt_shortcut() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("main.rs"), b"fn main() {}\n").unwrap();
+        let shared = crate::live_index::LiveIndex::load(project.path()).unwrap();
+        let expected_gen = shared.current_project_generation();
+        let mut degraded_plan = (*shared.scout_plan().expect("cold scout plan")).clone();
+        degraded_plan.issues.push(crate::domain::ScoutIssue {
+            path_id: Some("persistent-walk-entry".to_string()),
+            safe_path: Some("persistently-unavailable".to_string()),
+            kind: crate::domain::ScoutIssueKind::DirectoryEntryUnreadable {
+                kind: crate::domain::AccessErrorKind::PermissionDenied,
+            },
+            safe_message: "directory entry unavailable".to_string(),
+        });
+        crate::discovery::refresh_scout_plan(&mut degraded_plan).unwrap();
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let stop_token = AtomicBool::new(false);
+        let publish_degraded = || {
+            let baseline = shared.scout_plan();
+            assert!(shared.publish_reconciled_scout_plan_at_generation(
+                baseline.as_deref(),
+                degraded_plan.clone(),
+                expected_gen,
+            ));
+            ReconciliationAttempt {
+                repaired: 0,
+                retry_degraded: false,
+                deferred: false,
+            }
+        };
+        let sweep = |defer_first: bool| {
+            let mut attempts = 0usize;
+            reconcile_for_cause_with(
+                project.path(),
+                &shared,
+                &watcher_info,
+                &stop_token,
+                expected_gen,
+                ReconciliationCause::Periodic,
+                || {
+                    attempts += 1;
+                    if defer_first && attempts == 1 {
+                        return ReconciliationAttempt {
+                            repaired: 0,
+                            retry_degraded: false,
+                            deferred: true,
+                        };
+                    }
+                    publish_degraded()
+                },
+                |_| {},
+            );
+            attempts
+        };
+        assert_eq!(sweep(false), 5);
+        assert_eq!(
+            sweep(false),
+            1,
+            "an observed unchanged sweep takes the shortcut"
+        );
+        assert_eq!(
+            sweep(true),
+            5,
+            "a deferred first attempt observed nothing and must keep retrying"
+        );
+    }
+
     // --- Plan 04-02: watcher incremental xref update (XREF-08) ---
 
     /// Proves that after `maybe_reindex` re-parses a file, the reverse_index
@@ -3627,6 +4056,27 @@ mod tests {
     fn sweep_observer(root: &Path) -> crate::live_index::index_lifecycle::observer::ObserverId {
         crate::live_index::index_lifecycle::activation::project_source_authority(root)
             .active_observer()
+    }
+
+    thread_local! {
+        /// Paths every watcher read on this thread observes as unreadable.
+        pub(super) static FORCED_UNREADABLE: std::cell::RefCell<HashSet<String>> =
+            std::cell::RefCell::new(HashSet::new());
+    }
+
+    /// Clears the forced-unreadable set on drop so it cannot leak into a
+    /// sibling test on the same thread.
+    struct ForcedUnreadableGuard;
+
+    impl Drop for ForcedUnreadableGuard {
+        fn drop(&mut self) {
+            FORCED_UNREADABLE.with(|paths| paths.borrow_mut().clear());
+        }
+    }
+
+    fn force_unreadable(relative_path: &str) -> ForcedUnreadableGuard {
+        FORCED_UNREADABLE.with(|paths| paths.borrow_mut().insert(relative_path.to_string()));
+        ForcedUnreadableGuard
     }
 
     /// Feature 020 Slice 4, T029 (observation lane): an event batch's

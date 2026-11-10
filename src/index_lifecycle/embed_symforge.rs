@@ -450,6 +450,7 @@ pub(super) fn render_search(
                 executed.auto_detected_regex,
                 executed.auto_corrected_regex,
                 &value.untracked_paths,
+                executed.hidden_test_matches,
             );
             if executed.auto_corrected_regex {
                 rendered.push_str(&format!(

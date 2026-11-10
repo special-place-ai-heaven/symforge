@@ -362,7 +362,7 @@ fn authority_is_allowed(request: &axum::extract::Request, allowed: &[String]) ->
     })
 }
 
-async fn require_allowed_authority(
+pub(crate) async fn require_allowed_authority(
     axum::extract::State(allowed): axum::extract::State<std::sync::Arc<Vec<String>>>,
     request: axum::extract::Request,
     next: axum::middleware::Next,

@@ -50,3 +50,17 @@ fn test_symforge_tool_schemas_are_strict_client_compatible() {
         visit_schema(&schema, tool.name.as_ref());
     }
 }
+
+/// SF-TE-05: the slimmed lists clients actually receive must stay
+/// strict-client compatible too.
+#[test]
+fn advertised_tool_lists_are_strict_client_compatible() {
+    use symforge::protocol::surface_probe::{SurfaceProfile, list_tools_for_profile};
+    for tool in list_tools_for_profile(SurfaceProfile::Full)
+        .into_iter()
+        .chain(symforge::stel::compact_surface_tools())
+    {
+        let schema = Value::Object(tool.input_schema.as_ref().clone());
+        visit_schema(&schema, tool.name.as_ref());
+    }
+}

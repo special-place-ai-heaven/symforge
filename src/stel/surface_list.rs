@@ -11,9 +11,14 @@ use super::surface::CompactSurfaceTool;
 use super::types::{StelEditRequest, StelRequest, StelStatusRequest};
 
 /// Drop serialized bytes no MCP client needs: the per-tool `$schema`
-/// declaration and the `"default": null` schemars emits for every optional
-/// field. Both are inert for routing and for validation, and together they are
-/// ~8% of the `tools/list` payload on the full surface.
+/// declaration, the `"default": null` schemars emits for every optional
+/// field, `null` members of `type` unions and `anyOf` branches, and the
+/// numeric `format` / `minimum: 0` annotations of unsigned integers.
+///
+/// Advertised-schema only: the server decodes arguments with serde, never
+/// against this schema, so the set of accepted inputs is unchanged (an omitted
+/// or explicit-`null` optional still decodes to `None`). Optionality is carried
+/// by `required`, which is never touched.
 pub(crate) fn strip_schema_noise(root: &mut Map<String, Value>) {
     // Root-only: a nested `$schema` key would be a struct FIELD name under
     // `properties`, not the JSON Schema keyword.
@@ -26,9 +31,29 @@ pub(crate) fn strip_schema_noise(root: &mut Map<String, Value>) {
 fn strip_null_defaults(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            // Safe against a field literally named `default`: under
-            // `properties` that entry's value is a schema object, never null.
+            // Every keyword below is matched by key AND value shape. Under
+            // `properties` a field that happens to be named `default`, `type`,
+            // `format`, `minimum` or `anyOf` maps to a schema OBJECT, so none of
+            // these shapes can match a field name.
             map.retain(|key, val| !(key == "default" && val.is_null()));
+            if let Some(Value::Array(types)) = map.get_mut("type") {
+                types.retain(|t| t != "null");
+                if types.len() == 1 {
+                    let only = types.remove(0);
+                    map.insert("type".to_string(), only);
+                }
+            }
+            collapse_nullable_any_of(map);
+            let unsigned = matches!(
+                map.get("format"),
+                Some(Value::String(f)) if f.starts_with("uint")
+            );
+            if unsigned && map.get("minimum").and_then(Value::as_u64) == Some(0) {
+                map.remove("minimum");
+            }
+            if matches!(map.get("format"), Some(Value::String(f)) if is_numeric_format(f)) {
+                map.remove("format");
+            }
             for child in map.values_mut() {
                 strip_null_defaults(child);
             }
@@ -36,6 +61,42 @@ fn strip_null_defaults(value: &mut Value) {
         Value::Array(items) => items.iter_mut().for_each(strip_null_defaults),
         _ => {}
     }
+}
+
+/// schemars' integer `format` annotations (`uint32`, `int64`, ...). String
+/// formats such as `date-time` carry meaning for clients and are kept.
+fn is_numeric_format(format: &str) -> bool {
+    let digits = format
+        .strip_prefix("uint")
+        .or_else(|| format.strip_prefix("int"));
+    matches!(digits, Some(d) if d.is_empty() || d.chars().all(|c| c.is_ascii_digit()))
+        || format == "float"
+        || format == "double"
+}
+
+/// `Option<EnumOrStruct>` renders as `anyOf: [{$ref}, {type: null}]`; drop the
+/// null branch and, when one branch remains, inline it into the parent schema.
+fn collapse_nullable_any_of(map: &mut Map<String, Value>) {
+    let Some(Value::Array(branches)) = map.get_mut("anyOf") else {
+        return;
+    };
+    branches.retain(|b| {
+        !(b.get("type") == Some(&Value::from("null"))
+            && b.as_object().is_some_and(|o| o.len() == 1))
+    });
+    if branches.len() != 1 {
+        return;
+    }
+    let Some(Value::Object(only)) = branches.pop() else {
+        return;
+    };
+    if only.keys().any(|k| map.contains_key(k)) {
+        // Inlining would overwrite a sibling keyword; keep the one-branch anyOf.
+        map.insert("anyOf".to_string(), Value::Array(vec![Value::Object(only)]));
+        return;
+    }
+    map.remove("anyOf");
+    map.extend(only);
 }
 
 fn schema_object<T: JsonSchema>() -> Arc<Map<String, Value>> {

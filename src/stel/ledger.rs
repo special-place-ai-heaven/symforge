@@ -8,7 +8,6 @@ use serde_json::Value;
 
 use super::controller::EconomicsBreakdown;
 use super::executor::is_pff_bypass_body;
-use super::handler::estimate_tokens;
 use super::ledger_store::StoredLedgerRecord;
 use super::planner::confidence_label;
 use super::types::{
@@ -87,7 +86,10 @@ pub struct LedgerEnvelopeMeta {
 
 /// Build a schema-aligned [`StelLedgerEvent`] from a completed `symforge` invocation.
 pub fn build_ledger_event(input: &LedgerCaptureInput<'_>) -> StelLedgerEvent {
-    let output_tokens = estimate_tokens(input.output_body);
+    let output_tokens = u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+        input.output_body.len() as u64,
+    ))
+    .unwrap_or(u32::MAX);
     let symforge_cost = output_tokens
         .saturating_add(input.economics.predicted_schema_tokens)
         .saturating_add(input.economics.predicted_invoke_tokens);
@@ -148,7 +150,10 @@ pub fn format_ledger_envelope_line(event: &StelLedgerEvent, meta: &LedgerEnvelop
 
 /// Build envelope metadata and ledger event together.
 pub fn capture_ledger(input: &LedgerCaptureInput<'_>) -> (StelLedgerEvent, LedgerEnvelopeMeta) {
-    let output_tokens = estimate_tokens(input.output_body);
+    let output_tokens = u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+        input.output_body.len() as u64,
+    ))
+    .unwrap_or(u32::MAX);
     let output_bytes = input.output_body.len() as u64;
     let event = build_ledger_event(input);
     let meta = LedgerEnvelopeMeta {

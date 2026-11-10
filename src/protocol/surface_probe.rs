@@ -122,6 +122,26 @@ pub fn enforce_compact_surface(tool_name: &str) -> Result<(), rmcp::ErrorData> {
     Ok(())
 }
 
+/// Upper bound for the `initialize` instructions string (SF-ADOPT-04): it is
+/// paid on every session, so it stays a routing hint, not a manual.
+pub const SERVER_INSTRUCTIONS_MAX_BYTES: usize = 600;
+
+/// Full-surface routing hint. Names only tools the full surface lists.
+pub const FULL_SURFACE_INSTRUCTIONS: &str = "SymForge indexes this repository. Start with search_symbols to find a function or type, get_symbol to read its body (pass targets[] to fetch several in one call), and find_references for callers and usages. Use search_text for code text. For exact literal match counts your own grep is fine. Read raw files with get_file_content only for docs, configs or exact bytes. On a daemon with several open projects, the project/projects parameters select one by ID or alias (never a path); omit both for the active project.";
+
+/// Compact-surface routing hint. Names only the three compact tools.
+pub const COMPACT_SURFACE_INSTRUCTIONS: &str = "SymForge indexes this repository. Ask code questions (find, read, trace, impact) with symforge, edit a symbol with symforge_edit, and check index state with status. For exact literal match counts your own grep is fine.";
+
+/// Instructions for the surface this process serves. The meta probe is a
+/// measurement surface and gets none.
+pub fn server_instructions(profile: SurfaceProfile) -> Option<&'static str> {
+    match profile {
+        SurfaceProfile::Full => Some(FULL_SURFACE_INSTRUCTIONS),
+        SurfaceProfile::Compact => Some(COMPACT_SURFACE_INSTRUCTIONS),
+        SurfaceProfile::Meta => None,
+    }
+}
+
 pub fn list_tools_for_profile(profile: SurfaceProfile) -> Vec<Tool> {
     match profile {
         SurfaceProfile::Full => SymForgeServer::tool_router()
@@ -134,12 +154,40 @@ pub fn list_tools_for_profile(profile: SurfaceProfile) -> Vec<Tool> {
                 // compact surface strips in `schema_object`.
                 let mut schema = (*tool.input_schema).clone();
                 crate::stel::surface_list::strip_schema_noise(&mut schema);
+                shorten_project_selector_text(&mut schema);
                 tool.input_schema = Arc::new(schema);
                 tool
             })
             .collect(),
         SurfaceProfile::Compact => compact_probe_tools(),
         SurfaceProfile::Meta => meta_probe_tools(),
+    }
+}
+
+/// One-line text for the `project` selector; the full explanation lives in the
+/// server instructions (`get_info`) instead of being repeated on ~30 tools.
+const PROJECT_SELECTOR_TEXT: &str =
+    "Open-project ID or alias (not a path); omit for the active project.";
+/// One-line text for the `projects` multi-project selector.
+const PROJECTS_SELECTOR_TEXT: &str =
+    "Open-project IDs/aliases, or [\"*\"] for all; daemon only; exclusive with `project`.";
+
+/// SF-TE-05: replace the per-tool `project` / `projects` descriptions with one
+/// line each. Only the top-level `properties` are touched, and only the
+/// `description` string, so the property set and `required` are unchanged.
+fn shorten_project_selector_text(schema: &mut Map<String, Value>) {
+    let Some(Value::Object(props)) = schema.get_mut("properties") else {
+        return;
+    };
+    for (name, text) in [
+        ("project", PROJECT_SELECTOR_TEXT),
+        ("projects", PROJECTS_SELECTOR_TEXT),
+    ] {
+        if let Some(Value::Object(field)) = props.get_mut(name)
+            && field.contains_key("description")
+        {
+            field.insert("description".to_string(), Value::from(text));
+        }
     }
 }
 
@@ -312,6 +360,129 @@ mod tests {
         assert!(
             !tools.iter().any(|t| t.name == "symforge"),
             "full surface must not advertise symforge facade"
+        );
+    }
+
+    /// SF-TE-05: the default full surface is paid for by every session before any
+    /// call. Measured with the same method as `scripts/measure-schema-bytes.ps1`
+    /// (UTF-8 bytes of the serialized `{"tools": [...]}` payload).
+    #[test]
+    fn full_surface_tools_list_under_byte_budget() {
+        // Measured 69,631 B before list-time slimming, 63,106 B after (40 tools).
+        // The 30,000 B target needs the ~10-tool core default profile; this budget
+        // guards the full profile against regrowth. Lower it, never raise it
+        // without a reviewed reason.
+        const FULL_SURFACE_BUDGET_BYTES: usize = 63_500;
+        let (count, bytes) = list_tools_schema_bytes(SurfaceProfile::Full);
+        eprintln!("full surface tools/list: {count} tools, {bytes} B");
+        assert!(
+            bytes <= FULL_SURFACE_BUDGET_BYTES,
+            "full tools/list JSON must be <= {FULL_SURFACE_BUDGET_BYTES} B; got {bytes} B"
+        );
+    }
+
+    /// SF-TE-05: list-time slimming rewrites only what is ADVERTISED. Every tool
+    /// keeps its property set and `required` list, no `null` / numeric-format noise
+    /// survives, and the server still decodes explicit `null` and absent optionals.
+    #[test]
+    fn schema_slimming_preserves_accepted_inputs() {
+        let raw: std::collections::HashMap<String, Arc<Map<String, Value>>> =
+            SymForgeServer::tool_router()
+                .list_all()
+                .into_iter()
+                .map(|t| (t.name.to_string(), t.input_schema))
+                .collect();
+        for tool in list_tools_for_profile(SurfaceProfile::Full) {
+            let name = tool.name.as_ref();
+            let before = &raw[name];
+            let after = &tool.input_schema;
+            let keys = |s: &Map<String, Value>| -> Vec<String> {
+                s.get("properties")
+                    .and_then(Value::as_object)
+                    .map(|p| p.keys().cloned().collect())
+                    .unwrap_or_default()
+            };
+            assert_eq!(keys(before), keys(after), "{name}: property set changed");
+            assert_eq!(
+                before.get("required"),
+                after.get("required"),
+                "{name}: required changed"
+            );
+            let text = serde_json::to_string(after.as_ref()).unwrap();
+            for noise in [r#""null""#, r#""format":"uint"#, r#""minimum":0"#] {
+                assert!(!text.contains(noise), "{name}: `{noise}` survived slimming");
+            }
+        }
+
+        // Server-side decode is serde, independent of the advertised schema:
+        // explicit null and absence both decode to None.
+        let text: crate::protocol::tools::SearchTextInput = serde_json::from_value(json!({
+            "query": "x", "limit": null, "include_tests": null, "group_by": null,
+            "project": null, "projects": null
+        }))
+        .expect("explicit nulls still decode");
+        assert!(text.limit.is_none() && text.projects.is_none() && text.group_by.is_none());
+        let _: crate::protocol::tools::SearchTextInput =
+            serde_json::from_value(json!({ "query": "x" })).expect("absent optionals decode");
+        let status: crate::stel::types::StelStatusRequest =
+            serde_json::from_value(json!({ "detail": null })).expect("null anyOf field decodes");
+        assert!(status.detail.is_none());
+        let knowledge: crate::protocol::tools::SearchKnowledgeInput =
+            serde_json::from_value(json!({ "query": "x", "authority_scope": null, "limit": null }))
+                .expect("null anyOf field decodes");
+        assert!(knowledge.authority_scope.is_none());
+    }
+
+    /// SF-ADOPT-04 snapshot: exact text, byte cap, and every tool name the text
+    /// mentions is callable on that surface.
+    #[test]
+    fn server_instructions_snapshot_cap_and_surface_names() {
+        assert_eq!(
+            server_instructions(SurfaceProfile::Full),
+            Some(
+                "SymForge indexes this repository. Start with search_symbols to find a function or type, get_symbol to read its body (pass targets[] to fetch several in one call), and find_references for callers and usages. Use search_text for code text. For exact literal match counts your own grep is fine. Read raw files with get_file_content only for docs, configs or exact bytes. On a daemon with several open projects, the project/projects parameters select one by ID or alias (never a path); omit both for the active project."
+            )
+        );
+        assert_eq!(
+            server_instructions(SurfaceProfile::Compact),
+            Some(
+                "SymForge indexes this repository. Ask code questions (find, read, trace, impact) with symforge, edit a symbol with symforge_edit, and check index state with status. For exact literal match counts your own grep is fine."
+            )
+        );
+        assert_eq!(server_instructions(SurfaceProfile::Meta), None);
+
+        let names = |tools: Vec<Tool>| -> Vec<String> {
+            tools.into_iter().map(|t| t.name.to_string()).collect()
+        };
+        let full = names(list_tools_for_profile(SurfaceProfile::Full));
+        let compact = names(crate::stel::compact_surface_tools());
+        let every: Vec<&String> = full.iter().chain(compact.iter()).collect();
+        for (profile, served) in [
+            (SurfaceProfile::Full, &full),
+            (SurfaceProfile::Compact, &compact),
+        ] {
+            let text = server_instructions(profile).unwrap();
+            assert!(
+                text.len() <= SERVER_INSTRUCTIONS_MAX_BYTES,
+                "{profile:?}: {} B",
+                text.len()
+            );
+            let words: Vec<&str> = text
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .collect();
+            for name in &every {
+                if words.contains(&name.as_str()) {
+                    assert!(
+                        served.contains(name),
+                        "{profile:?} names off-surface tool `{name}`"
+                    );
+                }
+            }
+        }
+        assert!(
+            compact.len() < full.len()
+                && server_instructions(SurfaceProfile::Compact).unwrap().len()
+                    < server_instructions(SurfaceProfile::Full).unwrap().len()
         );
     }
 

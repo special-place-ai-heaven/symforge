@@ -1457,6 +1457,7 @@ fn parity_audit_knowledge() {
                 projects: None,
                 limit: Some(10),
                 max_tokens: None,
+                include_archived: None,
             }),
             QueryLimits::default(),
         )

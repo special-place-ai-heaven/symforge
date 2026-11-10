@@ -69,6 +69,11 @@ pub struct ProjectEvidence {
     pub canonical_root: Option<String>,
     pub generation: u64,
     pub index_state: String,
+    /// SF-DOG-04 headline from the same publication as `index_state`
+    /// (`Ready (stale)` when freshness is degraded). Empty from a daemon that
+    /// predates the field.
+    #[serde(default)]
+    pub trust: String,
     pub load_source: String,
     pub index_files: usize,
     pub index_symbols: usize,
@@ -344,6 +349,7 @@ mod tests {
             canonical_root: Some(root.display().to_string()),
             generation: 1,
             index_state: "ready".to_string(),
+            trust: "Ready".to_string(),
             load_source: "memory".to_string(),
             index_files: 1,
             index_symbols: 1,

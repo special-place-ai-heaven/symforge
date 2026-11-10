@@ -188,7 +188,7 @@ pub async fn spawn_sidecar(
     };
 
     // Bearer only when the listener is NonLoopbackAuthenticated.
-    let app = router::build_router(state, bearer_token);
+    let app = router::build_router(state, &resolved_host, bearer_token);
 
     // Create graceful shutdown channel.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

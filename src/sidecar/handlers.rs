@@ -98,6 +98,9 @@ pub struct HealthResponse {
     pub file_count: usize,
     pub symbol_count: usize,
     pub index_state: String,
+    /// Headline trust state from readiness and freshness together
+    /// (SF-DOG-04); `index_state` stays the readiness axis alone.
+    pub trust: String,
     pub uptime_secs: u64,
     /// Freshness of the published generation, as the hook gate reads it.
     pub freshness: String,
@@ -262,9 +265,7 @@ pub async fn caller_root_guard(
         return (
             StatusCode::CONFLICT,
             format!(
-                "Sidecar index is rooted at {} but the caller is in {} — the shared session was likely retargeted by another agent's index_folder. Fall back to the daemon to resolve the caller's project by root.",
-                indexed_root.display(),
-                caller_root
+                "Sidecar index belongs to a different project than the caller's root {caller_root} — the shared session was likely retargeted by another agent's index_folder. Fall back to the daemon to resolve the caller's project by root."
             ),
         )
             .into_response();
@@ -324,9 +325,10 @@ pub(crate) fn roots_match(caller: &std::path::Path, indexed: &std::path::Path) -
 pub async fn health_handler(
     State(state): State<SidecarState>,
 ) -> Result<Json<HealthResponse>, StatusCode> {
-    let published = state.index.data_plane().published_state();
-    // SF-ADOPT-01: report the same generation state the enrichment gate uses.
+    // SF-ADOPT-01 / SF-DOG-04: every field below reads ONE published
+    // generation, the same capture the enrichment gate judges.
     let generation = state.index.data_plane().published_generation();
+    let published = &generation.health;
 
     let uptime_secs = published
         .loaded_at_system
@@ -338,6 +340,9 @@ pub async fn health_handler(
         file_count: published.file_count,
         symbol_count: published.symbol_count,
         index_state: published.status_label().to_string(),
+        trust: crate::live_index::store::TrustHeadline::of(&generation)
+            .label()
+            .to_string(),
         uptime_secs,
         freshness: freshness_label(generation.freshness.as_ref()),
         hook_queryable: published_sidecar_index_is_queryable(&generation),
@@ -365,6 +370,9 @@ struct SidecarQueryFence {
 fn published_sidecar_index_is_queryable(
     published: &crate::live_index::PublishedGeneration,
 ) -> bool {
+    // SF-DOG-04: the Ready lane is exactly the headline's serving states, the
+    // same rule health and the search envelope print.
+    let headline = crate::live_index::store::TrustHeadline::of(published);
     let health_is_ready = matches!(
         published.health.status,
         crate::live_index::PublishedIndexStatus::Ready
@@ -373,11 +381,12 @@ fn published_sidecar_index_is_queryable(
         published.health.status,
         crate::live_index::PublishedIndexStatus::Empty
     );
-    let freshness_is_queryable = matches!(
-        published.freshness.as_ref(),
-        crate::domain::FreshnessStatus::Current
-    ) || (health_is_ready
-        && freshness_is_observation_degraded(published.freshness.as_ref()))
+    let freshness_is_queryable = headline.serves_queries()
+        || (health_is_empty
+            && matches!(
+                published.freshness.as_ref(),
+                crate::domain::FreshnessStatus::Current
+            ))
         || (health_is_empty
             && matches!(
                 published.freshness.as_ref(),
@@ -391,28 +400,6 @@ fn published_sidecar_index_is_queryable(
         && published.source.is_some()
         && published.live.indexed_root.is_some()
         && freshness_is_queryable
-}
-
-/// SF-ADOPT-01 (owner rule): a Ready index whose only freshness defects are
-/// `ObservationFailed` / `ReconciliationPending` (e.g. one unreadable file)
-/// still serves hooks, with a staleness marker. Every other degraded reason,
-/// and Loading/Empty/Verifying, keeps the 503.
-fn freshness_is_observation_degraded(freshness: &crate::domain::FreshnessStatus) -> bool {
-    match freshness {
-        crate::domain::FreshnessStatus::Degraded { reason_codes, .. } => {
-            !reason_codes.is_empty()
-                && reason_codes.iter().all(|reason| {
-                    matches!(
-                        reason,
-                        crate::domain::FreshnessReason::ObservationFailed
-                            | crate::domain::FreshnessReason::ReconciliationPending
-                    )
-                })
-        }
-        crate::domain::FreshnessStatus::Current | crate::domain::FreshnessStatus::Verifying => {
-            false
-        }
-    }
 }
 
 /// One-line staleness marker prepended to hook enrichment bodies served from a
@@ -2479,6 +2466,8 @@ mod tests {
             health.freshness,
             "degraded(ObservationFailed, ReconciliationPending)"
         );
+        assert_eq!(health.index_state, "Ready");
+        assert_eq!(health.trust, "Ready (stale)", "SF-DOG-04 headline");
 
         // A current index carries no marker.
         state

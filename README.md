@@ -113,7 +113,7 @@ symforge --version
 symforge init            # register every supported client already installed
 ```
 
-npm installs a JavaScript launcher plus the native binary for your platform: **Windows x64**, **Linux x64**, **macOS arm64**, **macOS x64**. There is no postinstall step; installing downloads nothing and configures no client. Update in place with `symforge update`. `cargo install symforge` builds from source instead; it needs a C compiler, because the tree-sitter grammars, the vendored libgit2, and the bundled SQLite are C code compiled through the `cc` crate.
+npm installs a JavaScript launcher plus the native binary for your platform: **Windows x64**, **Linux x64**, **macOS arm64**, **macOS x64**. There is no postinstall step; installing downloads nothing and configures no client. Update in place with `symforge update`. `cargo install symforge` builds from source instead; it needs a C compiler, because the tree-sitter grammars, the vendored libgit2, and the bundled SQLite are C code compiled through the `cc` crate. A `cargo install` build also lacks the vendored rmcp patch (`vendor/rmcp/SYMFORGE-PATCH.md`), because Cargo ignores `[patch]` for crates.io installs: a client that opens with `server/discover` and then falls back to `initialize` can be refused on later requests. The npm binaries carry the patch.
 
 > [!CAUTION]
 > **WSL:** if the shell inherits the Windows npm prefix, the install pulls the Windows binary and the launcher reports a missing `symforge-linux-x64` package. Give WSL its own Linux npm prefix ahead of any `/mnt/*` entries on `PATH`, then reinstall.

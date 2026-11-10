@@ -254,7 +254,7 @@ fn finish(
     budget: &mut Budget,
 ) -> Result<QueryOutput, QueryRefusalKind> {
     if request.estimate == Some(true) {
-        let tokens = source::approx_tokens_from_bytes(result.rendered.len());
+        let tokens = crate::stel::handler::estimate_tokens_from_bytes(result.rendered.len() as u64);
         result.estimated_tokens = Some(tokens);
         result.files.clear();
         result.target_candidates.clear();
@@ -610,7 +610,7 @@ pub(super) fn dependents(
         redirected_request: None,
     };
     if request.estimate == Some(true) {
-        let tokens = source::approx_tokens_from_bytes(result.rendered.len());
+        let tokens = crate::stel::handler::estimate_tokens_from_bytes(result.rendered.len() as u64);
         result.estimated_tokens = Some(tokens);
         result.files.clear();
         result.rendered = format!("Estimated tokens: {tokens}");
