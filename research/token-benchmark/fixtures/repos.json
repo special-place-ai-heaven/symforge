@@ -1,0 +1,7 @@
+{
+  "_comment": "Dry-run only. A tiny bundled Python repository, materialised as a local git repo at run time.",
+  "repositories": [
+    {"id": "mini", "fixture": "minirepo", "hidden_root": "hidden", "license": "fixture", "language": "Python",
+     "size_class": "fixture", "toolchain": "python", "prepare": [], "oracle_env": {}}
+  ]
+}

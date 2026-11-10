@@ -1,0 +1,1042 @@
+{
+ "run_ids": [
+  "dryrun-synthetic"
+ ],
+ "synthetic": true,
+ "model": "synthetic-fake-client",
+ "headline_pair": [
+  "a",
+  "c"
+ ],
+ "decision_rule": {
+  "min_valid_fraction": 0.95,
+  "require_quality_not_worse": true,
+  "require_both_modes": true
+ },
+ "claim": "NOT ADMISSIBLE (synthetic data)",
+ "rule_outcome": "REJECT",
+ "status_counts": {
+  "valid": 239,
+  "invalid_allowlist": 1
+ },
+ "comparisons": [
+  {
+   "mode": "off",
+   "native": "a",
+   "other": "c",
+   "pairs": [
+    {
+     "repo": "mini",
+     "task": "mini-cross-edit",
+     "category": "cross-module-edit",
+     "native": 282509.5,
+     "other": 291312.5,
+     "saving": -0.03116001408802182
+    },
+    {
+     "repo": "mini",
+     "task": "mini-debugging",
+     "category": "debugging",
+     "native": 264195.0,
+     "other": 279321.0,
+     "saving": -0.057253165275648665
+    },
+    {
+     "repo": "mini",
+     "task": "mini-discovery",
+     "category": "discovery",
+     "native": 127247.5,
+     "other": 100138,
+     "saving": 0.21304544293601052
+    },
+    {
+     "repo": "mini",
+     "task": "mini-rename",
+     "category": "rename-refactor",
+     "native": 213845,
+     "other": 292140.0,
+     "saving": -0.3661296733615469
+    },
+    {
+     "repo": "mini",
+     "task": "mini-review",
+     "category": "review",
+     "native": 146355,
+     "other": 164145,
+     "saving": -0.12155375627754433
+    },
+    {
+     "repo": "mini",
+     "task": "mini-single-edit",
+     "category": "single-file-edit",
+     "native": 219252.0,
+     "other": 242413.5,
+     "saving": -0.1056387170926605
+    },
+    {
+     "repo": "mini",
+     "task": "mini-tracing",
+     "category": "tracing",
+     "native": 159019,
+     "other": 133244.0,
+     "saving": 0.16208754928656324
+    },
+    {
+     "repo": "mini",
+     "task": "mini-unfamiliar",
+     "category": "unfamiliar-module",
+     "native": 168304,
+     "other": 162806.0,
+     "saving": 0.03266707861964065
+    }
+   ],
+   "excluded_pairs": [],
+   "pairs_won": 3,
+   "pairs_counted": 8,
+   "total_saving": -0.05364177369020706,
+   "median_saving": -0.044206589681835246,
+   "pass_counts": {
+    "a": 36,
+    "c": 34
+   },
+   "valid_fraction": 0.9875,
+   "gates": {
+    "total_saving_positive": false,
+    "median_saving_positive": false,
+    "quality_not_worse": false,
+    "enough_valid_cells": true
+   },
+   "verdict": "REJECT",
+   "categories": {
+    "discovery": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.21304544293601052
+    },
+    "tracing": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.16208754928656324
+    },
+    "unfamiliar-module": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.03266707861964065
+    },
+    "debugging": {
+     "pairs": 1,
+     "won": 0,
+     "median_saving": -0.057253165275648665
+    },
+    "single-file-edit": {
+     "pairs": 1,
+     "won": 0,
+     "median_saving": -0.1056387170926605
+    },
+    "cross-module-edit": {
+     "pairs": 1,
+     "won": 0,
+     "median_saving": -0.03116001408802182
+    },
+    "rename-refactor": {
+     "pairs": 1,
+     "won": 0,
+     "median_saving": -0.3661296733615469
+    },
+    "review": {
+     "pairs": 1,
+     "won": 0,
+     "median_saving": -0.12155375627754433
+    }
+   },
+   "losing_categories": [
+    "debugging",
+    "single-file-edit",
+    "cross-module-edit",
+    "rename-refactor",
+    "review"
+   ],
+   "headline": true
+  },
+  {
+   "mode": "off",
+   "native": "a",
+   "other": "b",
+   "pairs": [
+    {
+     "repo": "mini",
+     "task": "mini-cross-edit",
+     "category": "cross-module-edit",
+     "native": 282509.5,
+     "other": 272260,
+     "saving": 0.03628019588721795
+    },
+    {
+     "repo": "mini",
+     "task": "mini-debugging",
+     "category": "debugging",
+     "native": 264195.0,
+     "other": 257196,
+     "saving": 0.026491795832623632
+    },
+    {
+     "repo": "mini",
+     "task": "mini-discovery",
+     "category": "discovery",
+     "native": 127247.5,
+     "other": 80788,
+     "saving": 0.3651112988467357
+    },
+    {
+     "repo": "mini",
+     "task": "mini-rename",
+     "category": "rename-refactor",
+     "native": 213845,
+     "other": 265985.0,
+     "saving": -0.2438214594683065
+    },
+    {
+     "repo": "mini",
+     "task": "mini-review",
+     "category": "review",
+     "native": 146355,
+     "other": 159192,
+     "saving": -0.08771138669673055
+    },
+    {
+     "repo": "mini",
+     "task": "mini-single-edit",
+     "category": "single-file-edit",
+     "native": 219252.0,
+     "other": 217356,
+     "saving": 0.00864758360243008
+    },
+    {
+     "repo": "mini",
+     "task": "mini-tracing",
+     "category": "tracing",
+     "native": 159019,
+     "other": 84384,
+     "saving": 0.46934643030078166
+    },
+    {
+     "repo": "mini",
+     "task": "mini-unfamiliar",
+     "category": "unfamiliar-module",
+     "native": 168304,
+     "other": 142449,
+     "saving": 0.1536208289761384
+    }
+   ],
+   "excluded_pairs": [],
+   "pairs_won": 6,
+   "pairs_counted": 8,
+   "total_saving": 0.0639686675814356,
+   "median_saving": 0.031385995859920794,
+   "pass_counts": {
+    "a": 36,
+    "b": 39
+   },
+   "valid_fraction": 0.9875,
+   "gates": {
+    "total_saving_positive": true,
+    "median_saving_positive": true,
+    "quality_not_worse": true,
+    "enough_valid_cells": true
+   },
+   "verdict": "ACCEPT",
+   "categories": {
+    "discovery": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.3651112988467357
+    },
+    "tracing": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.46934643030078166
+    },
+    "unfamiliar-module": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.1536208289761384
+    },
+    "debugging": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.026491795832623632
+    },
+    "single-file-edit": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.00864758360243008
+    },
+    "cross-module-edit": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.03628019588721795
+    },
+    "rename-refactor": {
+     "pairs": 1,
+     "won": 0,
+     "median_saving": -0.2438214594683065
+    },
+    "review": {
+     "pairs": 1,
+     "won": 0,
+     "median_saving": -0.08771138669673055
+    }
+   },
+   "losing_categories": [
+    "rename-refactor",
+    "review"
+   ],
+   "headline": false
+  },
+  {
+   "mode": "on",
+   "native": "a",
+   "other": "c",
+   "pairs": [
+    {
+     "repo": "mini",
+     "task": "mini-cross-edit",
+     "category": "cross-module-edit",
+     "native": 372757,
+     "other": 294765,
+     "saving": 0.20923014188868352
+    },
+    {
+     "repo": "mini",
+     "task": "mini-debugging",
+     "category": "debugging",
+     "native": 283800,
+     "other": 328143.0,
+     "saving": -0.15624735729386893
+    },
+    {
+     "repo": "mini",
+     "task": "mini-discovery",
+     "category": "discovery",
+     "native": 118680,
+     "other": 106122,
+     "saving": 0.1058139534883721
+    },
+    {
+     "repo": "mini",
+     "task": "mini-rename",
+     "category": "rename-refactor",
+     "native": 200050,
+     "other": 272045,
+     "saving": -0.3598850287428143
+    },
+    {
+     "repo": "mini",
+     "task": "mini-review",
+     "category": "review",
+     "native": 152907,
+     "other": 138375,
+     "saving": 0.0950381604504699
+    },
+    {
+     "repo": "mini",
+     "task": "mini-single-edit",
+     "category": "single-file-edit",
+     "native": 228662.0,
+     "other": 227012,
+     "saving": 0.007215890703308814
+    },
+    {
+     "repo": "mini",
+     "task": "mini-tracing",
+     "category": "tracing",
+     "native": 148186.5,
+     "other": 132111,
+     "saving": 0.10848154184085596
+    },
+    {
+     "repo": "mini",
+     "task": "mini-unfamiliar",
+     "category": "unfamiliar-module",
+     "native": 200380,
+     "other": 181140,
+     "saving": 0.09601756662341551
+    }
+   ],
+   "excluded_pairs": [],
+   "pairs_won": 6,
+   "pairs_counted": 8,
+   "total_saving": 0.015075149999486892,
+   "median_saving": 0.0955278635369427,
+   "pass_counts": {
+    "a": 36,
+    "c": 35
+   },
+   "valid_fraction": 1.0,
+   "gates": {
+    "total_saving_positive": true,
+    "median_saving_positive": true,
+    "quality_not_worse": false,
+    "enough_valid_cells": true
+   },
+   "verdict": "REJECT",
+   "categories": {
+    "discovery": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.1058139534883721
+    },
+    "tracing": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.10848154184085596
+    },
+    "unfamiliar-module": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.09601756662341551
+    },
+    "debugging": {
+     "pairs": 1,
+     "won": 0,
+     "median_saving": -0.15624735729386893
+    },
+    "single-file-edit": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.007215890703308814
+    },
+    "cross-module-edit": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.20923014188868352
+    },
+    "rename-refactor": {
+     "pairs": 1,
+     "won": 0,
+     "median_saving": -0.3598850287428143
+    },
+    "review": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.0950381604504699
+    }
+   },
+   "losing_categories": [
+    "debugging",
+    "rename-refactor"
+   ],
+   "headline": true
+  },
+  {
+   "mode": "on",
+   "native": "a",
+   "other": "b",
+   "pairs": [
+    {
+     "repo": "mini",
+     "task": "mini-cross-edit",
+     "category": "cross-module-edit",
+     "native": 372757,
+     "other": 285810.0,
+     "saving": 0.23325383560872096
+    },
+    {
+     "repo": "mini",
+     "task": "mini-debugging",
+     "category": "debugging",
+     "native": 283800,
+     "other": 257940,
+     "saving": 0.09112050739957717
+    },
+    {
+     "repo": "mini",
+     "task": "mini-discovery",
+     "category": "discovery",
+     "native": 118680,
+     "other": 82230,
+     "saving": 0.30712841253791706
+    },
+    {
+     "repo": "mini",
+     "task": "mini-rename",
+     "category": "rename-refactor",
+     "native": 200050,
+     "other": 253230.0,
+     "saving": -0.2658335416145963
+    },
+    {
+     "repo": "mini",
+     "task": "mini-review",
+     "category": "review",
+     "native": 152907,
+     "other": 145833,
+     "saving": 0.0462634150169711
+    },
+    {
+     "repo": "mini",
+     "task": "mini-single-edit",
+     "category": "single-file-edit",
+     "native": 228662.0,
+     "other": 227859,
+     "saving": 0.0035117334756102894
+    },
+    {
+     "repo": "mini",
+     "task": "mini-tracing",
+     "category": "tracing",
+     "native": 148186.5,
+     "other": 89845.0,
+     "saving": 0.39370320508278417
+    },
+    {
+     "repo": "mini",
+     "task": "mini-unfamiliar",
+     "category": "unfamiliar-module",
+     "native": 200380,
+     "other": 162600,
+     "saving": 0.188541770635792
+    }
+   ],
+   "excluded_pairs": [],
+   "pairs_won": 7,
+   "pairs_counted": 8,
+   "total_saving": 0.11731726302426526,
+   "median_saving": 0.13983113901768457,
+   "pass_counts": {
+    "a": 36,
+    "b": 35
+   },
+   "valid_fraction": 1.0,
+   "gates": {
+    "total_saving_positive": true,
+    "median_saving_positive": true,
+    "quality_not_worse": false,
+    "enough_valid_cells": true
+   },
+   "verdict": "REJECT",
+   "categories": {
+    "discovery": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.30712841253791706
+    },
+    "tracing": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.39370320508278417
+    },
+    "unfamiliar-module": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.188541770635792
+    },
+    "debugging": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.09112050739957717
+    },
+    "single-file-edit": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.0035117334756102894
+    },
+    "cross-module-edit": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.23325383560872096
+    },
+    "rename-refactor": {
+     "pairs": 1,
+     "won": 0,
+     "median_saving": -0.2658335416145963
+    },
+    "review": {
+     "pairs": 1,
+     "won": 1,
+     "median_saving": 0.0462634150169711
+    }
+   },
+   "losing_categories": [
+    "rename-refactor"
+   ],
+   "headline": false
+  }
+ ],
+ "categories": {
+  "off": {
+   "discovery": {
+    "a": {
+     "runs": 4,
+     "pass_rate": 1.0,
+     "median_total_tokens": 127247.5,
+     "median_round_trips": 5.0,
+     "median_tool_result_tokens_est": 1757.5,
+     "median_wall_s": 131.6415
+    },
+    "b": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 80788,
+     "median_round_trips": 2,
+     "median_tool_result_tokens_est": 467,
+     "median_wall_s": 162.197
+    },
+    "c": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 100138,
+     "median_round_trips": 2,
+     "median_tool_result_tokens_est": 414,
+     "median_wall_s": 147.479
+    }
+   },
+   "tracing": {
+    "a": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 159019,
+     "median_round_trips": 7,
+     "median_tool_result_tokens_est": 2151,
+     "median_wall_s": 110.434
+    },
+    "b": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 84384,
+     "median_round_trips": 2,
+     "median_tool_result_tokens_est": 517,
+     "median_wall_s": 150.487
+    },
+    "c": {
+     "runs": 5,
+     "pass_rate": 0.8,
+     "median_total_tokens": 133244.0,
+     "median_round_trips": 4.5,
+     "median_tool_result_tokens_est": 1196.0,
+     "median_wall_s": 106.80799999999999
+    }
+   },
+   "unfamiliar-module": {
+    "a": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 168304,
+     "median_round_trips": 4,
+     "median_tool_result_tokens_est": 1313,
+     "median_wall_s": 156.862
+    },
+    "b": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 142449,
+     "median_round_trips": 3,
+     "median_tool_result_tokens_est": 749,
+     "median_wall_s": 116.25
+    },
+    "c": {
+     "runs": 5,
+     "pass_rate": 0.8,
+     "median_total_tokens": 162806.0,
+     "median_round_trips": 3.5,
+     "median_tool_result_tokens_est": 844.0,
+     "median_wall_s": 108.69049999999999
+    }
+   },
+   "debugging": {
+    "a": {
+     "runs": 5,
+     "pass_rate": 0.8,
+     "median_total_tokens": 264195.0,
+     "median_round_trips": 6.0,
+     "median_tool_result_tokens_est": 1940.0,
+     "median_wall_s": 179.14350000000002
+    },
+    "b": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 257196,
+     "median_round_trips": 6,
+     "median_tool_result_tokens_est": 1893,
+     "median_wall_s": 105.641
+    },
+    "c": {
+     "runs": 5,
+     "pass_rate": 0.8,
+     "median_total_tokens": 279321.0,
+     "median_round_trips": 6.0,
+     "median_tool_result_tokens_est": 2302.0,
+     "median_wall_s": 185.09750000000003
+    }
+   },
+   "single-file-edit": {
+    "a": {
+     "runs": 5,
+     "pass_rate": 0.8,
+     "median_total_tokens": 219252.0,
+     "median_round_trips": 4.0,
+     "median_tool_result_tokens_est": 1138.0,
+     "median_wall_s": 76.04650000000001
+    },
+    "b": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 217356,
+     "median_round_trips": 3,
+     "median_tool_result_tokens_est": 713,
+     "median_wall_s": 164.618
+    },
+    "c": {
+     "runs": 5,
+     "pass_rate": 0.8,
+     "median_total_tokens": 242413.5,
+     "median_round_trips": 4.0,
+     "median_tool_result_tokens_est": 1482.5,
+     "median_wall_s": 112.644
+    }
+   },
+   "cross-module-edit": {
+    "a": {
+     "runs": 5,
+     "pass_rate": 0.8,
+     "median_total_tokens": 282509.5,
+     "median_round_trips": 7.0,
+     "median_tool_result_tokens_est": 2484.0,
+     "median_wall_s": 74.10300000000001
+    },
+    "b": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 272260,
+     "median_round_trips": 5,
+     "median_tool_result_tokens_est": 1326,
+     "median_wall_s": 136.635
+    },
+    "c": {
+     "runs": 5,
+     "pass_rate": 0.8,
+     "median_total_tokens": 291312.5,
+     "median_round_trips": 5.0,
+     "median_tool_result_tokens_est": 1656.0,
+     "median_wall_s": 146.9175
+    }
+   },
+   "rename-refactor": {
+    "a": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 213845,
+     "median_round_trips": 5,
+     "median_tool_result_tokens_est": 1694,
+     "median_wall_s": 63.912
+    },
+    "b": {
+     "runs": 5,
+     "pass_rate": 0.8,
+     "median_total_tokens": 265985.0,
+     "median_round_trips": 5.0,
+     "median_tool_result_tokens_est": 1508.0,
+     "median_wall_s": 131.95100000000002
+    },
+    "c": {
+     "runs": 5,
+     "pass_rate": 0.8,
+     "median_total_tokens": 292140.0,
+     "median_round_trips": 5.0,
+     "median_tool_result_tokens_est": 1479.5,
+     "median_wall_s": 111.49100000000001
+    }
+   },
+   "review": {
+    "a": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 146355,
+     "median_round_trips": 3,
+     "median_tool_result_tokens_est": 989,
+     "median_wall_s": 138.455
+    },
+    "b": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 159192,
+     "median_round_trips": 3,
+     "median_tool_result_tokens_est": 806,
+     "median_wall_s": 167.658
+    },
+    "c": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 164145,
+     "median_round_trips": 3,
+     "median_tool_result_tokens_est": 834,
+     "median_wall_s": 193.147
+    }
+   }
+  },
+  "on": {
+   "discovery": {
+    "a": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 118680,
+     "median_round_trips": 5,
+     "median_tool_result_tokens_est": 1729,
+     "median_wall_s": 153.526
+    },
+    "b": {
+     "runs": 5,
+     "pass_rate": 0.6,
+     "median_total_tokens": 82230,
+     "median_round_trips": 2,
+     "median_tool_result_tokens_est": 225,
+     "median_wall_s": 224.804
+    },
+    "c": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 106122,
+     "median_round_trips": 5,
+     "median_tool_result_tokens_est": 1510,
+     "median_wall_s": 96.168
+    }
+   },
+   "tracing": {
+    "a": {
+     "runs": 5,
+     "pass_rate": 0.8,
+     "median_total_tokens": 148186.5,
+     "median_round_trips": 7.0,
+     "median_tool_result_tokens_est": 2339.0,
+     "median_wall_s": 103.29400000000001
+    },
+    "b": {
+     "runs": 5,
+     "pass_rate": 0.8,
+     "median_total_tokens": 89845.0,
+     "median_round_trips": 2.0,
+     "median_tool_result_tokens_est": 366.5,
+     "median_wall_s": 138.6465
+    },
+    "c": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 132111,
+     "median_round_trips": 7,
+     "median_tool_result_tokens_est": 2232,
+     "median_wall_s": 131.98
+    }
+   },
+   "unfamiliar-module": {
+    "a": {
+     "runs": 5,
+     "pass_rate": 0.6,
+     "median_total_tokens": 200380,
+     "median_round_trips": 4,
+     "median_tool_result_tokens_est": 1383,
+     "median_wall_s": 95.014
+    },
+    "b": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 162600,
+     "median_round_trips": 3,
+     "median_tool_result_tokens_est": 797,
+     "median_wall_s": 167.93
+    },
+    "c": {
+     "runs": 5,
+     "pass_rate": 0.6,
+     "median_total_tokens": 181140,
+     "median_round_trips": 4,
+     "median_tool_result_tokens_est": 1568,
+     "median_wall_s": 33.007
+    }
+   },
+   "debugging": {
+    "a": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 283800,
+     "median_round_trips": 6,
+     "median_tool_result_tokens_est": 2131,
+     "median_wall_s": 50.13
+    },
+    "b": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 257940,
+     "median_round_trips": 6,
+     "median_tool_result_tokens_est": 1861,
+     "median_wall_s": 167.505
+    },
+    "c": {
+     "runs": 5,
+     "pass_rate": 0.8,
+     "median_total_tokens": 328143.0,
+     "median_round_trips": 6.0,
+     "median_tool_result_tokens_est": 1601.0,
+     "median_wall_s": 136.071
+    }
+   },
+   "single-file-edit": {
+    "a": {
+     "runs": 5,
+     "pass_rate": 0.8,
+     "median_total_tokens": 228662.0,
+     "median_round_trips": 4.0,
+     "median_tool_result_tokens_est": 1136.5,
+     "median_wall_s": 172.305
+    },
+    "b": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 227859,
+     "median_round_trips": 3,
+     "median_tool_result_tokens_est": 664,
+     "median_wall_s": 199.166
+    },
+    "c": {
+     "runs": 5,
+     "pass_rate": 0.6,
+     "median_total_tokens": 227012,
+     "median_round_trips": 4,
+     "median_tool_result_tokens_est": 668,
+     "median_wall_s": 180.489
+    }
+   },
+   "cross-module-edit": {
+    "a": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 372757,
+     "median_round_trips": 7,
+     "median_tool_result_tokens_est": 2356,
+     "median_wall_s": 59.466
+    },
+    "b": {
+     "runs": 5,
+     "pass_rate": 0.8,
+     "median_total_tokens": 285810.0,
+     "median_round_trips": 5.0,
+     "median_tool_result_tokens_est": 1371.5,
+     "median_wall_s": 143.074
+    },
+    "c": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 294765,
+     "median_round_trips": 5,
+     "median_tool_result_tokens_est": 1771,
+     "median_wall_s": 101.401
+    }
+   },
+   "rename-refactor": {
+    "a": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 200050,
+     "median_round_trips": 5,
+     "median_tool_result_tokens_est": 1527,
+     "median_wall_s": 90.16
+    },
+    "b": {
+     "runs": 5,
+     "pass_rate": 0.8,
+     "median_total_tokens": 253230.0,
+     "median_round_trips": 5.0,
+     "median_tool_result_tokens_est": 1804.5,
+     "median_wall_s": 96.542
+    },
+    "c": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 272045,
+     "median_round_trips": 5,
+     "median_tool_result_tokens_est": 1753,
+     "median_wall_s": 184.809
+    }
+   },
+   "review": {
+    "a": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 152907,
+     "median_round_trips": 3,
+     "median_tool_result_tokens_est": 699,
+     "median_wall_s": 109.8
+    },
+    "b": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 145833,
+     "median_round_trips": 3,
+     "median_tool_result_tokens_est": 1042,
+     "median_wall_s": 212.255
+    },
+    "c": {
+     "runs": 5,
+     "pass_rate": 1.0,
+     "median_total_tokens": 138375,
+     "median_round_trips": 3,
+     "median_tool_result_tokens_est": 946,
+     "median_wall_s": 143.157
+    }
+   }
+  }
+ },
+ "arm_mode_config": {
+  "a/off": {
+   "cells": 40,
+   "hooks": false,
+   "rules": false,
+   "rule_sentinel_hits_median": 0.0,
+   "cells_with_rule_injection": 0,
+   "median_price_usd": 0.12144925000000001
+  },
+  "b/off": {
+   "cells": 40,
+   "hooks": false,
+   "rules": false,
+   "rule_sentinel_hits_median": 0.0,
+   "cells_with_rule_injection": 0,
+   "median_price_usd": 0.13013175
+  },
+  "c/off": {
+   "cells": 40,
+   "hooks": false,
+   "rules": false,
+   "rule_sentinel_hits_median": 0.0,
+   "cells_with_rule_injection": 0,
+   "median_price_usd": 0.13833610000000002
+  },
+  "a/on": {
+   "cells": 40,
+   "hooks": false,
+   "rules": true,
+   "rule_sentinel_hits_median": 1.0,
+   "cells_with_rule_injection": 40,
+   "median_price_usd": 0.13736335
+  },
+  "b/on": {
+   "cells": 40,
+   "hooks": true,
+   "rules": true,
+   "rule_sentinel_hits_median": 0.0,
+   "cells_with_rule_injection": 0,
+   "median_price_usd": 0.12505755
+  },
+  "c/on": {
+   "cells": 40,
+   "hooks": true,
+   "rules": true,
+   "rule_sentinel_hits_median": 1.0,
+   "cells_with_rule_injection": 23,
+   "median_price_usd": 0.1389708
+  }
+ },
+ "cell_config_check": {
+  "cells": 240,
+  "mismatched": []
+ }
+}

@@ -1,0 +1,49 @@
+{
+  "_comment": "Pins verified with `git ls-remote <url> HEAD` on 2026-11-10. Anchors used by tasks were checked against raw files at these commits; oracles re-derive every answer from the checkout at run time.",
+  "repositories": [
+    {
+      "id": "flask",
+      "url": "https://github.com/pallets/flask.git",
+      "commit": "49943b5a94413a530761350f04e896f76e8d620e",
+      "license": "BSD-3-Clause",
+      "language": "Python",
+      "size_class": "small",
+      "toolchain": "python",
+      "prepare": [["{python}", "-m", "pip", "install", "--quiet", "pytest", "werkzeug", "jinja2", "itsdangerous", "click", "blinker"]],
+      "oracle_env": {"PYTHONPATH": "src"}
+    },
+    {
+      "id": "cobra",
+      "url": "https://github.com/spf13/cobra.git",
+      "commit": "adbc8813901bba65827259daa8e22ff94ec1f30e",
+      "license": "Apache-2.0",
+      "language": "Go",
+      "size_class": "small-mid",
+      "toolchain": "go",
+      "prepare": [["go", "mod", "download"]],
+      "oracle_env": {}
+    },
+    {
+      "id": "zod",
+      "url": "https://github.com/colinhacks/zod.git",
+      "commit": "19c40d2072288b4cafec851e9d056a72a88e5973",
+      "license": "MIT",
+      "language": "TypeScript",
+      "size_class": "mid",
+      "toolchain": null,
+      "prepare": [],
+      "oracle_env": {}
+    },
+    {
+      "id": "ripgrep",
+      "url": "https://github.com/BurntSushi/ripgrep.git",
+      "commit": "178cc027e283fd965cb72d0a7395b219eada170c",
+      "license": "MIT OR Unlicense",
+      "language": "Rust",
+      "size_class": "large",
+      "toolchain": "cargo",
+      "prepare": [["cargo", "fetch"]],
+      "oracle_env": {}
+    }
+  ]
+}
