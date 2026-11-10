@@ -281,3 +281,102 @@ fn rich_symbol_search_browses_with_language_kind_and_explicit_invalid_options() 
         .unwrap_err();
     assert_eq!(invalid.kind(), QueryRefusalKind::UnsupportedOption);
 }
+
+/// SF-TE-07 embed lane: per-file counts lift every display cap, match an
+/// independent `rg -F -s --count` oracle, and report the test-code remainder.
+#[test]
+fn count_grouping_matches_line_oracle_and_reports_hidden_tests() {
+    let root = tempfile::tempdir().unwrap();
+    git2::Repository::init(root.path()).unwrap();
+    fs::create_dir(root.path().join("src")).unwrap();
+    fs::create_dir(root.path().join("tests")).unwrap();
+    let mut many = String::from("pub fn many() {\n");
+    for i in 0..60 {
+        many.push_str(&format!("    let needle_{i} = {i};\n"));
+    }
+    many.push_str("}\n\n#[cfg(test)]\nmod tests {\n    fn t() { let needle = 0; }\n}\n");
+    fs::write(root.path().join("src/many.rs"), many).unwrap();
+    fs::write(
+        root.path().join("src/few.rs"),
+        "pub fn first() {\n    let marker_body_only = 0;\n    let needle_a = 1;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("tests/it_test.rs"),
+        "fn a() { let needle = 1; }\nfn b() { let needle = 2; }\n",
+    )
+    .unwrap();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+    let counts = |include_tests| {
+        let claim = text(
+            &handle,
+            TextSearchRequest {
+                query: Some("needle".into()),
+                case_sensitive: Some(true),
+                group_by: Some(TextGrouping::Count),
+                include_tests,
+                limit: Some(1),
+                max_per_file: Some(1),
+                ..Default::default()
+            },
+        );
+        let QueryOutput::TextSearch(report) = claim.value() else {
+            panic!()
+        };
+        let TextRows::Counts(rows) = &report.rows else {
+            panic!("{:?}", report.rows)
+        };
+        let rows: std::collections::BTreeMap<String, u64> = rows
+            .iter()
+            .map(|row| (row.path.clone(), row.count))
+            .collect();
+        (rows, report.hidden_test_matches)
+    };
+    let (all, hidden) = counts(Some(true));
+    assert_eq!(
+        all,
+        std::collections::BTreeMap::from([
+            ("src/few.rs".to_string(), 1),
+            ("src/many.rs".to_string(), 61),
+            ("tests/it_test.rs".to_string(), 2),
+        ])
+    );
+    assert_eq!(hidden, None, "tests already included: nothing to report");
+    let (visible, hidden) = counts(None);
+    assert_eq!(
+        visible,
+        std::collections::BTreeMap::from([
+            ("src/few.rs".to_string(), 1),
+            ("src/many.rs".to_string(), 60),
+        ])
+    );
+    assert_eq!(hidden, Some(3));
+
+    // SF-TE-08 embed lane: the symbol group carries its body on request only.
+    let grouped = |include_body| {
+        let claim = text(
+            &handle,
+            TextSearchRequest {
+                query: Some("needle".into()),
+                path_prefix: Some("src/few.rs".into()),
+                group_by: Some(TextGrouping::Symbol),
+                include_body,
+                ..Default::default()
+            },
+        );
+        let QueryOutput::TextSearch(report) = claim.value() else {
+            panic!()
+        };
+        let TextRows::Symbols { groups, .. } = &report.rows else {
+            panic!()
+        };
+        groups[0].body.clone()
+    };
+    assert!(
+        grouped(Some(true))
+            .expect("body requested")
+            .contains("let marker_body_only = 0;")
+    );
+    assert_eq!(grouped(None), None);
+}

@@ -379,6 +379,37 @@ impl<'a> BudgetState<'a> {
     }
 }
 
+/// SF-ARC-07 default knowledge-scope exclusion: a directory segment (never the
+/// file name) named `archive` or `archived`, or a date-named folder
+/// (`2026-07-06-...`) beneath a `research` or `reviews` folder. Undated
+/// research/review folders stay in scope.
+pub(crate) fn is_archival_knowledge_path(path: &str) -> bool {
+    let mut segments: Vec<String> = path
+        .split(['/', '\\'])
+        .map(str::to_ascii_lowercase)
+        .collect();
+    segments.pop();
+    let mut under_record_folder = false;
+    for segment in &segments {
+        if matches!(segment.as_str(), "archive" | "archived")
+            || (under_record_folder && starts_with_iso_date(segment))
+        {
+            return true;
+        }
+        under_record_folder |= matches!(segment.as_str(), "research" | "reviews");
+    }
+    false
+}
+
+fn starts_with_iso_date(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.len() >= 10
+        && bytes[..10].iter().enumerate().all(|(i, b)| match i {
+            4 | 7 => *b == b'-',
+            _ => b.is_ascii_digit(),
+        })
+}
+
 pub fn build_knowledge_bridge(
     live: &LiveIndex,
     source: &SourceIdentity,
@@ -423,7 +454,14 @@ pub fn build_knowledge_bridge(
                 cards.push(card);
             }
         }
-        let mut candidates = extract_candidates(path, file, decoded.text);
+        // SF-ARC-07: archived and dated research/review records keep their
+        // cards (they stay searchable) but contribute no bridge links, so they
+        // cannot exhaust the candidate budget that current docs need.
+        let mut candidates = if is_archival_knowledge_path(path) {
+            Vec::new()
+        } else {
+            extract_candidates(path, file, decoded.text)
+        };
         for candidate in &mut candidates {
             candidate.range.start = candidate.range.start.saturating_add(leading);
             candidate.range.end = candidate.range.end.saturating_add(leading);
@@ -1544,6 +1582,52 @@ mod tests {
                 breaches.iter().map(|breach| breach.kind).collect()
             }
         }
+    }
+
+    #[test]
+    fn archival_records_keep_cards_but_contribute_no_bridge_links() {
+        let link = "# Notes\n\n[library](../../src/lib.rs) and `launch`\n";
+        let (_root, shared) = fixture(&[
+            ("src/lib.rs", "pub fn launch() {}\n"),
+            ("docs/guide/current.md", link),
+            ("docs/archive/old.md", link),
+            ("docs/archived/old.md", link),
+            ("docs/reviews/r.md", link),
+            ("research/notes/r.md", link),
+            ("docs/reviews/2026-07-06-campaign/r.md", link),
+            ("research/2026-08-01-spike/r.md", link),
+        ]);
+        let bridge = bridge(&shared);
+        let linked: BTreeSet<&str> = bridge
+            .forward
+            .iter()
+            .map(|link| link.evidence.path.as_str())
+            .collect();
+        // Undated research/review folders stay in scope; archive folders and
+        // date-named folders beneath research/reviews do not.
+        assert_eq!(
+            linked,
+            BTreeSet::from([
+                "docs/guide/current.md",
+                "docs/reviews/r.md",
+                "research/notes/r.md"
+            ])
+        );
+        let carded: BTreeSet<&str> = bridge
+            .cards
+            .iter()
+            .map(|card| card.anchor.path.as_str())
+            .collect();
+        assert!(carded.contains("docs/archive/old.md"));
+        assert!(!is_archival_knowledge_path("docs/2026-07-06-campaign/r.md"));
+        assert!(!is_archival_knowledge_path(
+            "docs/reviews/2026-07-06-findings.md"
+        ));
+
+        // The rule reads directory segments only: a file NAMED like a record is current.
+        assert!(!is_archival_knowledge_path("specs/015-x/research.md"));
+        assert!(!is_archival_knowledge_path("docs/reviews.md"));
+        assert!(is_archival_knowledge_path("docs\\Archive\\x.md"));
     }
 
     #[test]

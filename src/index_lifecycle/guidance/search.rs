@@ -152,7 +152,45 @@ fn resolve_text_search_enclosing_symbols(
                         name: symbol.name.clone(),
                         kind: symbol.kind.to_string(),
                         line_range: symbol.line_range,
+                        body: None,
                     });
+        }
+    }
+}
+
+/// SF-TE-08: attach each enclosing symbol's source once, on its first
+/// SURVIVING match. Runs after compaction, which may drop any match line.
+fn attach_symbol_bodies(
+    index: &LiveIndex,
+    result: &mut Result<search::TextSearchResult, search::TextSearchError>,
+) {
+    let Ok(result) = result else {
+        return;
+    };
+    for file_matches in &mut result.files {
+        let Some(file) = index.get_file(&file_matches.path) else {
+            continue;
+        };
+        let mut bodied = std::collections::HashSet::new();
+        for line_match in &mut file_matches.matches {
+            let zero_based_line = line_match.line_number.saturating_sub(1) as u32;
+            let Some(idx) = crate::domain::find_enclosing_symbol(&file.symbols, zero_based_line)
+            else {
+                continue;
+            };
+            let (Some(enclosing), Some(symbol)) = (
+                line_match.enclosing_symbol.as_mut(),
+                file.symbols.get(idx as usize),
+            ) else {
+                continue;
+            };
+            if bodied.insert(idx) {
+                let (start, end) = symbol.byte_range;
+                enclosing.body = file
+                    .content
+                    .get(start as usize..end as usize)
+                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+            }
         }
     }
 }
@@ -168,12 +206,20 @@ fn hidden_search_symbols_noise_count(
     options: &search::SymbolSearchOptions,
     visible: &search::SymbolSearchResult,
 ) -> usize {
-    if options.noise_policy.include_vendor && options.include_personal_tooling {
+    // Every default-hidden class counts (SF-TE-06): a hidden test or generated
+    // symbol is a non-default condition the envelope must name.
+    if options.noise_policy.include_vendor
+        && options.noise_policy.include_tests
+        && options.noise_policy.include_generated
+        && options.include_personal_tooling
+    {
         return 0;
     }
 
     let mut unfiltered_options = options.clone();
     unfiltered_options.noise_policy.include_vendor = true;
+    unfiltered_options.noise_policy.include_tests = true;
+    unfiltered_options.noise_policy.include_generated = true;
     unfiltered_options.include_personal_tooling = true;
     let unfiltered = search::search_symbols_with_options(index, query, kind, &unfiltered_options);
     search_symbols_total_matches(&unfiltered).saturating_sub(search_symbols_total_matches(visible))
@@ -187,6 +233,9 @@ pub(crate) struct TextSearchExecution {
     pub auto_detected_regex: bool,
     pub auto_corrected_regex: bool,
     pub effective_query: Option<String>,
+    /// Count mode only: matches `include_tests=true` would add, measured by a
+    /// second run. `None` when not measured.
+    pub hidden_test_matches: Option<usize>,
 }
 
 /// Shared request semantics above the indexed text/AST search engine. Transport
@@ -198,18 +247,37 @@ pub(crate) fn execute_text_search(
     use super::search_contract::search_text_options_from_input;
     let index = &generation.live;
     let mut options = search_text_options_from_input(input)?;
-    if input.structural.unwrap_or(false) {
-        let pattern = input
-            .query
-            .as_deref()
-            .map(str::trim)
-            .filter(|pattern| !pattern.is_empty())
-            .ok_or_else(|| "Error: `query` is required for structural search.".to_owned())?;
-        let mut result = search::search_structural(index, pattern, &options);
+    let count_mode = input.group_by.as_deref() == Some(GROUP_BY_COUNT);
+    let include_body = input.include_body.unwrap_or(false);
+    if include_body && (input.group_by.as_deref() != Some("symbol") || input.context.is_some()) {
+        return Err(
+            "Error: include_body=true requires group_by=\"symbol\" and no `context`.".to_owned(),
+        );
+    }
+    if count_mode
+        && (input.context.is_some()
+            || input.follow_refs == Some(true)
+            || input.ranked == Some(true))
+    {
+        return Err(
+            "Error: group_by=\"count\" cannot be combined with `context`, `follow_refs` or `ranked`."
+                .to_owned(),
+        );
+    }
+    if count_mode {
+        // SF-TE-07: a count is only true when nothing caps it. Display caps,
+        // context windows and ranking (which keeps at most 500 files) are off.
+        // ponytail: every matching line is retained, so a sweep holds all hits
+        // in memory; carry a per-file counter instead if sweeps grow huge.
+        options.total_limit = usize::MAX;
+        options.max_per_file = usize::MAX;
+        options.context = None;
+        options.ranked = false;
+    }
+    let follow_refs = input.follow_refs.unwrap_or(false) && !count_mode;
+    let finish = |mut result: Result<search::TextSearchResult, search::TextSearchError>| {
         resolve_text_search_enclosing_symbols(index, &mut result);
-        if input.follow_refs.unwrap_or(false)
-            && let Ok(result) = &mut result
-        {
+        if follow_refs && let Ok(result) = &mut result {
             enrich_with_callers(index, result, input.follow_refs_limit.unwrap_or(3) as usize);
         }
         apply_path_predicate_filter(
@@ -217,7 +285,29 @@ pub(crate) fn execute_text_search(
             input.include_vendor.unwrap_or(false),
             input.include_personal_tooling.unwrap_or(false),
         );
-        maybe_compact_text_search_result(&mut result, pattern);
+        result
+    };
+    if input.structural.unwrap_or(false) {
+        let pattern = input
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|pattern| !pattern.is_empty())
+            .ok_or_else(|| "Error: `query` is required for structural search.".to_owned())?;
+        let mut result = finish(search::search_structural(index, pattern, &options));
+        if !count_mode {
+            maybe_compact_text_search_result(&mut result, pattern);
+        }
+        if include_body {
+            attach_symbol_bodies(index, &mut result);
+        }
+        let hidden_test_matches = count_mode
+            .then(|| {
+                hidden_test_match_count(&options, &result, |opts| {
+                    finish(search::search_structural(index, pattern, opts))
+                })
+            })
+            .flatten();
         return Ok(TextSearchExecution {
             result,
             options,
@@ -226,6 +316,7 @@ pub(crate) fn execute_text_search(
             auto_detected_regex: false,
             auto_corrected_regex: false,
             effective_query: Some(pattern.to_owned()),
+            hidden_test_matches,
         });
     }
     let mut is_regex = input.regex.unwrap_or(false);
@@ -258,28 +349,18 @@ pub(crate) fn execute_text_search(
             }
         }
     }
-    let run = |query: Option<&str>| {
-        let mut result = search::search_text_with_options(
+    let run = |query: Option<&str>, opts: &search::TextSearchOptions| {
+        finish(search::search_text_with_options(
             index,
             query,
             input.terms.as_deref(),
             is_regex,
-            &options,
-        );
-        resolve_text_search_enclosing_symbols(index, &mut result);
-        if input.follow_refs.unwrap_or(false)
-            && let Ok(result) = &mut result
-        {
-            enrich_with_callers(index, result, input.follow_refs_limit.unwrap_or(3) as usize);
-        }
-        apply_path_predicate_filter(
-            &mut result,
-            input.include_vendor.unwrap_or(false),
-            input.include_personal_tooling.unwrap_or(false),
-        );
-        result
+            opts,
+        ))
     };
-    let mut result = run(input.query.as_deref());
+    let mut result = run(input.query.as_deref(), &options);
+    let mut effective_query = input.query.clone();
+    let mut auto_corrected_regex = false;
     let should_retry = matches!(&result, Err(search::TextSearchError::InvalidRegex { .. }))
         || matches!(&result, Ok(result) if result.files.is_empty());
     if is_regex
@@ -287,30 +368,64 @@ pub(crate) fn execute_text_search(
         && let Some(query) = &input.query
         && let Some(fixed) = super::filters::fix_common_double_escapes(query)
     {
-        let retry = run(Some(&fixed));
+        let retry = run(Some(&fixed), &options);
         if matches!(&retry, Ok(result) if !result.files.is_empty()) {
-            return Ok(TextSearchExecution {
-                result: retry,
-                options,
-                is_regex,
-                structural: false,
-                auto_detected_regex,
-                auto_corrected_regex: true,
-                effective_query: Some(fixed),
-            });
+            result = retry;
+            effective_query = Some(fixed);
+            auto_corrected_regex = true;
         }
     }
-    let compaction = search_text_compaction_query(input.query.as_deref(), input.terms.as_deref());
-    maybe_compact_text_search_result(&mut result, &compaction);
+    if !auto_corrected_regex && !count_mode {
+        let compaction =
+            search_text_compaction_query(input.query.as_deref(), input.terms.as_deref());
+        maybe_compact_text_search_result(&mut result, &compaction);
+    }
+    if include_body {
+        attach_symbol_bodies(index, &mut result);
+    }
+    let hidden_test_matches = count_mode
+        .then(|| {
+            hidden_test_match_count(&options, &result, |opts| {
+                run(effective_query.as_deref(), opts)
+            })
+        })
+        .flatten();
     Ok(TextSearchExecution {
         result,
         options,
         is_regex,
         structural: false,
         auto_detected_regex,
-        auto_corrected_regex: false,
-        effective_query: input.query.clone(),
+        auto_corrected_regex,
+        effective_query,
+        hidden_test_matches,
     })
+}
+
+/// `group_by` value for the per-file count view (SF-TE-07).
+pub(crate) const GROUP_BY_COUNT: &str = "count";
+
+/// Matches that `include_tests=true` would add to a count, measured by running
+/// the same search with tests included. `None` when tests are already included
+/// or either run failed (nothing observed, nothing claimed).
+fn hidden_test_match_count(
+    options: &search::TextSearchOptions,
+    visible: &Result<search::TextSearchResult, search::TextSearchError>,
+    rerun: impl FnOnce(
+        &search::TextSearchOptions,
+    ) -> Result<search::TextSearchResult, search::TextSearchError>,
+) -> Option<usize> {
+    if options.noise_policy.include_tests {
+        return None;
+    }
+    let mut with_tests = options.clone();
+    with_tests.noise_policy.include_tests = true;
+    let matched = |result: &search::TextSearchResult| -> usize {
+        result.files.iter().map(|file| file.matches.len()).sum()
+    };
+    let visible = matched(visible.as_ref().ok()?);
+    let all = matched(&rerun(&with_tests).ok()?);
+    Some(all.saturating_sub(visible))
 }
 
 pub(crate) struct SymbolSearchExecution {
@@ -643,6 +758,7 @@ pub(crate) fn render_search_text_output(
     auto_detected_regex: bool,
     auto_corrected_regex: bool,
     matching_untracked_paths: &[String],
+    hidden_test_matches: Option<usize>,
 ) -> String {
     use super::search_envelope::{
         SourceAuthority, format_search_envelope, search_completeness_label, search_scope_summary,
@@ -688,18 +804,23 @@ pub(crate) fn render_search_text_output(
     } else {
         0.95
     };
-    let output = super::search_render::search_text_result_view(
-        result,
-        group_by,
-        terms,
-        Some(confidence),
-        super::search_render::SearchSuggestionContext {
-            regex: is_regex,
-            include_tests: options.noise_policy.include_tests,
-            multi_word_literal: !is_regex
-                && query.is_some_and(|q| q.trim().contains(char::is_whitespace)),
-        },
-    );
+    let suggestion_ctx = super::search_render::SearchSuggestionContext {
+        regex: is_regex,
+        include_tests: options.noise_policy.include_tests,
+        multi_word_literal: !is_regex
+            && query.is_some_and(|q| q.trim().contains(char::is_whitespace)),
+    };
+    let output = if group_by == Some(GROUP_BY_COUNT) {
+        super::search_render::search_text_count_view(result, hidden_test_matches, suggestion_ctx)
+    } else {
+        super::search_render::search_text_result_view(
+            result,
+            group_by,
+            terms,
+            Some(confidence),
+            suggestion_ctx,
+        )
+    };
     let mut rendered = match envelope {
         Some(envelope) => format!("{envelope}\n\n{output}"),
         None => output,

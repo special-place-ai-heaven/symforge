@@ -612,6 +612,8 @@ pub fn search_text_result_view(
                         usize,
                     > = std::collections::HashMap::new();
                     let mut no_symbol_count = 0usize;
+                    let mut bodies: std::collections::HashMap<(String, String, u32, u32), &str> =
+                        std::collections::HashMap::new();
                     for line_match in &file.matches {
                         if let Some(ref enc) = line_match.enclosing_symbol {
                             let key = (
@@ -620,6 +622,9 @@ pub fn search_text_result_view(
                                 enc.line_range.0 + 1,
                                 enc.line_range.1 + 1,
                             );
+                            if let Some(body) = enc.body.as_deref() {
+                                bodies.entry(key.clone()).or_insert(body);
+                            }
                             match symbol_counts.entry(key.clone()) {
                                 std::collections::hash_map::Entry::Vacant(entry) => {
                                     symbol_order.push(key);
@@ -642,6 +647,14 @@ pub fn search_text_result_view(
                                 "  {} {} (lines {}-{}): {} {}",
                                 kind, sym_name, start, end, count, match_word
                             ));
+                            if let Some(body) =
+                                bodies.get(&(sym_name.clone(), kind.clone(), *start, *end))
+                            {
+                                lines
+                                    .extend(body.lines().map(|line| {
+                                        format!("    {}", line.trim_end_matches('\r'))
+                                    }));
+                            }
                         }
                     }
                     if no_symbol_count > 0 {
@@ -727,6 +740,41 @@ pub fn search_text_result_view(
         lines.join("\n"),
         result.withheld_policy_files,
         result.withheld_size_files,
+    )
+}
+
+/// `group_by="count"` view (SF-TE-07): a total, then one `path: n` line per
+/// file. The total and the test-code note lead so a response budget cut can
+/// only drop per-file rows. Counts are the matching lines the engine returned
+/// with every display cap lifted (see `execute_text_search`). Errors and
+/// zero-hit results fall back to the ordinary view so their diagnostics are
+/// unchanged.
+pub fn search_text_count_view(
+    result: Result<search::TextSearchResult, search::TextSearchError>,
+    hidden_test_matches: Option<usize>,
+    suggestion_ctx: SearchSuggestionContext,
+) -> String {
+    let found = match result {
+        Ok(found) if !found.files.is_empty() => found,
+        other => return search_text_result_view(other, None, None, None, suggestion_ctx),
+    };
+    let total: usize = found.files.iter().map(|file| file.matches.len()).sum();
+    let mut lines = vec![format!("total: {total} in {} files", found.files.len())];
+    if let Some(hidden) = hidden_test_matches.filter(|hidden| *hidden > 0) {
+        lines.push(format!(
+            "{hidden} more match(es) in test code are excluded; retry with include_tests=true to count them."
+        ));
+    }
+    lines.extend(
+        found
+            .files
+            .iter()
+            .map(|file| format!("{}: {}", file.path, file.matches.len())),
+    );
+    append_withheld_admission_note(
+        lines.join("\n"),
+        found.withheld_policy_files,
+        found.withheld_size_files,
     )
 }
 

@@ -155,14 +155,30 @@ fn count_in_scope_knowledge_only_files(
         .count()
 }
 
-fn count_in_scope_withheld_files(index: &LiveIndex, path_scope: &PathScope) -> (usize, usize) {
+/// Withheld catalog files the search would have scanned had they been
+/// admitted: the same path, glob, language, noise and personal-tooling scope
+/// as the search itself, so the note names only files inside the query.
+fn count_in_scope_withheld_files(
+    index: &LiveIndex,
+    options: &TextSearchOptions,
+    glob_filters: &CompiledTextGlobFilters,
+) -> (usize, usize) {
     let mut policy = 0usize;
     let mut size = 0usize;
     for entry in &index.manifest_entries {
         let Some(path) = entry.path.normalized_utf8.as_deref() else {
             continue;
         };
-        if !path_scope.matches(path) {
+        if !options.path_scope.matches(path)
+            || !glob_filters.matches(path)
+            || !options.noise_policy.allows(&entry.classification)
+            || (!options.include_personal_tooling
+                && crate::live_index::query::is_personal_tooling_path(path))
+            || options
+                .language_filter
+                .as_ref()
+                .is_some_and(|language| entry.language.as_ref() != Some(language))
+        {
             continue;
         }
         match &entry.disposition {
@@ -187,10 +203,11 @@ fn with_excluded_knowledge_count(
     mut result: TextSearchResult,
     index: &LiveIndex,
     options: &TextSearchOptions,
+    glob_filters: &CompiledTextGlobFilters,
 ) -> TextSearchResult {
     result.excluded_knowledge_files =
         count_in_scope_knowledge_only_files(index, &options.path_scope, options.search_scope);
-    let (policy, size) = count_in_scope_withheld_files(index, &options.path_scope);
+    let (policy, size) = count_in_scope_withheld_files(index, options, glob_filters);
     result.withheld_policy_files = policy;
     result.withheld_size_files = size;
     result
@@ -735,6 +752,9 @@ pub struct EnclosingMatchSymbol {
     pub name: String,
     pub kind: String,
     pub line_range: (u32, u32),
+    /// Symbol source, set only for `search_text(include_body=true)` and only on
+    /// the first match inside the symbol.
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1182,6 +1202,7 @@ pub fn search_text_with_options(
             |line| regex.is_match(line),
             label.clone(),
             options,
+            &compiled_globs,
         );
         result.suppressed_by_noise =
             result
@@ -1307,6 +1328,7 @@ pub fn search_text_with_options(
         |line| line_matches(line),
         label.clone(),
         opts,
+        &compiled_globs,
     );
     result.suppressed_by_noise =
         result
@@ -1592,6 +1614,7 @@ fn search_structural_with_compiler(
                         name: s.name.clone(),
                         kind: s.kind.to_string(),
                         line_range: s.line_range,
+                        body: None,
                     }),
             });
             if matches.len() >= per_file_limit {
@@ -1645,6 +1668,7 @@ fn search_structural_with_compiler(
         },
         index,
         options,
+        &compiled_globs,
     ))
 }
 
@@ -1786,6 +1810,7 @@ fn collect_text_matches<F>(
     mut is_match: F,
     label: String,
     options: &TextSearchOptions,
+    glob_filters: &CompiledTextGlobFilters,
 ) -> TextSearchResult
 where
     F: FnMut(&str) -> bool,
@@ -1852,6 +1877,7 @@ where
                             name: s.name.clone(),
                             kind: s.kind.to_string(),
                             line_range: s.line_range,
+                            body: None,
                         }),
                 });
             }
@@ -1971,7 +1997,7 @@ where
         withheld_policy_files: 0,
         withheld_size_files: 0,
     };
-    let (policy, size) = count_in_scope_withheld_files(index, &options.path_scope);
+    let (policy, size) = count_in_scope_withheld_files(index, options, glob_filters);
     result.withheld_policy_files = policy;
     result.withheld_size_files = size;
     result
@@ -3696,6 +3722,7 @@ mod tests {
                     name: "dead_code_fn".to_string(),
                     kind: "function".to_string(),
                     line_range: (1, 20),
+                    body: None,
                 }),
             }],
             rendered_lines: None,
@@ -3711,6 +3738,7 @@ mod tests {
                     name: "popular_fn".to_string(),
                     kind: "function".to_string(),
                     line_range: (1, 10),
+                    body: None,
                 }),
             }],
             rendered_lines: None,
@@ -3755,6 +3783,7 @@ mod tests {
                     name: "some_fn".to_string(),
                     kind: "function".to_string(),
                     line_range: (1, 5),
+                    body: None,
                 }),
             }],
             rendered_lines: None,

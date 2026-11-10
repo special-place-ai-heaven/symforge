@@ -373,14 +373,8 @@ pub fn build_with_budget(items: &[String], max_bytes: u64) -> (String, usize) {
 }
 
 const CANONICAL_TRUNCATION_MARKER: &str = "[truncated]";
-const APPROX_BYTES_PER_TOKEN: u64 = 4;
-
-fn approx_tokens_from_bytes(bytes: u64) -> u64 {
-    bytes.saturating_add(APPROX_BYTES_PER_TOKEN - 1) / APPROX_BYTES_PER_TOKEN
-}
-
 fn budget_truncation_suffix(max_bytes: u64, remaining: usize) -> String {
-    let max_tokens = approx_tokens_from_bytes(max_bytes);
+    let max_tokens = crate::stel::handler::estimate_tokens_from_bytes(max_bytes);
     format!(
         "\n{CANONICAL_TRUNCATION_MARKER} Truncated at ~{max_tokens} tokens. {remaining} additional output line(s) not shown."
     )
@@ -1073,7 +1067,6 @@ pub(crate) fn outline_text_for_generation_with(
 
 use super::file_read::{
     COMPETENT_READ_WINDOW_LINES, SMALL_FILE_CHAR_THRESHOLD, competent_manual_baseline_chars,
-    estimate_tokens_from_chars,
 };
 
 pub const SMALL_FILE_LINE_THRESHOLD: usize = 50;
@@ -1093,7 +1086,7 @@ pub fn saved_tokens_whole_file(response_chars: usize, raw_chars: usize) -> u64 {
     if raw_chars <= response_chars || raw_chars < SMALL_FILE_CHAR_THRESHOLD {
         return 0;
     }
-    estimate_tokens_from_chars(raw_chars.saturating_sub(response_chars))
+    crate::stel::handler::estimate_tokens_from_bytes(raw_chars.saturating_sub(response_chars) as u64)
 }
 
 pub fn saved_tokens_vs_competent_manual(response_chars: usize, raw_chars: usize) -> u64 {
@@ -1101,7 +1094,7 @@ pub fn saved_tokens_vs_competent_manual(response_chars: usize, raw_chars: usize)
     if baseline <= response_chars {
         return 0;
     }
-    estimate_tokens_from_chars(baseline.saturating_sub(response_chars))
+    crate::stel::handler::estimate_tokens_from_bytes(baseline.saturating_sub(response_chars) as u64)
 }
 
 pub fn compact_savings_footer(response_chars: usize, raw_chars: usize) -> String {

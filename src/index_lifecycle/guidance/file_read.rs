@@ -1,8 +1,6 @@
 //! Shared source-read rendering. Presentation may normalize displayed line endings;
 //! the index and native exact-byte pages retain the original source bytes.
-use super::source::{
-    approx_tokens_from_bytes, canonical_truncation_notice, token_truncation_footer,
-};
+use super::source::{canonical_truncation_notice, token_truncation_footer};
 use crate::live_index::{FileContentView, IndexedFile, LiveIndex, search};
 /// Return raw file content, optionally sliced by 1-indexed line range.
 ///
@@ -568,8 +566,10 @@ pub fn cap_file_content_output(output: String) -> String {
         return output;
     }
     let original_bytes = output.len();
-    let original_tokens_est = approx_tokens_from_bytes(original_bytes);
-    let cap_tokens_est = approx_tokens_from_bytes(GET_FILE_CONTENT_MAX_BYTES);
+    let original_tokens_est =
+        crate::stel::handler::estimate_tokens_from_bytes(original_bytes as u64);
+    let cap_tokens_est =
+        crate::stel::handler::estimate_tokens_from_bytes(GET_FILE_CONTENT_MAX_BYTES as u64);
     let detail = format!(
         "Original output is ~{original_tokens_est} tokens ({original_bytes} bytes), exceeding {GET_FILE_CONTENT_MAX_BYTES}-byte cap. Use chunk_index + max_lines, around_line, around_match, or around_symbol to read a smaller window."
     );
@@ -709,7 +709,7 @@ pub fn competent_manual_baseline_chars(raw_chars: usize) -> usize {
 }
 
 pub fn default_read_max_tokens() -> u64 {
-    estimate_tokens_from_chars(competent_manual_baseline_chars(4000))
+    crate::stel::handler::estimate_tokens_from_bytes(competent_manual_baseline_chars(4000) as u64)
 }
 
 pub fn resolve_read_max_tokens(explicit: Option<u64>, raw_chars: usize) -> u64 {
@@ -717,13 +717,9 @@ pub fn resolve_read_max_tokens(explicit: Option<u64>, raw_chars: usize) -> u64 {
         Some(t) if t > 0 => t,
         _ => {
             let baseline = competent_manual_baseline_chars(raw_chars);
-            estimate_tokens_from_chars(baseline).max(64)
+            crate::stel::handler::estimate_tokens_from_bytes(baseline as u64).max(64)
         }
     }
-}
-
-pub fn estimate_tokens_from_chars(chars: usize) -> u64 {
-    chars.div_ceil(4) as u64
 }
 
 pub fn append_dedup_hint_footer(

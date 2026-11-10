@@ -370,9 +370,19 @@ fn repair_lifecycle_retirement_contract_documents_checkpoint_snapshot_workflow()
     }
 }
 
+/// Raw registered definitions plus the slimmed full-surface list clients
+/// actually receive from `tools/list` (SF-TE-05): both must pass every check.
+fn raw_and_advertised_tools() -> Vec<rmcp::model::Tool> {
+    let mut tools = SymForgeServer::tool_definitions();
+    tools.extend(symforge::protocol::surface_probe::list_tools_for_profile(
+        symforge::protocol::surface_probe::SurfaceProfile::Full,
+    ));
+    tools
+}
+
 #[test]
 fn all_tools_have_valid_schemas() {
-    for tool in SymForgeServer::tool_definitions() {
+    for tool in raw_and_advertised_tools() {
         let schema = tool.input_schema.as_ref();
 
         // Must be type=object
@@ -397,7 +407,7 @@ fn minimal_payloads_deserialize_for_all_tools() {
     // For each tool, build a minimal JSON payload from the schema's required
     // fields, roundtrip it through JSON serialization, and verify it satisfies
     // every schema-required field and declared JSON property type.
-    for tool in SymForgeServer::tool_definitions() {
+    for tool in raw_and_advertised_tools() {
         let schema = tool.input_schema.as_ref();
         let payload = build_minimal_payload(schema);
 

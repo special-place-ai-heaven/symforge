@@ -35,7 +35,7 @@ use super::{SidecarState, handlers};
 /// `bearer_token` is `Some` only for a non-loopback authenticated listener.
 /// The Bearer layer is attached to this entire router, not a single workflow
 /// route. `/health` is the only documented exemption.
-pub fn build_router(state: SidecarState, bearer_token: Option<String>) -> Router {
+pub fn build_router(state: SidecarState, bind_host: &str, bearer_token: Option<String>) -> Router {
     let router = Router::new()
         .route("/health", get(handlers::health_handler))
         .route("/outline", get(handlers::outline_handler))
@@ -73,16 +73,33 @@ pub fn build_router(state: SidecarState, bearer_token: Option<String>) -> Router
         ));
 
     // `with_state` type-erases so the optional Bearer layer does not split
-    // the function's return type. No layer on loopback (hook-compat).
-    match bearer_token {
-        Some(token) => router
-            .layer(axum::middleware::from_fn_with_state(
-                token,
-                require_sidecar_bearer,
-            ))
-            .with_state(state),
-        None => router.with_state(state),
+    // the function's return type. Loopback gets the serve lane's Host
+    // allow-list instead of Bearer (hook-compat; defeats DNS rebinding).
+    let router = match bearer_token {
+        Some(token) => router.layer(axum::middleware::from_fn_with_state(
+            token,
+            require_sidecar_bearer,
+        )),
+        None => router.layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::new(crate::server::auth::host_allow_list(bind_host)),
+            crate::server::auth::require_allowed_authority,
+        )),
+    };
+    // Outermost: hook clients never send Origin, browsers always do.
+    router
+        .layer(axum::middleware::from_fn(refuse_origin))
+        .with_state(state)
+}
+
+async fn refuse_origin(request: Request, next: Next) -> Response {
+    if request.headers().contains_key(header::ORIGIN) {
+        return (
+            StatusCode::FORBIDDEN,
+            "Forbidden: browser origin not allowed",
+        )
+            .into_response();
     }
+    next.run(request).await
 }
 
 /// Constant-time byte-slice equality (daemon shape).

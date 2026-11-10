@@ -798,13 +798,6 @@ pub use crate::index_lifecycle::guidance::file_read::default_read_max_tokens;
 /// Resolve an explicit or default token budget for read-like tools.
 pub use crate::index_lifecycle::guidance::file_read::resolve_read_max_tokens;
 
-/// Estimated tokens from a character count (`~chars/4` approximation).
-///
-/// Coarse heuristic, NOT a measured token count. Callers that surface the
-/// result to an agent label it as an estimate (the savings footer uses `~N
-/// tokens` framing) so no figure is presented as exact/measured (010 N-4).
-pub use crate::index_lifecycle::guidance::file_read::estimate_tokens_from_chars;
-
 pub fn saved_tokens_whole_file(response_chars: usize, raw_chars: usize) -> u64 {
     crate::index_lifecycle::guidance::read_context::saved_tokens_whole_file(
         response_chars,

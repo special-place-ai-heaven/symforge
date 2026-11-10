@@ -549,6 +549,7 @@ fn test_search_text_result_view_group_by_symbol_keeps_duplicate_names_separate()
                             name: "connect".to_string(),
                             kind: "fn".to_string(),
                             line_range: (0, 1),
+                            body: None,
                         }),
                     },
                     search::TextLineMatch {
@@ -558,6 +559,7 @@ fn test_search_text_result_view_group_by_symbol_keeps_duplicate_names_separate()
                             name: "connect".to_string(),
                             kind: "fn".to_string(),
                             line_range: (3, 4),
+                            body: None,
                         }),
                     },
                 ],
@@ -875,6 +877,59 @@ fn search_text_partial_result_reports_policy_withheld_files_and_reasons() {
     assert!(
         !rendered.contains("path-rule") && !rendered.contains("SensitivePath"),
         "must not disclose the detector; got: {rendered}"
+    );
+}
+
+#[test]
+fn withheld_note_counts_only_files_inside_the_search_scope() {
+    let mut index = make_index(vec![make_file(
+        "src/code/lib.rs",
+        b"fn needle() {}\n",
+        vec![make_symbol("needle", SymbolKind::Function, 0, 0, 1)],
+    )]);
+    index.manifest_entries = vec![
+        catalog_indexed(
+            "src/code/lib.rs",
+            crate::domain::IndexTargets::Code,
+            LanguageId::Rust,
+        ),
+        catalog_metadata_only(
+            "tests/fixtures/leaky.env",
+            crate::domain::MetadataOnlyReason::SensitivePath {
+                rule_id: "path-rule".to_string(),
+            },
+        ),
+    ];
+    let render = |options: &search::TextSearchOptions| {
+        search_text_result_view(
+            search::search_text_with_options(&index, Some("needle"), None, false, options),
+            None,
+            None,
+            None,
+            SearchSuggestionContext::default(),
+        )
+    };
+    let mut options = search::TextSearchOptions::for_current_code_search();
+    assert!(!options.noise_policy.include_tests);
+    let default = render(&options);
+    assert!(default.contains("needle"), "{default}");
+    assert!(
+        !default.contains("withheld by admission policy"),
+        "a withheld test fixture is outside a tests-excluded search: {default}"
+    );
+
+    options.noise_policy.include_tests = true;
+    let with_tests = render(&options);
+    assert!(
+        with_tests.contains("1 in-scope file withheld by admission policy"),
+        "{with_tests}"
+    );
+
+    options.glob = Some("src/**".to_string());
+    let globbed = render(&options);
+    assert!(
+        !globbed.contains("withheld by admission policy"),
+        "the glob excludes the withheld file: {globbed}"
     );
 }
 
@@ -1927,6 +1982,7 @@ fn test_health_compact_idle_watcher_shows_reconcile_repairs() {
         last_overflow_at: None,
         stale_files_found: 7,
         last_reconcile_at: Some(SystemTime::now()),
+        last_degraded_publication: None,
     };
     let report = health_report_compact_from_published_state(&published, &watcher, 0);
     assert!(

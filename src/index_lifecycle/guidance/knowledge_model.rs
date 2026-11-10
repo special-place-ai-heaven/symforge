@@ -297,7 +297,8 @@ fn render_budgeted_code_knowledge_only_with_mode(
         if lean.len() <= (max_tokens as usize).saturating_mul(4) {
             lean
         } else {
-            let minimum_tokens = lean.len().div_ceil(4);
+            let minimum_tokens =
+                crate::stel::handler::estimate_tokens_from_bytes(lean.len() as u64);
             format!(
                 "Error: max_tokens is too small for atomic knowledge provenance; minimum_tokens={minimum_tokens}. Continuation: retry sections=[\"knowledge\"] with a higher max_tokens."
             )

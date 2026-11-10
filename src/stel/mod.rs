@@ -102,7 +102,7 @@ pub use golden_replay::{
 };
 pub use handler::{
     DecisionEnvelopeMetrics, StubServeMetrics, envelope_for_decision, envelope_for_stub_serve,
-    estimate_tokens, finalize_symforge_output, format_preview_body, format_preview_body_for_plan,
+    finalize_symforge_output, format_preview_body, format_preview_body_for_plan,
     format_preview_estimate, metrics_for_decision, prepend_envelope, stub_plan_summary,
 };
 pub use ledger::{

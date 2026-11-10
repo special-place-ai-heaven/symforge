@@ -15,6 +15,10 @@ pub struct SearchKnowledgeCounts {
     pub suppressed: u64,
     pub review_required: u64,
     pub unknown: u64,
+    /// Matching units the default scope excluded (archive or dated
+    /// research/review folders); `include_archived` searches them.
+    #[serde(default)]
+    pub archived: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

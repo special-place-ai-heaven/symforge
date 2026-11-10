@@ -26,8 +26,20 @@ fn server_for_repo(root: &Path) -> SymForgeServer {
     server_and_index(root).0
 }
 
+/// Dismiss apply needs operator approval; this binary runs as the approved
+/// operator. The unapproved refusal is pinned in `secret_dismiss_operator_gate.rs`.
+#[allow(unsafe_code)] // test-only process env setup
+fn approve_dismiss_as_operator() {
+    static APPROVE: std::sync::Once = std::sync::Once::new();
+    APPROVE.call_once(|| {
+        // SAFETY: set once before any server in this binary reads it; never unset.
+        unsafe { std::env::set_var("SYMFORGE_SECRET_DISMISS_APPROVED", "1") };
+    });
+}
+
 /// A server plus the shared index it serves, for tests that checkpoint.
 fn server_and_index(root: &Path) -> (SymForgeServer, symforge::live_index::SharedIndex) {
+    approve_dismiss_as_operator();
     let shared = LiveIndex::load(root).unwrap_or_else(|e| panic!("index: {e}"));
     let server = SymForgeServer::new(
         shared.clone(),
@@ -467,24 +479,9 @@ async fn encrypt_apply_with_sops_leaves_no_plaintext_value() {
     }
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join(".git")).unwrap();
-    // Prefer an operator-provided recipient; otherwise write a synthetic
-    // `.sops.yaml` so the tool path can resolve a public age recipient without
-    // mutating process env (forbid unsafe-code).
-    let recipient = std::env::var("SOPS_AGE_RECIPIENTS").unwrap_or_else(|_| {
-        "age1ql3z7hjy54pw3nyyy8by74w8k6v8xq0xq0xq0xq0xq0xq0xq0xq0xq0x".to_string()
-    });
-    if std::env::var_os("SOPS_AGE_RECIPIENTS").is_none() {
-        write_file(
-            dir.path(),
-            ".sops.yaml",
-            &format!(
-                "creation_rules:
-  - path_regex: .*
-    age: {recipient}
-"
-            ),
-        );
-    }
+    // The recipient is operator configuration (`SOPS_AGE_RECIPIENTS`); a
+    // repo `.sops.yaml` is deliberately ignored. Without it apply must fail
+    // honestly, which the Error branch below accepts.
     let body = format!("{{\n  \"token\": \"{SYNTHETIC_SECRET}\"\n}}\n");
     write_file(dir.path(), "config/app.json", &body);
     let server = server_for_repo(dir.path());

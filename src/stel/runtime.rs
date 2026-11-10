@@ -220,6 +220,9 @@ pub struct StatusObservation<'a> {
     pub project_name: &'a str,
     pub project_root: Option<String>,
     pub index_ready: bool,
+    /// SF-DOG-04 headline label from the same published generation as
+    /// `index_ready` and the counts.
+    pub index_trust: &'static str,
     pub index_files: usize,
     pub index_symbols: usize,
     pub ledger: &'a SessionLedger,
@@ -249,6 +252,7 @@ pub fn render_status_body(request: &StelStatusRequest, observed: StatusObservati
         observed.ledger,
         observed.session_tokens,
     )
+    .with_index_trust(observed.index_trust)
     // US3/T029: surface the durable ledger subsystem state so
     // restart-survival is observable from `status`.
     .with_durable_ledger(durable_ledger_state(observed.store));
@@ -305,10 +309,13 @@ pub fn finalize_with_ledger(
 /// that admits its output after rendering records the event only once the
 /// answer is delivered.
 pub fn render_facade_answer(input: FacadeLedgerInput<'_>) -> (String, StelLedgerEvent) {
-    use super::handler::{self, finalize_symforge_output, metrics_for_decision_tuned};
+    use super::handler::{finalize_symforge_output, metrics_for_decision_tuned};
     use super::ledger::{LedgerCaptureInput, capture_ledger, format_ledger_envelope_line};
 
-    let response_tokens = handler::estimate_tokens(input.body);
+    let response_tokens = u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+        input.body.len() as u64,
+    ))
+    .unwrap_or(u32::MAX);
     // T032: record the prediction the predictor ACTUALLY made for this call —
     // tuned when a validated tuning is in force, static otherwise — so the
     // ledger's predicted-vs-actual residual reflects the live estimator and

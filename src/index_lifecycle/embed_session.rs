@@ -749,6 +749,11 @@ fn record_context(context: &mut SessionContext, output: &QueryOutput, tokens: u3
                     }
                 }
                 TextRows::Names(_) => {}
+                TextRows::Counts(rows) => {
+                    for row in rows {
+                        context.record_listed_file(&row.path, 0);
+                    }
+                }
             }
         }
         QueryOutput::Files(files) => {

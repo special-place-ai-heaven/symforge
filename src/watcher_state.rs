@@ -35,6 +35,10 @@ pub struct WatcherInfo {
     pub stale_files_found: u64,
     /// Wall-clock time of the most recent reconciliation sweep.
     pub last_reconcile_at: Option<SystemTime>,
+    /// Publication generation the last reconciliation sweep ended on while
+    /// still degraded; `None` once a sweep ends non-degraded. A periodic
+    /// sweep that finds this same generation retries once, not five times.
+    pub last_degraded_publication: Option<u64>,
 }
 
 impl Default for WatcherInfo {
@@ -48,6 +52,7 @@ impl Default for WatcherInfo {
             last_overflow_at: None,
             stale_files_found: 0,
             last_reconcile_at: None,
+            last_degraded_publication: None,
         }
     }
 }
@@ -69,5 +74,6 @@ impl WatcherInfo {
             && self.last_overflow_at.is_none()
             && self.stale_files_found == 0
             && self.last_reconcile_at.is_none()
+            && self.last_degraded_publication.is_none()
     }
 }

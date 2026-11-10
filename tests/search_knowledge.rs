@@ -623,6 +623,45 @@ async fn bridge_preview_carries_stable_link_id_without_full_bridge_record() {
     );
 }
 
+/// SF-ARC-07: archive folders are outside the default knowledge scope; the
+/// response says how many matching units were left out and how to include them.
+#[tokio::test]
+async fn archived_docs_are_excluded_by_default_with_a_measured_note() {
+    let fixture = KnowledgeFixture::new();
+    let server = &fixture.server;
+    let call = |args: serde_json::Value| async move {
+        server
+            .dispatch_tool_for_tests("search_knowledge", args)
+            .await
+    };
+    let note = "Excluded by default scope: 1 matching unit(s)";
+
+    let default = call(json!({"query": "snapshot"})).await;
+    assert!(!default.contains("docs/archive/history.md"), "{default}");
+    assert!(
+        default.contains(note) && default.contains("include_archived=true"),
+        "{default}"
+    );
+
+    let opted_out =
+        call(json!({"query": "snapshot", "authority_scope": "all", "include_archived": false}))
+            .await;
+    assert!(
+        !opted_out.contains("docs/archive/history.md"),
+        "{opted_out}"
+    );
+    assert!(opted_out.contains(note), "{opted_out}");
+
+    let opted_in =
+        call(json!({"query": "snapshot", "authority_scope": "all", "include_archived": true}))
+            .await;
+    assert!(opted_in.contains("docs/archive/history.md"), "{opted_in}");
+    assert!(
+        !opted_in.contains("Excluded by default scope"),
+        "{opted_in}"
+    );
+}
+
 #[tokio::test]
 async fn authority_scopes_are_distinct_and_filtered_matches_are_not_false_absence() {
     let fixture = KnowledgeFixture::new();

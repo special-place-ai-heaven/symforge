@@ -200,7 +200,12 @@ impl EmbeddedSourceHandle {
                             session.with_context(|context| {
                                 context.record_summary_output(
                                     "symforge_edit",
-                                    crate::stel::handler::estimate_tokens(&answer.rendered),
+                                    u32::try_from(
+                                        crate::stel::handler::estimate_tokens_from_bytes(
+                                            answer.rendered.len() as u64,
+                                        ),
+                                    )
+                                    .unwrap_or(u32::MAX),
                                 )
                             });
                         }
@@ -735,7 +740,10 @@ impl EmbeddedSourceHandle {
             session.with_context(|context| {
                 context.record_summary_output(
                     "symforge_edit",
-                    crate::stel::handler::estimate_tokens(&output),
+                    u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                        output.len() as u64,
+                    ))
+                    .unwrap_or(u32::MAX),
                 )
             });
         }

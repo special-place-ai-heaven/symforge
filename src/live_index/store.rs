@@ -2231,6 +2231,13 @@ pub struct SharedIndexHandle {
     /// path has survived, tagged with the project generation they were counted
     /// under. In memory only: after a restart a path re-settles.
     unreadable_sweeps: Mutex<(u64, HashMap<crate::domain::CatalogPath, u32>)>,
+    /// Id of the watcher reconcile sweep in progress (0: none). A sweep may
+    /// publish its plan once per retry attempt; the unreadable count advances
+    /// only on the first publication of each sweep.
+    active_reconcile_sweep: AtomicU64,
+    /// Last sweep id the unreadable count advanced for.
+    counted_reconcile_sweep: AtomicU64,
+    next_reconcile_sweep: AtomicU64,
     /// Git temporal intelligence — independently swapped side-table with
     /// per-file churn, ownership, and co-change data. Populated asynchronously
     /// after index load/reload completes.
@@ -2532,6 +2539,9 @@ impl SharedIndexHandle {
             physical_replacement_latched: AtomicBool::new(false),
             rejected_stale_mutations: AtomicU64::new(0),
             unreadable_sweeps: Mutex::new((0, HashMap::new())),
+            active_reconcile_sweep: AtomicU64::new(0),
+            counted_reconcile_sweep: AtomicU64::new(0),
+            next_reconcile_sweep: AtomicU64::new(1),
             git_temporal: ArcSwap::new(temporal),
             git_temporal_jobs: Mutex::new(super::git_temporal::GitTemporalJobQueue::default()),
             pre_update_snapshots: Mutex::new(HashMap::new()),
@@ -3191,6 +3201,11 @@ impl SharedIndexHandle {
     /// a path that became readable (or left the manifest) restarts at zero,
     /// as does everything when the project generation moved.
     fn record_unreadable_sweep_locked(&self, live: &LiveIndex, project_generation: u64) {
+        // Retry attempts inside one watcher sweep are the same sweep.
+        let sweep = self.active_reconcile_sweep.load(Ordering::Acquire);
+        if sweep != 0 && self.counted_reconcile_sweep.swap(sweep, Ordering::AcqRel) == sweep {
+            return;
+        }
         let mut guard = self.unreadable_sweeps.lock();
         let (generation, sweeps) = &mut *guard;
         if *generation != project_generation {
@@ -3224,6 +3239,14 @@ impl SharedIndexHandle {
             .lock()
             .1
             .retain(|path, _| unreadable.contains(path));
+    }
+
+    /// Mark the start of one watcher reconcile sweep; until the guard drops,
+    /// every plan publication counts as that single sweep.
+    pub(crate) fn begin_reconcile_sweep(&self) -> ReconcileSweepGuard<'_> {
+        let id = self.next_reconcile_sweep.fetch_add(1, Ordering::AcqRel);
+        self.active_reconcile_sweep.store(id, Ordering::Release);
+        ReconcileSweepGuard { handle: self }
     }
 
     /// Unreadable paths whose sweep counter, under the current project
@@ -4646,12 +4669,29 @@ impl SharedIndexHandle {
             return None;
         }
         let manifest_entry = catalog_entry_from_scout(&scouted, disposition.clone(), None);
-        let mut live = (*self.live.load_full()).clone();
+        let current = self.live.load_full();
         let retains_last_valid_content = matches!(
             &disposition,
             crate::domain::FileDisposition::Unreadable { .. }
                 | crate::domain::FileDisposition::UnstableDuringRead
         );
+        // Re-observing the disposition already published (a file that stays
+        // unreadable sweep after sweep) changes nothing, so it must not mint
+        // a generation. The current bundle already reflects this observation.
+        let already_published = current
+            .manifest_entries
+            .iter()
+            .any(|entry| entry == &manifest_entry)
+            && (retains_last_valid_content || !current.files.contains_key(path))
+            && self.scout_plan.load_full().is_some_and(|plan| {
+                plan.entries
+                    .iter()
+                    .any(|entry| entry.path == scouted.path && entry == &scouted)
+            });
+        if already_published {
+            return Some(self.published_generation());
+        }
+        let mut live = (*current).clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if !retains_last_valid_content {
                 live.remove_file(path);
@@ -5727,6 +5767,95 @@ impl PublishedIndexState {
     }
 }
 
+/// Ends the watcher reconcile sweep begun by
+/// [`SharedIndexHandle::begin_reconcile_sweep`].
+pub(crate) struct ReconcileSweepGuard<'a> {
+    handle: &'a SharedIndexHandle,
+}
+
+impl Drop for ReconcileSweepGuard<'_> {
+    fn drop(&mut self) {
+        self.handle
+            .active_reconcile_sweep
+            .store(0, Ordering::Release);
+    }
+}
+
+/// SF-DOG-04: the one headline trust state, derived from readiness and
+/// freshness together. Health, the hook sidecar gate and the search envelope
+/// all read it, so no surface can call an index Ready while its freshness is
+/// degraded without saying it may be stale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrustHeadline {
+    /// Ready and current.
+    Ready,
+    /// Ready, but some files were unobserved or a sweep is pending: answers
+    /// are served with a staleness note.
+    ReadyStale,
+    /// Ready, but the view is still being verified against disk.
+    Verifying,
+    /// Ready, but freshness is degraded for a reason that stops serving
+    /// (watcher unavailable, failed verification, capacity, ...).
+    Stale,
+    /// The index itself is degraded (circuit breaker).
+    Degraded,
+    Loading,
+    Empty,
+}
+
+impl TrustHeadline {
+    /// The headline of one published generation: readiness and freshness from
+    /// the same capture.
+    pub(crate) fn of(published: &PublishedGeneration) -> Self {
+        Self::derive(&published.health.status, published.freshness.as_ref())
+    }
+
+    pub(crate) fn derive(
+        status: &PublishedIndexStatus,
+        freshness: &crate::domain::FreshnessStatus,
+    ) -> Self {
+        use crate::domain::{FreshnessReason, FreshnessStatus};
+        match status {
+            PublishedIndexStatus::Empty => Self::Empty,
+            PublishedIndexStatus::Loading => Self::Loading,
+            PublishedIndexStatus::Degraded => Self::Degraded,
+            PublishedIndexStatus::Ready => match freshness {
+                FreshnessStatus::Current => Self::Ready,
+                FreshnessStatus::Verifying => Self::Verifying,
+                FreshnessStatus::Degraded { reason_codes, .. }
+                    if !reason_codes.is_empty()
+                        && reason_codes.iter().all(|reason| {
+                            matches!(
+                                reason,
+                                FreshnessReason::ObservationFailed
+                                    | FreshnessReason::ReconciliationPending
+                            )
+                        }) =>
+                {
+                    Self::ReadyStale
+                }
+                FreshnessStatus::Degraded { .. } => Self::Stale,
+            },
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "Ready",
+            Self::ReadyStale => "Ready (stale)",
+            Self::Verifying => "Ready (verifying)",
+            Self::Stale => "Ready (stale, not served to hooks)",
+            Self::Degraded => "Degraded",
+            Self::Loading => "Loading",
+            Self::Empty => "Empty",
+        }
+    }
+
+    /// Hooks and queries may be answered from this state.
+    pub(crate) fn serves_queries(self) -> bool {
+        matches!(self, Self::Ready | Self::ReadyStale)
+    }
+}
 /// Secondary indices derived from a single `files` map snapshot.
 /// Invariant: these indices are one coherent snapshot derived from exactly
 /// the `files` map they are paired with. Grouping them enforces this.
@@ -9960,6 +10089,146 @@ mod tests {
             shared.scout_plan().expect("plan").coverage,
             crate::domain::CoverageStatus::Complete
         );
+    }
+
+    #[test]
+    fn trust_headline_table_covers_every_readiness_and_freshness_pair() {
+        use crate::domain::FreshnessReason::*;
+        let degraded = |reason_codes: Vec<FreshnessReason>| FreshnessStatus::Degraded {
+            last_valid_content_generation: 1,
+            reason_codes,
+        };
+        let freshness = [
+            ("current", FreshnessStatus::Current),
+            ("verifying", FreshnessStatus::Verifying),
+            ("observation", degraded(vec![ObservationFailed])),
+            ("pending", degraded(vec![ReconciliationPending])),
+            (
+                "both",
+                degraded(vec![ObservationFailed, ReconciliationPending]),
+            ),
+            ("watcher", degraded(vec![WatcherUnavailable])),
+            (
+                "mixed",
+                degraded(vec![ObservationFailed, WatcherUnavailable]),
+            ),
+            ("verify-failed", degraded(vec![SnapshotVerificationFailed])),
+            ("no-reason", degraded(vec![])),
+        ];
+        let expected = |status: &PublishedIndexStatus, name: &str| match (status, name) {
+            (PublishedIndexStatus::Empty, _) => TrustHeadline::Empty,
+            (PublishedIndexStatus::Loading, _) => TrustHeadline::Loading,
+            (PublishedIndexStatus::Degraded, _) => TrustHeadline::Degraded,
+            (PublishedIndexStatus::Ready, "current") => TrustHeadline::Ready,
+            (PublishedIndexStatus::Ready, "verifying") => TrustHeadline::Verifying,
+            (PublishedIndexStatus::Ready, "observation" | "pending" | "both") => {
+                TrustHeadline::ReadyStale
+            }
+            (PublishedIndexStatus::Ready, _) => TrustHeadline::Stale,
+        };
+        for status in [
+            PublishedIndexStatus::Empty,
+            PublishedIndexStatus::Loading,
+            PublishedIndexStatus::Ready,
+            PublishedIndexStatus::Degraded,
+        ] {
+            for (name, fresh) in &freshness {
+                let headline = TrustHeadline::derive(&status, fresh);
+                assert_eq!(headline, expected(&status, name), "{status:?} / {name}");
+                let label = headline.label();
+                if label.starts_with("Ready") && matches!(fresh, FreshnessStatus::Degraded { .. }) {
+                    assert!(
+                        label.contains("stale"),
+                        "{status:?} / {name}: Ready with degraded freshness needs the stale qualifier"
+                    );
+                }
+                assert_eq!(
+                    headline.serves_queries(),
+                    matches!(headline, TrustHeadline::Ready | TrustHeadline::ReadyStale),
+                    "{status:?} / {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn health_status_line_carries_the_stale_qualifier_when_freshness_is_degraded() {
+        use crate::index_lifecycle::guidance::health::{
+            HealthProcessSections, HealthReportInputs, QuarantineWindow, RuntimeMode,
+            RuntimeStatus, render_health_compact, render_health_report,
+        };
+        let project = TempDir::new().unwrap();
+        write_file(project.path(), "main.rs", "fn main() {}\n");
+        write_file(project.path(), "locked.rs", "fn locked() {}\n");
+        let shared = LiveIndex::load(project.path()).unwrap();
+        let scouted = shared
+            .scout_plan()
+            .expect("cold scout plan")
+            .entries
+            .iter()
+            .find(|entry| entry.path.normalized_utf8.as_deref() == Some("locked.rs"))
+            .expect("scouted locked.rs")
+            .clone();
+        assert!(
+            shared
+                .publish_terminal_disposition_at_generation(
+                    "locked.rs",
+                    scouted,
+                    FileDisposition::Unreadable {
+                        stage: crate::domain::AccessStage::FullRead,
+                        kind: crate::domain::AccessErrorKind::PermissionDenied,
+                    },
+                    shared.current_project_generation(),
+                    shared.published_state().generation,
+                )
+                .is_some()
+        );
+        let source_set = shared.published_source_set();
+        let generation = source_set.current_generation();
+        assert_eq!(generation.health.status, PublishedIndexStatus::Ready);
+        assert!(matches!(
+            generation.freshness.as_ref(),
+            FreshnessStatus::Degraded { .. }
+        ));
+        let runtime_status = RuntimeStatus {
+            mode: RuntimeMode::LocalProcess,
+            project_root: None,
+            project_id: "project-test".to_string(),
+            session_id: "session-test".to_string(),
+            index_generation: generation.health.generation,
+            project_generation: generation.project_generation,
+            reset_project_generation: None,
+            load_source: generation.health.load_source,
+        };
+        let watcher = crate::watcher_state::WatcherInfo::default();
+        let inputs = HealthReportInputs {
+            source_set: &source_set,
+            watcher: &watcher,
+            rejected_stale_mutations: 0,
+            runtime_status: &runtime_status,
+            repo_root: None,
+            placement: None,
+            persistence: crate::domain::CapabilityStatus::Available,
+            session_is_daemon: false,
+            worktree_routing: String::new(),
+            curation_health: String::new(),
+            settled_unreadable: shared.settled_unreadable_paths(),
+        };
+        let process = HealthProcessSections {
+            after_runtime: String::new(),
+            worktree_misuse: Err("not observed in this test"),
+            trailing: String::new(),
+        };
+        for report in [
+            render_health_report(&inputs, QuarantineWindow::default(), &process),
+            render_health_compact(&inputs, &process),
+        ] {
+            let status = report.lines().next().unwrap_or_default();
+            assert!(
+                status == "Status: Ready (stale)" || status.starts_with("Status: Ready (stale) | "),
+                "degraded freshness must qualify Ready: {report}"
+            );
+        }
     }
 
     #[test]

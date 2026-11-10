@@ -29,6 +29,9 @@ const MAX_REMEDIATION_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_REMEDIATION_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REMEDIATION_SCAN_FILES: usize = 4096;
 
+/// Operator approval for `dismiss` apply; never settable through MCP.
+pub(crate) const SECRET_DISMISS_APPROVAL_ENV: &str = "SYMFORGE_SECRET_DISMISS_APPROVED";
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SecretRemediateInput {
     /// One path, list of paths, or the string `"repo"`.
@@ -109,6 +112,25 @@ impl SymForgeServer {
                 ));
             }
         };
+
+        // Dismiss apply clears a refusal, so the refused caller cannot grant
+        // it: without operator approval it degrades to a preview (no replay
+        // reservation, no write) plus the instruction.
+        if matches!(action, RemediationActionName::Dismiss)
+            && !input.preview
+            && std::env::var(SECRET_DISMISS_APPROVAL_ENV).as_deref() != Ok("1")
+        {
+            let preview = SecretRemediateInput {
+                preview: true,
+                idempotency_key: None,
+                ..input
+            };
+            let paths = resolve_scope_paths(self, &preview.scope)?;
+            let shown = self.run_dismiss(&preview, &paths, &None).await?;
+            return Err(format!(
+                "Error: dismiss apply refused: dismissal requires operator approval outside MCP ({SECRET_DISMISS_APPROVAL_ENV}=1 in the server environment). Nothing was written; the refusal remains in force.\n\n{shown}"
+            ));
+        }
 
         // Idempotency: preview never reserves; apply honors edit-lane replay.
         let idempotency = match begin_secret_replay(self, &input) {
@@ -731,11 +753,10 @@ fn encrypt_runtime_availability(server: &SymForgeServer) -> (bool, String) {
     if sops_binary_on_path().is_none() {
         return (false, "sops_not_installed".to_string());
     }
-    let live = server.index.data_plane().read();
-    let Some(root) = live.indexed_root.as_deref() else {
+    if server.index.data_plane().read().indexed_root.is_none() {
         return (false, "no_indexed_root".to_string());
-    };
-    match resolve_age_recipient(root) {
+    }
+    match resolve_age_recipient() {
         Ok(r) => (true, r),
         Err(reason) => (false, reason),
     }
@@ -753,28 +774,18 @@ fn sops_binary_on_path() -> Option<PathBuf> {
     })
 }
 
-fn resolve_age_recipient(root: &Path) -> Result<String, String> {
-    if let Ok(env) = std::env::var("SOPS_AGE_RECIPIENTS") {
-        let first = env
-            .split(',')
-            .map(str::trim)
-            .find(|s| !s.is_empty() && s.starts_with("age1"));
-        if let Some(r) = first {
-            return Ok(r.to_string());
-        }
-    }
-    let sops_yaml = root.join(".sops.yaml");
-    if !sops_yaml.is_file() {
-        return Err("no_recipient_configured".to_string());
-    }
-    let text = std::fs::read_to_string(&sops_yaml).map_err(|_| "no_recipient_configured")?;
-    for token in text.split_whitespace() {
-        let t = token.trim_matches(|c: char| c == '"' || c == '\'' || c == ',');
-        if t.starts_with("age1") && t.len() > 16 {
-            return Ok(t.to_string());
-        }
-    }
-    Err("no_recipient_configured".to_string())
+/// Operator configuration only: a repo-controlled `.sops.yaml` must not choose
+/// who can decrypt the encrypted value.
+fn resolve_age_recipient() -> Result<String, String> {
+    std::env::var("SOPS_AGE_RECIPIENTS")
+        .ok()
+        .and_then(|env| {
+            env.split(',')
+                .map(str::trim)
+                .find(|s| !s.is_empty() && s.starts_with("age1"))
+                .map(str::to_string)
+        })
+        .ok_or_else(|| "no_recipient_configured".to_string())
 }
 
 fn resolve_scope_paths(server: &SymForgeServer, scope: &Value) -> Result<Vec<String>, String> {
@@ -926,5 +937,25 @@ mod tests {
             apply_status_for_rescan("unreadable after write: boom"),
             "apply_status: ok"
         );
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // test-only: clear and restore the operator recipient env.
+    fn repo_sops_yaml_does_not_supply_the_age_recipient() {
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::write(
+            repo.path().join(".sops.yaml"),
+            "creation_rules:\n  - path_regex: .*\n    age: age1ql3z7hjy54pw3nyyy8by74w8k6v8xq0xq0xq0xq0xq0xq0xq0xq0xq0x\n",
+        )
+        .expect("write .sops.yaml");
+        let previous = std::env::var_os("SOPS_AGE_RECIPIENTS");
+        // SAFETY: single-threaded test context; restored below.
+        unsafe { std::env::remove_var("SOPS_AGE_RECIPIENTS") };
+        let resolved = super::resolve_age_recipient();
+        if let Some(previous) = previous {
+            // SAFETY: single-threaded test context; restores the prior value.
+            unsafe { std::env::set_var("SOPS_AGE_RECIPIENTS", previous) };
+        }
+        assert_eq!(resolved, Err("no_recipient_configured".to_string()));
     }
 }

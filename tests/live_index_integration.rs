@@ -865,6 +865,7 @@ fn test_health_report_with_watcher_reconciliation_fields() {
         last_overflow_at: Some(SystemTime::now()),
         stale_files_found: 4,
         last_reconcile_at: Some(SystemTime::now()),
+        last_degraded_publication: None,
     };
 
     let result = format::health_report_with_watcher(&index, &watcher);
