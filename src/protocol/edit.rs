@@ -760,6 +760,16 @@ pub(crate) fn execute_batch_edit(
         language: LanguageId,
     }
 
+    // Every per-edit value, not only the first per file, before anything else.
+    crate::worktree::refuse_network_working_directories(
+        std::iter::once(top_level_working_directory).chain(
+            edits
+                .iter()
+                .map(|e| e.working_directory.as_deref().map(Path::new)),
+        ),
+    )
+    .map_err(|error| error.to_string())?;
+
     // Phase 1: Resolve all symbols.
     let n = edits.len();
     let targeted_paths: Vec<&str> = edits.iter().map(|e| e.path.as_str()).collect();
@@ -1607,6 +1617,16 @@ pub(crate) fn execute_batch_insert(
         InsertPosition::Before => "before",
         InsertPosition::After => "after",
     };
+
+    crate::worktree::refuse_network_working_directories(
+        std::iter::once(input.working_directory.as_deref().map(Path::new)).chain(
+            input
+                .targets
+                .iter()
+                .map(|t| t.working_directory.as_deref().map(Path::new)),
+        ),
+    )
+    .map_err(|error| error.to_string())?;
 
     // Phase 1: resolve all targets from the current index snapshot.
     let mut resolved = Vec::with_capacity(input.targets.len());
@@ -3020,6 +3040,50 @@ mod tests {
         let result = execute_batch_edit(&handle, dir.path(), None, &edits, false, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Overlapping"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_execute_batch_edit_refuses_any_network_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let original = b"fn foo() {}\nfn bar() {}\n";
+        std::fs::write(dir.path().join("src/a.rs"), original).unwrap();
+        let handle = crate::live_index::LiveIndex::empty();
+        let parsed = crate::parsing::process_file("src/a.rs", original, LanguageId::Rust);
+        handle.update_file(
+            "src/a.rs".to_string(),
+            IndexedFile::from_parse_result(parsed, original.to_vec()),
+        );
+        let root = dir.path().to_string_lossy().to_string();
+        let unc = r"\\nonexistent-host.invalid\share".to_string();
+        let edit = |name: &str, wd: &str| SingleEdit {
+            path: "src/a.rs".to_string(),
+            name: name.to_string(),
+            kind: None,
+            symbol_line: None,
+            operation: EditOperation::Delete,
+            working_directory: Some(wd.to_string()),
+        };
+        // Network value on either edit of one file, then on the top level while
+        // every edit carries its own local value.
+        let cases = [
+            (vec![edit("foo", &root), edit("bar", &unc)], None),
+            (vec![edit("foo", &unc), edit("bar", &root)], None),
+            (
+                vec![edit("foo", &root), edit("bar", &root)],
+                Some(Path::new(unc.as_str())),
+            ),
+        ];
+        for (edits, top_level) in cases {
+            let error = execute_batch_edit(&handle, dir.path(), None, &edits, false, top_level)
+                .expect_err("network working_directory must be refused");
+            assert!(error.starts_with("NetworkPathRefused"), "{error}");
+            assert_eq!(
+                std::fs::read(dir.path().join("src/a.rs")).unwrap(),
+                original
+            );
+        }
     }
 
     #[test]

@@ -218,6 +218,131 @@ fn run_hook_routed_success_writes_source_read_routed_event() {
     );
 }
 
+/// SF-TE-09: a regex Grep has nothing worth asking the sidecar. The hook must
+/// fail open with empty context, send no enrichment request (no `/health`
+/// stand-in), and record no `routed` row.
+#[test]
+fn run_hook_regex_grep_skips_enrichment_without_routed_row() {
+    const HEALTH_MARKER: &str = "index-health-json-must-not-escape";
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock sidecar listener");
+    let port = listener
+        .local_addr()
+        .expect("mock sidecar local_addr")
+        .port();
+    listener
+        .set_nonblocking(true)
+        .expect("set mock sidecar listener non-blocking");
+    let stop = Arc::new(AtomicBool::new(false));
+    let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mock = {
+        let stop = Arc::clone(&stop);
+        let requests = Arc::clone(&requests);
+        thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                };
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let request = read_http_request(&mut stream);
+                let Some(line) = request.lines().next() else {
+                    continue;
+                };
+                requests
+                    .lock()
+                    .expect("requests lock")
+                    .push(line.to_string());
+                let body = format!(r#"{{"index_state":"Ready","marker":"{HEALTH_MARKER}"}}"#);
+                write_http_ok(&mut stream, &body);
+            }
+        })
+    };
+
+    let tmp = TempDir::new().expect("tempdir creation");
+    let home = TempDir::new().expect("control-state tempdir creation");
+    // Daemon-backed descriptor: selecting it would send a GET /health
+    // boot-epoch probe, so an empty request list proves the skip happens
+    // before descriptor selection.
+    write_daemon_session_descriptor(home.path(), tmp.path(), port, "session-1");
+    // The helper asserts the log exists; a skip must leave it empty.
+    std::fs::write(home.path().join(ADOPTION_LOG_FILE), "").expect("seed adoption log");
+
+    let payload = r#"{"tool_name":"Grep","tool_input":{"pattern":"compact|SYMFORGE_SURFACE"}}"#;
+    let (stdout, log, _stderr) = run_hook_in_tempdir_with_env_and_stderr(
+        tmp.path(),
+        payload,
+        &[("SYMFORGE_HOME", home.path().to_string_lossy().as_ref())],
+    );
+    stop.store(true, Ordering::SeqCst);
+    mock.join().expect("mock sidecar thread joins");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("hook output must be valid JSON");
+    assert_eq!(
+        parsed["hookSpecificOutput"]["additionalContext"], "",
+        "a skipped Grep must inject no context; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(HEALTH_MARKER),
+        "health body leaked:\n{stdout}"
+    );
+    assert!(
+        !log.contains("routed"),
+        "a skipped Grep must not be counted as routed; got:\n{log}"
+    );
+    let requests = requests.lock().expect("requests lock");
+    assert!(
+        requests.is_empty(),
+        "a skipped Grep must send no HTTP request at all (not even the epoch probe); got: {requests:?}"
+    );
+}
+
+/// SF-ADOPT-01: a Ready sidecar whose freshness is degraded only by an
+/// unreadable file answers 200 with a staleness marker; the hook injects it
+/// and records `routed`, not a refusal.
+#[test]
+fn run_hook_observation_degraded_sidecar_records_routed_with_marker() {
+    const BODY: &str = "[symforge: index may be stale — freshness degraded (ObservationFailed, ReconciliationPending); see health for unreadable files]\nsrc/foo.rs outline";
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock sidecar listener");
+    let port = listener
+        .local_addr()
+        .expect("mock sidecar local_addr")
+        .port();
+    let mock = thread::spawn(move || serve_mock_http_response(listener, "200 OK", BODY));
+
+    let tmp = TempDir::new().expect("tempdir creation");
+    let home = TempDir::new().expect("control-state tempdir creation");
+    write_sidecar_descriptor(home.path(), tmp.path(), port);
+    let (stdout, log, _stderr) = run_hook_in_tempdir_with_env_and_stderr(
+        tmp.path(),
+        READ_PAYLOAD,
+        &[("SYMFORGE_HOME", home.path().to_string_lossy().as_ref())],
+    );
+    mock.join().expect("mock sidecar thread joins");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("hook output must be valid JSON");
+    let context = parsed["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("additionalContext is a string");
+    assert!(
+        context.starts_with("[symforge: index may be stale"),
+        "the staleness marker must reach the agent; got:\n{stdout}"
+    );
+    assert!(
+        log.contains("\tsource-read\trouted"),
+        "a served degraded answer is routed work; got:\n{log}"
+    );
+}
+
 /// A session that starts while the index is still loading gets the one-line
 /// initial-indexing notice instead of empty context, and never the 503 body.
 #[test]
@@ -317,6 +442,10 @@ fn run_hook_index_not_ready_fails_open_as_sidecar_error() {
         "an index-loading refusal must not suggest restarting a live sidecar; got:\n{log}"
     );
     assert!(
+        log.contains("\treason=index_not_ready\t"),
+        "SF-ADOPT-02: the refusal reason must be persisted; got:\n{log}"
+    );
+    assert!(
         stderr.contains("index not ready"),
         "verbose diagnostics must name the live-but-loading condition; got:\n{stderr}"
     );
@@ -370,6 +499,10 @@ fn run_hook_local_http_500_fails_open_as_http_failure_without_restart_hint() {
         "a live sidecar's 500 must use the HTTP-error lane; stderr:\n{stderr}\nlog:\n{log}"
     );
     assert!(!log.contains("sidecar_port_stale"));
+    assert!(
+        log.contains("\treason=http_failure\t"),
+        "SF-ADOPT-02: the refusal reason must be persisted; got:\n{log}"
+    );
     assert!(stderr.contains("outcome=SidecarError reason=http_failure"));
     assert!(!stderr.contains("sidecar not running"));
     assert!(!stderr.contains("restart_sidecar"));
@@ -410,6 +543,10 @@ fn run_hook_root_conflict_fails_open_without_stale_sidecar_hint() {
     assert_eq!(parsed["hookSpecificOutput"]["additionalContext"], "");
     assert!(!stdout.contains(CONFLICT_MARKER));
     assert!(log.contains("\tsource-read\tsidecar-error"));
+    assert!(
+        log.contains("\treason=root_conflict\t"),
+        "SF-ADOPT-02: the refusal reason must be persisted; got:\n{log}"
+    );
     assert!(!log.contains("sidecar_port_stale"));
     assert!(stderr.contains("root conflict"));
     assert!(!stderr.contains("sidecar not running"));

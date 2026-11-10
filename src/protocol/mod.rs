@@ -318,7 +318,7 @@ fn disabled_analytics_recorder(
 }
 
 fn estimate_tokens(response_bytes: u64) -> u64 {
-    response_bytes.saturating_add(3) / 4
+    crate::stel::handler::estimate_tokens_from_bytes(response_bytes)
 }
 
 impl SymForgeServer {

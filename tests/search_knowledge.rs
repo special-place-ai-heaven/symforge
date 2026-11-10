@@ -887,8 +887,9 @@ async fn ask_routes_repository_orientation_to_the_combined_map_without_prose_inv
     assert!(output.contains("Chosen tool: get_repo_map"));
     assert!(output.contains("Invocation: get_repo_map(detail=\"compact\")"));
     assert!(output.contains("Index:"));
-    assert!(output.contains("Repository knowledge:"));
-    assert!(output.contains("Missing roles:"));
+    // The knowledge digests are opt-in (include_knowledge) and cost ~2,500 tokens.
+    assert!(!output.contains("Repository knowledge:"));
+    assert!(!output.contains("unit_id="));
     assert!(!output.contains("A future checkpoint may stream snapshots."));
 }
 
@@ -897,12 +898,28 @@ async fn repo_map_preserves_topology_and_appends_one_captured_bounded_knowledge_
     let fixture = KnowledgeFixture::new();
     let first = fixture
         .server
-        .dispatch_tool_for_tests("get_repo_map", json!({"detail": "compact"}))
+        .dispatch_tool_for_tests(
+            "get_repo_map",
+            json!({"detail": "compact", "include_knowledge": true}),
+        )
         .await;
     let second = fixture
         .server
+        .dispatch_tool_for_tests(
+            "get_repo_map",
+            json!({"detail": "compact", "include_knowledge": true}),
+        )
+        .await;
+    let default_map = fixture
+        .server
         .dispatch_tool_for_tests("get_repo_map", json!({"detail": "compact"}))
         .await;
+    assert!(default_map.contains("Index:"));
+    assert!(!default_map.contains("unit_id="), "{default_map}");
+    assert!(
+        !default_map.contains("Repository knowledge:"),
+        "{default_map}"
+    );
 
     assert_eq!(first, second);
     assert!(first.contains("Index:"));
@@ -1464,7 +1481,7 @@ async fn real_repository_orientation_and_review_are_repeatable_and_actionable() 
         None,
     );
 
-    let map_request = json!({"detail": "compact", "max_tokens": 4000});
+    let map_request = json!({"detail": "compact", "max_tokens": 4000, "include_knowledge": true});
     let first_map = server
         .dispatch_tool_for_tests("get_repo_map", map_request.clone())
         .await;
@@ -1659,16 +1676,84 @@ async fn repository_map_tight_budget_prioritizes_exact_role_cards_and_degraded_c
         .server
         .dispatch_tool_for_tests(
             "get_repo_map",
-            json!({"detail": "compact", "max_tokens": 512}),
+            json!({"detail": "compact", "max_tokens": 60}),
         )
         .await;
 
+    // The over-budget summary is the code map cut at the budget, never digests.
     assert!(output.contains("output_coverage=degraded"), "{output}");
-    assert!(output.contains("Repository knowledge:"), "{output}");
-    assert!(output.contains("unit_id="), "{output}");
-    assert!(output.contains("content_hash="), "{output}");
-    assert!(output.contains("evidence_anchor="), "{output}");
+    assert!(output.contains("Index:"), "{output}");
+    assert!(output.contains("files"), "{output}");
+    assert!(!output.contains("unit_id="), "{output}");
     assert!(output.contains("CCR:"), "{output}");
+
+    let estimate = fixture
+        .server
+        .dispatch_tool_for_tests(
+            "get_repo_map",
+            json!({"detail": "compact", "estimate": true}),
+        )
+        .await;
+    assert!(estimate.contains("Estimate for get_repo_map"), "{estimate}");
+    assert!(!estimate.contains("~500 tokens"), "{estimate}");
+}
+
+#[tokio::test]
+async fn repo_map_estimate_is_measured_from_the_rendered_view() {
+    let fixture = KnowledgeFixture::new();
+    for args in [
+        json!({"detail": "compact"}),
+        json!({"detail": "tree", "path": "docs"}),
+        json!({"detail": "full", "max_files": 3}),
+    ] {
+        let rendered = fixture
+            .server
+            .dispatch_tool_for_tests("get_repo_map", args.clone())
+            .await;
+        let mut est_args = args;
+        est_args["estimate"] = json!(true);
+        let estimate = fixture
+            .server
+            .dispatch_tool_for_tests("get_repo_map", est_args)
+            .await;
+        let tokens: f64 = estimate
+            .split("~")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("no estimate in {estimate}"));
+        let actual = rendered.len() as f64 / 4.0;
+        assert!(
+            (tokens - actual).abs() <= actual * 0.2 + 1.0,
+            "estimate {tokens} vs rendered/4 {actual} for {estimate}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn repo_map_at_500_tokens_keeps_the_top_level_tree() {
+    let fixture = KnowledgeFixture::new();
+
+    // Adaptive detail (small repo fits the budget): per-file rows.
+    let adaptive = fixture
+        .server
+        .dispatch_tool_for_tests("get_repo_map", json!({"max_tokens": 500}))
+        .await;
+    assert!(adaptive.contains("\n  src/lib.rs "), "{adaptive}");
+    assert!(adaptive.contains("\n  docs/recovery.md "), "{adaptive}");
+    assert!(!adaptive.contains("unit_id="), "{adaptive}");
+
+    // Compact detail: directory rows, not just the `Index:` header.
+    let compact = fixture
+        .server
+        .dispatch_tool_for_tests(
+            "get_repo_map",
+            json!({"detail": "compact", "max_tokens": 500}),
+        )
+        .await;
+    assert!(compact.contains("\n  src "), "{compact}");
+    assert!(compact.contains("\n  docs "), "{compact}");
+    assert!(!compact.contains("unit_id="), "{compact}");
 }
 
 #[tokio::test]

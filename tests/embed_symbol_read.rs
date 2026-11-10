@@ -205,12 +205,12 @@ fn symbol_read_estimates_cache_bypass_and_full_overflow_retrieval_are_explicit()
         panic!("cached output")
     };
     let cached: serde_json::Value = serde_json::from_slice(&full.bytes).unwrap();
-    assert!(
-        cached["output"]["SymbolRead"]["rendered"]
-            .as_str()
-            .unwrap()
-            .contains(&source)
-    );
+    // Bodies over 20 lines carry file line numbers (SF-DOG-02): the full
+    // retrieved output is the numbered rendering of the same source.
+    let cached_text = cached["output"]["SymbolRead"]["rendered"].as_str().unwrap();
+    assert!(cached_text.contains("1: pub fn lengthy() {"));
+    assert!(cached_text.contains("81:     let value = 123;"));
+    assert!(cached_text.contains("83: }"));
     let forced = handle
         .query_with_session(
             &QueryRequest::SymbolRead(SymbolReadRequest {

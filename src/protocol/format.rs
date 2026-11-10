@@ -106,7 +106,8 @@ pub use crate::index_lifecycle::guidance::symbol_read::inspect_match_result_view
 #[cfg(test)]
 use crate::index_lifecycle::guidance::symbol_read::symbol_kind_name_label;
 pub use crate::index_lifecycle::guidance::symbol_read::{
-    code_slice_from_indexed_file, code_slice_view, symbol_detail, symbol_detail_from_indexed_file,
+    code_slice_from_indexed_file, code_slice_from_indexed_file_with, code_slice_view,
+    symbol_detail, symbol_detail_from_indexed_file, symbol_detail_from_indexed_file_with,
     symbol_detail_view,
 };
 
@@ -664,17 +665,18 @@ pub fn format_token_savings(snap: &StatsSnapshot) -> String {
         return String::new();
     }
 
-    let mut lines = vec!["── Token Savings (this session) ──".to_string()];
+    let mut lines =
+        vec!["── Token Savings (estimated vs assumed baselines, not measured) ──".to_string()];
 
     if snap.read_fires > 0 {
         lines.push(format!(
-            "Read:  {} fires, ~{} tokens saved",
+            "Read:  {} fires, ~{} tokens estimated saved (vs a 50x80 windowed read)",
             snap.read_fires, snap.read_saved_tokens
         ));
     }
     if snap.edit_fires > 0 {
         lines.push(format!(
-            "Edit:  {} fires, ~{} tokens saved",
+            "Edit:  {} fires, ~{} tokens estimated saved (vs a 50x80 windowed read)",
             snap.edit_fires, snap.edit_saved_tokens
         ));
     }
@@ -683,20 +685,21 @@ pub fn format_token_savings(snap: &StatsSnapshot) -> String {
     }
     if snap.grep_fires > 0 {
         lines.push(format!(
-            "Grep:  {} fires, ~{} tokens saved",
+            "Grep:  {} fires, ~{} tokens estimated saved (vs a grep+window baseline)",
             snap.grep_fires, snap.grep_saved_tokens
         ));
     }
 
     lines.push(format!(
-        "Total: ~{} tokens saved (vs competent-manual windowed read)",
+        "Total: ~{} tokens estimated saved (assumed baselines, not measured)",
         total_saved
     ));
 
     lines.join("\n")
 }
 
-/// Format a per-tool token breakdown section showing tokens served, saved, and efficiency ratio.
+/// Format a per-tool token breakdown: observed tokens served plus the estimated
+/// difference against an assumed windowed-read baseline (no ratios).
 ///
 /// Input: `details` — sorted Vec of `(tool_name, tokens_served, tokens_saved)`.
 /// Returns empty string when details is empty.
@@ -705,41 +708,32 @@ pub fn format_tool_token_breakdown(details: &[(String, u64, u64)]) -> String {
         return String::new();
     }
 
+    // `served` is what the tools returned; everything derived from an
+    // assumed baseline is an estimate and names the baseline it used:
+    // single-file reads use the 50x80 windowed read, listing tools a modelled
+    // grep+windows cost (`estimate_listing_baseline_chars`).
     let total_served: u64 = details.iter().map(|(_, s, _)| s).sum();
     let total_saved: u64 = details.iter().map(|(_, _, s)| s).sum();
-    let total_naive = total_served + total_saved;
-    let efficiency = if total_served > 0 {
-        total_naive as f64 / total_served as f64
-    } else {
-        1.0
-    };
-    let reduction_pct = if total_naive > 0 {
-        (total_saved as f64 / total_naive as f64 * 100.0) as u64
-    } else {
-        0
-    };
 
     let mut lines = vec![format!(
-        "\u{2500}\u{2500} Session Efficiency (competent-manual baseline) \u{2500}\u{2500}\nTokens served: {}\nCompetent-manual equivalent: {}\nEfficiency: {:.1}x ({reduction_pct}% reduction vs windowed-read baseline)",
-        total_served, total_naive, efficiency
+        "\u{2500}\u{2500} Tokens served (this session) \u{2500}\u{2500}\nTokens served: {total_served}\n\n\u{2500}\u{2500} Estimated vs assumed baselines (not measured) \u{2500}\u{2500}\nEstimated tokens saved: ~{total_saved}"
     )];
 
     lines.push(String::new());
     lines.push("\u{2500}\u{2500} Per-Tool Breakdown \u{2500}\u{2500}".to_string());
     let max_name = details.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
     for (name, served, saved) in details.iter().take(10) {
-        let tool_naive = served + saved;
-        let tool_eff = if *served > 0 {
-            format!("{:.1}x", tool_naive as f64 / *served as f64)
-        } else {
-            "-".to_string()
+        let baseline = match name.as_str() {
+            "search_symbols" | "find_references" | "explore" | "diff_symbols" => {
+                "vs a modelled grep+windows listing baseline"
+            }
+            _ => "vs a 50x80 windowed-read baseline",
         };
         lines.push(format!(
-            "  {:<width$}  {} served, {} saved ({})",
+            "  {:<width$}  {} served, ~{} estimated saved ({baseline})",
             name,
             served,
             saved,
-            tool_eff,
             width = max_name
         ));
     }
@@ -846,9 +840,16 @@ pub use crate::index_lifecycle::guidance::source::format_session_cache_hit_body;
 /// Dedup hint when agent forces a re-fetch of content already in session (011 US4).
 pub use crate::index_lifecycle::guidance::file_read::append_dedup_hint_footer;
 
-/// Format a "Hook Adoption (current session)" section from hook-time workflow counters.
+/// Format a "Hook Adoption" section from hook-time workflow counters, scoped to
+/// the sidecar lifetime the loader resolved.
 pub(crate) fn format_hook_adoption(snap: &HookAdoptionSnapshot) -> String {
-    if snap.is_empty() {
+    // SF-ADOPT-03: without a resolved sidecar lifetime nothing was counted;
+    // say so instead of printing a whole-log tally as "current session".
+    if snap.session_unknown {
+        return "── Hook Adoption ──\nsession unknown: no sidecar lifetime could be resolved for this project, so no hook rows were counted."
+            .to_string();
+    }
+    if snap.is_empty() && snap.unscoped_rows == 0 {
         return String::new();
     }
 
@@ -861,7 +862,10 @@ pub(crate) fn format_hook_adoption(snap: &HookAdoptionSnapshot) -> String {
     };
 
     let mut lines = vec![
-        "── Hook Adoption (current session) ──".to_string(),
+        match snap.scope.as_deref() {
+            Some(scope) => format!("── Hook Adoption (this sidecar lifetime: {scope}) ──"),
+            None => "── Hook Adoption ──".to_string(),
+        },
         format!("Owned workflows routed: {routed}/{total} ({percent}%)"),
     ];
 
@@ -882,6 +886,21 @@ pub(crate) fn format_hook_adoption(snap: &HookAdoptionSnapshot) -> String {
         ));
     } else {
         lines.push("Fail-open outcomes: 0".to_string());
+    }
+    // SF-ADOPT-02: per-reason breakdown, as recorded in each row's `reason=`.
+    if !snap.fail_open_reasons.is_empty() {
+        let reasons: Vec<String> = snap
+            .fail_open_reasons
+            .iter()
+            .map(|(reason, count)| format!("{reason} {count}"))
+            .collect();
+        lines.push(format!("Fail-open reasons: {}", reasons.join(", ")));
+    }
+    if snap.unscoped_rows > 0 {
+        lines.push(format!(
+            "Rows with no recorded lifetime in the whole log: {} (all sessions and projects sharing this control dir, both log generations; daemon fallback through another session or no descriptor); not attributable to this lifetime, not counted above",
+            snap.unscoped_rows
+        ));
     }
 
     // Show daemon fallback total if any occurred.

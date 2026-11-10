@@ -182,6 +182,10 @@ pub struct GetSymbolInput {
     /// When true, bypass session cache-hit and return a fresh payload.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub force_refresh: Option<bool>,
+    /// Prefix each body line with its file line number (`N: line`, the
+    /// `get_file_content` gutter). Default: on for bodies over 20 lines.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub line_numbers: Option<bool>,
 }
 
 /// A single target in a `get_symbols` batch request.
@@ -267,8 +271,11 @@ pub struct GetRepoMapInput {
     /// project; local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
-    /// Detail level: "compact" (default — ~500 token project overview), "full" (complete symbol outline of every file), "tree" (browsable file tree with per-file stats).
+    /// Detail level: "compact" (default — directory and key-type overview, typically 1-2k tokens), "full" (complete symbol outline of every file), "tree" (browsable file tree with per-file stats).
     pub detail: Option<String>,
+    /// When true, append the repository knowledge digests (docs map, ~2,500 tokens). Default false.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub include_knowledge: Option<bool>,
     /// Subtree path to browse (only used when detail="tree", default: project root).
     pub path: Option<String>,
     /// Max depth levels to expand (only used when detail="tree", default: 2, max: 5).

@@ -2254,6 +2254,7 @@ export function App() {
     /// 3.3 s of which 2.8 s was that fallback. Linear work gives about 4x for 4x
     /// the bytes; quadratic gives 16x.
     #[test]
+    #[ignore = "wall-clock assertion; runs in the scheduled performance job"]
     fn large_rust_file_indexing_is_linear_and_unchanged() {
         use std::fmt::Write as _;
 

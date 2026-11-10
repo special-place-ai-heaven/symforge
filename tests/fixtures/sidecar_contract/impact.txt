@@ -3,4 +3,4 @@ Status: indexed and unchanged
 Symbols: 0
 Tip: Use what_changed to see recent modifications.
 
-~300 tokens vs whole-file read; ~300 tokens vs ~50-line windowed read (competent-manual baseline)
+~300 tokens estimated vs whole-file read; ~300 tokens estimated vs ~50-line windowed read (assumed baseline, not measured)

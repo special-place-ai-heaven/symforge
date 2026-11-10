@@ -99,6 +99,10 @@ pub struct HealthResponse {
     pub symbol_count: usize,
     pub index_state: String,
     pub uptime_secs: u64,
+    /// Freshness of the published generation, as the hook gate reads it.
+    pub freshness: String,
+    /// Whether the hook enrichment gate would admit this generation now.
+    pub hook_queryable: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -290,8 +294,16 @@ fn normalized_root_text_for_match(path_text: &str, windows: bool) -> String {
 }
 
 pub(crate) fn roots_match(caller: &std::path::Path, indexed: &std::path::Path) -> bool {
+    // String-only, before any canonicalize: a UNC caller_root must not make the
+    // sidecar wait on a remote host, and never matches a local index root.
+    if crate::paths::is_network_path(caller) || crate::paths::is_network_path(indexed) {
+        return false;
+    }
     let caller = dunce::canonicalize(caller).unwrap_or_else(|_| caller.to_path_buf());
     let indexed = dunce::canonicalize(indexed).unwrap_or_else(|_| indexed.to_path_buf());
+    if crate::paths::is_network_path(&caller) || crate::paths::is_network_path(&indexed) {
+        return false;
+    }
     if cfg!(windows) {
         let (Some(caller), Some(indexed)) = (caller.to_str(), indexed.to_str()) else {
             return false;
@@ -309,11 +321,12 @@ pub(crate) fn roots_match(caller: &std::path::Path, indexed: &std::path::Path) -
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// `GET /health` — index state, file count, symbol count, uptime.
 pub async fn health_handler(
     State(state): State<SidecarState>,
 ) -> Result<Json<HealthResponse>, StatusCode> {
     let published = state.index.data_plane().published_state();
+    // SF-ADOPT-01: report the same generation state the enrichment gate uses.
+    let generation = state.index.data_plane().published_generation();
 
     let uptime_secs = published
         .loaded_at_system
@@ -326,7 +339,20 @@ pub async fn health_handler(
         symbol_count: published.symbol_count,
         index_state: published.status_label().to_string(),
         uptime_secs,
+        freshness: freshness_label(generation.freshness.as_ref()),
+        hook_queryable: published_sidecar_index_is_queryable(&generation),
     }))
+}
+
+fn freshness_label(freshness: &crate::domain::FreshnessStatus) -> String {
+    match freshness {
+        crate::domain::FreshnessStatus::Current => "current".to_string(),
+        crate::domain::FreshnessStatus::Verifying => "verifying".to_string(),
+        crate::domain::FreshnessStatus::Degraded { reason_codes, .. } => {
+            let reasons: Vec<String> = reason_codes.iter().map(|r| format!("{r:?}")).collect();
+            format!("degraded({})", reasons.join(", "))
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -350,19 +376,81 @@ fn published_sidecar_index_is_queryable(
     let freshness_is_queryable = matches!(
         published.freshness.as_ref(),
         crate::domain::FreshnessStatus::Current
-    ) || (health_is_empty
-        && matches!(
-            published.freshness.as_ref(),
-            crate::domain::FreshnessStatus::Verifying
-        )
-        && matches!(
-            published.health.snapshot_verify_state,
-            crate::live_index::SnapshotVerifyState::NotNeeded
-        ));
+    ) || (health_is_ready
+        && freshness_is_observation_degraded(published.freshness.as_ref()))
+        || (health_is_empty
+            && matches!(
+                published.freshness.as_ref(),
+                crate::domain::FreshnessStatus::Verifying
+            )
+            && matches!(
+                published.health.snapshot_verify_state,
+                crate::live_index::SnapshotVerifyState::NotNeeded
+            ));
     (health_is_ready || health_is_empty)
         && published.source.is_some()
         && published.live.indexed_root.is_some()
         && freshness_is_queryable
+}
+
+/// SF-ADOPT-01 (owner rule): a Ready index whose only freshness defects are
+/// `ObservationFailed` / `ReconciliationPending` (e.g. one unreadable file)
+/// still serves hooks, with a staleness marker. Every other degraded reason,
+/// and Loading/Empty/Verifying, keeps the 503.
+fn freshness_is_observation_degraded(freshness: &crate::domain::FreshnessStatus) -> bool {
+    match freshness {
+        crate::domain::FreshnessStatus::Degraded { reason_codes, .. } => {
+            !reason_codes.is_empty()
+                && reason_codes.iter().all(|reason| {
+                    matches!(
+                        reason,
+                        crate::domain::FreshnessReason::ObservationFailed
+                            | crate::domain::FreshnessReason::ReconciliationPending
+                    )
+                })
+        }
+        crate::domain::FreshnessStatus::Current | crate::domain::FreshnessStatus::Verifying => {
+            false
+        }
+    }
+}
+
+/// One-line staleness marker prepended to hook enrichment bodies served from a
+/// degraded-but-queryable index, naming the reasons the gate observed.
+pub(crate) fn sidecar_staleness_marker(
+    freshness: &crate::domain::FreshnessStatus,
+) -> Option<String> {
+    let crate::domain::FreshnessStatus::Degraded { reason_codes, .. } = freshness else {
+        return None;
+    };
+    // Word each cause by what it means; only an observation failure has
+    // files for health to name.
+    let causes: Vec<&str> = reason_codes
+        .iter()
+        .map(|reason| match reason {
+            crate::domain::FreshnessReason::ObservationFailed => {
+                "some files could not be read or changed while being read (health names unreadable files)"
+            }
+            crate::domain::FreshnessReason::ReconciliationPending => {
+                "a reconcile sweep has not yet covered the whole tree"
+            }
+            crate::domain::FreshnessReason::WatcherUnavailable => "the file watcher is unavailable",
+            crate::domain::FreshnessReason::SnapshotVerificationFailed => {
+                "snapshot verification failed"
+            }
+            crate::domain::FreshnessReason::DerivedPublicationPending => {
+                "derived data publication is pending"
+            }
+            crate::domain::FreshnessReason::CatalogEntryCapacityExceeded
+            | crate::domain::FreshnessReason::CatalogMetadataCapacityExceeded => {
+                "the catalog capacity was exceeded"
+            }
+        })
+        .collect();
+    Some(format!(
+        "[symforge: index may be stale — {}]",
+        causes.join("; ")
+    ))
 }
 
 fn sidecar_query_fence_for(
@@ -542,8 +630,8 @@ pub async fn outline_handler(
 ) -> Result<String, StatusCode> {
     let fence = require_queryable_sidecar_index(&state)?;
     let result = outline_hook_text(&state, &params, &fence);
-    capture_queryable_sidecar_generation(&state, &fence)?;
-    result
+    let published = capture_queryable_sidecar_generation(&state, &fence)?;
+    with_staleness_marker(&published, result)
 }
 
 /// Workflow adapter for source-code reads/orientation.
@@ -561,6 +649,7 @@ pub(crate) fn outline_tool_text_for_generation(
     state: &SidecarState,
     published: &crate::live_index::PublishedGeneration,
     params: &OutlineParams,
+    include_tests: bool,
 ) -> Result<String, StatusCode> {
     outline_text_for_generation(
         state,
@@ -568,6 +657,7 @@ pub(crate) fn outline_tool_text_for_generation(
         params,
         TOOL_RENDER_OPTIONS,
         ContextSourceAuthority::CurrentIndex,
+        include_tests,
     )
 }
 
@@ -592,7 +682,8 @@ fn outline_text(
         fence.project_generation,
     )?;
     let published = capture_queryable_sidecar_generation(state, fence)?;
-    outline_text_for_generation(state, &published, params, options, source_authority)
+    // The hook path keeps test modules expanded (its own 200-token budget).
+    outline_text_for_generation(state, &published, params, options, source_authority, true)
 }
 
 fn outline_text_for_generation(
@@ -601,6 +692,7 @@ fn outline_text_for_generation(
     params: &OutlineParams,
     options: RenderOptions,
     source_authority: ContextSourceAuthority,
+    include_tests: bool,
 ) -> Result<String, StatusCode> {
     let selection = crate::index_lifecycle::guidance::read_context::OutlineProjectionParams {
         path: params.path.clone(),
@@ -608,11 +700,12 @@ fn outline_text_for_generation(
         sections: params.sections.clone(),
     };
     let (text, file_bytes, output_bytes) =
-        crate::index_lifecycle::guidance::read_context::outline_text_for_generation(
+        crate::index_lifecycle::guidance::read_context::outline_text_for_generation_with(
             published,
             &selection,
             options.include_savings_footer,
             source_authority,
+            include_tests,
         )
         .ok_or(StatusCode::NOT_FOUND)?;
     if options.record_stats {
@@ -636,9 +729,11 @@ pub async fn impact_handler(
     let fence = require_queryable_sidecar_index(&state)?;
     let impact_index = state.index.data_plane().clone();
     let _impact_guard = impact_index.lock_impact_analysis().await;
-    capture_queryable_sidecar_generation(&state, &fence)?;
+    let published = capture_queryable_sidecar_generation(&state, &fence)?;
     let result = impact_hook_text(state.clone(), &params, &fence).await;
-    finish_impact_response_at_fence(&state, &fence, with_withheld_note(&state, result))
+    let result =
+        finish_impact_response_at_fence(&state, &fence, with_withheld_note(&state, result));
+    with_staleness_marker(&published, result)
 }
 
 /// Leads a hook enrichment with the files the snapshot verify withheld, so a
@@ -657,6 +752,21 @@ fn with_withheld_note(
             None => text,
         }
     })
+}
+
+/// Leads a hook enrichment with the staleness marker when the generation the
+/// gate admitted was degraded (SF-ADOPT-01), so hook text never presents a
+/// possibly stale index as current.
+fn with_staleness_marker(
+    published: &crate::live_index::PublishedGeneration,
+    result: Result<String, StatusCode>,
+) -> Result<String, StatusCode> {
+    result.map(
+        |text| match sidecar_staleness_marker(published.freshness.as_ref()) {
+            Some(marker) => format!("{marker}\n{text}"),
+            None => text,
+        },
+    )
 }
 
 fn finish_impact_response_at_fence(
@@ -854,8 +964,8 @@ pub async fn symbol_context_handler(
 ) -> Result<String, StatusCode> {
     let fence = require_queryable_sidecar_index(&state)?;
     let result = symbol_context_hook_text(&state, &params, &fence);
-    capture_queryable_sidecar_generation(&state, &fence)?;
-    with_withheld_note(&state, result)
+    let published = capture_queryable_sidecar_generation(&state, &fence)?;
+    with_staleness_marker(&published, with_withheld_note(&state, result))
 }
 
 /// Workflow adapter for search-hit expansion and quick caller/context reads.
@@ -966,8 +1076,8 @@ fn symbol_context_text_for_generation(
 pub async fn repo_map_handler(State(state): State<SidecarState>) -> Result<String, StatusCode> {
     let fence = require_queryable_sidecar_index(&state)?;
     let result = repo_map_text(&state, &fence);
-    capture_queryable_sidecar_generation(&state, &fence)?;
-    with_withheld_note(&state, result)
+    let published = capture_queryable_sidecar_generation(&state, &fence)?;
+    with_staleness_marker(&published, with_withheld_note(&state, result))
 }
 
 /// Workflow adapter for repo-start quick maps.
@@ -1015,8 +1125,8 @@ pub async fn prompt_context_handler(
 ) -> Result<String, StatusCode> {
     let fence = require_queryable_sidecar_index(&state)?;
     let result = prompt_context_hook_text(&state, &params, &fence).await;
-    capture_queryable_sidecar_generation(&state, &fence)?;
-    with_withheld_note(&state, result)
+    let published = capture_queryable_sidecar_generation(&state, &fence)?;
+    with_staleness_marker(&published, with_withheld_note(&state, result))
 }
 
 /// Workflow adapter for prompt-context narrowing.
@@ -1711,6 +1821,26 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn roots_match_refuses_network_caller_root_without_filesystem_access() {
+        // Identical UNC spellings would match through the identity fallback
+        // when canonicalize fails; only the network check refuses them.
+        for unc in [
+            r"\\nonexistent-host.invalid\share",
+            "//./UNC/nonexistent-host.invalid/share",
+            r"\\?\Global\UNC\nonexistent-host.invalid\share",
+        ] {
+            let started = std::time::Instant::now();
+            let path = std::path::Path::new(unc);
+            assert!(!roots_match(path, path), "{unc}");
+            assert!(
+                !roots_match(path, std::path::Path::new(r"C:\repo")),
+                "{unc}"
+            );
+            assert!(started.elapsed() < std::time::Duration::from_millis(250));
+        }
+    }
     #[cfg(unix)]
     #[test]
     fn roots_match_preserves_literal_backslash_path_components_on_unix() {
@@ -2235,6 +2365,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_unreadable_manifest_entry_on_ready_index_serves_200_with_marker() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("main.rs"), "fn alpha() {}\n").unwrap();
+        std::fs::write(project.path().join("locked.rs"), "fn locked() {}\n").unwrap();
+        let shared = LiveIndex::load(project.path()).unwrap();
+        let scouted = shared
+            .scout_plan()
+            .expect("cold scout plan")
+            .entries
+            .iter()
+            .find(|entry| entry.path.normalized_utf8.as_deref() == Some("locked.rs"))
+            .expect("scouted locked.rs")
+            .clone();
+        // A real Unreadable manifest entry, published through the same seam
+        // a failed stable read uses; freshness is recomputed by the store.
+        assert!(
+            shared
+                .publish_terminal_disposition_at_generation(
+                    "locked.rs",
+                    scouted,
+                    crate::domain::FileDisposition::Unreadable {
+                        stage: crate::domain::AccessStage::FullRead,
+                        kind: crate::domain::AccessErrorKind::PermissionDenied,
+                    },
+                    shared.current_project_generation(),
+                    shared.published_state().generation,
+                )
+                .is_some()
+        );
+        let state = SidecarState {
+            index: crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle::bind(
+                shared,
+            ),
+            token_stats: TokenStats::new(),
+            repo_root: None,
+            symbol_cache: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let published = state.index.data_plane().published_generation();
+        assert_eq!(published.health.status_label(), "Ready");
+        assert!(matches!(
+            published.freshness.as_ref(),
+            crate::domain::FreshnessStatus::Degraded { .. }
+        ));
+
+        let text = outline_handler(
+            State(state),
+            Query(OutlineParams {
+                path: "main.rs".to_string(),
+                max_tokens: None,
+                sections: None,
+            }),
+        )
+        .await
+        .expect("Ready index with one unreadable file must answer 200");
+        assert!(
+            text.starts_with("[symforge: index may be stale"),
+            "got:\n{text}"
+        );
+        assert!(text.contains("alpha"), "got:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn observation_degraded_ready_index_serves_hooks_with_staleness_marker() {
+        let file = make_indexed_file(
+            "src/foo.rs",
+            vec![make_symbol("alpha", SymbolKind::Function, 1, 5)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        let state = make_state(vec![("src/foo.rs", file)]);
+        let last_valid_content_generation = state
+            .index
+            .data_plane()
+            .published_generation()
+            .content_generation;
+        // The freshness an Unreadable manifest entry produces (store.rs
+        // freshness recompute: ObservationFailed + ReconciliationPending).
+        state
+            .index
+            .data_plane()
+            .set_freshness_status(crate::domain::FreshnessStatus::Degraded {
+                last_valid_content_generation,
+                reason_codes: vec![
+                    crate::domain::FreshnessReason::ObservationFailed,
+                    crate::domain::FreshnessReason::ReconciliationPending,
+                ],
+            });
+
+        let text = outline_handler(
+            State(state.clone()),
+            Query(OutlineParams {
+                path: "src/foo.rs".to_string(),
+                max_tokens: None,
+                sections: None,
+            }),
+        )
+        .await
+        .expect("observation-degraded Ready index must answer 200");
+        assert!(
+            text.starts_with("[symforge: index may be stale"),
+            "hook text must lead with the staleness marker; got:\n{text}"
+        );
+        assert!(text.contains("could not be read"), "got:\n{text}");
+        assert!(
+            text.contains("alpha"),
+            "enrichment body must follow; got:\n{text}"
+        );
+
+        let Json(health) = health_handler(State(state.clone())).await.unwrap();
+        assert!(health.hook_queryable);
+        assert_eq!(
+            health.freshness,
+            "degraded(ObservationFailed, ReconciliationPending)"
+        );
+
+        // A current index carries no marker.
+        state
+            .index
+            .data_plane()
+            .set_freshness_status(crate::domain::FreshnessStatus::Current);
+        let text = outline_handler(
+            State(state),
+            Query(OutlineParams {
+                path: "src/foo.rs".to_string(),
+                max_tokens: None,
+                sections: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!text.contains("index may be stale"), "got:\n{text}");
+    }
+
+    #[tokio::test]
     async fn test_health_handler_empty_index() {
         let state = make_state(vec![]);
         let result = health_handler(State(state)).await.unwrap();
@@ -2296,14 +2560,44 @@ mod tests {
         assert!(!published_sidecar_index_is_queryable(&variant(
             Ready, true, false
         )));
-        let mut freshness_degraded = variant(Ready, true, true);
-        freshness_degraded.freshness = Arc::new(crate::domain::FreshnessStatus::Degraded {
-            last_valid_content_generation: base.content_generation,
-            reason_codes: vec![crate::domain::FreshnessReason::ObservationFailed],
-        });
+        let degraded = |status, reason_codes| {
+            let mut generation = variant(status, true, true);
+            generation.freshness = Arc::new(crate::domain::FreshnessStatus::Degraded {
+                last_valid_content_generation: base.content_generation,
+                reason_codes,
+            });
+            generation
+        };
+        use crate::domain::FreshnessReason::{
+            ObservationFailed, ReconciliationPending, WatcherUnavailable,
+        };
+        // SF-ADOPT-01: one unreadable file degrades freshness with exactly
+        // these two reasons; a Ready index still serves hooks.
         assert!(
-            !published_sidecar_index_is_queryable(&freshness_degraded),
-            "a retained Ready health view with degraded freshness must refuse"
+            published_sidecar_index_is_queryable(&degraded(
+                Ready,
+                vec![ObservationFailed, ReconciliationPending]
+            )),
+            "Ready + observation-only degradation must serve with a staleness marker"
+        );
+        assert!(
+            !published_sidecar_index_is_queryable(&degraded(
+                Ready,
+                vec![ObservationFailed, WatcherUnavailable]
+            )),
+            "any other degraded reason must still refuse"
+        );
+        assert!(
+            !published_sidecar_index_is_queryable(&degraded(Ready, vec![])),
+            "a degraded view with no recorded reason proves nothing and must refuse"
+        );
+        assert!(
+            !published_sidecar_index_is_queryable(&degraded(Empty, vec![ObservationFailed])),
+            "Empty is not widened by the observation-degraded rule"
+        );
+        assert!(
+            !published_sidecar_index_is_queryable(&degraded(Loading, vec![ObservationFailed])),
+            "Loading keeps the 503"
         );
         let mut freshness_verifying_ready = variant(Ready, true, true);
         freshness_verifying_ready.freshness = Arc::new(crate::domain::FreshnessStatus::Verifying);
@@ -2348,7 +2642,7 @@ mod tests {
             .data_plane()
             .set_freshness_status(crate::domain::FreshnessStatus::Degraded {
                 last_valid_content_generation,
-                reason_codes: vec![crate::domain::FreshnessReason::ObservationFailed],
+                reason_codes: vec![crate::domain::FreshnessReason::WatcherUnavailable],
             });
 
         let gated_error = capture_queryable_sidecar_generation(&state, &fence)
@@ -3520,10 +3814,10 @@ mod tests {
             sections: Some(vec!["outline".to_string()]),
         };
 
-        let old_outline =
-            outline_tool_text_for_generation(&state, &captured, &params).expect("old outline");
+        let old_outline = outline_tool_text_for_generation(&state, &captured, &params, true)
+            .expect("old outline");
         let new_outline =
-            outline_tool_text_for_generation(&state, &next, &params).expect("new outline");
+            outline_tool_text_for_generation(&state, &next, &params, true).expect("new outline");
         assert!(old_outline.contains("OldOutlineMarker"), "{old_outline}");
         assert!(!old_outline.contains("NewOutlineMarker"), "{old_outline}");
         assert!(new_outline.contains("NewOutlineMarker"), "{new_outline}");

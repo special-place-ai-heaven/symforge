@@ -355,10 +355,10 @@ fn format_compact_status(ctx: &StelStatusContext<'_>) -> String {
     // Honest static labels (010 US1 / TR-10). These describe the *static*
     // truth that holds at compile time for this build — NOT a runtime liveness
     // probe (live probing is Phase B / US2). `wired` = the layer/handler code
-    // path is compiled in and reachable; `l4_ledger: in_memory` = the L4 layer
-    // is the always-on in-memory cache (durable restart-survival state is
-    // reported separately under `detail: full`). The blanket `active` literal
-    // implied more than the surface can prove without probing.
+    // path is compiled in and reachable. The blanket `active` literal implied
+    // more than the surface can prove without probing. Static roadmap labels
+    // (l4_ledger, deferred, superseded) are build facts, not state, and live
+    // under `detail: full` only.
     let mut lines = vec![
         "── stel status ──".to_string(),
         format!("surface: {}", ctx.surface),
@@ -368,7 +368,6 @@ fn format_compact_status(ctx: &StelStatusContext<'_>) -> String {
         "l1_planner: wired".to_string(),
         "l2_economics: wired".to_string(),
         "l3_bypass: wired".to_string(),
-        "l4_ledger: in_memory".to_string(),
         "handler_symforge: wired".to_string(),
         "handler_status: wired".to_string(),
         "handler_symforge_edit: preview-and-apply".to_string(),
@@ -382,10 +381,6 @@ fn format_compact_status(ctx: &StelStatusContext<'_>) -> String {
         ),
         format!("index_ready: {}", ctx.index_ready),
         format!("index_files: {}", ctx.index_files),
-        format!("deferred: {DEFERRED_ITEMS}"),
-        // D5/D19: planned-but-superseded capability, surfaced honestly so it is
-        // not silently dropped and never reads as in-progress server work.
-        format!("superseded: {SUPERSEDED_ITEMS} (client agentic loop + find-fusion)"),
         "──".to_string(),
     ];
     // Honest cross-process disclosure: when the surface served on this
@@ -427,6 +422,12 @@ fn format_full_status(ctx: &StelStatusContext<'_>) -> String {
         format!("project: {}", ctx.project_name),
         format!("index_symbols: {}", ctx.index_symbols),
         format!("session_tokens: {}", ctx.session_tokens),
+        // Compile-time facts about this build, not runtime observations.
+        "build_fact_l4_ledger: in_memory".to_string(),
+        format!("build_fact_deferred: {DEFERRED_ITEMS}"),
+        // D5/D19: planned-but-superseded capability, surfaced honestly so it is
+        // not silently dropped and never reads as in-progress server work.
+        format!("build_fact_superseded: {SUPERSEDED_ITEMS} (client agentic loop + find-fusion)"),
     ];
     // Single source of truth for the two last-ledger lines (shared with the
     // daemon-proxy overlay via `format_last_ledger_lines`), so the worker-side
@@ -507,7 +508,6 @@ mod tests {
             "l1_planner: wired",
             "l2_economics: wired",
             "l3_bypass: wired",
-            "l4_ledger: in_memory",
             "handler_symforge: wired",
             "handler_status: wired",
             "handler_symforge_edit: preview-and-apply",
@@ -517,12 +517,13 @@ mod tests {
             "project_root: E:/project/symforge-test",
             "index_ready: true",
             "index_files: 12",
-            "deferred: b_results",
-            // D5/D19: multi_step_planner is honestly SUPERSEDED, not deferred.
-            "superseded: multi_step_planner (client agentic loop + find-fusion)",
             "──",
         ] {
             assert!(body.contains(needle), "missing `{needle}` in:\n{body}");
+        }
+        // Roadmap labels are build facts: absent from the default output.
+        for label in ["l4_ledger", "deferred:", "superseded:"] {
+            assert!(!body.contains(label), "unexpected `{label}` in:\n{body}");
         }
         // Honest contract (010 TR-10): no blanket unconditional `active` literal
         // and the stale `ledger_persistence` deferred item is gone.
@@ -559,6 +560,9 @@ mod tests {
             "project: symforge-test",
             "index_symbols: 48",
             "session_tokens: 128",
+            "build_fact_l4_ledger: in_memory",
+            "build_fact_deferred: b_results",
+            "build_fact_superseded: multi_step_planner (client agentic loop + find-fusion)",
             "last_ledger_decision: serve",
             "last_ledger_route: search_text",
             "── calibration (observational) ──",

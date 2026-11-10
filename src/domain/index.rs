@@ -615,6 +615,7 @@ pub enum RootRefusalReason {
     DeviceOrSpecialNamespace,
     ProtectedRootRequiresExplicitOverride,
     CredentialDirectory,
+    NetworkPath,
 }
 
 impl RootRefusalReason {
@@ -633,6 +634,7 @@ impl RootRefusalReason {
                 "protected_root_requires_explicit_override"
             }
             Self::CredentialDirectory => "credential_directory",
+            Self::NetworkPath => "network_path",
         }
     }
 }

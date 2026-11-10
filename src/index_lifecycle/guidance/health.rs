@@ -1156,6 +1156,54 @@ pub(crate) fn render_disposition_line(entries: &[CatalogEntry]) -> String {
     )
 }
 
+/// Names the manifest entries the index could not read (SF-ADOPT-01), so a
+/// degraded freshness line has a cause a human can act on. `None` when there
+/// are none. Paths without a UTF-8 form render as their public id. A file is
+/// tagged `settled-unreadable` only when it is in `settled`, the set of paths
+/// whose sweep counter the store observed reaching the settle threshold.
+pub(crate) fn render_unreadable_files_line(
+    entries: &[CatalogEntry],
+    settled: &std::collections::HashSet<crate::domain::CatalogPath>,
+) -> Option<String> {
+    const MAX_NAMED: usize = 8;
+    let unreadable: Vec<&CatalogEntry> = entries
+        .iter()
+        .filter(|entry| matches!(entry.disposition, FileDisposition::Unreadable { .. }))
+        .collect();
+    if unreadable.is_empty() {
+        return None;
+    }
+    let settled_count = unreadable
+        .iter()
+        .filter(|entry| settled.contains(&entry.path))
+        .count();
+    let names: Vec<String> = unreadable
+        .iter()
+        .take(MAX_NAMED)
+        .map(|entry| {
+            let name = entry
+                .path
+                .normalized_utf8
+                .clone()
+                .unwrap_or_else(|| entry.path.public_id.clone());
+            if settled.contains(&entry.path) {
+                format!("{name} [settled-unreadable]")
+            } else {
+                name
+            }
+        })
+        .collect();
+    let mut line = format!(
+        "Unreadable files ({}, settled-unreadable {settled_count}): {}",
+        unreadable.len(),
+        names.join(", ")
+    );
+    if unreadable.len() > MAX_NAMED {
+        line.push_str(&format!(" (+{} more)", unreadable.len() - MAX_NAMED));
+    }
+    Some(line)
+}
+
 /// One source-set entry line. Uses [`manifest_coverage_digest`] so the current
 /// source renders identically here and in the primary manifest line.
 pub(crate) fn render_source_entry_line(
@@ -1287,13 +1335,11 @@ pub(crate) fn render_authority_hygiene_line(authority: &KnowledgeAuthorityView) 
     )
 }
 
-/// Full Feature 020 repository-knowledge health section (M-001). Extends the
-/// `health` report; every field is read from the already-published source set
-/// plus the reachable source-binding state.
 pub fn format_repository_knowledge_health(
     source_set: &PublishedSourceSet,
     binding: &SourceBindingHealthView<'_>,
     inflight_budget_bytes: u64,
+    settled_unreadable: &std::collections::HashSet<crate::domain::CatalogPath>,
 ) -> String {
     let generation = source_set.current_generation();
     let mut section = String::from("── Repository knowledge (Feature 020) ──\n");
@@ -1307,6 +1353,10 @@ pub fn format_repository_knowledge_health(
     if let Some(manifest) = generation.manifest.as_deref() {
         section.push('\n');
         section.push_str(&render_disposition_line(&manifest.entries));
+        if let Some(line) = render_unreadable_files_line(&manifest.entries, settled_unreadable) {
+            section.push('\n');
+            section.push_str(&line);
+        }
     }
     section.push('\n');
     section.push_str(&render_source_set_section(source_set));
@@ -1994,6 +2044,9 @@ pub(crate) struct HealthReportInputs<'a> {
     pub worktree_routing: String,
     /// The knowledge-curation recovery line from the caller's coordinator.
     pub curation_health: String,
+    /// Unreadable paths the store observed surviving the settle threshold of
+    /// reconcile sweeps (SF-ADOPT-01); empty when none has.
+    pub settled_unreadable: std::collections::HashSet<crate::domain::CatalogPath>,
 }
 
 /// Sections only a server process can observe. The MCP handler renders its
@@ -2065,6 +2118,7 @@ pub(crate) fn render_health_report(
         inputs.source_set,
         &health_binding_view(inputs, published.status_label() == "Ready"),
         crate::live_index::store::configured_inflight_byte_budget(),
+        &inputs.settled_unreadable,
     ));
     result.push('\n');
     result.push_str(&format!(

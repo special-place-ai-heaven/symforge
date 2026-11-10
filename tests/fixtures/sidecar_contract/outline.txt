@@ -6,4 +6,4 @@ Evidence: file anchor `src/lib.rs`
   fn         hello  L2-2
   struct     Config  L2-2
 
-~278 tokens vs whole-file read; ~278 tokens vs ~50-line windowed read (competent-manual baseline)
+~278 tokens estimated vs whole-file read; ~278 tokens estimated vs ~50-line windowed read (assumed baseline, not measured)

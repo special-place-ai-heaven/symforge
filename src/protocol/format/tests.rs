@@ -2645,6 +2645,87 @@ fn test_symbol_detail_from_indexed_file_matches_live_index_output() {
 }
 
 #[test]
+fn test_symbol_detail_numbers_long_bodies_with_file_line_numbers() {
+    let mut content = String::from("// pad\n// pad\n");
+    let start = content.len();
+    content.push_str("fn big() {\n");
+    for _ in 0..21 {
+        content.push_str("    x;\n");
+    }
+    content.push_str("}\n");
+    let end = content.len() - 1;
+    // Lines 3..=25 (1-based) -> 0-based 2..=24.
+    let (key, file) = make_file(
+        "src/big.rs",
+        content.as_bytes(),
+        vec![make_symbol_with_bytes(
+            "big",
+            SymbolKind::Function,
+            0,
+            2,
+            24,
+            start as u32,
+            end as u32,
+        )],
+    );
+    let index = make_index(vec![(key, file)]);
+    let shared = index.capture_shared_file("src/big.rs").unwrap();
+
+    let default = symbol_detail_from_indexed_file_with(shared.as_ref(), "big", None, None, None);
+    let lines: Vec<&str> = default.lines().collect();
+    assert_eq!(lines[0], "3: fn big() {");
+    assert_eq!(lines[1], "4:     x;");
+    assert_eq!(lines[22], "25: }");
+    assert!(lines[23].starts_with("[fn, lines 3-25"), "{default}");
+
+    let off = symbol_detail_from_indexed_file_with(shared.as_ref(), "big", None, None, Some(false));
+    assert!(off.starts_with("fn big() {\n    x;"), "{off}");
+    assert_eq!(
+        off,
+        symbol_detail_from_indexed_file(shared.as_ref(), "big", None, None)
+    );
+}
+
+#[test]
+fn test_format_tool_token_breakdown_has_no_multiplier_and_labels_estimates() {
+    let details = vec![
+        ("get_symbol".to_string(), 100u64, 400u64),
+        ("search_symbols".to_string(), 50u64, 150u64),
+    ];
+    let out = format_tool_token_breakdown(&details);
+
+    assert!(out.contains("Tokens served: 150"), "{out}");
+    assert!(!out.contains("Efficiency"), "{out}");
+    assert!(!out.contains("reduction"), "{out}");
+    assert!(
+        !regex::Regex::new(r"\d+(\.\d+)?x\b").unwrap().is_match(&out),
+        "no Nx multiplier may appear: {out}"
+    );
+    for line in out.lines().filter(|l| l.contains("saved")) {
+        assert!(
+            line.to_lowercase().contains("estimated"),
+            "unlabelled `saved`: {line}"
+        );
+    }
+    assert!(out.contains("windowed-read baseline"), "{out}");
+    assert!(out.contains("grep+windows listing baseline"), "{out}");
+    assert!(
+        format_token_savings(&crate::sidecar::StatsSnapshot {
+            read_fires: 1,
+            read_saved_tokens: 10,
+            edit_fires: 0,
+            edit_saved_tokens: 0,
+            write_fires: 0,
+            grep_fires: 1,
+            grep_saved_tokens: 5,
+        })
+        .lines()
+        .filter(|l| l.contains("saved"))
+        .all(|l| l.contains("estimated"))
+    );
+}
+
+#[test]
 fn test_file_content_view_matches_live_index_output() {
     let content = b"line 1\nline 2\nline 3\nline 4\nline 5";
     let (key, file) = make_file("src/main.rs", content, vec![]);
@@ -4237,6 +4318,7 @@ fn test_format_hook_adoption_shows_workflow_totals_and_first_repo_start() {
             daemon_fallback: 0,
         },
         first_repo_start: Some(crate::cli::hook::HookOutcome::Routed),
+        ..Default::default()
     };
 
     let result = format_hook_adoption(&snap);
@@ -4290,6 +4372,7 @@ fn test_format_hook_adoption_marks_no_sidecar_fail_open_as_mostly_benign() {
         prompt_context: crate::cli::hook::WorkflowAdoptionCounts::default(),
         post_edit_impact: crate::cli::hook::WorkflowAdoptionCounts::default(),
         first_repo_start: Some(crate::cli::hook::HookOutcome::NoSidecar),
+        ..Default::default()
     };
 
     let result = format_hook_adoption(&snap);
@@ -4347,6 +4430,47 @@ fn test_format_hook_adoption_names_all_sidecar_errors_honestly() {
         !result.contains("All hook attempts failed open (no sidecar found)"),
         "sidecar errors must never be described as an absent sidecar: {result}"
     );
+}
+
+#[test]
+fn test_format_hook_adoption_breaks_fail_open_down_by_reason() {
+    let snap = crate::cli::hook::HookAdoptionSnapshot {
+        source_read: crate::cli::hook::WorkflowAdoptionCounts {
+            routed: 1,
+            no_sidecar: 1,
+            sidecar_error: 2,
+            daemon_fallback: 0,
+        },
+        fail_open_reasons: [
+            ("index_not_ready".to_string(), 2),
+            ("sidecar_port_missing".to_string(), 1),
+        ]
+        .into_iter()
+        .collect(),
+        scope: Some("session session-1, daemon:42".to_string()),
+        ..Default::default()
+    };
+    let result = format_hook_adoption(&snap);
+    assert!(
+        result.contains("Fail-open reasons: index_not_ready 2, sidecar_port_missing 1"),
+        "missing per-reason line: {result}"
+    );
+    assert!(
+        result
+            .contains("── Hook Adoption (this sidecar lifetime: session session-1, daemon:42) ──"),
+        "heading must name what was counted: {result}"
+    );
+}
+
+#[test]
+fn test_format_hook_adoption_reports_unknown_session_instead_of_counting() {
+    let snap = crate::cli::hook::HookAdoptionSnapshot {
+        session_unknown: true,
+        ..Default::default()
+    };
+    let result = format_hook_adoption(&snap);
+    assert!(result.contains("session unknown"), "got: {result}");
+    assert!(!result.contains("Owned workflows routed"), "got: {result}");
 }
 
 #[test]

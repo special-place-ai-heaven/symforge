@@ -332,7 +332,7 @@ pub(super) fn content(
         budget.required(input.path.len() + 32)?;
         return Ok(QueryOutput::FileReadEstimate(FileReadEstimate {
             path: input.path,
-            approximate_tokens: size / 4,
+            approximate_tokens: crate::stel::handler::estimate_tokens_from_bytes(size),
             approximate_lines: lines,
             authority,
         }));

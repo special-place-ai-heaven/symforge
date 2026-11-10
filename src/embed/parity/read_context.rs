@@ -11,6 +11,9 @@ pub struct RepoMapRequest {
     #[serde(default)]
     pub estimate: bool,
     pub max_tokens: Option<u64>,
+    /// Append the repository knowledge digests (default off).
+    #[serde(default)]
+    pub include_knowledge: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

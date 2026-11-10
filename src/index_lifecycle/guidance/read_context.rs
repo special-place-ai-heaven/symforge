@@ -464,7 +464,13 @@ pub(crate) fn repo_map_text_for_generation(
 
     // Sort directories and emit tree.
     let mut dirs: Vec<String> = dir_file_counts.keys().cloned().collect();
-    dirs.sort();
+    // Code-symbol count DESC so source directories precede dot-directories
+    // and docs under the byte budget; name ASC keeps the order total.
+    dirs.sort_by(|a, b| {
+        dir_symbol_counts[b]
+            .cmp(&dir_symbol_counts[a])
+            .then_with(|| a.cmp(b))
+    });
 
     for dir in &dirs {
         let file_count = dir_file_counts[dir];
@@ -742,11 +748,35 @@ pub(crate) struct OutlineProjectionParams {
     pub max_tokens: Option<u64>,
     pub sections: Option<Vec<String>>,
 }
+/// Same name rule as `parse_test_module_outline_line`, on a symbol record.
+fn is_test_module_symbol(sym: &crate::domain::SymbolRecord) -> bool {
+    sym.kind == crate::domain::SymbolKind::Module
+        && (sym.name == "tests" || sym.name.ends_with("_tests") || sym.name.ends_with("Tests"))
+}
+
+/// Outline projection that leaves test modules expanded.
+#[cfg(test)]
 pub(crate) fn outline_text_for_generation(
     published: &crate::live_index::PublishedGeneration,
     params: &OutlineProjectionParams,
     include_savings_footer: bool,
     source_authority: ContextSourceAuthority,
+) -> Option<(String, u64, u64)> {
+    outline_text_for_generation_with(
+        published,
+        params,
+        include_savings_footer,
+        source_authority,
+        true,
+    )
+}
+
+pub(crate) fn outline_text_for_generation_with(
+    published: &crate::live_index::PublishedGeneration,
+    params: &OutlineProjectionParams,
+    include_savings_footer: bool,
+    source_authority: ContextSourceAuthority,
+    include_tests: bool,
 ) -> Option<(String, u64, u64)> {
     let guard = published.live.as_ref();
 
@@ -798,10 +828,38 @@ pub(crate) fn outline_text_for_generation(
         let symbol_cap = params
             .max_tokens
             .map(|tokens| ((tokens as usize).saturating_div(12)).clamp(25, 500));
-        let symbols_to_render = symbol_cap
-            .map(|cap| cap.min(file.symbols.len()))
-            .unwrap_or(file.symbols.len());
-        for sym in file.symbols.iter().take(symbols_to_render) {
+        // The cap counts production symbols only: children of a test module
+        // are not charged to it (the caller collapses them unless
+        // include_tests=true), so a test module can never use up the budget
+        // meant for production symbols or trigger the budget-omission advice.
+        let mut counted = 0usize;
+        let mut omitted = 0usize;
+        let mut test_module: Option<(u32, bool)> = None; // (depth, rendered)
+        for sym in file.symbols.iter() {
+            let mut test_child = false;
+            if let Some((module_depth, module_rendered)) = test_module {
+                if sym.depth > module_depth {
+                    if !module_rendered {
+                        continue;
+                    }
+                    test_child = true;
+                } else {
+                    test_module = None;
+                }
+            }
+            if !test_child && symbol_cap.is_some_and(|cap| counted >= cap) {
+                omitted += 1;
+                if test_module.is_none() && is_test_module_symbol(sym) {
+                    test_module = Some((sym.depth, false));
+                }
+                continue;
+            }
+            if !test_child {
+                counted += 1;
+            }
+            if test_module.is_none() && is_test_module_symbol(sym) {
+                test_module = Some((sym.depth, true));
+            }
             let indent = "  ".repeat(sym.depth as usize);
             let kind_str = sym.kind.to_string();
             // Strip redundant kind prefix from name (e.g., impl blocks named "impl Foo").
@@ -819,11 +877,10 @@ pub(crate) fn outline_text_for_generation(
                 sym.line_range.1 + 1,
             ));
         }
-        if symbols_to_render < file.symbols.len() {
+        if omitted > 0 {
             budget_omissions = true;
             body_lines.push(format!(
-                "  ...omitted {} symbols due to budget; pass a larger max_tokens or request get_file_content(start_line,end_line) for exact text",
-                file.symbols.len() - symbols_to_render
+                "  ...omitted {omitted} symbols due to budget; pass a larger max_tokens or request get_file_content(start_line,end_line) for exact text"
             ));
         }
     }
@@ -975,6 +1032,12 @@ pub(crate) fn outline_text_for_generation(
         None if include_savings_footer => 200 * 4, // compact sidecar hook default
         None => 0, // direct projection caller without max_tokens: unbudgeted
     };
+    // SF-DOG-01: collapse test modules to one line (true item count) BEFORE
+    // the byte budget, so collapsed tests never consume or overflow it.
+    if !include_tests {
+        let collapsed = collapse_large_test_modules(body_lines.join("\n"), false, None);
+        body_lines = collapsed.lines().map(str::to_string).collect();
+    }
     let (body_text, remaining) = build_with_budget(&body_lines, max_bytes);
     let completeness = if remaining > 0 || budget_omissions {
         "budget-limited"
@@ -1052,11 +1115,13 @@ pub fn compact_savings_footer(response_chars: usize, raw_chars: usize) -> String
     }
     let mut parts = Vec::new();
     if whole_saved >= 50 {
-        parts.push(format!("~{whole_saved} tokens vs whole-file read"));
+        parts.push(format!(
+            "~{whole_saved} tokens estimated vs whole-file read"
+        ));
     }
     if window_saved >= 10 {
         parts.push(format!(
-            "~{window_saved} tokens vs ~{COMPETENT_READ_WINDOW_LINES}-line windowed read (competent-manual baseline)"
+            "~{window_saved} tokens estimated vs ~{COMPETENT_READ_WINDOW_LINES}-line windowed read (assumed baseline, not measured)"
         ));
     }
     if parts.is_empty() {
@@ -1070,7 +1135,10 @@ pub fn collapse_large_test_modules(
     include_tests: bool,
     sections: Option<&[String]>,
 ) -> String {
-    if include_tests || outline_explicitly_requested(sections) {
+    // SF-DOG-01: asking for the outline section is not asking for tests; only
+    // include_tests=true expands a test module.
+    let _ = sections;
+    if include_tests {
         return text;
     }
 
@@ -1099,7 +1167,7 @@ pub fn collapse_large_test_modules(
             cursor += 1;
         }
 
-        if test_function_count > 100 {
+        if test_function_count > 0 {
             collapsed.push(line.to_string());
             collapsed.push(format!(
                 "{}  ... test module `{}` collapsed: {} functions not shown (pass include_tests=true to expand)",
@@ -1119,16 +1187,6 @@ pub fn collapse_large_test_modules(
         result.push('\n');
     }
     result
-}
-
-fn outline_explicitly_requested(sections: Option<&[String]>) -> bool {
-    sections
-        .map(|items| {
-            items
-                .iter()
-                .any(|section| section.eq_ignore_ascii_case("outline"))
-        })
-        .unwrap_or(false)
 }
 
 fn parse_test_module_outline_line(line: &str) -> Option<(usize, &str)> {

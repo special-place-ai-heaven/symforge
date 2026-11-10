@@ -204,6 +204,11 @@ fn resolve_index_folder_binding(
                 crate::domain::RootRefusalReason::UnsupportedPathEncoding => {
                     "Refused to index path: canonical root is not valid UTF-8 and cannot be represented without changing its identity".to_string()
                 }
+                crate::domain::RootRefusalReason::NetworkPath => format!(
+                    "Refused to index network path: {} ({}). Network (UNC) roots are never indexed; use a local directory.",
+                    input.path,
+                    reason.code()
+                ),
                 crate::domain::RootRefusalReason::CredentialDirectory => format!(
                     "Refused to index credential directory: {} ({}). A credential store (.aws, .kube, .ssh, .gnupg, .docker, .config/gcloud) is never indexed, even with allow_protected_root=true.",
                     input.path,
@@ -1596,6 +1601,7 @@ impl SymForgeServer {
             return refusal;
         }
 
+        let line_numbers = params.0.line_numbers;
         // Batch mode: targets[] provided
         if let Some(ref targets) = params.0.targets {
             if targets.is_empty() {
@@ -1678,17 +1684,23 @@ impl SymForgeServer {
                         name,
                         kind,
                         symbol_line,
-                    } => format::symbol_detail_from_indexed_file(
+                    } => format::symbol_detail_from_indexed_file_with(
                         file.as_ref(),
                         &name,
                         kind.as_deref(),
                         symbol_line,
+                        line_numbers,
                     ),
                     CapturedGetSymbolsEntry::CodeSlice {
                         file,
                         start_byte,
                         end_byte,
-                    } => format::code_slice_from_indexed_file(file.as_ref(), start_byte, end_byte),
+                    } => format::code_slice_from_indexed_file_with(
+                        file.as_ref(),
+                        start_byte,
+                        end_byte,
+                        line_numbers,
+                    ),
                     CapturedGetSymbolsEntry::FileNotFound { path } => format::not_found_file(&path),
                 })
                 .collect::<Vec<_>>()
@@ -1698,7 +1710,7 @@ impl SymForgeServer {
             self.record_tool_savings_named(
                 "get_symbol",
                 format::estimate_tokens_from_chars(batch_baseline_chars),
-                (output.len() / 4) as u64,
+                crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
             );
             self.bump_frecency(&bump_paths);
             return output;
@@ -1778,7 +1790,8 @@ impl SymForgeServer {
             &params.0.path,
             &params.0.name,
             params_hash,
-            force_refresh,
+            // The cached body was rendered under another gutter choice.
+            force_refresh || line_numbers.is_some(),
         ) && let Some(hit) = self.format_read_cache_hit(&meta, "session_repeat_read")
         {
             // Only a selected symbol is recorded for repeat hits (below).
@@ -1814,12 +1827,18 @@ impl SymForgeServer {
         // Estimate mode: return token cost without full content
         if params.0.estimate == Some(true) {
             if let Some(ref file) = file {
-                let file_tokens = file.content.len() / 4;
+                let file_tokens =
+                    crate::stel::handler::estimate_tokens_from_bytes(file.content.len() as u64)
+                        as usize;
                 let sym_tokens = file
                     .symbols
                     .iter()
                     .find(|s| s.name == params.0.name)
-                    .map(|s| (s.byte_range.1 - s.byte_range.0) as usize / 4)
+                    .map(|s| {
+                        crate::stel::handler::estimate_tokens_from_bytes(u64::from(
+                            s.byte_range.1 - s.byte_range.0,
+                        )) as usize
+                    })
                     .unwrap_or(0);
                 record_read_outcome(ReadOutcome::Found);
                 return format!(
@@ -1854,11 +1873,12 @@ impl SymForgeServer {
                 };
                 record_read_outcome(outcome);
                 let raw_chars = file.content.len();
-                let body = format::symbol_detail_from_indexed_file(
+                let body = format::symbol_detail_from_indexed_file_with(
                     file.as_ref(),
                     &params.0.name,
                     params.0.kind.as_deref(),
                     params.0.symbol_line,
+                    params.0.line_numbers,
                 );
                 let output = match &resolved_from_bare_name {
                     Some(path) => format!(
@@ -1873,9 +1893,9 @@ impl SymForgeServer {
                     format::estimate_tokens_from_chars(format::competent_manual_baseline_chars(
                         raw_chars,
                     )),
-                    (output.len() / 4) as u64,
+                    crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
                 );
-                let tokens = (output.len() / 4) as u32;
+                let tokens = crate::stel::handler::estimate_tokens(&output);
                 let prior_dedup = if force_refresh {
                     self.session_context.prior_fetch_for_dedup(
                         crate::protocol::session::FetchKind::Symbol,
@@ -1924,8 +1944,8 @@ impl SymForgeServer {
         }
     }
 
-    /// Start here. Project overview with adjustable detail level. Modes: (1) default/compact: ~500 token
-    /// overview with file count, languages, and directory tree. (2) detail='full': complete symbol outline
+    /// Start here. Project overview with adjustable detail level. Modes: (1) default/compact: bounded
+    /// overview with file count, languages, and directory tree (include_knowledge=true adds docs digests). (2) detail='full': complete symbol outline
     /// of every file — warning: large output. (3) detail='tree': browsable file tree with per-file symbol
     /// counts and language tags — supports path and depth params for subtree browsing.
     /// NOT for file details (use get_file_context) or finding symbols (use search_symbols).
@@ -1954,22 +1974,6 @@ impl SymForgeServer {
             loading_guard!(guard);
         }
         let published = self.capture_local_response_generation();
-        if params.0.estimate == Some(true) {
-            let file_count = published.live.file_count();
-            let detail = params.0.detail.as_deref().unwrap_or("compact");
-            let est = match detail {
-                "full" => {
-                    let max = params.0.max_files.unwrap_or(200) as usize;
-                    max.min(file_count) * 30
-                }
-                "tree" => file_count * 10,
-                _ => 500,
-            };
-            return format!(
-                "Estimate for get_repo_map: ~{} tokens (detail={}, files={})",
-                est, detail, file_count
-            );
-        }
         let detail = if let Some(ref d) = params.0.detail {
             d.as_str()
         } else if let Some(max_tokens) = params.0.max_tokens {
@@ -2079,22 +2083,31 @@ impl SymForgeServer {
                 Err(other) => format!("Repository map failed: HTTP {}", other.as_u16()),
             },
         };
-        let knowledge_map =
-            crate::protocol::knowledge_model::render_repository_knowledge_map(&published);
-        output.push_str("\n\n");
-        output.push_str(&knowledge_map);
+        // The knowledge digests cost ~2,500 tokens per call; opt-in only.
+        if params.0.include_knowledge == Some(true) {
+            output.push_str("\n\n");
+            output.push_str(
+                &crate::protocol::knowledge_model::render_repository_knowledge_map(&published),
+            );
+        }
         let output = with_withheld_note(&published.live, None, output);
+        if params.0.estimate == Some(true) {
+            // Measured, not assumed: the same view this call would render.
+            return format!(
+                "Estimate for get_repo_map: ~{} tokens (detail={}, files={}; length of the rendered response / 4)",
+                crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
+                detail,
+                published.live.file_count()
+            );
+        }
         self.session_context.record_summary_output(
             "get_repo_map",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            crate::stel::handler::estimate_tokens(&output),
         );
-        let budget_summary = with_withheld_note(
-            &published.live,
-            None,
-            format!(
-                "Repository orientation budget summary\noutput_coverage=degraded\n{knowledge_map}\n\nCode topology omitted from the bounded summary; retrieve the full map through the CCR handle."
-            ),
-        );
+        // Over budget: the summary is the code map itself, cut at the budget
+        // by `enforce_token_budget`; the full output stays behind the CCR handle.
+        let budget_summary =
+            format!("Repository orientation budget summary\noutput_coverage=degraded\n{output}");
         self.apply_ccr_budget_with_summary(
             "get_repo_map",
             output,
@@ -2227,7 +2240,9 @@ impl SymForgeServer {
         );
         if params.0.estimate == Some(true) {
             if let Some(file) = published.live.capture_shared_file(&params.0.path) {
-                let file_tokens = file.content.len() / 4;
+                let file_tokens =
+                    crate::stel::handler::estimate_tokens_from_bytes(file.content.len() as u64)
+                        as usize;
                 let outline_tokens = file.content.len() / 50; // ~5-10% of raw
                 return format!(
                     "Estimate for get_file_context(path=\"{}\"):\n  Outline: ~{} tokens\n  Raw file: ~{} tokens\n  Savings: ~{}%",
@@ -2316,7 +2331,7 @@ impl SymForgeServer {
                 knowledge_section.as_deref(),
                 context_max_tokens,
             );
-            let tokens = (output.len() / 4) as u32;
+            let tokens = crate::stel::handler::estimate_tokens(&output);
             let handle = self.ccr_store.lock().insert(
                 "get_file_context",
                 output.clone(),
@@ -2338,7 +2353,8 @@ impl SymForgeServer {
             max_tokens: context_max_tokens,
             sections: sections.clone(),
         };
-        match outline_tool_text_for_generation(&state, &published, &outline) {
+        // The test-module collapse runs before the byte budget (SF-DOG-01).
+        match outline_tool_text_for_generation(&state, &published, &outline, include_tests) {
             Ok(result) => {
                 let mut result =
                     format::collapse_large_test_modules(result, include_tests, sections.as_deref());
@@ -2421,7 +2437,7 @@ impl SymForgeServer {
                     // (dogfood 2026-07-11).
                     output = format::downgrade_full_completeness_after_truncation(&output);
                 }
-                let tokens = (output.len() / 4) as u32;
+                let tokens = crate::stel::handler::estimate_tokens(&output);
                 let prior_dedup = if force_refresh {
                     self.session_context.prior_fetch_for_dedup(
                         crate::protocol::session::FetchKind::FileContext,
@@ -2585,7 +2601,11 @@ impl SymForgeServer {
                     .symbols
                     .iter()
                     .find(|s| s.name == params.0.name)
-                    .map(|s| (s.byte_range.1 - s.byte_range.0) as usize / 4)
+                    .map(|s| {
+                        crate::stel::handler::estimate_tokens_from_bytes(u64::from(
+                            s.byte_range.1 - s.byte_range.0,
+                        )) as usize
+                    })
                     .unwrap_or(0);
                 let ref_count = file
                     .references
@@ -2693,8 +2713,11 @@ impl SymForgeServer {
                 raw_chars,
             ));
             let output = format!("{result}{footer}");
-            self.session_context
-                .record_symbol(&path, &params.0.name, (output.len() / 4) as u32);
+            self.session_context.record_symbol(
+                &path,
+                &params.0.name,
+                crate::stel::handler::estimate_tokens(&output),
+            );
             // Frecency bump — commitment tool, bundle-mode happy path.
             // Collection policy is resolved inside bump_frecency.
             self.bump_frecency(&[PathBuf::from(&path)]);
@@ -2761,7 +2784,7 @@ impl SymForgeServer {
                 self.session_context.record_symbol(
                     &path,
                     &params.0.name,
-                    (output.len() / 4) as u32,
+                    crate::stel::handler::estimate_tokens(&output),
                 );
                 self.bump_frecency(&[PathBuf::from(&path)]);
                 return output;
@@ -2820,7 +2843,7 @@ impl SymForgeServer {
             self.session_context.record_symbol(
                 &path,
                 &params.0.name,
-                (trace_result.len() / 4) as u32,
+                crate::stel::handler::estimate_tokens(&trace_result),
             );
             // Frecency bump — commitment tool, trace-mode happy path.
             // Collection policy is resolved inside bump_frecency.
@@ -2984,13 +3007,13 @@ impl SymForgeServer {
                         self.session_context.record_symbol(
                             p,
                             &params.0.name,
-                            (output.len() / 4) as u32,
+                            crate::stel::handler::estimate_tokens(&output),
                         );
                     } else if let Some(ref p) = params.0.path {
                         self.session_context.record_symbol(
                             p,
                             &params.0.name,
-                            (output.len() / 4) as u32,
+                            crate::stel::handler::estimate_tokens(&output),
                         );
                     }
                     // Frecency bump — commitment tool, fallback-definition
@@ -3097,7 +3120,7 @@ impl SymForgeServer {
 
         self.session_context.record_summary_output(
             "analyze_file_impact",
-            (result.len() / 4).min(u32::MAX as usize) as u32,
+            crate::stel::handler::estimate_tokens(&result),
         );
         result
     }
@@ -3184,11 +3207,11 @@ impl SymForgeServer {
             format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
                 output.len(),
             )),
-            (output.len() / 4) as u64,
+            crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
         );
         self.session_context.record_summary_output(
             "search_symbols",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            crate::stel::handler::estimate_tokens(&output),
         );
         // Session tracking: record each symbol hit as list-only until its body is fetched.
         for hit in &result.hits {
@@ -3496,7 +3519,7 @@ impl SymForgeServer {
         }
         self.session_context.record_summary_output(
             "search_text",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            crate::stel::handler::estimate_tokens(&output),
         );
         // Discovery stays neutral: only loaded context and mutations record frecency.
         self.apply_ccr_budget(
@@ -3544,7 +3567,7 @@ impl SymForgeServer {
         self.session_context.record_symbol(
             &params.0.path,
             &params.0.name,
-            (output.len() / 4) as u32,
+            crate::stel::handler::estimate_tokens(&output),
         );
         output
     }
@@ -3588,7 +3611,7 @@ impl SymForgeServer {
         let output = format::inspect_match_result_view(&view);
         self.session_context.record_summary_output(
             "inspect_match",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            crate::stel::handler::estimate_tokens(&output),
         );
         format::enforce_token_budget(output, params.0.max_tokens)
     }
@@ -3745,7 +3768,7 @@ impl SymForgeServer {
             let result = format::enforce_token_budget(result, params.0.max_tokens);
             self.session_context.record_summary_output(
                 "search_files",
-                (result.len() / 4).min(u32::MAX as usize) as u32,
+                crate::stel::handler::estimate_tokens(&result),
             );
             return result;
         }
@@ -3923,7 +3946,7 @@ impl SymForgeServer {
         );
         self.session_context.record_summary_output(
             "search_files",
-            (result.len() / 4).min(u32::MAX as usize) as u32,
+            crate::stel::handler::estimate_tokens(&result),
         );
         // Intentionally NO frecency bump here — search_files is a discovery
         // tool, and bumping on discovery creates a positive feedback loop
@@ -4135,6 +4158,7 @@ impl SymForgeServer {
                 placement.as_ref(),
                 persistence,
             ),
+            settled_unreadable: self.index.data_plane().settled_unreadable_paths(),
         };
 
         let mut after_runtime = self.health_trust_diagnostics();
@@ -4250,6 +4274,7 @@ impl SymForgeServer {
                 placement.as_ref(),
                 persistence,
             ),
+            settled_unreadable: self.index.data_plane().settled_unreadable_paths(),
         };
 
         let mut after_runtime = self.health_trust_diagnostics();
@@ -4276,7 +4301,7 @@ impl SymForgeServer {
                 snap.read_fires + snap.edit_fires + snap.write_fires + snap.grep_fires;
             if total_fires > 0 {
                 after_runtime.push_str(&format!(
-                    "\nToken savings: ~{} tokens saved across {} hook fires",
+                    "\nToken savings (estimated vs assumed windowed-read and grep+window baselines, not measured): ~{} tokens estimated saved across {} hook fires",
                     total_saved, total_fires
                 ));
             }
@@ -4365,7 +4390,7 @@ impl SymForgeServer {
         );
         let result = self.health_for_runtime(self.local_runtime_mode(), None, None, None, window);
         self.session_context
-            .record_summary_output("health", (result.len() / 4).min(u32::MAX as usize) as u32);
+            .record_summary_output("health", crate::stel::handler::estimate_tokens(&result));
         result
     }
 
@@ -4387,7 +4412,7 @@ impl SymForgeServer {
         let result = self.health_compact_for_runtime(self.local_runtime_mode(), None, None, None);
         self.session_context.record_summary_output(
             "health_compact",
-            (result.len() / 4).min(u32::MAX as usize) as u32,
+            crate::stel::handler::estimate_tokens(&result),
         );
         result
     }
@@ -4953,7 +4978,7 @@ impl SymForgeServer {
                 if let Some(response) = replay_response {
                     self.session_context.record_summary_output(
                         "index_folder",
-                        (response.len() / 4).min(u32::MAX as usize) as u32,
+                        crate::stel::handler::estimate_tokens(&response),
                     );
                     return response;
                 }
@@ -5002,7 +5027,7 @@ impl SymForgeServer {
                 }
                 self.session_context.record_summary_output(
                     "index_folder",
-                    (output.len() / 4).min(u32::MAX as usize) as u32,
+                    crate::stel::handler::estimate_tokens(&output),
                 );
                 output
             }
@@ -5153,7 +5178,7 @@ impl SymForgeServer {
                             let result = format!("{envelope}\n\n{output}");
                             self.session_context.record_summary_output(
                                 "what_changed",
-                                (result.len() / 4).min(u32::MAX as usize) as u32,
+                                crate::stel::handler::estimate_tokens(&result),
                             );
                             result
                         }
@@ -5161,7 +5186,7 @@ impl SymForgeServer {
                             record_read_outcome(ReadOutcome::InvalidRequest);
                             self.session_context.record_summary_output(
                                 "what_changed",
-                                (error.len() / 4).min(u32::MAX as usize) as u32,
+                                crate::stel::handler::estimate_tokens(&error),
                             );
                             error
                         }
@@ -5170,7 +5195,7 @@ impl SymForgeServer {
                     let result = format::what_changed_timestamp_view(&view, *since_ts);
                     self.session_context.record_summary_output(
                         "what_changed",
-                        (result.len() / 4).min(u32::MAX as usize) as u32,
+                        crate::stel::handler::estimate_tokens(&result),
                     );
                     result
                 }
@@ -5291,7 +5316,7 @@ impl SymForgeServer {
                                 let result = format!("{envelope}\n\n{output}");
                                 self.session_context.record_summary_output(
                                     "what_changed",
-                                    (result.len() / 4).min(u32::MAX as usize) as u32,
+                                    crate::stel::handler::estimate_tokens(&result),
                                 );
                                 format::enforce_token_budget(result, params.0.max_tokens)
                             }
@@ -5419,7 +5444,7 @@ impl SymForgeServer {
                                 let result = format!("{envelope}\n\n{output}");
                                 self.session_context.record_summary_output(
                                     "what_changed",
-                                    (result.len() / 4).min(u32::MAX as usize) as u32,
+                                    crate::stel::handler::estimate_tokens(&result),
                                 );
                                 result
                             }
@@ -5653,7 +5678,7 @@ impl SymForgeServer {
         );
         self.session_context.record_summary_output(
             "detect_impact",
-            (result.len() / 4).min(u32::MAX as usize) as u32,
+            crate::stel::handler::estimate_tokens(&result),
         );
         result
     }
@@ -5718,7 +5743,9 @@ impl SymForgeServer {
                 guard.capture_shared_file(&input.path)
             };
             if let Some(file) = indexed {
-                let file_tokens = file.content.len() / 4;
+                let file_tokens =
+                    crate::stel::handler::estimate_tokens_from_bytes(file.content.len() as u64)
+                        as usize;
                 let line_count = file.content.iter().filter(|&&b| b == b'\n').count();
                 record_read_outcome(ReadOutcome::Found);
                 return format!(
@@ -5734,7 +5761,9 @@ impl SymForgeServer {
                 match edit::safe_repo_path(&root, &input.path) {
                     Ok(canon_path) if canon_path.is_file() => {
                         if let Ok(metadata) = std::fs::metadata(&canon_path) {
-                            let file_tokens = metadata.len() as usize / 4;
+                            let file_tokens =
+                                crate::stel::handler::estimate_tokens_from_bytes(metadata.len())
+                                    as usize;
                             record_read_outcome(ReadOutcome::Found);
                             return format!(
                                 "Estimate for get_file_content(path=\"{}\"):\n  ~{} tokens (raw disk read; not indexed)",
@@ -5856,13 +5885,13 @@ impl SymForgeServer {
                     format::estimate_tokens_from_chars(format::competent_manual_baseline_chars(
                         raw_chars,
                     )),
-                    (output.len() / 4) as u64,
+                    crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
                 );
                 let capped =
                     format::cap_file_content_output(format!("{}{}", mode_annotation, output));
                 let with_warning = format::append_nul_byte_warning(capped, &file.as_ref().content);
                 let mut final_output = format::enforce_token_budget(with_warning, max_tokens);
-                let tokens = (final_output.len() / 4) as u32;
+                let tokens = crate::stel::handler::estimate_tokens(&final_output);
                 let prior_dedup = if force_refresh {
                     self.session_context.prior_fetch_for_dedup(
                         crate::protocol::session::FetchKind::FileContent,
@@ -6046,7 +6075,7 @@ impl SymForgeServer {
             let output = format::validate_file_syntax_result(&input.path, file.as_ref());
             self.session_context.record_summary_output(
                 "validate_file_syntax",
-                (output.len() / 4).min(u32::MAX as usize) as u32,
+                crate::stel::handler::estimate_tokens(&output),
             );
             return output;
         }
@@ -6108,7 +6137,7 @@ impl SymForgeServer {
         let output = format::validate_file_syntax_result(&input.path, &file);
         self.session_context.record_summary_output(
             "validate_file_syntax",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            crate::stel::handler::estimate_tokens(&output),
         );
         output
     }
@@ -6422,11 +6451,11 @@ impl SymForgeServer {
                     format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
                         output.len(),
                     )),
-                    (output.len() / 4) as u64,
+                    crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
                 );
                 self.session_context.record_summary_output(
                     "find_references",
-                    (output.len() / 4).min(u32::MAX as usize) as u32,
+                    crate::stel::handler::estimate_tokens(&output),
                 );
                 self.session_context.record_listed_symbol("", &input.name);
                 let result = match envelope {
@@ -6540,7 +6569,7 @@ impl SymForgeServer {
         };
         self.session_context.record_summary_output(
             "find_dependents",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            crate::stel::handler::estimate_tokens(&output),
         );
         format::enforce_token_budget(output, params.0.max_tokens)
     }
@@ -6665,10 +6694,10 @@ impl SymForgeServer {
             format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
                 output.len(),
             )),
-            (output.len() / 4) as u64,
+            crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
         );
         self.session_context
-            .record_summary_output("explore", (output.len() / 4).min(u32::MAX as usize) as u32);
+            .record_summary_output("explore", crate::stel::handler::estimate_tokens(&output));
         self.apply_ccr_budget("explore", output, params.0.max_tokens)
     }
 
@@ -6726,7 +6755,7 @@ impl SymForgeServer {
         );
         self.session_context.record_summary_output(
             "conventions",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            crate::stel::handler::estimate_tokens(&output),
         );
         output
     }
@@ -6748,10 +6777,8 @@ impl SymForgeServer {
         loading_guard!(guard);
         let temporal = Arc::clone(&generation.code_signals.temporal);
         let output = crate::protocol::edit_plan::plan_edit(&guard, &temporal, &params.0.target);
-        self.session_context.record_summary_output(
-            "edit_plan",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
-        );
+        self.session_context
+            .record_summary_output("edit_plan", crate::stel::handler::estimate_tokens(&output));
         output
     }
 
@@ -6784,7 +6811,7 @@ impl SymForgeServer {
         );
         self.session_context.record_summary_output(
             "investigation_suggest",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            crate::stel::handler::estimate_tokens(&output),
         );
         output
     }
@@ -8417,6 +8444,7 @@ impl SymForgeServer {
                         depth: None,
                         max_files: None,
                         estimate: None,
+                        include_knowledge: None,
                         max_tokens: params.0.max_tokens,
                     }))
                     .await
@@ -8484,7 +8512,7 @@ impl SymForgeServer {
 
         let output = smart_query::render_answer(&intent, assessment, original_q, q, &result);
         self.session_context
-            .record_summary_output("ask", (output.len() / 4).min(u32::MAX as usize) as u32);
+            .record_summary_output("ask", crate::stel::handler::estimate_tokens(&output));
         format::enforce_token_budget(output, params.0.max_tokens)
     }
 
@@ -8581,11 +8609,11 @@ impl SymForgeServer {
             format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
                 output.len(),
             )),
-            (output.len() / 4) as u64,
+            crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
         );
         self.session_context.record_summary_output(
             "diff_symbols",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            crate::stel::handler::estimate_tokens(&output),
         );
         format::enforce_token_budget(output, params.0.max_tokens)
     }
@@ -10311,6 +10339,7 @@ mod tests {
 
     fn get_symbol_input(path: &str, name: &str) -> super::GetSymbolInput {
         super::GetSymbolInput {
+            line_numbers: None,
             project: None,
             path: path.to_string(),
             name: name.to_string(),
@@ -10505,6 +10534,7 @@ mod tests {
         // Any non-health tool should return the empty guard message
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: "anything.rs".to_string(),
                 name: "anything".to_string(),
@@ -10538,6 +10568,7 @@ mod tests {
                 depth: None,
                 max_files: None,
                 estimate: None,
+                include_knowledge: None,
                 max_tokens: None,
             }))
             .await;
@@ -10556,6 +10587,7 @@ mod tests {
                 depth: None,
                 max_files: None,
                 estimate: None,
+                include_knowledge: None,
                 max_tokens: None,
             }))
             .await;
@@ -10574,6 +10606,7 @@ mod tests {
                 depth: None,
                 max_files: None,
                 estimate: None,
+                include_knowledge: None,
                 max_tokens: None,
             }))
             .await;
@@ -10606,6 +10639,7 @@ mod tests {
                 depth: None,
                 max_files: None,
                 estimate: None,
+                include_knowledge: None,
                 max_tokens: None,
             })),
         )
@@ -10636,6 +10670,7 @@ mod tests {
         let result = crate::protocol::surface_probe::with_connection_surface(
             Some(crate::protocol::surface_probe::SurfaceProfile::Full),
             server.get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: "anything.rs".to_string(),
                 name: "anything".to_string(),
@@ -10672,6 +10707,7 @@ mod tests {
         let result = crate::protocol::surface_probe::with_connection_surface(
             None,
             server.get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: "anything.rs".to_string(),
                 name: "anything".to_string(),
@@ -10701,6 +10737,7 @@ mod tests {
         let server = make_server(make_live_index_tripped());
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: "anything.rs".to_string(),
                 name: "anything".to_string(),
@@ -10770,6 +10807,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: "src/lib.rs".to_string(),
                 name: "foo".to_string(),
@@ -10804,6 +10842,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: String::new(),
                 name: "foo".to_string(),
@@ -11032,6 +11071,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                include_knowledge: None,
                 project: None,
                 detail: Some("full".to_string()),
                 path: None,
@@ -11052,6 +11092,7 @@ mod tests {
         let server = make_server(make_live_index_empty());
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                include_knowledge: None,
                 project: None,
                 detail: Some("full".to_string()),
                 path: None,
@@ -11113,6 +11154,7 @@ mod tests {
 
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                include_knowledge: None,
                 project: None,
                 detail: Some("full".to_string()),
                 path: None,
@@ -11233,6 +11275,7 @@ mod tests {
 
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                include_knowledge: None,
                 project: None,
                 detail: None,
                 path: None,
@@ -12351,6 +12394,186 @@ mod tests {
             assert!(
                 !result.contains("test module `tests` collapsed"),
                 "include_tests=true should not render collapse summary; got:\n{result}"
+            );
+        }
+
+        #[tokio::test]
+        async fn explicit_outline_section_still_collapses_test_module() {
+            let file = nested_test_module_fixture("src/lib.rs", 5);
+            let server = make_server(make_live_index_ready(vec![file]));
+
+            let input: super::super::GetFileContextInput =
+                serde_json::from_value(serde_json::json!({
+                    "path": "src/lib.rs",
+                    "sections": ["outline"],
+                    "max_tokens": 1800
+                }))
+                .expect("input should deserialize");
+            let result = server.get_file_context(Parameters(input)).await;
+
+            assert!(
+                result.contains("test module `tests` collapsed: 5 functions not shown"),
+                "outline request without include_tests must collapse the test module; got:\n{result}"
+            );
+            assert!(
+                !result.contains("test_4"),
+                "no test function may be listed; got:\n{result}"
+            );
+        }
+
+        #[tokio::test]
+        async fn collapsed_test_symbols_do_not_trigger_budget_omission_advice() {
+            let file = nested_test_module_fixture("src/lib.rs", 200);
+            let server = make_server(make_live_index_ready(vec![file]));
+
+            let input: super::super::GetFileContextInput =
+                serde_json::from_value(serde_json::json!({
+                    "path": "src/lib.rs",
+                    "sections": ["outline"],
+                    "max_tokens": 1800
+                }))
+                .expect("input should deserialize");
+            let result = server.get_file_context(Parameters(input)).await;
+
+            assert!(
+                result.contains("test module `tests` collapsed: 200 functions not shown (pass include_tests=true to expand)"),
+                "{result}"
+            );
+            assert!(!result.contains("omitted"), "{result}");
+            assert!(!result.contains("higher max_tokens"), "{result}");
+        }
+
+        #[tokio::test]
+        async fn collapsed_test_module_does_not_consume_the_byte_budget() {
+            // ~100 production symbols + ~90 tests: expanded it exceeds the 1800-token
+            // (7200-byte) budget, collapsed it must fit with nothing cut.
+            let mut content = String::new();
+            let mut symbols = Vec::new();
+            for i in 0..100u32 {
+                let start = content.len() as u32;
+                content.push_str(&format!("fn prod_{i:03}() {{}}\n"));
+                symbols.push(make_symbol_with_depth(
+                    &format!("prod_{i:03}"),
+                    SymbolKind::Function,
+                    0,
+                    i,
+                    i,
+                    (start, content.len() as u32),
+                ));
+            }
+            let module_start = content.len() as u32;
+            content.push_str("mod tests {\n");
+            symbols.push(make_symbol_with_depth(
+                "tests",
+                SymbolKind::Module,
+                0,
+                100,
+                191,
+                (module_start, module_start),
+            ));
+            for i in 0..90u32 {
+                let start = content.len() as u32;
+                content.push_str(&format!("    fn long_test_name_for_budget_{i:03}() {{}}\n"));
+                symbols.push(make_symbol_with_depth(
+                    &format!("long_test_name_for_budget_{i:03}"),
+                    SymbolKind::Function,
+                    1,
+                    101 + i,
+                    101 + i,
+                    (start, content.len() as u32),
+                ));
+            }
+            content.push_str("}\n");
+            let file = make_file("src/big.rs", content.as_bytes(), symbols);
+            let server = make_server(make_live_index_ready(vec![file]));
+
+            let input: super::super::GetFileContextInput =
+                serde_json::from_value(serde_json::json!({
+                    "path": "src/big.rs",
+                    "sections": ["outline"],
+                    "max_tokens": 1800
+                }))
+                .expect("input should deserialize");
+            let result = server.get_file_context(Parameters(input)).await;
+
+            assert!(
+                result.contains("prod_000") && result.contains("prod_099"),
+                "{result}"
+            );
+            assert!(
+                result.contains("test module `tests` collapsed: 90 functions not shown"),
+                "{result}"
+            );
+            assert!(!result.contains("long_test_name_for_budget"), "{result}");
+            assert!(!result.contains("Truncated"), "{result}");
+            assert!(!result.contains("budget-limited"), "{result}");
+            assert!(!result.contains("omitted"), "{result}");
+        }
+
+        #[tokio::test]
+        async fn compact_repo_map_lists_source_directories_before_dot_directories_and_docs() {
+            let files = vec![
+                large_outline_fixture(".claude/x.rs", 1, 3),
+                large_outline_fixture("docs/d.rs", 1, 3),
+                large_outline_fixture("src/a.rs", 6, 8),
+            ];
+            let server = make_server(make_live_index_ready(files));
+
+            let result = server
+                .get_repo_map(Parameters(super::super::GetRepoMapInput {
+                    project: None,
+                    detail: None,
+                    path: None,
+                    depth: None,
+                    max_files: None,
+                    estimate: None,
+                    include_knowledge: None,
+                    max_tokens: None,
+                }))
+                .await;
+
+            let row = |dir: &str| {
+                result
+                    .find(&format!("\n  {dir} "))
+                    .unwrap_or_else(|| panic!("no `{dir}` row in:\n{result}"))
+            };
+            assert!(row("src") < row(".claude"), "{result}");
+            assert!(row("src") < row("docs"), "{result}");
+        }
+
+        #[tokio::test]
+        async fn get_symbol_batch_targets_are_numbered_per_target() {
+            let server = make_server(make_live_index_ready(vec![large_outline_fixture(
+                "src/big.rs",
+                30,
+                40,
+            )]));
+            let input: super::super::GetSymbolInput = serde_json::from_value(serde_json::json!({
+                "targets": [
+                    {"path": "src/big.rs", "name": "large"},
+                    {"path": "src/big.rs", "start_byte": 0, "end_byte": 800},
+                    {"path": "src/big.rs", "name": "function_000"}
+                ],
+                "max_tokens": 4000
+            }))
+            .expect("input should deserialize");
+            let result = server.get_symbol(Parameters(input)).await;
+
+            let parts: Vec<&str> = result.split("\n---\n").collect();
+            assert_eq!(parts.len(), 3, "{result}");
+            assert!(
+                parts[0].starts_with("1: mod large {\n2:     fn function_000"),
+                "{result}"
+            );
+            assert!(
+                parts[1].starts_with("src/big.rs\n1: mod large {\n2: "),
+                "{result}"
+            );
+            // Short bodies keep the raw form.
+            assert!(
+                parts[2].starts_with("    fn function_000() {}")
+                    || parts[2].starts_with("fn function_000"),
+                "{result}"
             );
         }
     }
@@ -13735,7 +13958,6 @@ mod tests {
         l1_planner: wired\n\
         l2_economics: wired\n\
         l3_bypass: wired\n\
-        l4_ledger: in_memory\n\
         handler_symforge: wired\n\
         handler_status: wired\n\
         handler_symforge_edit: preview-and-apply\n\
@@ -13743,12 +13965,13 @@ mod tests {
         project_root: {root}\n\
         index_ready: true\n\
         index_files: 1\n\
-        deferred: b_results\n\
-        superseded: multi_step_planner (client agentic loop + find-fusion)\n\
         ──\n\
         project: {project}\n\
         index_symbols: 1\n\
         session_tokens: 0\n\
+        build_fact_l4_ledger: in_memory\n\
+        build_fact_deferred: b_results\n\
+        build_fact_superseded: multi_step_planner (client agentic loop + find-fusion)\n\
         last_ledger_decision: none\n\
         last_ledger_route: none\n\
         durable_ledger: events=0 net_vs_manual=0 sessions=0\n\
@@ -18170,6 +18393,7 @@ mod tests {
         let server = make_server(index);
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: "src/lib.rs".to_string(),
                 name: "foo".to_string(),
@@ -18227,6 +18451,7 @@ mod tests {
 
         let symbol = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: "src/held.rs".to_string(),
                 name: "held".to_string(),
@@ -18600,6 +18825,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: String::new(),
                 name: String::new(),
@@ -18635,6 +18861,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: String::new(),
                 name: String::new(),
@@ -25297,6 +25524,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                include_knowledge: None,
                 project: None,
                 detail: Some("tree".to_string()),
                 path: None,
@@ -25321,6 +25549,7 @@ mod tests {
         let server = make_server(make_live_index_empty());
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                include_knowledge: None,
                 project: None,
                 detail: Some("tree".to_string()),
                 path: None,

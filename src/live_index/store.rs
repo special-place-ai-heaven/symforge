@@ -1932,7 +1932,9 @@ fn capture_published_manifest(
     };
     let coverage = scout_plan.map_or_else(
         || {
-            if manifest_requires_degraded_coverage(live) {
+            // No scout plan means no reconcile sweep has run, so no path
+            // can be settled yet.
+            if manifest_requires_degraded_coverage(live, &HashSet::new()) {
                 CoverageStatus::Degraded
             } else {
                 CoverageStatus::Complete
@@ -2225,6 +2227,10 @@ pub struct SharedIndexHandle {
     physical_replacement_latched: std::sync::atomic::AtomicBool,
     /// Telemetry counter for fenced mutations rejected due to stale project generation.
     rejected_stale_mutations: AtomicU64,
+    /// SF-ADOPT-01: consecutive reconcile sweeps each `Unreadable` manifest
+    /// path has survived, tagged with the project generation they were counted
+    /// under. In memory only: after a restart a path re-settles.
+    unreadable_sweeps: Mutex<(u64, HashMap<crate::domain::CatalogPath, u32>)>,
     /// Git temporal intelligence — independently swapped side-table with
     /// per-file churn, ownership, and co-change data. Populated asynchronously
     /// after index load/reload completes.
@@ -2525,6 +2531,7 @@ impl SharedIndexHandle {
             admitted_physical_anchor: Mutex::new(admitted_physical_anchor),
             physical_replacement_latched: AtomicBool::new(false),
             rejected_stale_mutations: AtomicU64::new(0),
+            unreadable_sweeps: Mutex::new((0, HashMap::new())),
             git_temporal: ArcSwap::new(temporal),
             git_temporal_jobs: Mutex::new(super::git_temporal::GitTemporalJobQueue::default()),
             pre_update_snapshots: Mutex::new(HashMap::new()),
@@ -3017,6 +3024,7 @@ impl SharedIndexHandle {
         entry: crate::domain::ScoutedEntry,
         live: &LiveIndex,
     ) -> anyhow::Result<Option<Arc<discovery::ScoutPlan>>> {
+        self.forget_readable_unreadable_counts_locked(live);
         let Some(current) = self.scout_plan.load_full() else {
             return Ok(None);
         };
@@ -3037,7 +3045,7 @@ impl SharedIndexHandle {
             }
         };
         discovery::refresh_scout_plan(&mut plan)?;
-        if manifest_requires_degraded_coverage(live) {
+        if manifest_requires_degraded_coverage(live, &self.settled_unreadable_paths()) {
             plan.coverage = crate::domain::CoverageStatus::Degraded;
         }
         if !entry_changed && plan.coverage == current.coverage {
@@ -3134,7 +3142,12 @@ impl SharedIndexHandle {
             tracing::error!(%error, "failed to refresh reconciled scout-plan accounting");
             return false;
         }
-        if manifest_requires_degraded_coverage(&self.live.load_full()) {
+        // The only place a sweep is counted: one full reconcile rescout.
+        self.record_unreadable_sweep_locked(&self.live.load_full(), current_gen);
+        if manifest_requires_degraded_coverage(
+            &self.live.load_full(),
+            &self.settled_unreadable_paths(),
+        ) {
             scout_plan.coverage = crate::domain::CoverageStatus::Degraded;
         }
         let live = self.live.load_full();
@@ -3151,10 +3164,11 @@ impl SharedIndexHandle {
         };
         self.scout_plan.store(Some(Arc::clone(&scout_plan)));
         // A latched observer gap is deliberately NOT retired here. This lane
-        // runs on every ordinary file event -- `watcher::run_watcher_with_stop`
-        // publishes a reconciled plan per event and its coverage is `Complete`
-        // in the steady state -- so retiring on it clears the latch at the
-        // first event after any handoff, whether or not the missed window was
+        // runs on every full reconcile sweep -- `watcher::run_watcher_with_stop`
+        // publishes a reconciled plan per periodic, overflow and post-verify
+        // sweep (never per file event), and its coverage is `Complete` in the
+        // steady state -- so retiring on it clears the latch at the first
+        // sweep after any handoff, whether or not the missed window was
         // ever recovered. That is not a latch, and
         // `observer_replacement_gap_is_latched_as_non_current` fails on it.
         //
@@ -3171,6 +3185,61 @@ impl SharedIndexHandle {
             self.swap_and_publish_retaining_content((*live).clone());
         }
         true
+    }
+
+    /// Count one reconcile sweep for every manifest path still `Unreadable`;
+    /// a path that became readable (or left the manifest) restarts at zero,
+    /// as does everything when the project generation moved.
+    fn record_unreadable_sweep_locked(&self, live: &LiveIndex, project_generation: u64) {
+        let mut guard = self.unreadable_sweeps.lock();
+        let (generation, sweeps) = &mut *guard;
+        if *generation != project_generation {
+            *generation = project_generation;
+            sweeps.clear();
+        }
+        let unreadable: HashSet<&crate::domain::CatalogPath> = live
+            .manifest_entries
+            .iter()
+            .filter(|entry| matches!(entry.disposition, FileDisposition::Unreadable { .. }))
+            .map(|entry| &entry.path)
+            .collect();
+        sweeps.retain(|path, _| unreadable.contains(path));
+        for path in unreadable {
+            let count = sweeps.entry(path.clone()).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+    }
+
+    /// A path that stopped being `Unreadable` (read again, or removed) loses
+    /// its consecutive count at once, so a later unreadable spell starts from
+    /// zero instead of settling immediately. Counts only drop here.
+    fn forget_readable_unreadable_counts_locked(&self, live: &LiveIndex) {
+        let unreadable: HashSet<&crate::domain::CatalogPath> = live
+            .manifest_entries
+            .iter()
+            .filter(|entry| matches!(entry.disposition, FileDisposition::Unreadable { .. }))
+            .map(|entry| &entry.path)
+            .collect();
+        self.unreadable_sweeps
+            .lock()
+            .1
+            .retain(|path, _| unreadable.contains(path));
+    }
+
+    /// Unreadable paths whose sweep counter, under the current project
+    /// generation, was observed at or above [`UNREADABLE_SETTLE_SWEEPS`].
+    pub(crate) fn settled_unreadable_paths(&self) -> HashSet<crate::domain::CatalogPath> {
+        let current_gen = self.project_generation.load(Ordering::Acquire);
+        let guard = self.unreadable_sweeps.lock();
+        if guard.0 != current_gen {
+            return HashSet::new();
+        }
+        guard
+            .1
+            .iter()
+            .filter(|(_, sweeps)| **sweeps >= UNREADABLE_SETTLE_SWEEPS)
+            .map(|(path, _)| path.clone())
+            .collect()
     }
 
     pub(crate) fn terminal_dispositions(
@@ -4991,6 +5060,7 @@ impl SharedIndexHandle {
         removed_paths: &[String],
         live: &LiveIndex,
     ) -> anyhow::Result<Option<Arc<discovery::ScoutPlan>>> {
+        self.forget_readable_unreadable_counts_locked(live);
         let Some(current) = self.scout_plan.load_full() else {
             return Ok(None);
         };
@@ -5027,7 +5097,7 @@ impl SharedIndexHandle {
             }
         }
         discovery::refresh_scout_plan(&mut plan)?;
-        if manifest_requires_degraded_coverage(live) {
+        if manifest_requires_degraded_coverage(live, &self.settled_unreadable_paths()) {
             plan.coverage = crate::domain::CoverageStatus::Degraded;
         }
         if !changed && plan.coverage == current.coverage {
@@ -5781,15 +5851,25 @@ fn scouted_entry_path(entry: &crate::domain::ScoutedEntry) -> &str {
     scouted_catalog_path(&entry.path)
 }
 
-fn manifest_requires_degraded_coverage(live: &LiveIndex) -> bool {
-    live.manifest_entries.iter().any(|entry| {
-        matches!(
-            entry.disposition,
-            FileDisposition::Unreadable { .. }
-                | FileDisposition::UnstableDuringRead
-                | FileDisposition::AbortedCircuitBreaker
-        )
-    })
+/// Sweeps a path must stay `Unreadable` before it stops holding coverage
+/// degraded (SF-ADOPT-01). ponytail: fixed constant; the owner left N open.
+pub(crate) const UNREADABLE_SETTLE_SWEEPS: u32 = 3;
+
+/// `settled` holds `Unreadable` paths that survived
+/// [`UNREADABLE_SETTLE_SWEEPS`] consecutive sweeps: they no longer degrade
+/// coverage. Their freshness reason (`ObservationFailed`) is kept, so the
+/// index still says it is not fully observed.
+fn manifest_requires_degraded_coverage(
+    live: &LiveIndex,
+    settled: &HashSet<crate::domain::CatalogPath>,
+) -> bool {
+    live.manifest_entries
+        .iter()
+        .any(|entry| match entry.disposition {
+            FileDisposition::Unreadable { .. } => !settled.contains(&entry.path),
+            FileDisposition::UnstableDuringRead | FileDisposition::AbortedCircuitBreaker => true,
+            _ => false,
+        })
 }
 
 fn catalog_entry_from_scout(
@@ -9794,6 +9874,169 @@ mod tests {
             "an unchanged Complete reconciliation must not mint a publication"
         );
         assert_eq!(unchanged.content_generation, healed.content_generation);
+    }
+
+    #[test]
+    fn unreadable_path_settles_coverage_after_n_sweeps_but_keeps_observation_failed() {
+        let project = TempDir::new().unwrap();
+        write_file(project.path(), "main.rs", "fn main() {}\n");
+        write_file(project.path(), "locked.rs", "fn locked() {}\n");
+        let shared = LiveIndex::load(project.path()).unwrap();
+        let complete_plan = (*shared.scout_plan().expect("cold scout plan")).clone();
+        let scouted = complete_plan
+            .entries
+            .iter()
+            .find(|entry| entry.path.normalized_utf8.as_deref() == Some("locked.rs"))
+            .expect("scouted locked.rs")
+            .clone();
+        let project_generation = shared.current_project_generation();
+        assert!(
+            shared
+                .publish_terminal_disposition_at_generation(
+                    "locked.rs",
+                    scouted,
+                    FileDisposition::Unreadable {
+                        stage: crate::domain::AccessStage::FullRead,
+                        kind: crate::domain::AccessErrorKind::PermissionDenied,
+                    },
+                    project_generation,
+                    shared.published_state().generation,
+                )
+                .is_some()
+        );
+        let reasons =
+            |shared: &SharedIndexHandle| match shared.published_generation().freshness.as_ref() {
+                FreshnessStatus::Degraded { reason_codes, .. } => reason_codes.clone(),
+                other => panic!("unreadable file must keep freshness degraded; got {other:?}"),
+            };
+        assert!(reasons(&shared).contains(&FreshnessReason::ReconciliationPending));
+
+        for sweep in 1..=UNREADABLE_SETTLE_SWEEPS {
+            let baseline = shared.scout_plan().map(|plan| (*plan).clone());
+            assert!(shared.publish_reconciled_scout_plan_at_generation(
+                baseline.as_ref(),
+                complete_plan.clone(),
+                project_generation,
+            ));
+            let pending = reasons(&shared).contains(&FreshnessReason::ReconciliationPending);
+            assert_eq!(
+                pending,
+                sweep < UNREADABLE_SETTLE_SWEEPS,
+                "sweep {sweep}: coverage must stay degraded until the path settles"
+            );
+            assert!(
+                reasons(&shared).contains(&FreshnessReason::ObservationFailed),
+                "sweep {sweep}: a settled unreadable path is still unobserved"
+            );
+            // Health may call the file settled only once the counter was
+            // observed at the threshold.
+            let settled = shared.settled_unreadable_paths();
+            let settled_names: Vec<_> = settled
+                .iter()
+                .filter_map(|path| path.normalized_utf8.as_deref())
+                .collect();
+            if sweep < UNREADABLE_SETTLE_SWEEPS {
+                assert!(settled.is_empty(), "sweep {sweep}: settled too early");
+            } else {
+                assert_eq!(settled_names, vec!["locked.rs"]);
+            }
+            let manifest = shared
+                .published_generation()
+                .manifest
+                .clone()
+                .expect("published manifest");
+            let line = crate::index_lifecycle::guidance::health::render_unreadable_files_line(
+                &manifest.entries,
+                &settled,
+            )
+            .expect("unreadable line");
+            assert_eq!(
+                line.contains("locked.rs [settled-unreadable]"),
+                sweep >= UNREADABLE_SETTLE_SWEEPS,
+                "sweep {sweep}: {line}"
+            );
+        }
+        assert_eq!(
+            shared.scout_plan().expect("plan").coverage,
+            crate::domain::CoverageStatus::Complete
+        );
+    }
+
+    #[test]
+    fn readable_again_path_restarts_its_unreadable_count_from_zero() {
+        let project = TempDir::new().unwrap();
+        write_file(project.path(), "main.rs", "fn main() {}\n");
+        write_file(project.path(), "locked.rs", "fn locked() {}\n");
+        let shared = LiveIndex::load(project.path()).unwrap();
+        let complete_plan = (*shared.scout_plan().expect("cold scout plan")).clone();
+        let project_generation = shared.current_project_generation();
+        let mark_unreadable = |shared: &SharedIndex| {
+            let scouted = shared
+                .scout_plan()
+                .expect("plan")
+                .entries
+                .iter()
+                .find(|entry| entry.path.normalized_utf8.as_deref() == Some("locked.rs"))
+                .expect("scouted locked.rs")
+                .clone();
+            assert!(
+                shared
+                    .publish_terminal_disposition_at_generation(
+                        "locked.rs",
+                        scouted,
+                        FileDisposition::Unreadable {
+                            stage: crate::domain::AccessStage::FullRead,
+                            kind: crate::domain::AccessErrorKind::PermissionDenied,
+                        },
+                        project_generation,
+                        shared.published_state().generation,
+                    )
+                    .is_some()
+            );
+        };
+        let sweep = |shared: &SharedIndex| {
+            let baseline = shared.scout_plan().map(|plan| (*plan).clone());
+            assert!(shared.publish_reconciled_scout_plan_at_generation(
+                baseline.as_ref(),
+                complete_plan.clone(),
+                project_generation,
+            ));
+        };
+
+        mark_unreadable(&shared);
+        for _ in 0..UNREADABLE_SETTLE_SWEEPS {
+            sweep(&shared);
+        }
+        assert_eq!(
+            shared.settled_unreadable_paths().len(),
+            1,
+            "precondition: settled"
+        );
+
+        // The file is read successfully again: its count must go.
+        write_file(project.path(), "locked.rs", "fn locked_again() {}\n");
+        assert!(matches!(
+            crate::live_index::single_file::update_file_from_disk(
+                &shared,
+                project.path(),
+                "locked.rs"
+            ),
+            crate::live_index::single_file::ReindexResult::Reindexed
+        ));
+        assert!(shared.settled_unreadable_paths().is_empty());
+
+        // A new unreadable spell starts from zero: one sweep does not settle it.
+        mark_unreadable(&shared);
+        sweep(&shared);
+        assert!(
+            shared.settled_unreadable_paths().is_empty(),
+            "a fresh unreadable spell settled at once"
+        );
+        assert!(matches!(
+            shared.published_generation().freshness.as_ref(),
+            FreshnessStatus::Degraded { reason_codes, .. }
+                if reason_codes.contains(&FreshnessReason::ReconciliationPending)
+        ));
     }
 
     #[test]

@@ -16,6 +16,9 @@ pub struct SymbolReadRequest {
     pub estimate: Option<bool>,
     pub max_tokens: Option<u64>,
     pub force_refresh: Option<bool>,
+    /// Prefix body lines with file line numbers (default: bodies over 20 lines).
+    #[serde(default)]
+    pub line_numbers: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

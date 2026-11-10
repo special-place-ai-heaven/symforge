@@ -382,10 +382,15 @@ where
             {
                 debug!("reconciliation: stale incarnation's admission observation refused");
             }
-            if matches!(
-                outcome,
-                ReindexResult::Reindexed | ReindexResult::HashSkip | ReindexResult::Skipped
-            ) {
+            // A reindex repaired something. A hash skip repaired something only
+            // when it re-observed a path with a transient (unreadable) or
+            // withheld disposition; on a healthy file it changed nothing.
+            // An admission skip changed nothing either.
+            if matches!(outcome, ReindexResult::Reindexed)
+                || (matches!(outcome, ReindexResult::HashSkip)
+                    && (transient_paths.contains(&relative_path)
+                        || withheld.contains(&relative_path)))
+            {
                 repairs_applied += 1;
             }
         }
@@ -2146,6 +2151,24 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn reconcile_hash_skip_sweep_reports_zero_repairs() {
+        let project = TempDir::new().unwrap();
+        let source = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"fn seed() {}").unwrap();
+        let shared = crate::live_index::LiveIndex::load(project.path()).unwrap();
+
+        // Same bytes, new mtime: the plan sees a change, the content hash does not.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&source, b"fn seed() {}").unwrap();
+
+        assert_eq!(
+            reconcile_stale_files(project.path(), &shared),
+            0,
+            "a sweep that only hash-skips repaired nothing"
+        );
+    }
     #[test]
     fn reconcile_rescout_discovers_new_text_files() {
         let project = TempDir::new().unwrap();

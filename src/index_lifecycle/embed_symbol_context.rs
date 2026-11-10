@@ -499,7 +499,9 @@ pub(super) fn project(
         }
     };
     if request.estimate == Some(true) {
-        let body_tokens = (symbol.byte_range.1 - symbol.byte_range.0) as u64 / 4;
+        let body_tokens = crate::stel::handler::estimate_tokens_from_bytes(u64::from(
+            symbol.byte_range.1 - symbol.byte_range.0,
+        ));
         let caller_tokens = file
             .references
             .iter()
@@ -511,7 +513,9 @@ pub(super) fn project(
             body_tokens,
             caller_tokens,
             bundle_tokens: body_tokens * 3,
-            raw_file_tokens: file.content.len() as u64 / 4,
+            raw_file_tokens: crate::stel::handler::estimate_tokens_from_bytes(
+                file.content.len() as u64
+            ),
         });
         result.rendered=budget.text(&format!("Estimate for get_symbol_context(name=\"{}\"):\n  Symbol body: ~{} tokens\n  Callers: ~{} tokens\n  Bundle: ~{} tokens",request.name,body_tokens,caller_tokens,body_tokens*3))?;
         return Ok(QueryOutput::SymbolContext(result));

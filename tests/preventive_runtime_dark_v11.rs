@@ -1148,9 +1148,9 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Same 89 paths; no new lifecycle/server-API bridge. Review and dual-surface proof:
 // docs/reviews/2026-10-25-differential-overlap-review.md.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "4bc5920f0dbb120e3bac60c946111f833488f99995243b8950b9a29fc552bbbd",
+    "772b6b906f57850c5de42edac49dd2de5b50f382d51d4514dccdd13e812eb71e",
     89,
-    2266962,
+    2274703,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1326,9 +1326,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Same 312 files; independently reviewed and recomputed; no new boundary bridge.
 // docs/reviews/2026-10-25-differential-overlap-review.md.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "6fb09f890c1626698c6a9869032f9388031c9c1b68d4e1bdc64df22207136f65",
+    "b86b81c9041c5e0eb9413006957d6f1fae03811ee80856d663e5f1bf0ca5b156",
     313,
-    12322732,
+    12407274,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
@@ -1463,7 +1463,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "f58c558e6e5002df:28962"),
+    ("ci.yml", "dde54a23ec6387cc:29612"),
     ("release.yml", "b174946ff2c434bb:115022"),
 ];
 
@@ -1668,6 +1668,13 @@ const CARGO_LINES: &[(&str, usize)] = &[
         "run: cargo test --release --test live_index_integration test_load_perf_1000_files -- --ignored --test-threads=1",
         1,
     ),
+    (
+        "run: cargo test --release --lib large_rust_file_indexing_is_linear_and_unchanged -- --ignored --test-threads=1",
+        1,
+    ),
+    // Advisories job: an install and a database check. No test harness runs.
+    ("run: cargo install cargo-deny --locked", 1),
+    ("run: cargo deny check advisories", 1),
     // Windows-native job. No test harness: nextest never builds or runs
     // doctests, the install line is a binary fetch, and the fmt/clippy
     // gates cannot reach the doctest lane.
@@ -2529,8 +2536,8 @@ fn no_gate_builds_doctests() {
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(
         (seen.len(), distinct.len(), files),
-        (65, 49, 2),
-        "the CI workflows hold sixty-five cargo-mentioning lines, forty-nine \
+        (68, 52, 2),
+        "the CI workflows hold sixty-eight cargo-mentioning lines, fifty-two \
          of them distinct, across two workflow files; this walk saw {:?}. A gate \
          added, removed, reworded, or a workflow file added — reconcile \
          CARGO_LINES with the workflows deliberately, never by loosening this \

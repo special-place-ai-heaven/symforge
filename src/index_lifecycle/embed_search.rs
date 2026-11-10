@@ -129,7 +129,11 @@ pub(super) fn symbols(
             .result
             .hits
             .iter()
-            .map(|hit| ((hit.path.len() + hit.name.len() + hit.kind.len() + 128) / 4) as u64)
+            .map(|hit| {
+                crate::stel::handler::estimate_tokens_from_bytes(
+                    (hit.path.len() + hit.name.len() + hit.kind.len() + 128) as u64,
+                )
+            })
             .sum::<u64>()
             + 24;
         return Ok(QueryOutput::SearchEstimate(SearchEstimate {

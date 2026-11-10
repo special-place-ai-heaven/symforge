@@ -218,6 +218,7 @@ pub(crate) fn health_report(
                     curation_health:
                         crate::knowledge::curation::KnowledgeCurationCoordinator::default()
                             .health_line(&shared_index, Some(&root), Some(&placement), persistence),
+                    settled_unreadable: shared_index.settled_unreadable_paths(),
                 };
             let not_applicable_lines = |sections: &[(&str, &str)]| {
                 sections

@@ -163,6 +163,18 @@ pub(crate) struct HookAdoptionSnapshot {
     pub prompt_context: WorkflowAdoptionCounts,
     pub post_edit_impact: WorkflowAdoptionCounts,
     pub first_repo_start: Option<HookOutcome>,
+    /// Fail-open rows per recorded `reason=`; rows without one count as
+    /// `unrecorded`.
+    pub fail_open_reasons: std::collections::BTreeMap<String, usize>,
+    /// The loader could not resolve which sidecar lifetime is current, so it
+    /// counted nothing.
+    pub session_unknown: bool,
+    /// The session and lifetime the rows were filtered on, when resolved.
+    pub scope: Option<String>,
+    /// Rows anywhere in the log (both generations, every session and project
+    /// sharing the control dir) recorded with no provable sidecar lifetime.
+    /// Never attributed to the scoped lifetime; reported with that scope.
+    pub unscoped_rows: usize,
 }
 
 impl HookAdoptionSnapshot {
@@ -289,20 +301,6 @@ pub fn run_hook_with_input_at(
         .map(event_name_for)
         .unwrap_or("PostToolUse");
     let workflow = workflow_for_subcommand(resolved.as_ref(), &input);
-    let sidecar_endpoint = control_state_dir
-        .as_ref()
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "process control state unavailable",
-            )
-        })
-        .and_then(|state_dir| read_sidecar_endpoint(state_dir, &repo_root))
-        .map(|(port, session_id)| (port, normalize_session_id(session_id)));
-    let session_id = sidecar_endpoint
-        .as_ref()
-        .ok()
-        .and_then(|(_, session_id)| session_id.clone());
 
     // Conservatively fail open for workflows we do not want to semanticize.
     // This keeps docs/config/non-source reads and unknown tool events from
@@ -315,9 +313,54 @@ pub fn run_hook_with_input_at(
         return Ok(());
     }
 
+    // SF-TE-09: nothing worth asking (e.g. a regex Grep) — fail open with no
+    // HTTP request and no adoption row; nothing was routed. Decided BEFORE
+    // descriptor selection, whose daemon epoch probe is itself an HTTP GET.
+    let Some((path, query)) = endpoint_for(resolved.as_ref(), &input) else {
+        if verbose {
+            eprintln!("[symforge-hook] no enrichment endpoint for this input — skipping");
+        }
+        println!("{}", fail_open_json(event_name));
+        return Ok(());
+    };
+
+    let sidecar_endpoint = control_state_dir
+        .as_ref()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "process control state unavailable",
+            )
+        })
+        .and_then(|state_dir| read_sidecar_endpoint(state_dir, &repo_root))
+        .map(|identity| {
+            let lifetime = adoption_lifetime_label(&identity);
+            (
+                identity.port,
+                normalize_session_id(identity.session_id),
+                lifetime,
+            )
+        });
+    let session_id = sidecar_endpoint
+        .as_ref()
+        .ok()
+        .and_then(|(_, session_id, _)| session_id.clone());
+    // SF-ADOPT-03: a row carries the descriptor's lifetime only when it was
+    // recorded against the descriptor's own session; a daemon-fallback
+    // session is a different lifetime the descriptor proves nothing about.
+    let descriptor_lifetime = sidecar_endpoint
+        .as_ref()
+        .ok()
+        .and_then(|(_, _, lifetime)| lifetime.clone());
+    let row_lifetime = |row_session: Option<&str>| {
+        (row_session == session_id.as_deref())
+            .then_some(descriptor_lifetime.as_deref())
+            .flatten()
+    };
+
     // Step 1 — read port file; if missing, try daemon fallback before fail-open.
     let (port, effective_session_id, used_daemon_fallback) = match sidecar_endpoint {
-        Ok((p, descriptor_session_id)) => {
+        Ok((p, descriptor_session_id, _)) => {
             if verbose {
                 eprintln!("[symforge-hook] read port file: port={p}");
             }
@@ -366,10 +409,11 @@ pub fn run_hook_with_input_at(
                         workflow,
                         HookOutcome::NoSidecar,
                         session_id.as_deref(),
-                        Some(NoSidecarDetail {
+                        row_lifetime(session_id.as_deref()),
+                        Some(HookOutcomeDetail {
                             reason: "sidecar_port_missing",
-                            searched_path: &port_file_path.to_string_lossy(),
-                            suggestion: "start_mcp_session",
+                            searched_path: Some(&port_file_path.to_string_lossy()),
+                            suggestion: Some("start_mcp_session"),
                             project_root: &repo_root.to_string_lossy(),
                         }),
                     );
@@ -386,9 +430,7 @@ pub fn run_hook_with_input_at(
     // descriptor read so this predicate is identical to `proxy_path` routing.
     let initial_endpoint_is_daemon = effective_session_id.is_some();
 
-    // Step 2 — determine endpoint + query string.
-    let resolved_ref = resolved.as_ref();
-    let (path, query) = endpoint_for(resolved_ref, &input);
+    // Step 2 — endpoint + query string were resolved above.
     let request_path = proxy_path(path, effective_session_id.as_deref());
 
     if verbose {
@@ -406,10 +448,17 @@ pub fn run_hook_with_input_at(
                 "[symforge-hook] project root is not valid UTF-8 — refusing enrichment authority and failing open"
             );
         }
-        record_hook_outcome(
+        record_hook_outcome_with_detail(
             workflow,
             HookOutcome::NoSidecar,
             effective_session_id.as_deref(),
+            row_lifetime(effective_session_id.as_deref()),
+            Some(HookOutcomeDetail {
+                reason: "project_root_not_utf8",
+                searched_path: None,
+                suggestion: None,
+                project_root: &repo_root.to_string_lossy(),
+            }),
         );
         println!("{}", fail_open_json(event_name));
         return Ok(());
@@ -554,6 +603,7 @@ pub fn run_hook_with_input_at(
                         workflow,
                         event_name,
                         Some(&daemon_session_id),
+                        row_lifetime(Some(&daemon_session_id)),
                         "index_not_ready",
                         verbose,
                         &repo_root,
@@ -565,6 +615,7 @@ pub fn run_hook_with_input_at(
                         workflow,
                         event_name,
                         Some(&daemon_session_id),
+                        row_lifetime(Some(&daemon_session_id)),
                         "root_conflict",
                         verbose,
                         &repo_root,
@@ -576,6 +627,7 @@ pub fn run_hook_with_input_at(
                         workflow,
                         event_name,
                         Some(&daemon_session_id),
+                        row_lifetime(Some(&daemon_session_id)),
                         "http_failure",
                         verbose,
                         &repo_root,
@@ -587,6 +639,7 @@ pub fn run_hook_with_input_at(
                         workflow,
                         event_name,
                         effective_session_id.as_deref(),
+                        row_lifetime(effective_session_id.as_deref()),
                         "index_not_ready",
                         verbose,
                         &repo_root,
@@ -598,6 +651,7 @@ pub fn run_hook_with_input_at(
                         workflow,
                         event_name,
                         effective_session_id.as_deref(),
+                        row_lifetime(effective_session_id.as_deref()),
                         "root_conflict",
                         verbose,
                         &repo_root,
@@ -609,6 +663,7 @@ pub fn run_hook_with_input_at(
                         workflow,
                         event_name,
                         effective_session_id.as_deref(),
+                        row_lifetime(effective_session_id.as_deref()),
                         "http_failure",
                         verbose,
                         &repo_root,
@@ -629,10 +684,11 @@ pub fn run_hook_with_input_at(
                         workflow,
                         HookOutcome::NoSidecar,
                         effective_session_id.as_deref(),
-                        Some(NoSidecarDetail {
+                        row_lifetime(effective_session_id.as_deref()),
+                        Some(HookOutcomeDetail {
                             reason: "sidecar_port_stale",
-                            searched_path: &port_file_path.to_string_lossy(),
-                            suggestion: "restart_sidecar",
+                            searched_path: Some(&port_file_path.to_string_lossy()),
+                            suggestion: Some("restart_sidecar"),
                             project_root: &repo_root.to_string_lossy(),
                         }),
                     );
@@ -648,7 +704,12 @@ pub fn run_hook_with_input_at(
     }
 
     // Step 5/6 — output result JSON.
-    record_hook_outcome(workflow, outcome, outcome_session_id.as_deref());
+    record_hook_outcome(
+        workflow,
+        outcome,
+        outcome_session_id.as_deref(),
+        row_lifetime(outcome_session_id.as_deref()),
+    );
     println!("{}", success_json(event_name, &body));
     Ok(())
 }
@@ -657,6 +718,7 @@ fn emit_live_refusal_fail_open(
     workflow: HookWorkflow,
     event_name: &str,
     session_id: Option<&str>,
+    lifetime: Option<&str>,
     reason: &str,
     verbose: bool,
     repo_root: &std::path::Path,
@@ -664,7 +726,19 @@ fn emit_live_refusal_fail_open(
     if verbose {
         eprintln!("[symforge-hook] outcome=SidecarError reason={reason}");
     }
-    record_hook_outcome(workflow, HookOutcome::SidecarError, session_id);
+    // SF-ADOPT-02: persist the refusal reason, not just the outcome lane.
+    record_hook_outcome_with_detail(
+        workflow,
+        HookOutcome::SidecarError,
+        session_id,
+        lifetime,
+        Some(HookOutcomeDetail {
+            reason,
+            searched_path: None,
+            suggestion: None,
+            project_root: &repo_root.to_string_lossy(),
+        }),
+    );
     // A session that starts while the index is still loading is told so in
     // one line instead of silently getting no context. Only on an observed
     // index-not-ready answer: nothing else here proves indexing is under way.
@@ -929,8 +1003,8 @@ fn is_non_source_path(path: &str) -> bool {
         ".ini",
         ".cfg",
         ".conf",
-        ".html",
-        ".css",
+        // `.html` / `.css` are indexed languages (SF-DOG-05); never list an
+        // extension `LanguageId` parses — the unit test below pins that.
         ".svg",
         ".png",
         ".jpg",
@@ -974,12 +1048,14 @@ fn is_plausible_symbol_name(pattern: &str) -> bool {
 /// Maps a resolved subcommand + stdin input to `(path, query_string)`.
 ///
 /// The `input` carries the file path and search pattern extracted from the
-/// Claude Code PostToolUse payload. When `subcommand` is `None` (unknown
-/// tool_name), returns fail-open empty values.
+/// Claude Code PostToolUse payload. `None` means there is nothing worth
+/// asking the sidecar: the caller must fail open without an HTTP request and
+/// without recording an adoption row (SF-TE-09 — the old `/health` stand-in
+/// injected index-health JSON into context and counted it as routed).
 pub(crate) fn endpoint_for(
     subcommand: Option<&HookSubcommand>,
     input: &HookInput,
-) -> (&'static str, String) {
+) -> Option<(&'static str, String)> {
     let cwd = input.cwd.as_deref().unwrap_or("");
 
     match subcommand {
@@ -990,7 +1066,7 @@ pub(crate) fn endpoint_for(
             } else {
                 format!("path={}", url_encode(&file))
             };
-            ("/outline", query)
+            Some(("/outline", query))
         }
         Some(HookSubcommand::Edit) => {
             let file = extract_file_path(input, cwd);
@@ -999,7 +1075,7 @@ pub(crate) fn endpoint_for(
             } else {
                 format!("path={}", url_encode(&file))
             };
-            ("/impact", query)
+            Some(("/impact", query))
         }
         Some(HookSubcommand::Write) => {
             let file = extract_file_path(input, cwd);
@@ -1008,7 +1084,7 @@ pub(crate) fn endpoint_for(
             } else {
                 format!("path={}&new_file=true", url_encode(&file))
             };
-            ("/impact", query)
+            Some(("/impact", query))
         }
         Some(HookSubcommand::Grep) => {
             // Use `pattern` field first, then fall back to `path` (directory) field.
@@ -1022,11 +1098,11 @@ pub(crate) fn endpoint_for(
             // symbol names. Forwarding them buys a guaranteed zero-hit report
             // in prompt context. Only a bare identifier is worth the lookup.
             if q.is_empty() || !is_plausible_symbol_name(q) {
-                return ("/health", String::new());
+                return None;
             }
-            ("/symbol-context", format!("name={}", url_encode(q)))
+            Some(("/symbol-context", format!("name={}", url_encode(q))))
         }
-        Some(HookSubcommand::SessionStart) => ("/repo-map", String::new()),
+        Some(HookSubcommand::SessionStart) => Some(("/repo-map", String::new())),
         Some(HookSubcommand::PromptSubmit) => {
             let prompt = input.prompt.as_deref().unwrap_or("");
             let query = if prompt.is_empty() {
@@ -1034,13 +1110,11 @@ pub(crate) fn endpoint_for(
             } else {
                 format!("text={}", url_encode(prompt))
             };
-            ("/prompt-context", query)
+            Some(("/prompt-context", query))
         }
-        // PreTool is handled before endpoint_for is called; this arm is
-        // unreachable but required for exhaustiveness.
-        Some(HookSubcommand::PreTool) => ("/health", String::new()),
-        // Unknown tool_name → fail-open: route to a no-op that returns empty.
-        None => ("/health", String::new()),
+        // PreTool is handled before endpoint_for is called; unknown tool
+        // names resolve to PassThrough. Neither has anything to ask.
+        Some(HookSubcommand::PreTool) | None => None,
     }
 }
 
@@ -1099,12 +1173,26 @@ fn extract_file_path(input: &HookInput, cwd: &str) -> String {
 fn read_sidecar_endpoint(
     control_state_dir: &ControlStateDir,
     project_root: &Path,
-) -> std::io::Result<(u16, Option<String>)> {
-    crate::sidecar::port_file::read_sidecar_endpoint(
+) -> std::io::Result<crate::sidecar::port_file::SidecarEndpointIdentity> {
+    crate::sidecar::port_file::read_sidecar_endpoint_identity(
         control_state_dir,
         "127.0.0.1",
         Some(project_root),
     )
+}
+
+/// The sidecar lifetime an adoption row belongs to (SF-ADOPT-03): the daemon
+/// boot epoch for daemon-backed descriptors (a restarted daemon re-mints
+/// `session-1`, so the session id alone aliases lifetimes), else the
+/// descriptor pid. `None` when the descriptor proves neither.
+fn adoption_lifetime_label(
+    identity: &crate::sidecar::port_file::SidecarEndpointIdentity,
+) -> Option<String> {
+    match (identity.daemon_started_at, identity.pid) {
+        (Some(epoch), _) => Some(format!("daemon:{epoch}")),
+        (None, Some(pid)) => Some(format!("pid:{pid}")),
+        (None, None) => None,
+    }
 }
 
 fn normalize_session_id(session_id: Option<String>) -> Option<String> {
@@ -1144,11 +1232,13 @@ fn parse_tracked_workflow(raw: &str) -> Option<HookWorkflow> {
     }
 }
 
-fn record_hook_outcome(workflow: HookWorkflow, outcome: HookOutcome, session_id: Option<&str>) {
-    let Some(control_state_dir) = process_control_state_dir() else {
-        return;
-    };
-    record_hook_outcome_at(&control_state_dir, workflow, outcome, session_id);
+fn record_hook_outcome(
+    workflow: HookWorkflow,
+    outcome: HookOutcome,
+    session_id: Option<&str>,
+    lifetime: Option<&str>,
+) {
+    record_hook_outcome_with_detail(workflow, outcome, session_id, lifetime, None);
 }
 
 fn record_hook_outcome_at(
@@ -1156,16 +1246,14 @@ fn record_hook_outcome_at(
     workflow: HookWorkflow,
     outcome: HookOutcome,
     session_id: Option<&str>,
+    lifetime: Option<&str>,
+    detail: Option<&HookOutcomeDetail<'_>>,
 ) {
     let Some(workflow_name) = tracked_workflow_name(workflow) else {
         return;
     };
-    let _ = append_hook_adoption_event(
-        &adoption_log_path(control_state_dir),
-        session_id,
-        workflow_name,
-        outcome.label(),
-    );
+    let row = adoption_row(session_id, lifetime, workflow_name, outcome.label(), detail);
+    let _ = append_adoption_row(&adoption_log_path(control_state_dir), &row);
 }
 
 // ---------------------------------------------------------------------------
@@ -1522,11 +1610,12 @@ fn decode_chunked_body(raw: &[u8], max_body_bytes: usize) -> anyhow::Result<Opti
 // Enhanced diagnostics (Gap 1)
 // ---------------------------------------------------------------------------
 
-/// Structured detail for no-sidecar adoption log entries.
-struct NoSidecarDetail<'a> {
+/// Structured detail for a fail-open adoption row: why the hook did not route
+/// (SF-ADOPT-02), so `health` can break fail-open down by cause.
+struct HookOutcomeDetail<'a> {
     reason: &'a str,
-    searched_path: &'a str,
-    suggestion: &'a str,
+    searched_path: Option<&'a str>,
+    suggestion: Option<&'a str>,
     project_root: &'a str,
 }
 
@@ -1623,97 +1712,174 @@ fn record_hook_outcome_with_detail(
     workflow: HookWorkflow,
     outcome: HookOutcome,
     session_id: Option<&str>,
-    detail: Option<NoSidecarDetail<'_>>,
+    lifetime: Option<&str>,
+    detail: Option<HookOutcomeDetail<'_>>,
 ) {
-    let Some(workflow_name) = tracked_workflow_name(workflow) else {
-        return;
-    };
     let Some(control_state_dir) = process_control_state_dir() else {
         return;
     };
-    let _ = append_hook_adoption_event_with_detail(
-        &adoption_log_path(&control_state_dir),
+    record_hook_outcome_at(
+        &control_state_dir,
+        workflow,
+        outcome,
         session_id,
-        workflow_name,
-        outcome.label(),
-        detail,
+        lifetime,
+        detail.as_ref(),
     );
 }
 
-/// Append a hook adoption event with optional structured detail fields.
+/// Rotate the adoption log at this size so `health` never re-reads an
+/// unbounded file. ponytail: one `.1` generation; rows older than that drop.
+const ADOPTION_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Build one adoption row, newline included.
 ///
-/// Extended log format (tab-separated):
-///   session_id \t workflow \t outcome [\t reason=X \t searched_path=X \t suggestion=X]
+/// Format (tab-separated; columns after the third are `key=value`, so the
+/// loader reads them in any order and ignores unknown keys):
+///   session \t workflow \t outcome \t lifetime=X [\t reason=X [\t searched_path=X]
+///   [\t suggestion=X] \t project_root=X]
+fn adoption_row(
+    session_id: Option<&str>,
+    lifetime: Option<&str>,
+    workflow_name: &str,
+    outcome_label: &str,
+    detail: Option<&HookOutcomeDetail<'_>>,
+) -> String {
+    let session = session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-");
+    let lifetime = lifetime.unwrap_or("-");
+    let mut row = format!("{session}\t{workflow_name}\t{outcome_label}\tlifetime={lifetime}");
+    if let Some(d) = detail {
+        row.push_str(&format!("\treason={}", d.reason));
+        if let Some(path) = d.searched_path {
+            row.push_str(&format!("\tsearched_path={path}"));
+        }
+        if let Some(suggestion) = d.suggestion {
+            row.push_str(&format!("\tsuggestion={suggestion}"));
+        }
+        row.push_str(&format!("\tproject_root={}", d.project_root));
+    }
+    row.push('\n');
+    row
+}
+
+/// Append one whole row with a single `write_all` on an append-mode handle,
+/// so concurrent hook processes cannot interleave partial rows.
+fn append_adoption_row(log_path: &Path, row: &str) -> std::io::Result<()> {
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    rotate_adoption_log_if_full(log_path);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    file.write_all(row.as_bytes())
+}
+
+/// A rotation lock older than this is left by a crashed rotator and broken.
+const ADOPTION_LOG_ROTATE_LOCK_STALE: Duration = Duration::from_secs(30);
+
+/// Rotate the log to `.1` once it reaches the cap, with a single winner: the
+/// rotator holds an exclusive `create_new` lock file, re-checks the size under
+/// it (a rotation that already won leaves a small live file, so a second
+/// rename that would replace the fresh `.1` never happens), and losers just
+/// append. ponytail: two processes breaking the same stale lock at the same
+/// instant can still both rotate; that needs a crash plus exact contention.
+fn rotate_adoption_log_if_full(log_path: &Path) {
+    let is_full = |path: &Path| {
+        std::fs::metadata(path).is_ok_and(|meta| meta.len() >= ADOPTION_LOG_MAX_BYTES)
+    };
+    if !is_full(log_path) {
+        return;
+    }
+    let lock_path = log_path.with_extension("log.rotate-lock");
+    let acquire = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+    };
+    let lock = match acquire() {
+        Ok(lock) => lock,
+        Err(_) => {
+            let stale = std::fs::metadata(&lock_path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= ADOPTION_LOG_ROTATE_LOCK_STALE);
+            if !stale {
+                return;
+            }
+            let _ = std::fs::remove_file(&lock_path);
+            match acquire() {
+                Ok(lock) => lock,
+                Err(_) => return,
+            }
+        }
+    };
+    if is_full(log_path) {
+        let _ = std::fs::rename(log_path, rotated_adoption_log_path(log_path));
+    }
+    drop(lock);
+    let _ = std::fs::remove_file(&lock_path);
+}
+
+/// The single rotated generation of the adoption log (`hook-adoption.log.1`).
+fn rotated_adoption_log_path(log_path: &Path) -> PathBuf {
+    log_path.with_extension("log.1")
+}
+
+#[cfg(test)]
 fn append_hook_adoption_event_with_detail(
     log_path: &Path,
     session_id: Option<&str>,
     workflow_name: &str,
     outcome_label: &str,
-    detail: Option<NoSidecarDetail<'_>>,
+    detail: Option<HookOutcomeDetail<'_>>,
 ) -> std::io::Result<()> {
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)?;
-    let session = session_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("-");
-
-    match detail {
-        Some(d) => writeln!(
-            file,
-            "{session}\t{workflow_name}\t{outcome_label}\treason={}\tsearched_path={}\tsuggestion={}\tproject_root={}",
-            d.reason, d.searched_path, d.suggestion, d.project_root
-        ),
-        None => writeln!(file, "{session}\t{workflow_name}\t{outcome_label}"),
-    }
+    let row = adoption_row(
+        session_id,
+        None,
+        workflow_name,
+        outcome_label,
+        detail.as_ref(),
+    );
+    append_adoption_row(log_path, &row)
 }
 
+#[cfg(test)]
 fn append_hook_adoption_event(
     log_path: &Path,
     session_id: Option<&str>,
     workflow_name: &str,
     outcome_label: &str,
 ) -> std::io::Result<()> {
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)?;
-    let session = session_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("-");
-    writeln!(file, "{session}\t{workflow_name}\t{outcome_label}")
+    append_adoption_row(
+        log_path,
+        &adoption_row(session_id, None, workflow_name, outcome_label, None),
+    )
 }
 
 fn adoption_log_path(control_state_dir: &ControlStateDir) -> PathBuf {
     crate::paths::control_state_path(control_state_dir, ADOPTION_LOG_FILE)
 }
 
-fn read_session_id_for_repo_at(
-    control_state_dir: &ControlStateDir,
-    repo_root: Option<&Path>,
-) -> Option<String> {
-    crate::sidecar::port_file::read_sidecar_endpoint(control_state_dir, "127.0.0.1", repo_root)
-        .ok()?
-        .1
-        .filter(|value| !value.trim().is_empty())
-}
-
+/// Tally adoption rows. `session_filter` and `lifetime_filter` each, when
+/// set, keep only rows whose session column / `lifetime=` column equals it;
+/// rows written before the lifetime column existed never match a lifetime.
 fn load_hook_adoption_snapshot_from_path(
     log_path: &Path,
     session_filter: Option<&str>,
+    lifetime_filter: Option<&str>,
 ) -> std::io::Result<HookAdoptionSnapshot> {
-    let Ok(contents) = std::fs::read_to_string(log_path) else {
-        return Ok(HookAdoptionSnapshot::default());
-    };
+    // Read the rotated generation first (older rows) so a lifetime that
+    // straddles the rotation keeps its whole tally and its first repo start.
+    let rotated = std::fs::read_to_string(rotated_adoption_log_path(log_path)).unwrap_or_default();
+    let live = std::fs::read_to_string(log_path).unwrap_or_default();
+    let contents = rotated + &live;
 
     let mut snapshot = HookAdoptionSnapshot::default();
     for line in contents.lines() {
@@ -1727,9 +1893,31 @@ fn load_hook_adoption_snapshot_from_path(
         let Some(outcome_raw) = parts.next() else {
             continue;
         };
+        let mut lifetime = None;
+        let mut reason = None;
+        for column in parts {
+            if let Some(value) = column.strip_prefix("lifetime=") {
+                lifetime = Some(value);
+            } else if let Some(value) = column.strip_prefix("reason=") {
+                reason = Some(value);
+            }
+        }
 
+        // Rows explicitly written without a provable lifetime (a daemon
+        // fallback through another session, or no descriptor) cannot be
+        // attributed to the scoped lifetime. They are counted across the
+        // whole log, before any session filter, and reported as such.
+        if lifetime_filter.is_some() && lifetime == Some("-") {
+            snapshot.unscoped_rows += 1;
+            continue;
+        }
         if let Some(filter) = session_filter
             && session_id != filter
+        {
+            continue;
+        }
+        if let Some(filter) = lifetime_filter
+            && lifetime != Some(filter)
         {
             continue;
         }
@@ -1746,6 +1934,10 @@ fn load_hook_adoption_snapshot_from_path(
         }
         if let Some(counts) = snapshot.counts_mut(workflow) {
             counts.record(outcome);
+            if matches!(outcome, HookOutcome::NoSidecar | HookOutcome::SidecarError) {
+                let reason = reason.unwrap_or("unrecorded").to_string();
+                *snapshot.fail_open_reasons.entry(reason).or_default() += 1;
+            }
         }
     }
 
@@ -1763,9 +1955,33 @@ fn load_hook_adoption_snapshot_at(
     control_state_dir: &ControlStateDir,
     repo_root: Option<&Path>,
 ) -> HookAdoptionSnapshot {
-    let session = read_session_id_for_repo_at(control_state_dir, repo_root);
-    load_hook_adoption_snapshot_from_path(&adoption_log_path(control_state_dir), session.as_deref())
-        .unwrap_or_default()
+    // SF-ADOPT-03: count only the resolved sidecar lifetime. Without a
+    // descriptor that proves one, report the session as unknown instead of
+    // tallying every row in the log.
+    let identity = crate::sidecar::port_file::read_sidecar_endpoint_identity(
+        control_state_dir,
+        "127.0.0.1",
+        repo_root,
+    )
+    .ok();
+    let Some((session, lifetime)) = identity.and_then(|identity| {
+        let lifetime = adoption_lifetime_label(&identity)?;
+        let session = normalize_session_id(identity.session_id).unwrap_or_else(|| "-".to_string());
+        Some((session, lifetime))
+    }) else {
+        return HookAdoptionSnapshot {
+            session_unknown: true,
+            ..HookAdoptionSnapshot::default()
+        };
+    };
+    let mut snapshot = load_hook_adoption_snapshot_from_path(
+        &adoption_log_path(control_state_dir),
+        Some(&session),
+        Some(&lifetime),
+    )
+    .unwrap_or_default();
+    snapshot.scope = Some(format!("session {session}, {lifetime}"));
+    snapshot
 }
 
 /// Make a synchronous enrichment GET to `127.0.0.1:{port}{path}?{query}`.
@@ -2137,7 +2353,8 @@ mod tests {
     #[test]
     fn test_endpoint_for_read_stdin_routes_to_outline() {
         let input = make_input("Read", Some("/abs/src/foo.rs"), None, "/abs");
-        let (path, query) = endpoint_for(Some(&HookSubcommand::Read), &input);
+        let (path, query) =
+            endpoint_for(Some(&HookSubcommand::Read), &input).expect("routed endpoint");
         assert_eq!(path, "/outline");
         assert!(
             query.contains("src/foo.rs"),
@@ -2148,7 +2365,8 @@ mod tests {
     #[test]
     fn test_endpoint_for_edit_stdin_routes_to_impact() {
         let input = make_input("Edit", Some("/abs/src/bar.rs"), None, "/abs");
-        let (path, query) = endpoint_for(Some(&HookSubcommand::Edit), &input);
+        let (path, query) =
+            endpoint_for(Some(&HookSubcommand::Edit), &input).expect("routed endpoint");
         assert_eq!(path, "/impact");
         assert!(
             query.contains("src/bar.rs"),
@@ -2159,7 +2377,8 @@ mod tests {
     #[test]
     fn test_endpoint_for_write_routes_to_impact_with_new_file() {
         let input = make_input("Write", Some("/abs/src/new.rs"), None, "/abs");
-        let (path, query) = endpoint_for(Some(&HookSubcommand::Write), &input);
+        let (path, query) =
+            endpoint_for(Some(&HookSubcommand::Write), &input).expect("routed endpoint");
         assert_eq!(path, "/impact");
         assert!(
             query.contains("new_file=true"),
@@ -2175,7 +2394,8 @@ mod tests {
     fn test_endpoint_for_grep_stdin_routes_to_symbol_context() {
         let json = r#"{"tool_name":"Grep","tool_input":{"pattern":"TODO","path":"/abs/src"},"cwd":"/abs"}"#;
         let input: HookInput = serde_json::from_str(json).unwrap_or_default();
-        let (path, query) = endpoint_for(Some(&HookSubcommand::Grep), &input);
+        let (path, query) =
+            endpoint_for(Some(&HookSubcommand::Grep), &input).expect("routed endpoint");
         assert_eq!(path, "/symbol-context");
         assert!(
             query.contains("TODO"),
@@ -2199,11 +2419,10 @@ mod tests {
                 r#"{{"tool_name":"Grep","tool_input":{{"pattern":"{pattern}"}},"cwd":"/abs"}}"#
             );
             let input: HookInput = serde_json::from_str(&json).unwrap_or_default();
-            let (path, query) = endpoint_for(Some(&HookSubcommand::Grep), &input);
-            assert_eq!(path, "/health", "pattern {pattern:?} must fail open");
-            assert!(
-                query.is_empty(),
-                "pattern {pattern:?} must not forward a query"
+            assert_eq!(
+                endpoint_for(Some(&HookSubcommand::Grep), &input),
+                None,
+                "pattern {pattern:?} must skip enrichment, not route to /health"
             );
         }
         // Bare identifiers still get the lookup.
@@ -2212,7 +2431,8 @@ mod tests {
                 r#"{{"tool_name":"Grep","tool_input":{{"pattern":"{pattern}"}},"cwd":"/abs"}}"#
             );
             let input: HookInput = serde_json::from_str(&json).unwrap_or_default();
-            let (path, _) = endpoint_for(Some(&HookSubcommand::Grep), &input);
+            let (path, _) =
+                endpoint_for(Some(&HookSubcommand::Grep), &input).expect("routed endpoint");
             assert_eq!(
                 path, "/symbol-context",
                 "pattern {pattern:?} is a plausible symbol"
@@ -2223,7 +2443,8 @@ mod tests {
     #[test]
     fn test_endpoint_for_session_start_routes_to_repo_map() {
         let input = HookInput::default();
-        let (path, query) = endpoint_for(Some(&HookSubcommand::SessionStart), &input);
+        let (path, query) =
+            endpoint_for(Some(&HookSubcommand::SessionStart), &input).expect("routed endpoint");
         assert_eq!(path, "/repo-map");
         assert!(query.is_empty(), "repo-map has no query params");
     }
@@ -2234,7 +2455,8 @@ mod tests {
             prompt: Some("please inspect src/foo.rs".to_string()),
             ..HookInput::default()
         };
-        let (path, query) = endpoint_for(Some(&HookSubcommand::PromptSubmit), &input);
+        let (path, query) =
+            endpoint_for(Some(&HookSubcommand::PromptSubmit), &input).expect("routed endpoint");
         assert_eq!(path, "/prompt-context");
         assert!(
             query.contains("please%20inspect%20src/foo.rs"),
@@ -2261,9 +2483,8 @@ mod tests {
             tool_name: Some("UnknownTool".to_string()),
             ..Default::default()
         };
-        let (path, _) = endpoint_for(None, &input);
-        // Returns /health as the fail-open endpoint — no useful data, but graceful
-        assert_eq!(path, "/health");
+        // Unknown tool → explicit skip; no /health request is made.
+        assert_eq!(endpoint_for(None, &input), None);
     }
 
     // --- event_name_for ---
@@ -2305,31 +2526,32 @@ mod tests {
     #[test]
     fn test_hook_subcommand_to_endpoint_read_backward_compat() {
         let input = HookInput::default();
-        let (path, _query) = endpoint_for(Some(&HookSubcommand::Read), &input);
+        let (path, _query) =
+            endpoint_for(Some(&HookSubcommand::Read), &input).expect("routed endpoint");
         assert_eq!(path, "/outline");
     }
 
     #[test]
     fn test_hook_subcommand_to_endpoint_edit_backward_compat() {
         let input = HookInput::default();
-        let (path, _query) = endpoint_for(Some(&HookSubcommand::Edit), &input);
+        let (path, _query) =
+            endpoint_for(Some(&HookSubcommand::Edit), &input).expect("routed endpoint");
         assert_eq!(path, "/impact");
     }
 
     #[test]
     fn test_hook_subcommand_to_endpoint_grep_backward_compat() {
-        // Empty pattern fail-opens to /health (dogfood #8): with nothing to
-        // look up, /symbol-context could only produce a zero-hit report.
+        // Empty pattern skips enrichment (dogfood #8, SF-TE-09): with nothing
+        // to look up, /symbol-context could only produce a zero-hit report.
         let input = HookInput::default();
-        let (path, query) = endpoint_for(Some(&HookSubcommand::Grep), &input);
-        assert_eq!(path, "/health");
-        assert!(query.is_empty());
+        assert_eq!(endpoint_for(Some(&HookSubcommand::Grep), &input), None);
     }
 
     #[test]
     fn test_hook_subcommand_to_endpoint_session_start_backward_compat() {
         let input = HookInput::default();
-        let (path, query) = endpoint_for(Some(&HookSubcommand::SessionStart), &input);
+        let (path, query) =
+            endpoint_for(Some(&HookSubcommand::SessionStart), &input).expect("routed endpoint");
         assert_eq!(path, "/repo-map");
         assert!(query.is_empty(), "repo-map has no query params");
     }
@@ -2340,7 +2562,8 @@ mod tests {
             prompt: Some("review MinioService".to_string()),
             ..HookInput::default()
         };
-        let (path, query) = endpoint_for(Some(&HookSubcommand::PromptSubmit), &input);
+        let (path, query) =
+            endpoint_for(Some(&HookSubcommand::PromptSubmit), &input).expect("routed endpoint");
         assert_eq!(path, "/prompt-context");
         assert!(query.contains("review%20MinioService"));
     }
@@ -2636,16 +2859,30 @@ mod tests {
     }
 
     #[test]
+    fn test_is_non_source_path_never_skips_an_indexed_language() {
+        // SF-DOG-05: an extension the index parses must reach the hook. `Text` is
+        // the plaintext knowledge catch-all (`.txt`, `.ini`, `.xml`, ...), whose
+        // reads are literal by design, so it is the one family excluded here.
+        for language in crate::domain::LanguageId::ALL {
+            if language == crate::domain::LanguageId::Text {
+                continue;
+            }
+            for ext in language.extensions() {
+                let path = format!("src/file.{ext}");
+                assert!(
+                    !is_non_source_path(&path),
+                    "{language:?} extension .{ext} is indexed but classified non-source"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_load_hook_adoption_snapshot_filters_to_current_session() {
         let tmp = TempDir::new().unwrap();
         let control_state = ControlStateDir::new(tmp.path().join(".symforge"));
         let log_path = adoption_log_path(&control_state);
 
-        append_hook_adoption_event(&log_path, Some("session-a"), "source-read", "routed").unwrap();
-        append_hook_adoption_event(&log_path, Some("session-a"), "repo-start", "no-sidecar")
-            .unwrap();
-        append_hook_adoption_event(&log_path, Some("session-b"), "source-search", "routed")
-            .unwrap();
         crate::sidecar::port_file::write_session_descriptor(
             &control_state,
             41_321,
@@ -2654,6 +2891,17 @@ mod tests {
             None,
         )
         .unwrap();
+        let lifetime = format!("pid:{}", std::process::id());
+        let row = |session, workflow, outcome| {
+            append_adoption_row(
+                &log_path,
+                &adoption_row(Some(session), Some(&lifetime), workflow, outcome, None),
+            )
+            .unwrap()
+        };
+        row("session-a", "source-read", "routed");
+        row("session-a", "repo-start", "no-sidecar");
+        row("session-b", "source-search", "routed");
 
         let snapshot = load_hook_adoption_snapshot_at(&control_state, Some(tmp.path()));
         assert_eq!(snapshot.source_read.routed, 1);
@@ -2679,13 +2927,251 @@ mod tests {
         append_hook_adoption_event(&log_path, Some("session-z"), "source-read", "no-sidecar")
             .unwrap();
 
-        let snapshot = load_hook_adoption_snapshot_from_path(&log_path, Some("session-z")).unwrap();
+        let snapshot =
+            load_hook_adoption_snapshot_from_path(&log_path, Some("session-z"), None).unwrap();
         assert_eq!(snapshot.prompt_context.sidecar_error, 1);
         assert_eq!(snapshot.post_edit_impact.routed, 1);
         assert_eq!(snapshot.source_read.no_sidecar, 1);
         assert_eq!(snapshot.total_routed(), 1);
         assert_eq!(snapshot.total_fail_open(), 2);
         assert_eq!(snapshot.total_attempts(), 3);
+    }
+
+    #[test]
+    fn test_adoption_loader_parses_extra_columns_and_tallies_reasons() {
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("hook-adoption.log");
+        std::fs::write(
+            &log_path,
+            "s\tsource-read\tsidecar-error\tlifetime=pid:7\tfuture=1\treason=index_not_ready\tproject_root=/r\n\
+             s\tsource-read\tno-sidecar\n\
+             s\tsource-read\trouted\tlifetime=pid:7\tunknown_key=x\n",
+        )
+        .unwrap();
+        let snapshot = load_hook_adoption_snapshot_from_path(&log_path, Some("s"), None).unwrap();
+        assert_eq!(snapshot.source_read.total(), 3);
+        assert_eq!(snapshot.fail_open_reasons.get("index_not_ready"), Some(&1));
+        assert_eq!(snapshot.fail_open_reasons.get("unrecorded"), Some(&1));
+        // A lifetime filter excludes rows that predate the lifetime column.
+        let scoped =
+            load_hook_adoption_snapshot_from_path(&log_path, Some("s"), Some("pid:7")).unwrap();
+        assert_eq!(scoped.source_read.total(), 2);
+    }
+
+    #[test]
+    fn test_adoption_two_daemon_lifetimes_with_same_session_do_not_share_a_tally() {
+        let tmp = TempDir::new().unwrap();
+        let control_state = ControlStateDir::new(tmp.path().join(".symforge"));
+        let log_path = adoption_log_path(&control_state);
+        for (lifetime, outcome) in [
+            ("daemon:100", "no-sidecar"),
+            ("daemon:100", "no-sidecar"),
+            ("daemon:200", "routed"),
+        ] {
+            let row = adoption_row(
+                Some("session-1"),
+                Some(lifetime),
+                "source-read",
+                outcome,
+                None,
+            );
+            append_adoption_row(&log_path, &row).unwrap();
+        }
+        crate::sidecar::port_file::write_session_descriptor(
+            &control_state,
+            41_322,
+            Some("session-1"),
+            Some(tmp.path()),
+            Some(200),
+        )
+        .unwrap();
+        let snapshot = load_hook_adoption_snapshot_at(&control_state, Some(tmp.path()));
+        assert!(!snapshot.session_unknown);
+        assert_eq!(snapshot.source_read.routed, 1);
+        assert_eq!(
+            snapshot.source_read.no_sidecar, 0,
+            "the earlier lifetime leaked in"
+        );
+        assert_eq!(
+            snapshot.scope.as_deref(),
+            Some("session session-1, daemon:200")
+        );
+    }
+
+    #[test]
+    fn test_adoption_loader_reads_rotated_generation_and_reports_unscoped_rows() {
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("hook-adoption.log");
+        let row = |session, lifetime, outcome| {
+            adoption_row(Some(session), lifetime, "source-read", outcome, None)
+        };
+        std::fs::write(
+            rotated_adoption_log_path(&log_path),
+            row("s", Some("pid:7"), "routed"),
+        )
+        .unwrap();
+        append_adoption_row(&log_path, &row("s", Some("pid:7"), "no-sidecar")).unwrap();
+        append_adoption_row(&log_path, &row("other", None, "daemon-fallback")).unwrap();
+        let snapshot =
+            load_hook_adoption_snapshot_from_path(&log_path, Some("s"), Some("pid:7")).unwrap();
+        assert_eq!(snapshot.source_read.routed, 1, "rotated rows were dropped");
+        assert_eq!(snapshot.source_read.no_sidecar, 1);
+        assert_eq!(snapshot.unscoped_rows, 1);
+        let rendered = crate::protocol::format::format_hook_adoption(&snapshot);
+        assert!(
+            rendered.contains("Rows with no recorded lifetime in the whole log: 1"),
+            "unscoped rows must be reported: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_adoption_rotation_moves_log_to_dot_one_at_cap() {
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("hook-adoption.log");
+        let filler = "x".repeat(ADOPTION_LOG_MAX_BYTES as usize);
+        std::fs::write(&log_path, &filler).unwrap();
+        append_adoption_row(&log_path, "s\tsource-read\trouted\tlifetime=pid:7\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(rotated_adoption_log_path(&log_path)).unwrap(),
+            filler
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log_path).unwrap(),
+            "s\tsource-read\trouted\tlifetime=pid:7\n"
+        );
+    }
+
+    #[test]
+    fn test_adoption_concurrent_writers_crossing_the_cap_lose_no_rows() {
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("hook-adoption.log");
+        // One filler line leaves the log just under the cap, so the first
+        // rows push it over while every writer is racing to rotate.
+        let filler = format!("{}\n", "x".repeat(ADOPTION_LOG_MAX_BYTES as usize - 64));
+        std::fs::write(&log_path, &filler).unwrap();
+        const WRITERS: usize = 8;
+        const ROWS: usize = 50;
+        std::thread::scope(|scope| {
+            for writer in 0..WRITERS {
+                let log_path = &log_path;
+                scope.spawn(move || {
+                    for row in 0..ROWS {
+                        let session = format!("w{writer}-{row}");
+                        let line = adoption_row(
+                            Some(&session),
+                            Some("pid:1"),
+                            "source-read",
+                            "routed",
+                            None,
+                        );
+                        append_adoption_row(log_path, &line).unwrap();
+                    }
+                });
+            }
+        });
+        let rotated = std::fs::read_to_string(rotated_adoption_log_path(&log_path)).unwrap();
+        let live = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            rotated.starts_with(&filler),
+            "the filled generation must be the rotated one"
+        );
+        let mut sessions: Vec<&str> = rotated
+            .lines()
+            .chain(live.lines())
+            .filter(|line| line.contains('\t'))
+            .map(|line| line.split('\t').next().unwrap())
+            .collect();
+        sessions.sort_unstable();
+        sessions.dedup();
+        assert_eq!(
+            sessions.len(),
+            WRITERS * ROWS,
+            "rows were lost across live + .1"
+        );
+        assert!(!log_path.with_extension("log.rotate-lock").exists());
+    }
+
+    #[test]
+    fn test_adoption_rotation_breaks_a_stale_lock_but_respects_a_fresh_one() {
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("hook-adoption.log");
+        let lock_path = log_path.with_extension("log.rotate-lock");
+        let filler = "x".repeat(ADOPTION_LOG_MAX_BYTES as usize);
+
+        // A fresh lock means another rotator is at work: skip, just append.
+        std::fs::write(&log_path, &filler).unwrap();
+        std::fs::write(&lock_path, "").unwrap();
+        append_adoption_row(&log_path, "a\tsource-read\trouted\n").unwrap();
+        assert!(!rotated_adoption_log_path(&log_path).exists());
+
+        // A lock left by a crashed rotator must not block rotation forever.
+        let old = std::time::SystemTime::now() - ADOPTION_LOG_ROTATE_LOCK_STALE * 2;
+        std::fs::File::options()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        append_adoption_row(&log_path, "b\tsource-read\trouted\n").unwrap();
+        assert!(rotated_adoption_log_path(&log_path).exists());
+        assert_eq!(
+            std::fs::read_to_string(&log_path).unwrap(),
+            "b\tsource-read\trouted\n"
+        );
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn test_adoption_unresolvable_session_yields_empty_unknown_tally() {
+        let tmp = TempDir::new().unwrap();
+        let control_state = ControlStateDir::new(tmp.path().join(".symforge"));
+        let log_path = adoption_log_path(&control_state);
+        append_hook_adoption_event(&log_path, Some("session-a"), "source-read", "routed").unwrap();
+        append_hook_adoption_event(&log_path, None, "source-read", "no-sidecar").unwrap();
+        let snapshot = load_hook_adoption_snapshot_at(&control_state, Some(tmp.path()));
+        assert!(snapshot.session_unknown);
+        assert_eq!(snapshot.total_attempts(), 0);
+    }
+
+    #[test]
+    fn test_adoption_concurrent_writers_produce_no_torn_rows() {
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("hook-adoption.log");
+        let long_root = "r".repeat(2_000);
+        std::thread::scope(|scope| {
+            for writer in 0..8 {
+                let log_path = &log_path;
+                let long_root = &long_root;
+                scope.spawn(move || {
+                    for _ in 0..50 {
+                        let session = format!("w{writer}");
+                        let detail = HookOutcomeDetail {
+                            reason: "http_failure",
+                            searched_path: None,
+                            suggestion: None,
+                            project_root: long_root,
+                        };
+                        let row = adoption_row(
+                            Some(&session),
+                            Some("pid:1"),
+                            "source-read",
+                            "sidecar-error",
+                            Some(&detail),
+                        );
+                        append_adoption_row(log_path, &row).unwrap();
+                    }
+                });
+            }
+        });
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 400);
+        for line in lines {
+            let columns: Vec<&str> = line.split('\t').collect();
+            assert_eq!(columns.len(), 6, "torn row: {line:.80}");
+            assert!(columns[0].starts_with('w'), "torn row: {line:.80}");
+            assert_eq!(columns[5].len(), "project_root=".len() + 2_000);
+        }
     }
 
     // ---- Hook-adoption metric regression tests ----
@@ -2717,7 +3203,7 @@ mod tests {
         // where the log lives — pin that too.
         assert_eq!(adoption_log_path(&control), log_path);
 
-        let snapshot = load_hook_adoption_snapshot_from_path(&log_path, Some("sess-live"))
+        let snapshot = load_hook_adoption_snapshot_from_path(&log_path, Some("sess-live"), None)
             .expect("load adoption snapshot");
         assert_eq!(snapshot.total_routed(), 2);
         assert_eq!(snapshot.total_attempts(), 2);
@@ -2725,7 +3211,7 @@ mod tests {
 
         let rendered = crate::protocol::format::format_hook_adoption(&snapshot);
         assert!(
-            rendered.contains("── Hook Adoption (current session) ──"),
+            rendered.contains("── Hook Adoption ──"),
             "missing section header: {rendered}"
         );
         assert!(
@@ -2763,7 +3249,7 @@ mod tests {
             .unwrap();
         append_hook_adoption_event(&log_path, Some("sess-down"), "prompt-context", "no-sidecar")
             .unwrap();
-        let snapshot = load_hook_adoption_snapshot_from_path(&log_path, Some("sess-down"))
+        let snapshot = load_hook_adoption_snapshot_from_path(&log_path, Some("sess-down"), None)
             .expect("load adoption snapshot");
         let rendered = crate::protocol::format::format_hook_adoption(&snapshot);
 
@@ -2794,6 +3280,8 @@ mod tests {
             HookWorkflow::SourceRead,
             HookOutcome::Routed,
             Some("sess-wireup"),
+            None,
+            None,
         );
 
         let log_path = adoption_log_path(&control);
@@ -2852,10 +3340,10 @@ mod tests {
     fn adoption_log_missing_port_includes_reason_and_project_root() {
         let tmp = TempDir::new().unwrap();
         let log_path = tmp.path().join("hook-adoption.log");
-        let detail = NoSidecarDetail {
+        let detail = HookOutcomeDetail {
             reason: "sidecar_port_missing",
-            searched_path: "/repo/.symforge/sidecar.port",
-            suggestion: "start_mcp_session",
+            searched_path: Some("/repo/.symforge/sidecar.port"),
+            suggestion: Some("start_mcp_session"),
             project_root: "/repo",
         };
         append_hook_adoption_event_with_detail(
@@ -2883,10 +3371,10 @@ mod tests {
     fn adoption_log_stale_port_has_distinct_reason() {
         let tmp = TempDir::new().unwrap();
         let log_path = tmp.path().join("hook-adoption.log");
-        let detail = NoSidecarDetail {
+        let detail = HookOutcomeDetail {
             reason: "sidecar_port_stale",
-            searched_path: "/repo/.symforge/sidecar.port",
-            suggestion: "restart_sidecar",
+            searched_path: Some("/repo/.symforge/sidecar.port"),
+            suggestion: Some("restart_sidecar"),
             project_root: "/repo",
         };
         append_hook_adoption_event_with_detail(

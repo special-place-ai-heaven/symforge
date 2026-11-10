@@ -12,7 +12,14 @@ use super::types::{AdmissionDecision, StelDecision, StelEstimate, StelPlan, Stel
 /// session totals) is an estimate and MUST be surfaced as such, never as an
 /// exact/measured token count (010 N-4 / FR-001).
 pub fn estimate_tokens(text: &str) -> u32 {
-    (text.len() / 4).min(u32::MAX as usize) as u32
+    estimate_tokens_from_bytes(text.len() as u64).min(u64::from(u32::MAX)) as u32
+}
+
+/// The one `len/4` estimator (rounded up) shared by the facade and
+/// `protocol::estimate_tokens`; lives here because the embed lane has no
+/// `protocol` module.
+pub fn estimate_tokens_from_bytes(bytes: u64) -> u64 {
+    bytes.saturating_add(3) / 4
 }
 
 /// Stub plan summary until L1 ships (`intent → tool (confidence)`).

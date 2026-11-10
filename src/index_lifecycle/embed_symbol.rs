@@ -65,6 +65,7 @@ fn target(
     snapshot: &EmbeddedQuerySnapshot,
     target: &SymbolTarget,
     estimate: bool,
+    line_numbers: Option<bool>,
     budget: &mut Budget,
 ) -> Result<(SymbolReadEntry, String), QueryRefusalKind> {
     let mut row = entry(target.path.clone());
@@ -88,11 +89,12 @@ fn target(
         return Ok((row, format!("Source withheld: {}", target.path)));
     }
     let (start, end, rendered) = if let Some(name) = &target.name {
-        let rendered = symbol_read::symbol_detail_from_indexed_file(
+        let rendered = symbol_read::symbol_detail_from_indexed_file_with(
             file,
             name,
             target.kind.as_deref(),
             target.symbol_line,
+            line_numbers,
         );
         match resolve_symbol_selector(file, name, target.kind.as_deref(), target.symbol_line) {
             SymbolSelectorMatch::Selected(index, symbol) => {
@@ -122,11 +124,16 @@ fn target(
         let end_byte = target.end_byte.map(|end| end as usize);
         let (start, end) =
             symbol_read::clamp_code_slice_range(file.content.len(), start_byte, end_byte);
-        let bytes = &file.content[start..end];
         (
             start,
             end,
-            symbol_read::code_slice_view(&target.path, bytes),
+            symbol_read::code_slice_view_with(
+                &target.path,
+                &file.content,
+                start,
+                end,
+                line_numbers,
+            ),
         )
     };
     let bytes = file
@@ -229,7 +236,13 @@ pub(super) fn read(
         }
         let (mut row, text) = match unresolved.take() {
             Some(value) => value,
-            None => target(snapshot, target_request, estimate, budget)?,
+            None => target(
+                snapshot,
+                target_request,
+                estimate,
+                request.line_numbers,
+                budget,
+            )?,
         };
         let candidates = std::mem::take(&mut row.candidates);
         budget.required(super::embed_usage::decoded_bytes(&row) as usize)?;
