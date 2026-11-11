@@ -1,0 +1,679 @@
+{
+  "audit": {
+    "subject": "SymForge",
+    "date": "2026-11-09",
+    "revision": "a7a39c85",
+    "binary_version": "11.11.0",
+    "platform": "Windows 11",
+    "mode": "inspection-only",
+    "report": "AUDIT.md",
+    "coverage": "COVERAGE.md",
+    "security_redaction": "SF-SEC-01 to SF-SEC-08 are listed by generic title and priority only. Evidence, attack scenarios and fixes are held privately and will be published after the fixes ship."
+  },
+  "priority_levels": {
+    "P0": "Immediate correctness, security or data-loss risk",
+    "P1": "Major reliability, performance or product-mission issue",
+    "P2": "Meaningful improvement or maintainability issue",
+    "P3": "Minor improvement or optional refinement"
+  },
+  "confidence_levels": {
+    "measured": "Observed or measured by a command or tool call run in this audit",
+    "code-confirmed": "The auditor read the cited lines",
+    "delegate-reported": "A subagent read the cited code; the auditor did not re-read every line",
+    "plausible-unverified": "Consistent with the code read, not exercised or fully traced"
+  },
+  "counts": {
+    "P0": 0,
+    "P1": 7,
+    "P2": 24,
+    "P3": 11,
+    "total": 42
+  },
+  "findings": [
+    {
+      "id": "SF-TE-01",
+      "priority": "P1",
+      "area": "token-efficiency",
+      "title": "A whole-task token reduction has not been demonstrated on the current version",
+      "description": "The repo's only 11.x cohort returned NO_WIN and observed no SymForge call in any session; its arms still differed by about 19% in total tokens, which indicates the size of run-to-run noise. The one positive result is two pairs on 8.14.1. This audit's 36-run paired pilot found a 2 to 12% price-weighted edge after removing the largest known confound, concentrated in two task types and reversed in three, with no reduction in round trips and no detectable difference in correctness.",
+      "evidence": [
+        "README.md:193",
+        "docs/research/token-optimization-2026-10-05.md",
+        "research/token-cost/end-to-end-feature-benchmark-2026-07-13.md",
+        "evidence/cost-model-output.txt: Sonnet (12 runs per arm) round trips 55 vs 53, retrieved chars -8%, unweighted tokens -7.5%, price-weighted -19%, price-weighted with rule files removed -12%, SymForge cheaper on 3 of 6 tasks; Haiku (6 runs per arm) round trips 26 vs 31, unweighted +12%, price-weighted -8%, with rule files removed -2%, cheaper on 2 of 6 tasks",
+        "evidence/paired-benchmark-runs.json"
+      ],
+      "confidence": "measured",
+      "impact": "The product's central claim is unproven in either direction. Decisions about what to build next have no objective signal.",
+      "recommended_action": "Build the three-arm benchmark in AUDIT.md section D.3 and gate every efficiency claim on it.",
+      "verification": "A scheduled run publishing per-category medians, pairs won and losing categories."
+    },
+    {
+      "id": "SF-TE-02",
+      "priority": "P1",
+      "area": "token-efficiency",
+      "title": "get_repo_map appends about 2,500 tokens of digests to every call and drops the code tree first when over budget",
+      "description": "A Repository knowledge block of 64-hex digests and unit ids is appended unconditionally. When the response exceeds max_tokens the bounded summary keeps that block and omits the code topology. The default compact map truncated before reaching src/.",
+      "evidence": [
+        "src/protocol/tools.rs:2079-2085 (unconditional append)",
+        "src/protocol/tools.rs:2091-2096 (budget summary keeps knowledge_map, omits topology)",
+        "Observed: get_repo_map(detail=tree,path=src,depth=1) returned about 350 tokens of tree and about 9,300 chars of appendix",
+        "Observed: get_repo_map(detail=tree,path=src,depth=2,max_tokens=3000) returned no tree"
+      ],
+      "confidence": "code-confirmed",
+      "impact": "Orientation, the first call in most sessions, costs about 7x its useful payload. Three calls were needed to see src/.",
+      "recommended_action": "Remove the knowledge block from the default response (offer it behind a section parameter). Budget the code tree first. Rank src-like directories ahead of dot-directories.",
+      "estimated_saving": "About 2,500 tokens per get_repo_map call (measured on this repo).",
+      "verification": "Byte count of get_repo_map responses in a fixture test; tree present under any max_tokens >= 500."
+    },
+    {
+      "id": "SF-TE-03",
+      "priority": "P2",
+      "area": "token-efficiency",
+      "title": "get_repo_map estimate=true ignores path and the appended block",
+      "description": "The tree estimate is file_count * 10 regardless of path; the compact estimate is the constant 500. The tool description also promises a ~500 token overview.",
+      "evidence": [
+        "src/protocol/tools.rs:1957-1971",
+        "Observed: estimate returned ~16000 tokens for a src depth-1 tree that measured about 350 tokens plus appendix; compact measured about 3,500 tokens against an estimate of 500"
+      ],
+      "confidence": "code-confirmed",
+      "impact": "Agents that check cost before calling are misled in both directions. Reports a number that was not observed.",
+      "recommended_action": "Compute the estimate from the same filtered view the call would render, including any appendix.",
+      "verification": "Estimate within 20% of the rendered length in tests for each detail mode with and without path."
+    },
+    {
+      "id": "SF-TE-04",
+      "priority": "P1",
+      "area": "token-efficiency",
+      "title": "In-product savings figures are estimates against an assumed baseline, presented as session efficiency",
+      "description": "health reported Efficiency 2.5x (60% reduction) and search_symbols 13.6x for a session consisting mostly of this audit's benchmark agents. Against a real native arm those agents retrieved 32% less content over all 36 runs (8% on Sonnet, 52% on Haiku). The product's baseline is an assumed 50-line by 80-character read window per result, not an observed alternative. The two figures are different metrics; the product's is an assumption presented as session efficiency.",
+      "evidence": [
+        "health output during the audit: Tokens served 172,285; Competent-manual equivalent 437,064; Efficiency 2.5x (60% reduction)",
+        "src/index_lifecycle/guidance/file_read.rs:702-727 (delegate-reported)",
+        "src/index_lifecycle/guidance/read_context.rs:1029-1044 (delegate-reported)",
+        "src/protocol/format.rs:656-692 (delegate-reported)",
+        "evidence/cost-model-output.txt: retrieved chars over all 36 runs 290,208 vs 198,023 (-32%)"
+      ],
+      "confidence": "measured",
+      "impact": "Violates the project's reporting invariant (CLAUDE.md). Users and agents are told a saving that measurement does not support.",
+      "recommended_action": "Relabel as an estimate with its baseline stated on the same line, or replace with observed counters (calls, bytes served). Drop multipliers.",
+      "verification": "No savings figure appears without either the word estimate and its baseline, or a benchmark run id."
+    },
+    {
+      "id": "SF-TE-05",
+      "priority": "P1",
+      "area": "token-efficiency",
+      "title": "The default tool surface costs about 17,300 tokens before any call",
+      "description": "tools/list for the full surface is 69,295 bytes for 40 tools. Input schemas are 83% of it. Parameter descriptions are 30,610 bytes; project/projects entries 6,670 bytes across 34 entries; nullable unions 5,988 bytes; $defs 7,926 bytes. The compact surface is 4,630 bytes.",
+      "evidence": [
+        "evidence/tool-surface-measurement.txt (measured against the installed 11.11.0 binary over stdio)",
+        "evidence/surface-probe.py, evidence/surface-analyze.py"
+      ],
+      "confidence": "measured",
+      "impact": "Clients that load every schema up front pay all of it in every session whether or not a tool is called. Clients that defer schemas pay per tool on first use. Which clients load eagerly was not surveyed, and a link to the NO_WIN cohort is not shown. Token figure is bytes/4, an estimate.",
+      "recommended_action": "Ship a lean default profile of 8 to 10 core tools. State project/projects semantics once. Emit plain optional types instead of nullable unions. Remove numeric format and minimum noise. Shorten parameter text.",
+      "estimated_saving": "8,000 to 11,000 tokens per session (estimate from the measured breakdown).",
+      "verification": "tools/list under 30,000 bytes with no drop in benchmark task success."
+    },
+    {
+      "id": "SF-TE-06",
+      "priority": "P2",
+      "area": "token-efficiency",
+      "title": "Search envelopes outweigh small answers",
+      "description": "A one-hit search_text returned six header lines (match type, source authority, parse state, completeness, scope, evidence) plus a trailing admission note around a three-line payload.",
+      "evidence": [
+        "Observed search_text responses in this audit, for example the query 'Owned workflows routed' with group_by=symbol"
+      ],
+      "confidence": "measured",
+      "impact": "Roughly 100 to 150 tokens of envelope per call (estimate). Contributes to SymForge returning more content than Grep on small lookups.",
+      "recommended_action": "Collapse the envelope to one line when every field is at its default and expand only on a non-default condition.",
+      "verification": "Envelope bytes per response in fixture tests."
+    },
+    {
+      "id": "SF-TE-07",
+      "priority": "P2",
+      "area": "token-efficiency",
+      "title": "No count mode and tests excluded by default make completeness sweeps dearer than Grep",
+      "description": "For a rename-impact count across src/ and tests/, the SymForge arm returned 6x the content of Grep count mode.",
+      "evidence": [
+        "evidence/paired-benchmark-runs.json task T4: retrieved chars 1,281 (native) vs 8,139 (SymForge), Sonnet means",
+        "search_text schema: include_tests defaults to false"
+      ],
+      "confidence": "measured",
+      "impact": "SymForge loses on the completeness questions that precede a rename or refactor.",
+      "recommended_action": "Add a count or per-file summary mode to search_text. When tests are excluded and suppressed matches exist, keep the current hint and offer the one-call retry.",
+      "verification": "T4 content at or below the native arm in the benchmark."
+    },
+    {
+      "id": "SF-TE-08",
+      "priority": "P2",
+      "area": "token-efficiency",
+      "title": "Reading several nearby regions takes more calls than one Read",
+      "description": "On module-facts and debugging tasks the SymForge arm made about twice the tool calls. Agents fetched symbols one at a time and mixed search_text, get_symbol and get_file_content.",
+      "evidence": [
+        "evidence/paired-benchmark-runs.json tasks T3 and T6: tool calls 3.5 vs 7.0 and 6.5 vs 10.5; round trips 3.0 vs 4.5 and 5.0 vs 8.0 (Sonnet means)",
+        "B-T6 runs called get_symbol 2 to 8 times singly although targets[] exists"
+      ],
+      "confidence": "measured",
+      "impact": "Each round trip re-reads about 83,000 tokens of fixed context in this environment. At an assumed one-tenth cache-read price that is equivalent to about 6,600 newly added tokens per extra call, two to three times the roughly 2,800 tokens of content a Sonnet run retrieved on average.",
+      "recommended_action": "Let search results return enclosing symbol bodies on request. Promote targets[] in the get_symbol description. Consider a combined definition-plus-callers lookup.",
+      "verification": "Round trips per task for T3 and T6 type tasks in the benchmark."
+    },
+    {
+      "id": "SF-TE-09",
+      "priority": "P2",
+      "area": "token-efficiency",
+      "title": "The Grep hook injects index health JSON into context and counts it as routed",
+      "description": "Non-identifier grep patterns are routed to /health as a no-op, but the response body is emitted as additional context and the event is recorded as a routed success.",
+      "evidence": [
+        "src/cli/hook.rs:1024-1025",
+        "Observed after each non-identifier Grep in this session: {\"file_count\":1600,\"symbol_count\":56404,\"index_state\":\"Ready\",\"uptime_secs\":N}",
+        "src/sidecar/handlers.rs:313 (delegate-reported: HealthResponse)"
+      ],
+      "confidence": "code-confirmed",
+      "impact": "A few dozen tokens of irrelevant context per search and inflated source-search adoption counts.",
+      "recommended_action": "Return an empty hook response for the fall-through case and record a distinct skipped outcome.",
+      "verification": "Hook unit test asserting empty output and a non-routed outcome for regex patterns."
+    },
+    {
+      "id": "SF-ADOPT-01",
+      "priority": "P1",
+      "area": "adoption",
+      "title": "One unreadable file disables hook enrichment while the tools report Ready",
+      "description": "Any Unreadable manifest entry forces degraded coverage. The sidecar serves only when freshness is Current and otherwise returns 503, which the hook records as a sidecar error and fails open. The MCP tools and /health continue to report Ready.",
+      "evidence": [
+        "src/live_index/store.rs:5784-5793",
+        "src/sidecar/handlers.rs:350-352",
+        "src/cli/hook.rs:552-617",
+        "health during the audit: unreadable=2, freshness=degraded[ObservationFailed,ReconciliationPending], hook events routed 663 of 4,211, failed open 3,548 (3,493 as sidecar errors), post-edit impact routed 0 of 1,965",
+        "~/.symforge/hook-adoption.log: 18,354 sidecar-error rows of 33,641 (54.6%)"
+      ],
+      "confidence": "code-confirmed",
+      "impact": "The main mechanism that steers agents to SymForge is silent most of the time. That this chain explains the historical 55% is a strong hypothesis; the reason is not logged (SF-ADOPT-02).",
+      "recommended_action": "Serve hook answers with a staleness note when freshness is degraded. Let a persistently unreadable path settle after a bounded number of sweeps. Expose freshness in the sidecar /health response.",
+      "verification": "Routed share above 95% over a week on a machine with a locked file in the tree."
+    },
+    {
+      "id": "SF-ADOPT-02",
+      "priority": "P2",
+      "area": "adoption",
+      "title": "The hook failure reason is not persisted",
+      "description": "emit_live_refusal_fail_open records the outcome without index_not_ready, root_conflict or http_failure. The reason reaches stderr only in verbose mode.",
+      "evidence": [
+        "src/cli/hook.rs:656-667"
+      ],
+      "confidence": "code-confirmed",
+      "impact": "18,354 failures cannot be attributed to a cause from the log.",
+      "recommended_action": "Write reason= on sidecar-error rows as is already done for no-sidecar rows.",
+      "verification": "Log rows for each refusal branch carry a reason field."
+    },
+    {
+      "id": "SF-ADOPT-03",
+      "priority": "P2",
+      "area": "adoption",
+      "title": "Hook Adoption (current session) counts rows from other daemon lifetimes and, with no session, the whole log",
+      "description": "Session ids are session-N from a counter that starts at 1 in each daemon process. The log is machine-wide, append-only and read in full on each health call. With no resolvable session the filter is skipped.",
+      "evidence": [
+        "src/cli/hook.rs:1731-1735, 1762-1769",
+        "src/daemon.rs:1172, 1522 (delegate-reported)",
+        "Observed: 6,861 events under session-1, then 4,211 under session-2 about an hour later",
+        "Torn rows observed in the log (delegate-reported)"
+      ],
+      "confidence": "code-confirmed",
+      "impact": "The label asserts a scope that was not observed. The file grows without bound and is re-read on every health call.",
+      "recommended_action": "Record a daemon start epoch and project in each row and filter on both. Render an empty tally when no session resolves. Rotate the log. Write each row with one write call.",
+      "verification": "Test with two daemon lifetimes sharing a session id."
+    },
+    {
+      "id": "SF-ADOPT-04",
+      "priority": "P1",
+      "area": "adoption",
+      "title": "Agents with SymForge available do not reliably call it, and the server gives no guidance",
+      "description": "The 2026-10-05 cohort observed no native SymForge invocation in any session. initialize returns no instructions string. Usage guidance exists only in client files the user must install.",
+      "evidence": [
+        "docs/research/token-optimization-2026-10-05.md (delegate-reported)",
+        "evidence/tool-surface-measurement.txt: instructions bytes 0"
+      ],
+      "confidence": "measured",
+      "impact": "Availability without use is pure cost. The shipped default is the configuration that lost.",
+      "recommended_action": "Return a short instructions string at initialize: when to prefer SymForge, which three tools to start with, and when not to use it. Measure the unsteered arm in the benchmark.",
+      "verification": "Share of unsteered sessions with at least one SymForge call."
+    },
+    {
+      "id": "SF-DOG-01",
+      "priority": "P2",
+      "area": "agent-experience",
+      "title": "get_file_context outline expanded the test module with include_tests=false",
+      "description": "An outline request for src/cli/hook.rs with max_tokens=1800 listed about 40 test functions and then reported the sections incomplete.",
+      "evidence": [
+        "Observed once in this audit; schema documents include_tests default false"
+      ],
+      "confidence": "measured",
+      "impact": "About 40% of the requested budget spent on test names; the production outline was cut short.",
+      "recommended_action": "Collapse cfg(test) modules to one line in outlines unless include_tests is true.",
+      "verification": "Outline fixture test."
+    },
+    {
+      "id": "SF-DOG-02",
+      "priority": "P2",
+      "area": "agent-experience",
+      "title": "get_symbol returns bodies without inner line numbers; one run miscited a line by 38",
+      "description": "Only the symbol's overall range is given. One SymForge-arm run that relied on get_symbol estimated an inner line number and was wrong by 38 lines. A SymForge-arm run that used get_file_content, which is numbered, cited correctly. One observed instance, not a rate.",
+      "evidence": [
+        "evidence/paired-benchmark-runs.json run B-T1-r1 cited tools.rs:2024 for a statement at src/protocol/tools.rs:2062",
+        "Runs A-T1-r1 and B-T1-r1-haiku cited 2062"
+      ],
+      "confidence": "measured",
+      "impact": "Wrong citations in reviews and follow-up edits; extra verification calls.",
+      "recommended_action": "Offer line-numbered output for get_symbol, on by default for bodies over a small threshold.",
+      "verification": "Citation accuracy check in the benchmark grader."
+    },
+    {
+      "id": "SF-DOG-03",
+      "priority": "P3",
+      "area": "agent-experience",
+      "title": "status prints hard-coded roadmap labels as if they were state",
+      "description": "l4_ledger: in_memory, deferred: b_results and superseded: multi_step_planner are literals.",
+      "evidence": [
+        "src/stel/status.rs:38, 371, 520-522 (delegate-reported)",
+        "status output observed in this audit"
+      ],
+      "confidence": "delegate-reported",
+      "impact": "Noise for agents; reads as live telemetry.",
+      "recommended_action": "Remove from the default status output or mark as static build facts.",
+      "verification": "status output review."
+    },
+    {
+      "id": "SF-DOG-04",
+      "priority": "P2",
+      "area": "agent-experience",
+      "title": "Trust signals contradict each other",
+      "description": "The same health output reports Status: Ready, coverage=degraded and freshness=degraded. Search results report Completeness: full for indexed scope. Readiness and freshness are separate axes computed in different places.",
+      "evidence": [
+        "health output observed in this audit",
+        "src/live_index/store.rs:5561 and :2936 (delegate-reported)"
+      ],
+      "confidence": "measured",
+      "impact": "An agent cannot tell whether to trust an answer. The sidecar treats the same state as unservable (SF-ADOPT-01).",
+      "recommended_action": "Derive one headline trust state from both axes and use the same rule in MCP tools, sidecar and health.",
+      "verification": "A single function computes the headline state for all three surfaces."
+    },
+    {
+      "id": "SF-DOG-05",
+      "priority": "P3",
+      "area": "agent-experience",
+      "title": "The hook treats .html and .css as non-source although both are indexed languages",
+      "description": "is_non_source_path lists .html and .css among non-source extensions, so hook enrichment is skipped for them.",
+      "evidence": [
+        "src/cli/hook.rs:914-962",
+        "Index language list includes Html and Css (get_repo_map)"
+      ],
+      "confidence": "code-confirmed",
+      "impact": "Minor loss of hook enrichment on front-end files.",
+      "recommended_action": "Derive the non-source list from the set of indexed languages.",
+      "verification": "Unit test over the language table."
+    },
+    {
+      "id": "SF-BEN-01",
+      "priority": "P2",
+      "area": "benchmark",
+      "title": "No standing benchmark; existing harnesses do not run in CI and cover old versions",
+      "description": "Four prior measurements exist, with 2 pairs, 5 pairs with no SymForge calls, tool-level recipes, and a run whose oracles failed 0 of 20. Debugging and review were never measured before this audit. Edits and refactors have one failed recipe.",
+      "evidence": [
+        "research/token-cost/, research/full-surface-benchmark/, docs/dogfood/2026-07-12-symforge-8.14.0-full-surface-benchmark-report.md (delegate-reported)",
+        ".github/workflows/ci.yml runs no research harness (delegate-reported)"
+      ],
+      "confidence": "delegate-reported",
+      "impact": "No objective way to accept or reject an efficiency change.",
+      "recommended_action": "Implement AUDIT.md section D.3.",
+      "verification": "Scheduled workflow producing a results artifact."
+    },
+    {
+      "id": "SF-BEN-02",
+      "priority": "P2",
+      "area": "benchmark",
+      "title": "Client-side rule injection confounds comparisons, and SymForge reads bypass path-scoped rules",
+      "description": "In this environment the first Read of a .rs file injects five rule files, a median of 4,165 tokens (characters/4), in 15 of 18 native-arm runs and no SymForge-arm run. Those tokens are re-read on every later turn. Removing them moves the Sonnet price-weighted difference from -19% to -12% and the Haiku difference from -8% to -2%.",
+      "evidence": [
+        "evidence/cost_model.py and evidence/cost-model-output.txt",
+        "Non-payload context (growth - retrieved chars/4 - output) median: 10,364 tokens for 15 native-arm runs that used Read, 920 for 3 that used Grep only, 1,949 for 18 SymForge-arm runs; rule files explain about half of the gap, the rest was not broken down"
+      ],
+      "confidence": "measured",
+      "impact": "Unadjusted benchmarks overstate SymForge. Agents working only through SymForge never load the project's path-scoped rules, which matters for edits.",
+      "recommended_action": "Control for hooks and rules in every benchmark cell. Document the interaction for users who rely on path-scoped rules.",
+      "verification": "Benchmark cells run with rules on and off."
+    },
+    {
+      "id": "SF-REL-01",
+      "priority": "P2",
+      "area": "reliability",
+      "title": "A degraded index rescans and republishes continuously",
+      "description": "While coverage is degraded the reconcile loop retries up to five times per sweep with backoff, on every sweep.",
+      "evidence": [
+        "src/watcher/mod.rs:626-701",
+        "Observed: index_generation 104 to 1,710 in about 65 minutes with a clean working tree; knowledge publication counter 103, 109, 116 on three calls about a minute apart"
+      ],
+      "confidence": "code-confirmed",
+      "impact": "Background CPU and I/O on an idle repo; generation churn that resets per-generation caches. That each attempt publishes is plausible, not traced.",
+      "recommended_action": "Back off when the degraded digest is unchanged between sweeps.",
+      "verification": "Generation counter stable on an idle tree containing one locked file."
+    },
+    {
+      "id": "SF-REL-02",
+      "priority": "P3",
+      "area": "reliability",
+      "title": "reconcile repairs counts no-op outcomes",
+      "description": "Reindexed, HashSkip and Skipped all increment the repairs counter.",
+      "evidence": [
+        "src/watcher/mod.rs:383-387 (delegate-reported)",
+        "health showed reconcile repairs: 40 on an idle tree"
+      ],
+      "confidence": "delegate-reported",
+      "impact": "The counter overstates repair activity.",
+      "recommended_action": "Count only Reindexed and applied removals.",
+      "verification": "Unit test on the counter."
+    },
+    {
+      "id": "SF-REL-03",
+      "priority": "P3",
+      "area": "reliability",
+      "title": "reindex_after_write may hide a failed re-read",
+      "description": "The helper warns and returns unit when the post-write re-read fails, so the edit reports applied while the index stays stale until the watcher catches up.",
+      "evidence": [
+        "src/protocol/edit.rs near line 120 (delegate-reported)"
+      ],
+      "confidence": "plausible-unverified",
+      "impact": "A success message for a state that was not observed.",
+      "recommended_action": "Return a Result and surface a stale-index note in the edit response.",
+      "verification": "Test injecting a failed re-read."
+    },
+    {
+      "id": "SF-REL-04",
+      "priority": "P3",
+      "area": "reliability",
+      "title": "write_snapshot may quarantine the old snapshot and then fail the write",
+      "description": "For a prior-format index.bin the first checkpoint after an upgrade may be lost.",
+      "evidence": [
+        "src/live_index/persist.rs:1704 (delegate-reported)"
+      ],
+      "confidence": "plausible-unverified",
+      "impact": "One cold start after upgrade.",
+      "recommended_action": "Write the new snapshot after a successful quarantine in the same call.",
+      "verification": "Upgrade fixture test."
+    },
+    {
+      "id": "SF-REL-05",
+      "priority": "P2",
+      "area": "reliability",
+      "title": "A wall-clock assertion in the default suite fails under load and, with fail-fast, hides most of the suite",
+      "description": "large_rust_file_indexing_is_linear_and_unchanged compares elapsed times for 1x and 4x input.",
+      "evidence": [
+        "src/parsing/mod.rs:2297: '4x the bytes took 5.273568s against 998.879ms: indexing is superlinear again'",
+        "First audit run of cargo nextest run --workspace: 2,129 of 4,790 tests run, 2,128 passed, 1 failed after retry, 2,661 not run",
+        "See COVERAGE.md for the second run"
+      ],
+      "confidence": "measured",
+      "impact": "False reds and lost coverage on busy machines and CI runners.",
+      "recommended_action": "Move timing assertions to the scheduled performance job, or assert on operation counts instead of wall time.",
+      "verification": "Suite passes under induced CPU load."
+    },
+    {
+      "id": "SF-SEC-01",
+      "priority": "P1",
+      "area": "security",
+      "title": "Input validation gap in root binding on Windows",
+      "description": "Details withheld until a fix ships.",
+      "evidence": [
+        "Held privately with the repair ledger."
+      ],
+      "confidence": "code-confirmed",
+      "impact": "Details withheld until a fix ships.",
+      "recommended_action": "Details withheld until a fix ships.",
+      "verification": "Details withheld until a fix ships.",
+      "redacted": true
+    },
+    {
+      "id": "SF-SEC-02",
+      "priority": "P2",
+      "area": "security",
+      "title": "A safety override is controllable by the caller it restricts",
+      "description": "Details withheld until a fix ships.",
+      "evidence": [
+        "Held privately with the repair ledger."
+      ],
+      "confidence": "code-confirmed",
+      "impact": "Details withheld until a fix ships.",
+      "recommended_action": "Details withheld until a fix ships.",
+      "verification": "Details withheld until a fix ships.",
+      "redacted": true
+    },
+    {
+      "id": "SF-SEC-03",
+      "priority": "P2",
+      "area": "security",
+      "title": "A loopback service lacks request-origin checks",
+      "description": "Details withheld until a fix ships.",
+      "evidence": [
+        "Held privately with the repair ledger."
+      ],
+      "confidence": "code-confirmed",
+      "impact": "Details withheld until a fix ships.",
+      "recommended_action": "Details withheld until a fix ships.",
+      "verification": "Details withheld until a fix ships.",
+      "redacted": true
+    },
+    {
+      "id": "SF-SEC-04",
+      "priority": "P2",
+      "area": "security",
+      "title": "A refusal can be cleared by the caller it refused",
+      "description": "Details withheld until a fix ships.",
+      "evidence": [
+        "Held privately with the repair ledger."
+      ],
+      "confidence": "code-confirmed",
+      "impact": "Details withheld until a fix ships.",
+      "recommended_action": "Details withheld until a fix ships.",
+      "verification": "Details withheld until a fix ships.",
+      "redacted": true
+    },
+    {
+      "id": "SF-SEC-05",
+      "priority": "P3",
+      "area": "security",
+      "title": "Hook context framing (unverified)",
+      "description": "Details withheld until a fix ships.",
+      "evidence": [
+        "Held privately with the repair ledger."
+      ],
+      "confidence": "plausible-unverified",
+      "impact": "Details withheld until a fix ships.",
+      "recommended_action": "Details withheld until a fix ships.",
+      "verification": "Details withheld until a fix ships.",
+      "redacted": true
+    },
+    {
+      "id": "SF-SEC-06",
+      "priority": "P3",
+      "area": "security",
+      "title": "Write guard precision (unverified)",
+      "description": "Details withheld until a fix ships.",
+      "evidence": [
+        "Held privately with the repair ledger."
+      ],
+      "confidence": "plausible-unverified",
+      "impact": "Details withheld until a fix ships.",
+      "recommended_action": "Details withheld until a fix ships.",
+      "verification": "Details withheld until a fix ships.",
+      "redacted": true
+    },
+    {
+      "id": "SF-SEC-07",
+      "priority": "P3",
+      "area": "security",
+      "title": "Token generation fallback on Windows (unverified)",
+      "description": "Details withheld until a fix ships.",
+      "evidence": [
+        "Held privately with the repair ledger."
+      ],
+      "confidence": "plausible-unverified",
+      "impact": "Details withheld until a fix ships.",
+      "recommended_action": "Details withheld until a fix ships.",
+      "verification": "Details withheld until a fix ships.",
+      "redacted": true
+    },
+    {
+      "id": "SF-SEC-08",
+      "priority": "P3",
+      "area": "security",
+      "title": "Process lifecycle trust on non-Linux platforms",
+      "description": "Details withheld until a fix ships.",
+      "evidence": [
+        "Held privately with the repair ledger."
+      ],
+      "confidence": "delegate-reported",
+      "impact": "Details withheld until a fix ships.",
+      "recommended_action": "Details withheld until a fix ships.",
+      "verification": "Details withheld until a fix ships.",
+      "redacted": true
+    },
+    {
+      "id": "SF-SEC-09",
+      "priority": "P2",
+      "area": "security",
+      "title": "No automated dependency advisory gate",
+      "description": "No deny.toml at the repository root and no cargo-deny or cargo-audit step in the workflows. 387 locked packages.",
+      "evidence": [
+        "Glob for deny.toml: only test fixtures",
+        "Grep of .github for cargo-deny, cargo audit, rustsec: no matches",
+        "Cargo.lock package count (delegate-reported)"
+      ],
+      "confidence": "measured",
+      "impact": "Advisories are checked by hand (commit #849 records a manual cargo deny check advisories run) rather than detected automatically.",
+      "recommended_action": "Commit a deny.toml and run cargo-deny in CI. Note that workflow edits require the fingerprint update described in CLAUDE.md.",
+      "verification": "CI job fails on a seeded advisory."
+    },
+    {
+      "id": "SF-ARC-01",
+      "priority": "P2",
+      "area": "architecture",
+      "title": "The embed lane re-implements the tool surface",
+      "description": "About 21,000 lines in src/index_lifecycle/embed_*.rs mirror server handlers, kept equal by parity tests.",
+      "evidence": [
+        "src/index_lifecycle/embed_changes.rs:136 vs src/protocol/tools.rs:5044 (delegate-reported)",
+        "Line counts (delegate-reported)"
+      ],
+      "confidence": "delegate-reported",
+      "impact": "Every behaviour change is made twice. Medium confidence: the two paths were not diffed line by line.",
+      "recommended_action": "Make server handlers thin adapters over the shared guidance layer and shrink the parity layer as it grows.",
+      "verification": "Lines in the parity layer; number of parity tests needed."
+    },
+    {
+      "id": "SF-ARC-02",
+      "priority": "P2",
+      "area": "architecture",
+      "title": "Cyclic module dependencies and lifecycle modules with no production callers",
+      "description": "live_index, index_lifecycle, protocol, knowledge and embed import each other. Three index_lifecycle modules are documented as having no production callers.",
+      "evidence": [
+        "use crate:: edge counts (delegate-reported)",
+        "src/index_lifecycle/mod.rs:24"
+      ],
+      "confidence": "delegate-reported",
+      "impact": "The engine cannot be understood or tested in isolation; unfinished code ships.",
+      "recommended_action": "Define one-way layering. Remove or feature-gate modules without production callers.",
+      "verification": "Dependency-direction check in CI."
+    },
+    {
+      "id": "SF-ARC-03",
+      "priority": "P2",
+      "area": "architecture",
+      "title": "Very large files and functions",
+      "description": "src/protocol/tools.rs is 34,120 lines and src/daemon.rs 19,818. 94 of 310 source files exceed 800 lines and hold 80% of source lines. Functions of 400 to 550 lines exist.",
+      "evidence": [
+        "Line counts (delegate-reported)",
+        "Test code observed at src/protocol/tools.rs:31442-33725"
+      ],
+      "confidence": "delegate-reported",
+      "impact": "Review and symbol-level editing are hard exactly where change is most frequent.",
+      "recommended_action": "Split tools.rs by tool family and move its tests to sibling files. Split the longest functions into phases.",
+      "verification": "Count of files over 800 lines."
+    },
+    {
+      "id": "SF-ARC-04",
+      "priority": "P2",
+      "area": "maintainability",
+      "title": "Tests pin bytes and structure rather than behaviour",
+      "description": "A whole-src seal, workflow fingerprints and document phrase pins fail on any edit to the pinned text.",
+      "evidence": [
+        "tests/preventive_runtime_dark_v11.rs, tests/conformance.rs (delegate-reported)",
+        "CLAUDE.md documents PR #612 failing on a four-line workflow edit"
+      ],
+      "confidence": "delegate-reported",
+      "impact": "Every source or workflow change carries a mandatory second edit; failures do not indicate regressions.",
+      "recommended_action": "Replace the source seal with the specific call-edge check it protects.",
+      "verification": "CI failures attributable to pins only."
+    },
+    {
+      "id": "SF-ARC-05",
+      "priority": "P2",
+      "area": "maintainability",
+      "title": "Release and CI complexity",
+      "description": "release.yml is 2,641 lines with 12 jobs and 81 steps. Recent fixes addressed release failures in the pipeline itself.",
+      "evidence": [
+        "Workflow line and job counts (delegate-reported)",
+        "Commits #850, #852"
+      ],
+      "confidence": "delegate-reported",
+      "impact": "A release can be blocked by the pipeline rather than the product.",
+      "recommended_action": "Move the largest gate job into a script or reusable workflow. Document a manual release path.",
+      "verification": "Release dry run from the documented manual path."
+    },
+    {
+      "id": "SF-ARC-06",
+      "priority": "P3",
+      "area": "maintainability",
+      "title": "Vendored rmcp patch is not applied for cargo install; unused feature; large binary",
+      "description": "The lifecycle patch is ignored by crates.io installs. The cbm-spike feature has no consumer. A release binary measured 66.5 MB.",
+      "evidence": [
+        "vendor/rmcp/SYMFORGE-PATCH.md, CLAUDE.md",
+        "Cargo.toml features (delegate-reported)",
+        "target/release/symforge.exe size from an October build (delegate-reported)"
+      ],
+      "confidence": "delegate-reported",
+      "impact": "Users of cargo install get a known bug.",
+      "recommended_action": "Upstream the patch or document the install limitation prominently. Remove the unused feature.",
+      "verification": "Feature list; install note."
+    },
+    {
+      "id": "SF-ARC-07",
+      "priority": "P3",
+      "area": "maintainability",
+      "title": "Two token estimators and a truncated knowledge bridge",
+      "description": "One estimator rounds up, the other truncates. The knowledge bridge reports 48,858 omitted links on this repo, which holds 8.66 MB of Markdown.",
+      "evidence": [
+        "src/protocol/mod.rs:320, src/stel/handler.rs:14 (delegate-reported)",
+        "health: Bridge coverage=truncated(48858 omitted)"
+      ],
+      "confidence": "delegate-reported",
+      "impact": "Small disagreements in reported numbers; knowledge search runs on a truncated graph here.",
+      "recommended_action": "Share one estimator. Exclude archived research and review documents from the knowledge scope by default.",
+      "verification": "Single estimator symbol; bridge coverage on this repo."
+    },
+    {
+      "id": "SF-ARC-08",
+      "priority": "P2",
+      "area": "product-scope",
+      "title": "Scope has outgrown the mission",
+      "description": "41 tools, a knowledge index, curation, secret remediation, an admin interface and an embed lane surround the few tools that carry the measured value (find_references, get_symbol, search_symbols).",
+      "evidence": [
+        "evidence/paired-benchmark-runs.json (wins on T1, T2, T5)",
+        "SFBENCH 8.14.0: only get_symbol saved (delegate-reported)",
+        "evidence/tool-surface-measurement.txt"
+      ],
+      "confidence": "measured",
+      "impact": "Each addition raises fixed surface cost and maintenance load without evidence of benefit to the mission.",
+      "recommended_action": "Use the benchmark to decide which tools belong in the default surface. Freeze new tools until then.",
+      "verification": "Default surface justified tool by tool with benchmark data."
+    }
+  ]
+}
