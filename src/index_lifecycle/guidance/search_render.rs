@@ -315,8 +315,7 @@ pub fn search_symbols_result_view(result: &search::SymbolSearchResult, query: &s
     if result.hits.is_empty() {
         return format!(
             "No symbols matching '{query}'. \
-             Try: search_text(query=\"{query}\") for text matches, \
-             or explore(query=\"{query}\") for concept-based discovery."
+             Try: search_text(query=\"{query}\") for text matches."
         );
     }
 
@@ -414,7 +413,7 @@ pub(crate) fn append_excluded_knowledge_note(message: String, excluded: usize) -
     }
     let noun = if excluded == 1 { "file" } else { "files" };
     format!(
-        "{message}\nThis search did not scan {excluded} in-scope knowledge-only {noun}; use search_knowledge."
+        "{message}\nThis search did not scan {excluded} in-scope knowledge-only {noun}; read one with get_file_content, or search them with search_knowledge."
     )
 }
 

@@ -2195,9 +2195,9 @@ impl ServerHandler for SymForgeServer {
     /// active surface is [`crate::protocol::surface_probe::SurfaceProfile::Compact`], a `tools/call` for any tool
     /// name NOT in the advertised compact-3 set
     /// ([`crate::stel::surface::COMPACT_TOOL_NAMES`]) is rejected with an MCP
-    /// `InvalidRequest` error. Full and Meta surfaces are unaffected, so the
-    /// default full surface (and any explicit `SYMFORGE_SURFACE=full`) reaches
-    /// every legacy tool; `SYMFORGE_SURFACE=compact` is the opt-in escape hatch
+    /// `InvalidRequest` error. Core, Full and Meta surfaces are unaffected, so the
+    /// default full surface and the opt-in core profile (which lists only
+    /// some tools) reach every legacy tool; `SYMFORGE_SURFACE=compact` is the opt-in escape hatch
     /// that gates them. This is shared by both transports because stdio and the HTTP `/mcp`
     /// serve path dispatch through the same `ServerHandler::call_tool`.
     async fn call_tool(
@@ -2377,10 +2377,14 @@ impl ServerHandler for SymForgeServer {
         };
         // FR-305 pinned struct shape: the constructor seeds
         // `result_type: Some(COMPLETE)`. FR-310/FR-311: 1h TTL, Public — the
-        // surface is fixed per-process (`SYMFORGE_SURFACE` is env-driven) and
-        // the INV-2 dispatch gate rejects off-surface calls, so a stale cached
-        // full list is harmless. Ordering is deterministic (router insertion
-        // order), verified by test (SC-313).
+        // surface is fixed per-process (`SYMFORGE_SURFACE` is env-driven), and a
+        // Public cache assumes ONE profile per HTTP origin (FR-311c). If core,
+        // full and compact servers share an origin, a cached list from one is
+        // served to the others: core<->full only hides or shows callable tools
+        // (core refuses nothing); a core or full list reaching a compact client
+        // discloses schemas the compact dispatch gate will refuse; a compact
+        // list reaching core or full hides callable tools. Ordering is
+        // deterministic (router insertion order), verified by test (SC-313).
         Ok(ListToolsResult::with_all_items(tools)
             .with_ttl_ms(3_600_000)
             .with_cache_scope(rmcp::model::CacheScope::Public))

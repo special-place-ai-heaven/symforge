@@ -605,7 +605,7 @@ pub fn loading_guard_message_for(state: &SnapshotVerifyState, cold_bootstrap: bo
 ///   and MUST NOT tell an LLM to "re-launch" (it cannot relaunch its own server).
 ///   The `Index not loaded.` prefix is load-bearing — empty-index classifiers
 ///   in tools/edit/golden-replay detect the guard by it.
-/// - [`SurfaceProfile::Full`] / [`SurfaceProfile::Meta`]: `index_folder` is
+/// - [`SurfaceProfile::Core`] / [`SurfaceProfile::Full`] / [`SurfaceProfile::Meta`]: `index_folder` is
 ///   callable, so the hint may name it directly.
 pub fn empty_index_recovery_hint(profile: SurfaceProfile) -> String {
     match profile {
@@ -614,7 +614,7 @@ pub fn empty_index_recovery_hint(profile: SurfaceProfile) -> String {
              MCP config, or run `symforge init` for this harness, then reconnect. \
              (SYMFORGE_SURFACE=full exposes the full tool surface for manual indexing.)"
             .to_string(),
-        SurfaceProfile::Full | SurfaceProfile::Meta => {
+        SurfaceProfile::Core | SurfaceProfile::Full | SurfaceProfile::Meta => {
             "Index not loaded. Call index_folder to index a directory.".to_string()
         }
     }

@@ -7,6 +7,25 @@ pub const COMPACT_SURFACE_TOOL_COUNT: usize = 3;
 pub const COMPACT_TOOL_NAMES: [&str; COMPACT_SURFACE_TOOL_COUNT] =
     ["symforge", "symforge_edit", "status"];
 
+/// Tools advertised on the opt-in core profile (SF-TE-05). Every other
+/// registered tool stays callable there; it is only not listed.
+pub const CORE_TOOL_NAMES: [&str; 13] = [
+    "status",
+    "get_repo_map",
+    "get_file_context",
+    "get_file_content",
+    "search_text",
+    "search_symbols",
+    "get_symbol",
+    "find_references",
+    "replace_symbol_body",
+    "edit_within_symbol",
+    "batch_edit",
+    "index_folder",
+    // Overflow footers and cache-hit notices from core tools point here.
+    "symforge_retrieve",
+];
+
 /// Compact L0 tool identifiers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompactSurfaceTool {
@@ -31,6 +50,8 @@ impl CompactSurfaceTool {
 /// The MCP tool-list profile a connection is served (`SYMFORGE_SURFACE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SurfaceProfile {
+    /// Opt-in (`SYMFORGE_SURFACE=core`): lists [`CORE_TOOL_NAMES`]; unlisted tools stay callable.
+    Core,
     Full,
     Compact,
     Meta,
@@ -43,6 +64,7 @@ pub enum SurfaceProfile {
 /// string (see `StelStatusRequest::connection_surface`).
 pub fn surface_profile_label(profile: SurfaceProfile) -> &'static str {
     match profile {
+        SurfaceProfile::Core => "core",
         SurfaceProfile::Full => "full",
         SurfaceProfile::Meta => "meta",
         SurfaceProfile::Compact => "compact",
@@ -69,6 +91,7 @@ pub fn surface_label_from_str(value: &str) -> Option<&'static str> {
 /// arbitrary text.
 pub fn surface_profile_from_label(value: &str) -> Option<SurfaceProfile> {
     match value {
+        "core" => Some(SurfaceProfile::Core),
         "full" => Some(SurfaceProfile::Full),
         "meta" => Some(SurfaceProfile::Meta),
         "compact" => Some(SurfaceProfile::Compact),

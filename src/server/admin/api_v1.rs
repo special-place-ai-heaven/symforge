@@ -304,6 +304,7 @@ impl SurfaceView {
 
 fn profile_label(profile: SurfaceProfile) -> &'static str {
     match profile {
+        SurfaceProfile::Core => "core",
         SurfaceProfile::Full => "full",
         SurfaceProfile::Compact => "compact",
         SurfaceProfile::Meta => "meta",
@@ -871,7 +872,7 @@ mod tests {
         let view = SurfaceView::from_env();
         assert!(!view.tools.is_empty());
         assert_eq!(view.tool_count, view.tools.len());
-        assert!(["full", "compact", "meta"].contains(&view.profile.as_str()));
+        assert!(["core", "full", "compact", "meta"].contains(&view.profile.as_str()));
     }
 
     #[test]

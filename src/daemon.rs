@@ -8811,6 +8811,11 @@ mod tests {
             connection_surface_from_headers(&headers),
             Some(SurfaceProfile::Full)
         );
+        headers.insert(CONNECTION_SURFACE_HEADER, "core".parse().unwrap());
+        assert_eq!(
+            connection_surface_from_headers(&headers),
+            Some(SurfaceProfile::Core)
+        );
 
         // Non-canonical value is ignored (falls back to env), never echoed.
         headers.insert(CONNECTION_SURFACE_HEADER, "garbage".parse().unwrap());

@@ -134,6 +134,8 @@ Details: [Configure a client](https://github.com/special-place-ai-heaven/symforg
 
 SymForge advertises **40 tools** over MCP `tools/list`; 41 are registered. The forty-first is the compact-surface `symforge` facade, which the full profile filters out because `symforge_retrieve` is its full-surface equivalent. A client reporting 40 is correct.
 
+**Opt-in core profile.** `SYMFORGE_SURFACE=core` lists a smaller set of 13 tools (about 27 KB of `tools/list` instead of 63 KB): `status`, `get_repo_map`, `get_file_context`, `get_file_content`, `search_text`, `search_symbols`, `get_symbol`, `find_references`, `replace_symbol_body`, `edit_within_symbol`, `batch_edit`, `index_folder`, `symforge_retrieve`. The other tools in the table below are not listed there but still answer a call by name (most clients only let the model call listed tools, so this mainly serves hooks and pinned clients); the compact-only `symforge` facade refuses outside `SYMFORGE_SURFACE=compact`.
+
 | Group | Tools |
 |---|---|
 | **Orient** | `health` · `health_compact` · `status` · `get_repo_map` · `explore` · `ask` · `conventions` · `context_inventory` · `investigation_suggest` |
@@ -144,7 +146,7 @@ SymForge advertises **40 tools** over MCP `tools/list`; 41 are registered. The f
 | **Edit** | `edit_plan` · `replace_symbol_body` · `edit_within_symbol` · `insert_symbol` · `delete_symbol` · `batch_edit` · `batch_insert` · `batch_rename` · `symforge_edit` · `secret_remediate` |
 | **Index** | `index_folder` · `checkpoint_now` |
 
-Alongside the tools: six resources, four resource templates, and eight prompts. The protocol layer is rmcp 3.5.0, serving MCP 2026-07-28 plus every legacy revision back to 2024-11-05 from a frozen allow-list. `SYMFORGE_SURFACE=compact` collapses the surface to three tools (`symforge`, `symforge_edit`, `status`); it is an escape hatch for token-sensitive setups, not the default.
+Alongside the tools: six resources, four resource templates, and eight prompts. The protocol layer is rmcp 3.5.0, serving MCP 2026-07-28 plus every legacy revision back to 2024-11-05 from a frozen allow-list. `SYMFORGE_SURFACE=compact` collapses the surface to three tools (`symforge`, `symforge_edit`, `status`); it is an escape hatch for token-sensitive setups, not the default, and unlike core it refuses calls to any other tool.
 
 The seven structural edit tools (`replace_symbol_body`, `edit_within_symbol`, `insert_symbol`, `delete_symbol`, `batch_edit`, `batch_insert`, `batch_rename`) accept an optional `working_directory` naming a sibling git worktree; `symforge_edit` accepts and forwards it without advertising it in its schema. Passing it is explicit routing consent: SymForge validates the worktree, writes there, and reports `wrote_to`, `indexed_path`, and `rerouted`, so parallel agents can each edit their own worktree against one index.
 
@@ -177,7 +179,7 @@ Workspace state lives under `.symforge/`: the snapshot and its quarantine, pre-w
 | Variable | Effect |
 |---|---|
 | `SYMFORGE_HOME` | Home for the installed binary and daemon metadata (default `~/.symforge`) |
-| `SYMFORGE_SURFACE` | `compact` collapses `tools/list` to three tools; default `full`. `symforge init` writes it into each client's `env` block, which wins over the shell |
+| `SYMFORGE_SURFACE` | `compact` collapses `tools/list` to three tools and `core` lists 13; default `full`. `symforge init` writes it into each client's `env` block, which wins over the shell |
 | `SYMFORGE_NO_DAEMON` | Any value other than empty or `0` forces local in-process mode; `symforge init` sets it to `1` for Codex on Linux |
 | `SYMFORGE_DAEMON_AUTH_TOKEN` | Bearer token the daemon requires on every route except `/health`; generated at daemon start when unset |
 | `SYMFORGE_INDEXING_THREADS` | Cap the parse thread pool, for tight-RAM hosts and PID-1 embedders; default is rayon's |
