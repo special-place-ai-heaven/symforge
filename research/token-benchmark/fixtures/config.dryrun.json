@@ -1,0 +1,13 @@
+{
+  "_comment": "Merged over config.json by `bench.py dry-run`. Replaces the model client with fake_client.py; no network, no API key, no model call.",
+  "synthetic": true,
+  "model": "synthetic-fake-client",
+  "client": {
+    "command": ["{python}", "{here}/fake_client.py", "--task", "{task_id}", "--arm", "{arm}", "--mode", "{mode}", "--rep", "{rep}", "--mcp-config", "{mcp_config}", "{*steering_args}"],
+    "steering_args": ["--steered"],
+    "version_command": ["{python}", "{here}/fake_client.py", "--version"],
+    "pass_env": [],
+    "timeout_s": 120
+  },
+  "symforge": {"hook_install": ["{python}", "{here}/fake_client.py", "--install-hooks"]}
+}
