@@ -1,0 +1,38 @@
+== sonnet: 12 runs per arm (A native, B SymForge) ==
+  round trips                                                    A           55  B           53  -4%
+  retrieval tool calls                                           A           61  B           58  -5%
+  retrieved chars                                                A       134447  B       123647  -8%
+  fresh input tokens (raw, launch-order biased)                  A       701654  B       531058  -24%
+  cached input tokens                                            A      4337199  B      4130262  -5%
+  output tokens                                                  A        17153  B        14431  -16%
+  price-weighted cost, warm prefix                               A       766312  B       621890  -19%
+  price-weighted cost, warm prefix, rule files removed from A    A       706333  B       621890  -12%
+  tasks where B is cheaper on the rules-removed weighted cost: 3/6
+    T1: A    191979  B    114019  -41%
+    T2: A    159943  B     55784  -65%
+    T3: A     81648  B    108840  +33%
+    T4: A     63866  B     89104  +40%
+    T5: A     74876  B     61285  -18%
+    T6: A    134022  B    192859  +44%
+== haiku: 6 runs per arm (A native, B SymForge) ==
+  round trips                                                    A           26  B           31  +19%
+  retrieval tool calls                                           A           29  B           42  +45%
+  retrieved chars                                                A       155761  B        74376  -52%
+  fresh input tokens (raw, launch-order biased)                  A       396820  B       282203  -29%
+  cached input tokens                                            A      2079194  B      2495974  +20%
+  output tokens                                                  A        19042  B        21433  +13%
+  price-weighted cost, warm prefix                               A       485025  B       444774  -8%
+  price-weighted cost, warm prefix, rule files removed from A    A       455660  B       444774  -2%
+  tasks where B is cheaper on the rules-removed weighted cost: 2/6
+    T1: A     66967  B    109904  +64%
+    T2: A    135295  B     27269  -80%
+    T3: A     62322  B     91640  +47%
+    T4: A     46227  B     58448  +26%
+    T5: A     42148  B     41026  -3%
+    T6: A    102701  B    116486  +13%
+== non-payload context per run (growth - tool chars/4 - output), all 36 runs ==
+  A, used Read   n=15 median   10364 min    8283 max   26731
+  A, Grep only   n= 3 median     920 min     814 max    1412
+  B              n=18 median    1949 min    1091 max    5182
+rule-file attachments: 15 runs, median 4165 tokens (chars/4), arms: A 15, B 0
+retrieved chars, all 36 runs: A 290208 B 198023 -32%

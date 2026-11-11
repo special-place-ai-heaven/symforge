@@ -1,0 +1,70 @@
+[
+  {
+    "id": "zod-discovery-prettify",
+    "repo": "zod",
+    "category": "discovery",
+    "status": "anchors_verified",
+    "prompt": "In the v4 core of this library, find the function that renders a validation error as a human-readable multi-line string (one line per issue with its path). Report the file and the line where it is defined, as path:line.",
+    "oracle": [
+      {"type": "locate", "pattern": "^export function prettifyError\\(", "glob": "*.ts", "tolerance": 1}
+    ]
+  },
+  {
+    "id": "zod-tracing-prefix-issues",
+    "repo": "zod",
+    "category": "tracing",
+    "status": "anchors_verified",
+    "prompt": "Find every caller of prefixIssues. List each file (repository-relative path) that contains a call to it, with the line numbers of the calls.",
+    "oracle": [
+      {"type": "files_mentioned", "pattern": "\\bprefixIssues\\(", "exclude_line": "export function prefixIssues\\(", "glob": "*.ts"}
+    ]
+  },
+  {
+    "id": "zod-unfamiliar-errors-module",
+    "repo": "zod",
+    "category": "unfamiliar-module",
+    "status": "anchors_verified",
+    "prompt": "You have not seen this codebase before. Explain what packages/zod/src/v4/core/errors.ts provides: list the name of every exported function in that file, each with one sentence on what it does.",
+    "oracle": [
+      {"type": "names", "file": "packages/zod/src/v4/core/errors.ts", "start": "\\A", "end": "\\Z", "item": "^export function (\\w+)"}
+    ]
+  },
+  {
+    "id": "zod-debug-multiple-of",
+    "repo": "zod",
+    "category": "debugging",
+    "status": "anchors_verified",
+    "prompt": "Bug report: z.number().multipleOf(0.1) now rejects 0.3 and accepts 0.35. Find the line that causes it. Report it as path:line and state the corrected expression. Do not modify any file.",
+    "seeds": [
+      {"id": "float-remainder", "stage": "base", "path": "packages/zod/src/v4/core/util.ts", "find": "if (Math.abs(ratio - roundedRatio) < tolerance) return 0;", "replace": "if (Math.abs(ratio - roundedRatio) > tolerance) return 0;"}
+    ],
+    "oracle": [
+      {"type": "seed_located", "seed": "float-remainder", "tolerance": 2},
+      {"type": "answer_regex", "all": [["<\\s*tolerance"]]}
+    ]
+  },
+  {
+    "id": "zod-rename-float-remainder",
+    "repo": "zod",
+    "category": "rename-refactor",
+    "status": "anchors_verified",
+    "prompt": "Rename the utility function floatSafeRemainder to safeFloatRemainder everywhere in the repository (definition, every import and call site, tests, docs). Make no other change.",
+    "oracle": [
+      {"type": "exact_rename", "old": "floatSafeRemainder", "new": "safeFloatRemainder"}
+    ]
+  },
+  {
+    "id": "zod-review-dot-path",
+    "repo": "zod",
+    "category": "review",
+    "status": "anchors_verified",
+    "prompt": "Review the uncommitted change in this working tree (see git diff). Report every defect it introduces as path:line with a one-sentence explanation. Do not modify any file.",
+    "seeds": [
+      {"id": "dot-path", "stage": "review", "path": "packages/zod/src/v4/core/errors.ts", "find": "if (segs.length) segs.push(\".\");", "replace": "if (!segs.length) segs.push(\".\");"},
+      {"id": "benign-comment", "stage": "review", "path": "packages/zod/src/v4/core/errors.ts", "find": "const segs: string[] = [];", "replace": "const segs: string[] = []; // rendered path segments", "benign": true}
+    ],
+    "oracle": [
+      {"type": "seed_located", "seed": "dot-path", "tolerance": 2}
+    ]
+  }
+]

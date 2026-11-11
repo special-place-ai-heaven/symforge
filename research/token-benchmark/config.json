@@ -1,0 +1,60 @@
+{
+  "_comment": "Everything a live run depends on is configuration. Model id, client command, tool lists and prices are never hard-coded in the scripts. Verify flag names against `claude --help` for the client version you pin; record that version in `client.version_pin`.",
+  "model": "claude-sonnet-5-5",
+  "effort": "medium",
+  "repetitions": 5,
+  "arms": {
+    "a": {"label": "native tools only", "mcp": false, "steering": false},
+    "b": {"label": "SymForge available, steered", "mcp": true, "steering": true},
+    "c": {"label": "SymForge available, no steering", "mcp": true, "steering": false}
+  },
+  "headline_pair": ["a", "c"],
+  "secondary_pairs": [["a", "b"]],
+  "modes": {
+    "off": {"hooks": false, "rules": false},
+    "on": {"hooks": true, "rules": true}
+  },
+  "tools": {
+    "native": ["Bash", "Read", "Grep", "Glob", "Edit", "Write"],
+    "symforge_pattern": "mcp__symforge__*",
+    "client_meta": ["ToolSearch", "TodoWrite"],
+    "disallowed": ["WebFetch", "WebSearch", "Task", "Agent", "NotebookEdit"]
+  },
+  "symforge": {
+    "command": "symforge",
+    "server_env": {"SYMFORGE_NO_DAEMON": "1", "SYMFORGE_AUTO_INDEX": "true", "NO_COLOR": "1"},
+    "hook_install": ["{symforge}", "init", "--client", "claude"]
+  },
+  "client": {
+    "version_pin": "",
+    "version_command": ["claude", "--version"],
+    "command": [
+      "claude", "--print", "--output-format", "stream-json", "--verbose",
+      "--no-session-persistence", "--model", "{model}", "--effort", "{effort}",
+      "--permission-mode", "dontAsk", "--setting-sources", "user,project",
+      "--strict-mcp-config", "--mcp-config", "{mcp_config}",
+      "--tools", "{native_tools}", "--allowedTools", "{allowed_tools}",
+      "--disallowedTools", "{disallowed_tools}",
+      "--max-budget-usd", "{max_budget_usd}",
+      "{*steering_args}"
+    ],
+    "steering_args": ["--append-system-prompt", "{steering_text}"],
+    "pass_env": ["ANTHROPIC_API_KEY"],
+    "max_budget_usd": "3.00",
+    "timeout_s": 1500
+  },
+  "prices_usd_per_mtok": {
+    "_source": "claude-api skill model table cached 2026-11-03: Sonnet 5.5 input 2.00, output 10.00, cache read 0.10. Cache write is ASSUMED at 1.25x input; confirm on the live pricing page before quoting a bill.",
+    "input": 2.0,
+    "cache_write": 2.5,
+    "cache_read": 0.1,
+    "output": 10.0
+  },
+  "rules_sentinel": "BENCH-RULE-SENTINEL-7F3A",
+  "decision": {
+    "min_valid_fraction": 0.95,
+    "require_quality_not_worse": true,
+    "require_both_modes": true
+  },
+  "python": "python"
+}

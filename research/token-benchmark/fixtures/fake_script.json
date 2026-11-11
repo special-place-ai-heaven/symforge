@@ -1,0 +1,54 @@
+{
+  "_comment": "SYNTHETIC. Token factors are invented to exercise winning and losing categories in the report; they say nothing about SymForge.",
+  "fail_rate": {"a": 0.1, "b": 0.1, "c": 0.2},
+  "allowlist_violation_cells": [["mini-discovery", "a", "off", 3]],
+  "tasks": {
+    "mini-discovery": {
+      "base_tokens": 120000, "factor": {"a": 1.0, "b": 0.7, "c": 0.85},
+      "tools": {"native": {"Grep": 3, "Read": 1}, "sf": {"mcp__symforge__search_symbols": 1}},
+      "answer": "ANSWER:\nminicalc/core.py:16 defines parse_number."
+    },
+    "mini-tracing": {
+      "base_tokens": 150000, "factor": {"a": 1.0, "b": 0.6, "c": 0.8},
+      "tools": {"native": {"Grep": 4, "Read": 2}, "sf": {"mcp__symforge__find_references": 1}},
+      "answer": "ANSWER:\n- minicalc/fmt.py:9\n- minicalc/cli.py:10\n- tests/test_core.py:12"
+    },
+    "mini-unfamiliar": {
+      "base_tokens": 180000, "factor": {"a": 1.0, "b": 0.9, "c": 0.95},
+      "tools": {"native": {"Read": 2, "Grep": 1}, "sf": {"mcp__symforge__get_file_context": 1, "mcp__symforge__get_symbol": 1}},
+      "answer": "ANSWER:\n- register(name, value): stores a value under a name\n- get(name): returns the stored value\n- names(): returns the sorted names"
+    },
+    "mini-debugging": {
+      "base_tokens": 260000, "factor": {"a": 1.0, "b": 1.05, "c": 1.1},
+      "tools": {"native": {"Read": 2, "Edit": 1, "Bash": 2}, "sf": {"mcp__symforge__get_symbol": 2, "mcp__symforge__replace_symbol_body": 1, "Bash": 2}},
+      "edits": [{"path": "minicalc/core.py", "find": "return min(lo, max(value, hi))", "replace": "return max(lo, min(value, hi))"}],
+      "answer": "ANSWER:\nclamp in minicalc/core.py:13 had min and max swapped; fixed."
+    },
+    "mini-single-edit": {
+      "base_tokens": 220000, "factor": {"a": 1.0, "b": 0.95, "c": 1.0},
+      "tools": {"native": {"Read": 1, "Edit": 1, "Bash": 1}, "sf": {"mcp__symforge__insert_symbol": 1, "Bash": 1}},
+      "edits": [{"path": "minicalc/core.py", "append": "\n\ndef mul(a, b):\n    return a * b\n"}],
+      "answer": "ANSWER:\nAdded mul(a, b) to minicalc/core.py."
+    },
+    "mini-cross-edit": {
+      "base_tokens": 320000, "factor": {"a": 1.0, "b": 0.85, "c": 0.9},
+      "tools": {"native": {"Read": 3, "Edit": 2, "Bash": 1}, "sf": {"mcp__symforge__get_file_context": 2, "mcp__symforge__batch_edit": 1, "Bash": 1}},
+      "edits": [
+        {"path": "minicalc/core.py", "find": "    def names(self):", "replace": "    def unregister(self, name):\n        del self._items[name]\n\n    def names(self):"},
+        {"path": "minicalc/fmt.py", "append": "\n\ndef format_registry(registry):\n    return \", \".join(f\"{n}={registry.get(n)}\" for n in registry.names())\n"}
+      ],
+      "answer": "ANSWER:\nAdded Registry.unregister and fmt.format_registry."
+    },
+    "mini-rename": {
+      "base_tokens": 200000, "factor": {"a": 1.0, "b": 1.3, "c": 1.4},
+      "tools": {"native": {"Grep": 1, "Edit": 3}, "sf": {"mcp__symforge__batch_rename": 2, "mcp__symforge__search_text": 2}},
+      "rename": {"old": "format_result", "new": "render_result"},
+      "answer": "ANSWER:\nRenamed format_result to render_result in 3 files."
+    },
+    "mini-review": {
+      "base_tokens": 140000, "factor": {"a": 1.0, "b": 1.1, "c": 1.05},
+      "tools": {"native": {"Bash": 1, "Read": 1}, "sf": {"mcp__symforge__what_changed": 1, "mcp__symforge__get_symbol": 1}},
+      "answer": "ANSWER:\nminicalc/fmt.py:9 clamps to 10 instead of 100, so bounded() caps results at 10."
+    }
+  }
+}

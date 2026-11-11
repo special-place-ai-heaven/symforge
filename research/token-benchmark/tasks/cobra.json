@@ -1,0 +1,72 @@
+[
+  {
+    "id": "cobra-tracing-name-matches",
+    "repo": "cobra",
+    "category": "tracing",
+    "status": "anchors_verified",
+    "prompt": "Find every caller of the unexported function commandNameMatches. List each file (repository-relative path) that contains a call to it, with the line numbers of the calls.",
+    "oracle": [
+      {"type": "files_mentioned", "pattern": "\\bcommandNameMatches\\(", "exclude_line": "^func commandNameMatches\\(", "glob": "*.go"}
+    ]
+  },
+  {
+    "id": "cobra-debug-minimum-n-args",
+    "repo": "cobra",
+    "category": "debugging",
+    "status": "anchors_verified",
+    "prompt": "Bug report: a command declared with Args: cobra.MinimumNArgs(2) rejects an invocation that passes exactly two positional arguments. Find the cause and fix it so that `go test .` passes.",
+    "seeds": [
+      {"id": "min-n-args", "stage": "base", "path": "args.go", "find": "if len(args) < n {", "replace": "if len(args) <= n {"}
+    ],
+    "oracle": [
+      {"type": "diff_scope", "allow": ["args.go"]},
+      {"type": "command", "hidden": ["bench_min_args_test.go"], "argv": ["go", "test", "."]}
+    ]
+  },
+  {
+    "id": "cobra-edit-even-args",
+    "repo": "cobra",
+    "category": "single-file-edit",
+    "status": "draft",
+    "prompt": "Add a new positional-argument validator to args.go: func EvenArgs(cmd *Command, args []string) error. It returns nil when the number of arguments is even (zero included) and a descriptive error otherwise. Change only args.go.",
+    "oracle": [
+      {"type": "diff_scope", "allow": ["args.go"]},
+      {"type": "command", "hidden": ["bench_even_args_test.go"], "argv": ["go", "test", "."]}
+    ]
+  },
+  {
+    "id": "cobra-edit-hidden-aliases",
+    "repo": "cobra",
+    "category": "cross-module-edit",
+    "status": "draft",
+    "prompt": "Add a HiddenAliases []string field to Command. A hidden alias resolves to the command exactly like an entry in Aliases (command lookup, HasAlias, prefix matching), but it is never shown: NameAndAliases, help and usage output, generated docs and shell completions must not list it. Update every place that needs it.",
+    "oracle": [
+      {"type": "diff_scope", "allow": ["*.go", "doc/*.go"]},
+      {"type": "command", "hidden": ["bench_hidden_aliases_test.go"], "argv": ["go", "test", "./..."]}
+    ]
+  },
+  {
+    "id": "cobra-rename-legacy-args",
+    "repo": "cobra",
+    "category": "rename-refactor",
+    "status": "anchors_verified",
+    "prompt": "Rename the unexported function legacyArgs to legacyArgsValidation everywhere in the repository, including tests and comments. Make no other change.",
+    "oracle": [
+      {"type": "exact_rename", "old": "legacyArgs", "new": "legacyArgsValidation"}
+    ]
+  },
+  {
+    "id": "cobra-review-range-args",
+    "repo": "cobra",
+    "category": "review",
+    "status": "anchors_verified",
+    "prompt": "Review the uncommitted change in this working tree (see git diff). Report every defect it introduces as path:line with a one-sentence explanation. Do not modify any file.",
+    "seeds": [
+      {"id": "range-args", "stage": "review", "path": "args.go", "find": "if len(args) < min || len(args) > max {", "replace": "if len(args) < min || len(args) >= max {"},
+      {"id": "benign-comment", "stage": "review", "path": "args.go", "find": "func NoArgs(cmd *Command, args []string) error {", "replace": "// NoArgs rejects any positional argument.\nfunc NoArgs(cmd *Command, args []string) error {", "benign": true}
+    ],
+    "oracle": [
+      {"type": "seed_located", "seed": "range-args", "tolerance": 2}
+    ]
+  }
+]
