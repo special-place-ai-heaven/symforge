@@ -136,14 +136,19 @@ async fn compact_status_reports_operational_state() {
         &format!("phase0_go: {}", stel::PHASE0_GO_COMMIT),
         &format!("phase0_evidence: {}", stel::PHASE0_EVIDENCE_COMMIT),
         "l1_planner: wired",
-        "l4_ledger: in_memory",
         "handler_status: wired",
         "handler_symforge_edit: preview-and-apply",
         "ledger_events: 0",
         "index_ready: true",
-        &format!("deferred: {}", stel::DEFERRED_ITEMS),
     ] {
         assert!(output.contains(needle), "missing `{needle}` in:\n{output}");
+    }
+    // Static roadmap labels are build facts; the default output carries none.
+    for label in ["l4_ledger", "deferred:", "superseded:"] {
+        assert!(
+            !output.contains(label),
+            "unexpected `{label}` in:\n{output}"
+        );
     }
 }
 

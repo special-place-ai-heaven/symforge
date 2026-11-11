@@ -95,6 +95,8 @@ impl EmbeddedSourceHandle {
         let empty = SessionLedger::new();
         let ledger = session.map_or(&empty, QuerySession::stel_ledger);
         let guard = shared.read();
+        // SF-DOG-04: the index lines come from ONE published generation.
+        let published = shared.published_generation();
         let project_name = root
             .file_name()
             .and_then(|name| name.to_str())
@@ -117,9 +119,11 @@ impl EmbeddedSourceHandle {
                 orphaned_daemon_pid: None,
                 project_name: &project_name,
                 project_root: Some(crate::paths::normalized_path_string(&root)),
-                index_ready: guard.is_ready(),
-                index_files: guard.file_count(),
-                index_symbols: guard.symbol_count(),
+                index_ready: published.health.status
+                    == crate::live_index::PublishedIndexStatus::Ready,
+                index_trust: crate::live_index::store::TrustHeadline::of(&published).label(),
+                index_files: published.health.file_count,
+                index_symbols: published.health.symbol_count,
                 ledger,
                 session_tokens: session.map_or(0, QuerySession::served_tokens),
                 store: store.as_deref(),

@@ -38,9 +38,11 @@ pub(super) fn text_input(input: &TextSearchRequest) -> search_contract::SearchTe
                 TextGrouping::Symbol => "symbol",
                 TextGrouping::Usage => "usage",
                 TextGrouping::Names => "names",
+                TextGrouping::Count => super::guidance::search::GROUP_BY_COUNT,
             }
             .into()
         }),
+        include_body: input.include_body,
         project: None,
         projects: None,
     }
@@ -129,7 +131,11 @@ pub(super) fn symbols(
             .result
             .hits
             .iter()
-            .map(|hit| ((hit.path.len() + hit.name.len() + hit.kind.len() + 128) / 4) as u64)
+            .map(|hit| {
+                crate::stel::handler::estimate_tokens_from_bytes(
+                    (hit.path.len() + hit.name.len() + hit.kind.len() + 128) as u64,
+                )
+            })
             .sum::<u64>()
             + 24;
         return Ok(QueryOutput::SearchEstimate(SearchEstimate {
@@ -328,6 +334,18 @@ fn project_text(
             }
         }
         TextRows::Names(names)
+    } else if grouping == TextGrouping::Count {
+        let mut counts = Vec::new();
+        for hits in &found.files {
+            if !budget.row(hits.path.len()) {
+                break;
+            }
+            counts.push(TextFileCount {
+                path: hits.path.clone(),
+                count: hits.matches.len() as u64,
+            });
+        }
+        TextRows::Counts(counts)
     } else if grouping == TextGrouping::Symbol && !context_mode {
         let mut counts = HashMap::new();
         for hits in &found.files {
@@ -361,7 +379,12 @@ fn project_text(
                         continue;
                     }
                     let symbol = symbol_row(file, index as usize, &file.symbols[index as usize])?;
-                    if !budget.row(symbol_size(&symbol) + hit.line.len()) {
+                    let body = hit
+                        .enclosing_symbol
+                        .as_ref()
+                        .and_then(|enclosing| enclosing.body.clone());
+                    let body_len = body.as_ref().map_or(0, String::len);
+                    if !budget.row(symbol_size(&symbol) + hit.line.len() + body_len) {
                         break 'files;
                     }
                     let match_count = counts[&(hits.path.as_str(), index)];
@@ -369,6 +392,7 @@ fn project_text(
                         symbol,
                         match_count,
                         preview: hit.line.clone(),
+                        body,
                     });
                 } else {
                     let Some(hit) = text_line(
@@ -481,5 +505,6 @@ fn project_text(
         auto_corrected_regex: executed.auto_corrected_regex,
         untracked_paths: untracked_paths.to_vec(),
         untracked_diagnostic,
+        hidden_test_matches: executed.hidden_test_matches.map(|n| n as u64),
     }))
 }

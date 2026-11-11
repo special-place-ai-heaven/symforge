@@ -75,7 +75,7 @@ async fn spawn_repo_sidecar() -> (TempDir, symforge::sidecar::SidecarHandle) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mismatched_caller_root_gets_409_not_wrong_project_answer() {
-    let (_repo, handle) = spawn_repo_sidecar().await;
+    let (repo, handle) = spawn_repo_sidecar().await;
     let other = tempfile::tempdir().expect("other tempdir");
 
     let query = format!(
@@ -89,10 +89,57 @@ async fn mismatched_caller_root_gets_409_not_wrong_project_answer() {
         status.contains("409"),
         "a wrong-root caller must get 409, not an answer from another project; got {status}: {body}"
     );
+    let repo_text = repo.path().to_string_lossy().to_string();
+    let canonical = repo.path().canonicalize().expect("canonical repo");
     assert!(
-        body.contains("rooted at"),
-        "the 409 body must name both roots; got: {body}"
+        body.contains("different project")
+            && !body.contains(&repo_text)
+            && !body.contains(canonical.to_string_lossy().as_ref()),
+        "the 409 body must not disclose the indexed root; got: {body}"
     );
+}
+
+async fn get_with_headers(port: u16, path: &str, headers: &[(&str, &str)]) -> anyhow::Result<u16> {
+    let mut request = HTTP_CLIENT.get(format!("http://127.0.0.1:{port}{path}"));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    Ok(request.send().await?.status().as_u16())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_sidecar_refuses_foreign_host_and_any_origin() {
+    let (_repo, handle) = spawn_repo_sidecar().await;
+    let port = handle.port;
+    let loopback = format!("127.0.0.1:{port}");
+    let localhost = format!("localhost:{port}");
+    for path in ["/outline?path=src/lib.rs", "/health", "/stats"] {
+        assert_eq!(
+            get_with_headers(port, path, &[("host", &format!("attacker.example:{port}"))])
+                .await
+                .expect("foreign host request"),
+            403,
+            "{path}: a foreign Host must be refused"
+        );
+        for origin in ["http://attacker.example", "http://127.0.0.1", "null"] {
+            assert_eq!(
+                get_with_headers(port, path, &[("host", &loopback), ("origin", origin)])
+                    .await
+                    .expect("origin request"),
+                403,
+                "{path}: a request carrying Origin {origin} must be refused"
+            );
+        }
+        for host in [&loopback, &localhost] {
+            assert_eq!(
+                get_with_headers(port, path, &[("host", host)])
+                    .await
+                    .expect("loopback host request"),
+                200,
+                "{path}: Host {host} must pass"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

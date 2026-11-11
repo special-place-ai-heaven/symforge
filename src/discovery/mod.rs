@@ -2111,6 +2111,11 @@ where
         safe_path_id: Some(safe_path_id()),
     };
 
+    // First, and string-only: a UNC root must be refused before any filesystem
+    // call can wait on a remote host.
+    if crate::paths::is_network_path(candidate) {
+        return unbound(RootRefusalReason::NetworkPath);
+    }
     if is_device_or_special_namespace(candidate) || is_special_filesystem_entry(candidate) {
         return unbound(RootRefusalReason::DeviceOrSpecialNamespace);
     }
@@ -2139,6 +2144,9 @@ where
         Ok(root) => root,
         Err(_) => return unbound(RootRefusalReason::CanonicalizationFailed),
     };
+    if crate::paths::is_network_path(&canonical_root) {
+        return unbound(RootRefusalReason::NetworkPath);
+    }
     // Every shipped protocol and persisted root record is UTF-8. A lossy
     // conversion would turn a distinct native path into another project's
     // identity, so reject it before indexing, publication, or state placement.
@@ -5886,15 +5894,100 @@ mod tests {
             );
         }
 
+        #[cfg(windows)]
+        #[test]
+        fn network_root_is_refused_before_any_filesystem_call() {
+            for raw in [
+                r"\\nonexistent-host.invalid\share",
+                "//nonexistent-host.invalid/share",
+                r"\\?\UNC\nonexistent-host.invalid\share",
+                r"\\.\UNC\nonexistent-host.invalid\share",
+                "//./UNC/nonexistent-host.invalid/share",
+                r"\??\UNC\nonexistent-host.invalid\share",
+                r"\\?\GLOBALROOT\Device\Mup\nonexistent-host.invalid\share",
+                "//?/GLOBALROOT/Device/Mup/nonexistent-host.invalid/share",
+                r"\\?\Global\UNC\nonexistent-host.invalid\share",
+            ] {
+                let started = std::time::Instant::now();
+                let resolution = resolve_root_candidate_with(
+                    Path::new(raw),
+                    RootCandidateSource::ExplicitIndexFolder,
+                    RootRequestMode::ExplicitIndexFolder {
+                        allow_protected_root: true,
+                    },
+                    |_| panic!("filesystem probe for {raw}"),
+                    |_| panic!("canonicalize for {raw}"),
+                );
+                assert!(
+                    matches!(
+                        resolution,
+                        RootResolution::Unbound {
+                            reason: UnboundReason::Refused(RootRefusalReason::NetworkPath),
+                            ..
+                        }
+                    ),
+                    "{raw}: {resolution:?}"
+                );
+                assert!(
+                    started.elapsed() < std::time::Duration::from_millis(250),
+                    "{raw}"
+                );
+            }
+            let local = TempDir::new().unwrap();
+            // Real canonicalize yields `\\?\X:\...`; the post-canonical check must
+            // accept it.
+            let verbatim = format!(r"\\?\{}", local.path().display());
+            let accepted = resolve_root_candidate(
+                Path::new(&verbatim),
+                RootCandidateSource::ExplicitIndexFolder,
+                RootRequestMode::ExplicitIndexFolder {
+                    allow_protected_root: true,
+                },
+            );
+            assert!(matches!(accepted, RootResolution::Bound(_)), "{accepted:?}");
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn root_canonicalizing_to_network_path_is_refused() {
+            let local = TempDir::new().unwrap();
+            let resolution = resolve_root_candidate_with(
+                local.path(),
+                RootCandidateSource::ExplicitIndexFolder,
+                RootRequestMode::ExplicitIndexFolder {
+                    allow_protected_root: false,
+                },
+                |_| true,
+                |_| {
+                    Ok(PathBuf::from(
+                        r"\\?\UNC\nonexistent-host.invalid\share\repo",
+                    ))
+                },
+            );
+            assert!(
+                matches!(
+                    resolution,
+                    RootResolution::Unbound {
+                        reason: UnboundReason::Refused(RootRefusalReason::NetworkPath),
+                        ..
+                    }
+                ),
+                "{resolution:?}"
+            );
+        }
         #[test]
         fn device_or_uncanonicalizable_root_remains_nonindexable_with_override() {
             let override_mode = RootRequestMode::ExplicitIndexFolder {
                 allow_protected_root: true,
             };
-            let device_namespace = if cfg!(windows) {
-                PathBuf::from(r"\\.\NUL")
+            // On Windows `\\.\` paths are refused by the earlier network check.
+            let (device_namespace, expected) = if cfg!(windows) {
+                (PathBuf::from(r"\\.\NUL"), RootRefusalReason::NetworkPath)
             } else {
-                PathBuf::from("/dev/null")
+                (
+                    PathBuf::from("/dev/null"),
+                    RootRefusalReason::DeviceOrSpecialNamespace,
+                )
             };
 
             let device = resolve_root_candidate(
@@ -5904,11 +5997,11 @@ mod tests {
             );
             assert!(
                 matches!(
-                    device,
+                    &device,
                     RootResolution::Unbound {
-                        reason: UnboundReason::Refused(RootRefusalReason::DeviceOrSpecialNamespace),
+                        reason: UnboundReason::Refused(reason),
                         ..
-                    }
+                    } if *reason == expected
                 ),
                 "explicit protected-root authority must never authorize a device namespace: {device:?}"
             );

@@ -642,6 +642,35 @@ pub fn is_credential_directory_path(path: &Path) -> bool {
     })
 }
 
+/// True when `path` names a network (UNC) location on Windows. String-only by
+/// design: no canonicalize, metadata or other filesystem call, so a refusal
+/// never waits on a remote host. Always false off Windows, where `//x` is an
+/// ordinary local path.
+pub fn is_network_path(path: &Path) -> bool {
+    cfg!(windows) && is_network_path_text(&path.to_string_lossy())
+}
+
+/// Refuses every path that starts with two separators (any mix of `\` and
+/// `/`) or with `\??\`, except a verbatim drive path `\\?\X:` followed by `\`
+/// or the end. Only the backslash spelling is exempt: Rust parses `//?/X:/`
+/// as a UNC server named `?`, not as a verbatim prefix.
+fn is_network_path_text(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let is_sep = |b: u8| b == b'\\' || b == b'/';
+    let double_sep = bytes.len() >= 2 && is_sep(bytes[0]) && is_sep(bytes[1]);
+    let nt_prefix =
+        bytes.len() >= 4 && is_sep(bytes[0]) && &bytes[1..3] == b"??" && is_sep(bytes[3]);
+    if !(double_sep || nt_prefix) {
+        return false;
+    }
+    let verbatim_drive = bytes.len() >= 6
+        && bytes.starts_with(br"\\?\")
+        && bytes[4].is_ascii_alphabetic()
+        && bytes[5] == b':'
+        && bytes.get(6).is_none_or(|&b| b == b'\\');
+    !verbatim_drive
+}
+
 /// Returns true if `canonical` is a sensitive system or credential-bearing
 /// directory (or a descendant of one) that must never be indexed.
 ///
@@ -807,6 +836,53 @@ mod tests {
 
     use tempfile::TempDir;
 
+    #[test]
+    fn network_path_text_refuses_unc_and_accepts_drive_paths() {
+        for refused in [
+            r"\\host\share",
+            "//host/share",
+            r"\/host/share",
+            r"\\?\UNC\host\share",
+            r"\\?\unc\host\share",
+            r"\\.\UNC\h\s",
+            "//./UNC/h/s",
+            r"\??\UNC\h\s",
+            r"\??\C:\repo",
+            r"\\?\GLOBALROOT\Device\Mup\h\s",
+            "//?/GLOBALROOT/Device/Mup/h/s",
+            r"\\?\Global\UNC\h\s",
+            "//?/C:/repo",
+            r"\\.\C:\repo",
+            r"\\?\C:repo",
+            r"\\.\NUL",
+            r"\\?",
+        ] {
+            assert!(is_network_path_text(refused), "{refused}");
+        }
+        for accepted in [
+            r"\\?\C:\repo",
+            r"\\?\c:\repo",
+            r"\\?\C:",
+            r"C:\repo",
+            "C:/repo",
+            "/repo",
+            r"repo\sub",
+            "file://host/share",
+            "",
+        ] {
+            assert!(!is_network_path_text(accepted), "{accepted}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn network_path_refusal_is_instant_for_unreachable_host() {
+        let started = std::time::Instant::now();
+        assert!(is_network_path(Path::new(
+            r"\\nonexistent-host.invalid\share"
+        )));
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+    }
     #[test]
     fn regular_file_is_accepted_as_non_link() {
         let dir = TempDir::new().expect("tempdir");

@@ -39,4 +39,9 @@ pub struct SearchKnowledgeInput {
     pub limit: Option<u32>,
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
+    /// Include docs under `archive`/`archived` folders and date-named folders
+    /// beneath `research`/`reviews`, which the default scope excludes.
+    /// Defaults to true only for authority_scope `history` or `all`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_archived: Option<bool>,
 }

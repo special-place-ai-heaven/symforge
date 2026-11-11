@@ -1,0 +1,8 @@
+# cargo-deny policy. CI runs `cargo deny check advisories` only; bans and
+# licenses have no declared repo policy yet, so they are not configured here.
+[advisories]
+version = 2
+yanked = "deny"
+# Add `{ id = "RUSTSEC-....", reason = "..." }` here only with a written reason
+# and an exit condition.
+ignore = []

@@ -549,6 +549,7 @@ fn test_search_text_result_view_group_by_symbol_keeps_duplicate_names_separate()
                             name: "connect".to_string(),
                             kind: "fn".to_string(),
                             line_range: (0, 1),
+                            body: None,
                         }),
                     },
                     search::TextLineMatch {
@@ -558,6 +559,7 @@ fn test_search_text_result_view_group_by_symbol_keeps_duplicate_names_separate()
                             name: "connect".to_string(),
                             kind: "fn".to_string(),
                             line_range: (3, 4),
+                            body: None,
                         }),
                     },
                 ],
@@ -875,6 +877,59 @@ fn search_text_partial_result_reports_policy_withheld_files_and_reasons() {
     assert!(
         !rendered.contains("path-rule") && !rendered.contains("SensitivePath"),
         "must not disclose the detector; got: {rendered}"
+    );
+}
+
+#[test]
+fn withheld_note_counts_only_files_inside_the_search_scope() {
+    let mut index = make_index(vec![make_file(
+        "src/code/lib.rs",
+        b"fn needle() {}\n",
+        vec![make_symbol("needle", SymbolKind::Function, 0, 0, 1)],
+    )]);
+    index.manifest_entries = vec![
+        catalog_indexed(
+            "src/code/lib.rs",
+            crate::domain::IndexTargets::Code,
+            LanguageId::Rust,
+        ),
+        catalog_metadata_only(
+            "tests/fixtures/leaky.env",
+            crate::domain::MetadataOnlyReason::SensitivePath {
+                rule_id: "path-rule".to_string(),
+            },
+        ),
+    ];
+    let render = |options: &search::TextSearchOptions| {
+        search_text_result_view(
+            search::search_text_with_options(&index, Some("needle"), None, false, options),
+            None,
+            None,
+            None,
+            SearchSuggestionContext::default(),
+        )
+    };
+    let mut options = search::TextSearchOptions::for_current_code_search();
+    assert!(!options.noise_policy.include_tests);
+    let default = render(&options);
+    assert!(default.contains("needle"), "{default}");
+    assert!(
+        !default.contains("withheld by admission policy"),
+        "a withheld test fixture is outside a tests-excluded search: {default}"
+    );
+
+    options.noise_policy.include_tests = true;
+    let with_tests = render(&options);
+    assert!(
+        with_tests.contains("1 in-scope file withheld by admission policy"),
+        "{with_tests}"
+    );
+
+    options.glob = Some("src/**".to_string());
+    let globbed = render(&options);
+    assert!(
+        !globbed.contains("withheld by admission policy"),
+        "the glob excludes the withheld file: {globbed}"
     );
 }
 
@@ -1927,6 +1982,7 @@ fn test_health_compact_idle_watcher_shows_reconcile_repairs() {
         last_overflow_at: None,
         stale_files_found: 7,
         last_reconcile_at: Some(SystemTime::now()),
+        last_degraded_publication: None,
     };
     let report = health_report_compact_from_published_state(&published, &watcher, 0);
     assert!(
@@ -2642,6 +2698,87 @@ fn test_symbol_detail_from_indexed_file_matches_live_index_output() {
     );
 
     assert_eq!(shared_result, live_result);
+}
+
+#[test]
+fn test_symbol_detail_numbers_long_bodies_with_file_line_numbers() {
+    let mut content = String::from("// pad\n// pad\n");
+    let start = content.len();
+    content.push_str("fn big() {\n");
+    for _ in 0..21 {
+        content.push_str("    x;\n");
+    }
+    content.push_str("}\n");
+    let end = content.len() - 1;
+    // Lines 3..=25 (1-based) -> 0-based 2..=24.
+    let (key, file) = make_file(
+        "src/big.rs",
+        content.as_bytes(),
+        vec![make_symbol_with_bytes(
+            "big",
+            SymbolKind::Function,
+            0,
+            2,
+            24,
+            start as u32,
+            end as u32,
+        )],
+    );
+    let index = make_index(vec![(key, file)]);
+    let shared = index.capture_shared_file("src/big.rs").unwrap();
+
+    let default = symbol_detail_from_indexed_file_with(shared.as_ref(), "big", None, None, None);
+    let lines: Vec<&str> = default.lines().collect();
+    assert_eq!(lines[0], "3: fn big() {");
+    assert_eq!(lines[1], "4:     x;");
+    assert_eq!(lines[22], "25: }");
+    assert!(lines[23].starts_with("[fn, lines 3-25"), "{default}");
+
+    let off = symbol_detail_from_indexed_file_with(shared.as_ref(), "big", None, None, Some(false));
+    assert!(off.starts_with("fn big() {\n    x;"), "{off}");
+    assert_eq!(
+        off,
+        symbol_detail_from_indexed_file(shared.as_ref(), "big", None, None)
+    );
+}
+
+#[test]
+fn test_format_tool_token_breakdown_has_no_multiplier_and_labels_estimates() {
+    let details = vec![
+        ("get_symbol".to_string(), 100u64, 400u64),
+        ("search_symbols".to_string(), 50u64, 150u64),
+    ];
+    let out = format_tool_token_breakdown(&details);
+
+    assert!(out.contains("Tokens served: 150"), "{out}");
+    assert!(!out.contains("Efficiency"), "{out}");
+    assert!(!out.contains("reduction"), "{out}");
+    assert!(
+        !regex::Regex::new(r"\d+(\.\d+)?x\b").unwrap().is_match(&out),
+        "no Nx multiplier may appear: {out}"
+    );
+    for line in out.lines().filter(|l| l.contains("saved")) {
+        assert!(
+            line.to_lowercase().contains("estimated"),
+            "unlabelled `saved`: {line}"
+        );
+    }
+    assert!(out.contains("windowed-read baseline"), "{out}");
+    assert!(out.contains("grep+windows listing baseline"), "{out}");
+    assert!(
+        format_token_savings(&crate::sidecar::StatsSnapshot {
+            read_fires: 1,
+            read_saved_tokens: 10,
+            edit_fires: 0,
+            edit_saved_tokens: 0,
+            write_fires: 0,
+            grep_fires: 1,
+            grep_saved_tokens: 5,
+        })
+        .lines()
+        .filter(|l| l.contains("saved"))
+        .all(|l| l.contains("estimated"))
+    );
 }
 
 #[test]
@@ -4237,6 +4374,7 @@ fn test_format_hook_adoption_shows_workflow_totals_and_first_repo_start() {
             daemon_fallback: 0,
         },
         first_repo_start: Some(crate::cli::hook::HookOutcome::Routed),
+        ..Default::default()
     };
 
     let result = format_hook_adoption(&snap);
@@ -4290,6 +4428,7 @@ fn test_format_hook_adoption_marks_no_sidecar_fail_open_as_mostly_benign() {
         prompt_context: crate::cli::hook::WorkflowAdoptionCounts::default(),
         post_edit_impact: crate::cli::hook::WorkflowAdoptionCounts::default(),
         first_repo_start: Some(crate::cli::hook::HookOutcome::NoSidecar),
+        ..Default::default()
     };
 
     let result = format_hook_adoption(&snap);
@@ -4347,6 +4486,47 @@ fn test_format_hook_adoption_names_all_sidecar_errors_honestly() {
         !result.contains("All hook attempts failed open (no sidecar found)"),
         "sidecar errors must never be described as an absent sidecar: {result}"
     );
+}
+
+#[test]
+fn test_format_hook_adoption_breaks_fail_open_down_by_reason() {
+    let snap = crate::cli::hook::HookAdoptionSnapshot {
+        source_read: crate::cli::hook::WorkflowAdoptionCounts {
+            routed: 1,
+            no_sidecar: 1,
+            sidecar_error: 2,
+            daemon_fallback: 0,
+        },
+        fail_open_reasons: [
+            ("index_not_ready".to_string(), 2),
+            ("sidecar_port_missing".to_string(), 1),
+        ]
+        .into_iter()
+        .collect(),
+        scope: Some("session session-1, daemon:42".to_string()),
+        ..Default::default()
+    };
+    let result = format_hook_adoption(&snap);
+    assert!(
+        result.contains("Fail-open reasons: index_not_ready 2, sidecar_port_missing 1"),
+        "missing per-reason line: {result}"
+    );
+    assert!(
+        result
+            .contains("── Hook Adoption (this sidecar lifetime: session session-1, daemon:42) ──"),
+        "heading must name what was counted: {result}"
+    );
+}
+
+#[test]
+fn test_format_hook_adoption_reports_unknown_session_instead_of_counting() {
+    let snap = crate::cli::hook::HookAdoptionSnapshot {
+        session_unknown: true,
+        ..Default::default()
+    };
+    let result = format_hook_adoption(&snap);
+    assert!(result.contains("session unknown"), "got: {result}");
+    assert!(!result.contains("Owned workflows routed"), "got: {result}");
 }
 
 #[test]

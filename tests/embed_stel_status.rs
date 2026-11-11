@@ -28,7 +28,6 @@ phase0_evidence: 08f7d14
 l1_planner: wired
 l2_economics: wired
 l3_bypass: wired
-l4_ledger: in_memory
 handler_symforge: wired
 handler_status: wired
 handler_symforge_edit: preview-and-apply
@@ -36,12 +35,13 @@ ledger_events: 0
 project_root: {root}
 index_ready: true
 index_files: 1
-deferred: b_results
-superseded: multi_step_planner (client agentic loop + find-fusion)
 ──
 project: {project}
 index_symbols: 1
 session_tokens: 0
+build_fact_l4_ledger: in_memory
+build_fact_deferred: b_results
+build_fact_superseded: multi_step_planner (client agentic loop + find-fusion)
 last_ledger_decision: none
 last_ledger_route: none
 durable_ledger: events=0 net_vs_manual=0 sessions=0

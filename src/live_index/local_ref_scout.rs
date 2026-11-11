@@ -1652,6 +1652,7 @@ mod tests {
             projects: None,
             limit: None,
             max_tokens: None,
+            include_archived: None,
         };
 
         let local_refs = search_scoped(&set, &input(KnowledgeSourceScope::LocalRefs));
@@ -3056,6 +3057,7 @@ mod tests {
                     projects: None,
                     limit: None,
                     max_tokens: None,
+                    include_archived: None,
                 },
             )
         };

@@ -90,12 +90,6 @@ pub(crate) fn extract_signature(body: &str) -> String {
 }
 
 pub(crate) const CANONICAL_TRUNCATION_MARKER: &str = "[truncated]";
-const APPROX_BYTES_PER_TOKEN: u64 = 4;
-
-pub(crate) fn approx_tokens_from_bytes(bytes: usize) -> u64 {
-    ((bytes as u64).saturating_add(APPROX_BYTES_PER_TOKEN - 1)) / APPROX_BYTES_PER_TOKEN
-}
-
 pub(crate) fn canonical_truncation_notice(amount: u64, unit: &str, detail: Option<&str>) -> String {
     match detail.filter(|value| !value.is_empty()) {
         Some(detail) => {
@@ -135,7 +129,7 @@ pub fn enforce_token_budget_flagged(output: String, max_tokens: Option<u64>) -> 
     if output.len() <= max_bytes {
         return (output, false);
     }
-    let actual_tokens_est = approx_tokens_from_bytes(output.len());
+    let actual_tokens_est = crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64);
     let mut truncated = truncate_text_at_line_boundary(&output, max_bytes);
     let detail =
         format!("Original output is ~{actual_tokens_est} tokens; budget is {max_tokens} tokens.");

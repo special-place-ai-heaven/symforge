@@ -42,24 +42,6 @@ pub(super) fn repo_map(
     let published = snapshot.generation.as_ref();
     let view = published.outline.as_ref();
     let file_count = published.live.file_count();
-    let requested_detail = request.detail.as_deref().unwrap_or("compact");
-    if request.estimate {
-        let estimate = match requested_detail {
-            "full" => (request.max_files.unwrap_or(200) as usize).min(file_count) * 30,
-            "tree" => file_count * 10,
-            _ => 500,
-        };
-        let rendered = format!(
-            "Estimate for get_repo_map: ~{estimate} tokens (detail={requested_detail}, files={file_count})"
-        );
-        return Ok(QueryOutput::RepoMap(RepoMapResult {
-            detail: requested_detail.to_string(),
-            rendered: budget.text(&rendered)?,
-            estimated_tokens: Some(estimate as u64),
-            total_files: file_count as u64,
-            shown_files: 0,
-        }));
-    }
     let detail = if let Some(detail) = request.detail.as_deref() {
         detail
     } else if let Some(max_tokens) = request.max_tokens {
@@ -136,7 +118,7 @@ pub(super) fn repo_map(
     };
     let body_lines = rendered.lines().count();
     budget.check()?;
-    if request.path.is_none() {
+    if request.include_knowledge {
         rendered.push_str("\n\n");
         rendered.push_str(&knowledge_model::render_repository_knowledge_map(published));
     }
@@ -145,6 +127,20 @@ pub(super) fn repo_map(
     {
         rendered.push_str("\n\n");
         rendered.push_str(&note);
+    }
+    if request.estimate {
+        // Measured, not assumed: the same view this call would render.
+        let estimate = crate::stel::handler::estimate_tokens_from_bytes(rendered.len() as u64);
+        let text = format!(
+            "Estimate for get_repo_map: ~{estimate} tokens (detail={detail}, files={file_count}; length of the rendered response / 4)"
+        );
+        return Ok(QueryOutput::RepoMap(RepoMapResult {
+            detail: detail.to_string(),
+            rendered: budget.text(&text)?,
+            estimated_tokens: Some(estimate),
+            total_files: file_count as u64,
+            shown_files: 0,
+        }));
     }
     // Keep the full projection retrievable, while each delivered line consumes
     // one result row. Count only file rows that actually survived both caps.
@@ -222,7 +218,7 @@ pub(super) fn file_context(
         .get_file(&request.path)
         .ok_or(QueryRefusalKind::NotFound)?;
     let raw_chars = file.content.len();
-    let raw_tokens = (raw_chars / 4) as u64;
+    let raw_tokens = crate::stel::handler::estimate_tokens_from_bytes(raw_chars as u64);
     if request.estimate {
         let outline_tokens = (raw_chars / 50) as u64;
         let savings = (outline_tokens as usize * 100)
@@ -316,11 +312,12 @@ pub(super) fn file_context(
             max_tokens: context_max_tokens,
             sections: sections.clone(),
         };
-        let (text, _, _) = read_context::outline_text_for_generation(
+        let (text, _, _) = read_context::outline_text_for_generation_with(
             published,
             &params,
             false,
             read_context::ContextSourceAuthority::CurrentIndex,
+            request.include_tests,
         )
         .ok_or(QueryRefusalKind::NotFound)?;
         let mut body = read_context::collapse_large_test_modules(

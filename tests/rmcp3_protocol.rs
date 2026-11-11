@@ -271,6 +271,34 @@ async fn negotiation_modern_and_legacy_versions() {
     server.shutdown().await;
 }
 
+/// SF-ADOPT-04: `initialize` carries the surface's routing instructions on the
+/// wire, within the byte cap.
+#[tokio::test]
+async fn initialize_carries_surface_instructions_within_cap() {
+    use symforge::protocol::surface_probe;
+    let server = start_server(test_runtime()).await;
+    let mut client = McpHttpClient::new(server.mcp_url());
+    let result = client
+        .call(
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "adopt04", "version": "0.0.0"},
+            }),
+            &[],
+        )
+        .await;
+    let expected = surface_probe::server_instructions(surface_probe::surface_profile_from_env())
+        .expect("full and compact surfaces carry instructions");
+    let text = result["instructions"]
+        .as_str()
+        .expect("initialize result must carry instructions");
+    assert_eq!(text, expected);
+    assert!(text.len() <= surface_probe::SERVER_INSTRUCTIONS_MAX_BYTES);
+    server.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // SC-311 — discover-first full surface, zero handshake
 // ---------------------------------------------------------------------------
@@ -293,6 +321,13 @@ async fn discover_first_serves_full_surface_without_handshake() {
     assert_eq!(
         discover["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
         "symforge"
+    );
+    // SF-ADOPT-04: discover-first clients get the same routing instructions.
+    assert_eq!(
+        discover["instructions"].as_str(),
+        symforge::protocol::surface_probe::server_instructions(
+            symforge::protocol::surface_probe::surface_profile_from_env()
+        )
     );
     let versions: Vec<&str> = discover["supportedVersions"]
         .as_array()

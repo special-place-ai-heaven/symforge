@@ -113,9 +113,14 @@ pub struct SearchTextInput {
     #[serde(default, deserialize_with = "lenient_bool")]
     pub whole_word: Option<bool>,
     /// Group matches: "file" (default), "symbol" (one entry per enclosing symbol),
-    /// "usage" (exclude imports and comments), or "names" (flat deduplicated list of
-    /// symbol names containing matches — useful as input to batch operations).
+    /// "usage" (exclude imports and comments), "names" (flat deduplicated list of
+    /// symbol names containing matches — useful as input to batch operations), or
+    /// "count" (one `path: n` line per file plus a total; ignores limit/max_per_file).
     pub group_by: Option<String>,
+    /// With group_by="symbol": also return each enclosing symbol's body, up to the
+    /// response budget.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub include_body: Option<bool>,
     /// When true, for each match include a compact list of callers of the enclosing symbol.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub follow_refs: Option<bool>,

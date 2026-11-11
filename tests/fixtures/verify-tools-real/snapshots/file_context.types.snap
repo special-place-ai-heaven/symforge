@@ -38,10 +38,7 @@ Evidence: file anchor `src/types.rs`
   impl       GoldenRouteRow  L438-446
     fn         to_request  L439-445
   mod        tests  L449-531
-    fn         symforge_call_input_detects_probe_relay  L454-474
-    fn         stel_request_roundtrip_matches_schema_shape  L477-495
-    fn         stel_plan_roundtrip_from_schema_example  L498-520
-    fn         golden_route_row_deserializes_fixture_shape  L523-530
+    ... test module `tests` collapsed: 4 functions not shown (pass include_tests=true to expand)
 
 Imports from (5 sources):
   schemars::JsonSchema (1 symbols)
@@ -50,12 +47,11 @@ Imports from (5 sources):
   serde_json::Value (1 symbols)
   serde_json::json (1 symbols)
 
-Knowledge summary: details omitted by budget; freshness=Current | bridge=complete authority=complete
-Identity: source=<src> publication=<gen> content=<gen> target=file:src/types.rs
-Scope: requested code anchor
-Evidence: reverse knowledge bridge
-
 Knowledge evidence:
-  counts total=6 emitted=0 omitted=6 available_in_full_result=5 overflow=1 ambiguous=0 missing=0
+  source=<src> publication=<gen> content=<gen> target=file:src/types.rs
+  counts total=2 shown=2 overflow=0 ambiguous=0 missing=0
   coverage bridge=complete authority=complete
-  Continuation: request sections=["knowledge"] with a higher max_tokens value.
+  1. cases.jsonl:7 bytes=2075..2087 content_hash=<hash> source=<src> generation=<gen> link_id=<id> bridge_index=2 resolution=resolved_exact lifecycle=unknown voice=unknown
+  2. cases.jsonl:8 bytes=2354..2366 content_hash=<hash> source=<src> generation=<gen> link_id=<id> bridge_index=3 resolution=resolved_exact lifecycle=unknown voice=unknown
+
+~4588 tokens estimated vs whole-file read; ~332 tokens estimated vs ~50-line windowed read (assumed baseline, not measured)

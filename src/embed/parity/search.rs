@@ -42,6 +42,8 @@ pub struct TextSearchRequest {
     pub case_sensitive: Option<bool>,
     pub whole_word: Option<bool>,
     pub group_by: Option<TextGrouping>,
+    /// With `group_by: Symbol`: return each enclosing symbol's body, up to budget.
+    pub include_body: Option<bool>,
     pub follow_refs: Option<bool>,
     pub follow_refs_limit: Option<u32>,
     pub ranked: Option<bool>,
@@ -58,6 +60,8 @@ pub enum TextGrouping {
     #[serde(alias = "purpose")]
     Usage,
     Names,
+    /// Per-file match counts with every display cap lifted.
+    Count,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -126,6 +130,9 @@ pub struct TextSymbolGroup {
     pub symbol: QuerySymbol,
     pub match_count: u64,
     pub preview: String,
+    /// Symbol source, present only when `include_body` was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -136,6 +143,14 @@ pub enum TextRows {
         top_level: Vec<QueryTextMatch>,
     },
     Names(Vec<String>),
+    /// `group_by: Count`: one row per file, in engine order.
+    Counts(Vec<TextFileCount>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TextFileCount {
+    pub path: String,
+    pub count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -161,4 +176,8 @@ pub struct TextSearchResult {
     /// The exact diagnostic line MCP appends for [`Self::untracked_paths`].
     #[serde(default)]
     pub untracked_diagnostic: Option<String>,
+    /// Count mode: matches `include_tests: Some(true)` would add, measured by a
+    /// second run. `None` when not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_test_matches: Option<u64>,
 }

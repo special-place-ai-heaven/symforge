@@ -5,14 +5,15 @@ use super::envelope::{TrustEnvelopeInput, format_trust_envelope};
 use super::ledger_store::TunedEstimateConstants;
 use super::types::{AdmissionDecision, StelDecision, StelEstimate, StelPlan, StelRequest};
 
-/// Estimated token count from UTF-8 body length (`chars/4` approximation).
+/// The one token estimator: UTF-8 byte length / 4, rounded up. Lives here
+/// because the embed lane has no `protocol` module.
 ///
 /// This is NOT a measured token count — it is the coarse `len/4` heuristic.
 /// Every figure derived from it (envelope `served`, ledger `output_tokens`,
 /// session totals) is an estimate and MUST be surfaced as such, never as an
 /// exact/measured token count (010 N-4 / FR-001).
-pub fn estimate_tokens(text: &str) -> u32 {
-    (text.len() / 4).min(u32::MAX as usize) as u32
+pub fn estimate_tokens_from_bytes(bytes: u64) -> u64 {
+    bytes.saturating_add(3) / 4
 }
 
 /// Stub plan summary until L1 ships (`intent → tool (confidence)`).

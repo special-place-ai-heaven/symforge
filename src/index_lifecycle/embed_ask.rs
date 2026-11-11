@@ -112,6 +112,7 @@ fn routed_request(
                     limit: None,
                     // MCP forwards the outer budget to this route.
                     max_tokens,
+                    include_archived: None,
                 },
             )),
         ),
@@ -280,6 +281,7 @@ pub(super) fn render_routed(
                                             symbol.start_line.saturating_sub(1),
                                             symbol.end_line.saturating_sub(1),
                                         ),
+                                        body: None,
                                     }
                                 }),
                             })

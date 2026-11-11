@@ -25,9 +25,12 @@ use symforge::protocol::tools::*;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Find a tool definition by name from the server's advertised tool list.
+/// Find a tool definition by name from the slimmed full-surface list that
+/// `tools/list` actually advertises (SF-TE-05), not the raw registration.
 fn tool_schema(name: &str) -> Map<String, Value> {
-    let tools = SymForgeServer::tool_definitions();
+    let tools = symforge::protocol::surface_probe::list_tools_for_profile(
+        symforge::protocol::surface_probe::SurfaceProfile::Full,
+    );
     let tool = tools
         .iter()
         .find(|t| t.name.as_ref() == name)
@@ -238,6 +241,7 @@ fn search_knowledge_schema_is_exact_read_only_and_multi_source_scope() {
         properties,
         [
             "authority_scope",
+            "include_archived",
             "limit",
             "max_tokens",
             "path_prefix",

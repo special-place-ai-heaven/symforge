@@ -61,6 +61,42 @@ mod tests {
     use crate::protocol::surface_probe::{SurfaceProfile, with_connection_surface};
     use std::ffi::OsString;
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn batch_edit_with_idempotency_key_refuses_network_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let original = "fn foo() {}\nfn bar() {}\n";
+        std::fs::write(&file, original).unwrap();
+        let server = crate::protocol::SymForgeServer::new(
+            crate::live_index::LiveIndex::load(dir.path()).unwrap(),
+            "network_wd_test".to_string(),
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::watcher::WatcherInfo::default(),
+            )),
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+        let root = dir.path().to_string_lossy().to_string();
+        let input: crate::protocol::edit::BatchEditInput =
+            serde_json::from_value(serde_json::json!({
+                "idempotency_key": "network-wd-key",
+                "edits": [
+                    {"path": "src/lib.rs", "name": "foo", "operation": {"type": "delete"},
+                     "working_directory": root},
+                    {"path": "src/lib.rs", "name": "bar", "operation": {"type": "delete"},
+                     "working_directory": r"\\nonexistent-host.invalid\share"},
+                ],
+            }))
+            .unwrap();
+        let output = server
+            .batch_edit(rmcp::handler::server::wrapper::Parameters(input))
+            .await;
+        assert!(output.contains("NetworkPathRefused"), "{output}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+    }
+
     /// Successful outputs echo source lines and agent-provided content. A
     /// refusal phrase inside that echo is data, not a status: the envelope
     /// (or the rename header) proves the apply path was reached and must win
@@ -798,6 +834,9 @@ fn routed_worktree_authorities(
     let indexed_root = dunce::simplified(indexed_root);
     let mut roots: Vec<std::path::PathBuf> = Vec::new();
     for directory in working_directories.iter().flatten() {
+        if crate::paths::is_network_path(std::path::Path::new(directory)) {
+            continue;
+        }
         let Ok(root) = crate::worktree::canonicalize(std::path::Path::new(directory)) else {
             continue;
         };

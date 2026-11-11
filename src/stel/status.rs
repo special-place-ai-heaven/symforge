@@ -82,6 +82,11 @@ pub struct StelStatusContext<'a> {
     /// LOUD signal so a stale or wrong binding can never read as a working one.
     pub project_root: Option<String>,
     pub index_ready: bool,
+    /// SF-DOG-04 headline label (readiness and freshness from one published
+    /// generation). Rendered as `index_trust:` whenever it is not plain
+    /// `Ready`, so a ready-but-stale index never reads as just `index_ready:
+    /// true`. `None` only for contexts that render no index lines.
+    pub index_trust: Option<&'static str>,
     pub index_files: usize,
     pub index_symbols: usize,
     pub ledger_events: usize,
@@ -157,6 +162,7 @@ impl<'a> StelStatusContext<'a> {
             project_name,
             project_root,
             index_ready,
+            index_trust: None,
             index_files,
             index_symbols,
             ledger_events: ledger.len(),
@@ -169,6 +175,18 @@ impl<'a> StelStatusContext<'a> {
             daemon_env_surface: None,
             orphaned_daemon_pid: None,
         }
+    }
+
+    /// Attach the headline trust label observed with the index counts.
+    pub fn with_index_trust(mut self, label: &'static str) -> Self {
+        self.index_trust = Some(label);
+        self
+    }
+
+    /// The `index_trust:` qualifier, present only when it says more than
+    /// `index_ready` already does.
+    fn index_trust_qualifier(&self) -> Option<&'static str> {
+        self.index_trust.filter(|label| *label != "Ready")
     }
 
     /// Attach the durable-ledger subsystem state (US3/T029 restart-survival view;
@@ -337,14 +355,18 @@ pub fn format_stel_status(request: &StelStatusRequest, ctx: &StelStatusContext<'
 /// session inventory (one row per open project, home marked) instead.
 fn format_projects_status(ctx: &StelStatusContext<'_>) -> String {
     let mut lines = vec!["── projects ──".to_string()];
-    lines.push(format!(
+    let mut row = format!(
         "name={} root={} home=yes files={} symbols={} index_ready={}",
         ctx.project_name,
         ctx.project_root.as_deref().unwrap_or("(unbound)"),
         ctx.index_files,
         ctx.index_symbols,
         ctx.index_ready,
-    ));
+    );
+    if let Some(trust) = ctx.index_trust_qualifier() {
+        row.push_str(&format!(" trust=\"{trust}\""));
+    }
+    lines.push(row);
     lines.join(
         "
 ",
@@ -355,10 +377,10 @@ fn format_compact_status(ctx: &StelStatusContext<'_>) -> String {
     // Honest static labels (010 US1 / TR-10). These describe the *static*
     // truth that holds at compile time for this build — NOT a runtime liveness
     // probe (live probing is Phase B / US2). `wired` = the layer/handler code
-    // path is compiled in and reachable; `l4_ledger: in_memory` = the L4 layer
-    // is the always-on in-memory cache (durable restart-survival state is
-    // reported separately under `detail: full`). The blanket `active` literal
-    // implied more than the surface can prove without probing.
+    // path is compiled in and reachable. The blanket `active` literal implied
+    // more than the surface can prove without probing. Static roadmap labels
+    // (l4_ledger, deferred, superseded) are build facts, not state, and live
+    // under `detail: full` only.
     let mut lines = vec![
         "── stel status ──".to_string(),
         format!("surface: {}", ctx.surface),
@@ -368,7 +390,6 @@ fn format_compact_status(ctx: &StelStatusContext<'_>) -> String {
         "l1_planner: wired".to_string(),
         "l2_economics: wired".to_string(),
         "l3_bypass: wired".to_string(),
-        "l4_ledger: in_memory".to_string(),
         "handler_symforge: wired".to_string(),
         "handler_status: wired".to_string(),
         "handler_symforge_edit: preview-and-apply".to_string(),
@@ -382,12 +403,12 @@ fn format_compact_status(ctx: &StelStatusContext<'_>) -> String {
         ),
         format!("index_ready: {}", ctx.index_ready),
         format!("index_files: {}", ctx.index_files),
-        format!("deferred: {DEFERRED_ITEMS}"),
-        // D5/D19: planned-but-superseded capability, surfaced honestly so it is
-        // not silently dropped and never reads as in-progress server work.
-        format!("superseded: {SUPERSEDED_ITEMS} (client agentic loop + find-fusion)"),
         "──".to_string(),
     ];
+    if let Some(trust) = ctx.index_trust_qualifier() {
+        let at = lines.len() - 2;
+        lines.insert(at, format!("index_trust: {trust}"));
+    }
     // Honest cross-process disclosure: when the surface served on this
     // connection (`ctx.surface`) differs from the daemon process's own env,
     // name the daemon's env right under the served surface. Set only in the
@@ -427,6 +448,12 @@ fn format_full_status(ctx: &StelStatusContext<'_>) -> String {
         format!("project: {}", ctx.project_name),
         format!("index_symbols: {}", ctx.index_symbols),
         format!("session_tokens: {}", ctx.session_tokens),
+        // Compile-time facts about this build, not runtime observations.
+        "build_fact_l4_ledger: in_memory".to_string(),
+        format!("build_fact_deferred: {DEFERRED_ITEMS}"),
+        // D5/D19: planned-but-superseded capability, surfaced honestly so it is
+        // not silently dropped and never reads as in-progress server work.
+        format!("build_fact_superseded: {SUPERSEDED_ITEMS} (client agentic loop + find-fusion)"),
     ];
     // Single source of truth for the two last-ledger lines (shared with the
     // daemon-proxy overlay via `format_last_ledger_lines`), so the worker-side
@@ -456,6 +483,7 @@ mod tests {
             project_name: "symforge-test",
             project_root: Some("E:/project/symforge-test".to_string()),
             index_ready: true,
+            index_trust: Some("Ready"),
             index_files: 12,
             index_symbols: 48,
             ledger_events: 2,
@@ -497,6 +525,37 @@ mod tests {
     }
 
     #[test]
+    fn stale_ready_index_is_qualified_on_every_status_detail() {
+        let mut ctx = sample_context();
+        for detail in [
+            StelStatusDetail::Compact,
+            StelStatusDetail::Full,
+            StelStatusDetail::Projects,
+        ] {
+            let request = StelStatusRequest {
+                detail: Some(detail),
+                ..StelStatusRequest::default()
+            };
+            let current = format_stel_status(&request, &ctx);
+            assert!(!current.contains("index_trust"), "{current}");
+            assert!(!current.contains("trust="), "{current}");
+        }
+        ctx.index_trust = Some("Ready (stale)");
+        for (detail, needle) in [
+            (StelStatusDetail::Compact, "index_trust: Ready (stale)"),
+            (StelStatusDetail::Full, "index_trust: Ready (stale)"),
+            (StelStatusDetail::Projects, "trust=\"Ready (stale)\""),
+        ] {
+            let request = StelStatusRequest {
+                detail: Some(detail),
+                ..StelStatusRequest::default()
+            };
+            let stale = format_stel_status(&request, &ctx);
+            assert!(stale.contains(needle), "{stale}");
+        }
+    }
+
+    #[test]
     fn compact_status_reports_required_operational_fields() {
         let body = format_stel_status(&StelStatusRequest::default(), &sample_context());
         for needle in [
@@ -507,7 +566,6 @@ mod tests {
             "l1_planner: wired",
             "l2_economics: wired",
             "l3_bypass: wired",
-            "l4_ledger: in_memory",
             "handler_symforge: wired",
             "handler_status: wired",
             "handler_symforge_edit: preview-and-apply",
@@ -517,12 +575,13 @@ mod tests {
             "project_root: E:/project/symforge-test",
             "index_ready: true",
             "index_files: 12",
-            "deferred: b_results",
-            // D5/D19: multi_step_planner is honestly SUPERSEDED, not deferred.
-            "superseded: multi_step_planner (client agentic loop + find-fusion)",
             "──",
         ] {
             assert!(body.contains(needle), "missing `{needle}` in:\n{body}");
+        }
+        // Roadmap labels are build facts: absent from the default output.
+        for label in ["l4_ledger", "deferred:", "superseded:"] {
+            assert!(!body.contains(label), "unexpected `{label}` in:\n{body}");
         }
         // Honest contract (010 TR-10): no blanket unconditional `active` literal
         // and the stale `ledger_persistence` deferred item is gone.
@@ -559,6 +618,9 @@ mod tests {
             "project: symforge-test",
             "index_symbols: 48",
             "session_tokens: 128",
+            "build_fact_l4_ledger: in_memory",
+            "build_fact_deferred: b_results",
+            "build_fact_superseded: multi_step_planner (client agentic loop + find-fusion)",
             "last_ledger_decision: serve",
             "last_ledger_route: search_text",
             "── calibration (observational) ──",

@@ -1,6 +1,9 @@
 {
   "file_count": 2,
+  "freshness": "verifying",
+  "hook_queryable": false,
   "index_state": "Loading",
   "symbol_count": 2,
+  "trust": "Loading",
   "uptime_secs": 0
 }

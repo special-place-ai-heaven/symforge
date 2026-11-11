@@ -166,24 +166,66 @@ pub struct IndexFolderInput {
     /// `add:true`.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub add: Option<bool>,
-    /// Direct, per-request authority to index the exact protected root in
-    /// read/index-only mode. Never inherited by automatic root discovery.
+    /// Deprecated and not honored: protected roots are admitted only by
+    /// operator configuration. Accepted for compatibility; grants nothing.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub allow_protected_root: Option<bool>,
 }
 
-fn resolve_index_folder_binding(
+/// Operator setting that admits protected roots for explicit `index_folder`.
+/// The tool's `allow_protected_root` field grants nothing.
+pub(crate) const PROTECTED_ROOT_OVERRIDE_ENV: &str = "SYMFORGE_ALLOW_PROTECTED_ROOT";
+/// Optional operator allow-list (platform path-list syntax) restricting which
+/// protected roots the override admits.
+pub(crate) const PROTECTED_ROOT_ALLOWLIST_ENV: &str = "SYMFORGE_PROTECTED_ROOT_ALLOWLIST";
+
+fn protected_root_allowlisted(canonical_root: &Path) -> bool {
+    let Some(list) = std::env::var_os(PROTECTED_ROOT_ALLOWLIST_ENV).filter(|v| !v.is_empty())
+    else {
+        return true;
+    };
+    let Ok(root) = dunce::canonicalize(canonical_root) else {
+        return false;
+    };
+    std::env::split_paths(&list)
+        .filter(|entry| !entry.as_os_str().is_empty())
+        .any(|entry| dunce::canonicalize(entry).is_ok_and(|entry| entry == root))
+}
+
+/// The one authority decision for an explicit `index_folder` root, shared by
+/// the local and daemon routes: protected roots need operator configuration.
+pub(crate) fn resolve_explicit_index_folder_root(path: &Path) -> crate::domain::RootResolution {
+    let operator_allows = std::env::var(PROTECTED_ROOT_OVERRIDE_ENV).as_deref() == Ok("1");
+    match crate::discovery::resolve_root_candidate(
+        path,
+        crate::domain::RootCandidateSource::ExplicitIndexFolder,
+        crate::domain::RootRequestMode::ExplicitIndexFolder {
+            allow_protected_root: operator_allows,
+        },
+    ) {
+        crate::domain::RootResolution::Bound(binding)
+            if matches!(
+                binding.access_mode,
+                crate::domain::SourceAccessMode::ExplicitProtected
+            ) && !protected_root_allowlisted(&binding.canonical_root) =>
+        {
+            crate::domain::RootResolution::Unbound {
+                rejected_source: Some(binding.source),
+                reason: crate::domain::UnboundReason::Refused(
+                    crate::domain::RootRefusalReason::ProtectedRootRequiresExplicitOverride,
+                ),
+                safe_path_id: None,
+            }
+        }
+        resolution => resolution,
+    }
+}
+
+pub(crate) fn resolve_index_folder_binding(
     input: &IndexFolderInput,
 ) -> Result<crate::domain::RootBinding, String> {
     let requested_root = PathBuf::from(&input.path);
-    let allow_protected_root = input.allow_protected_root == Some(true);
-    match crate::discovery::resolve_root_candidate(
-        &requested_root,
-        crate::domain::RootCandidateSource::ExplicitIndexFolder,
-        crate::domain::RootRequestMode::ExplicitIndexFolder {
-            allow_protected_root,
-        },
-    ) {
+    match resolve_explicit_index_folder_root(&requested_root) {
         crate::domain::RootResolution::Bound(binding) => Ok(binding),
         crate::domain::RootResolution::Unbound { reason, .. } => {
             let crate::domain::UnboundReason::Refused(reason) = reason else {
@@ -204,13 +246,18 @@ fn resolve_index_folder_binding(
                 crate::domain::RootRefusalReason::UnsupportedPathEncoding => {
                     "Refused to index path: canonical root is not valid UTF-8 and cannot be represented without changing its identity".to_string()
                 }
+                crate::domain::RootRefusalReason::NetworkPath => format!(
+                    "Refused to index network path: {} ({}). Network (UNC) roots are never indexed; use a local directory.",
+                    input.path,
+                    reason.code()
+                ),
                 crate::domain::RootRefusalReason::CredentialDirectory => format!(
-                    "Refused to index credential directory: {} ({}). A credential store (.aws, .kube, .ssh, .gnupg, .docker, .config/gcloud) is never indexed, even with allow_protected_root=true.",
+                    "Refused to index credential directory: {} ({}). A credential store (.aws, .kube, .ssh, .gnupg, .docker, .config/gcloud) is never indexed.",
                     input.path,
                     reason.code()
                 ),
                 _ => format!(
-                    "Refused to index sensitive system path: {}. Use a project directory or retry this exact direct request with allow_protected_root=true.",
+                    "Refused to index sensitive system path: {}. Use a project directory. Protected roots are admitted only by operator configuration ({PROTECTED_ROOT_OVERRIDE_ENV}, optionally limited by {PROTECTED_ROOT_ALLOWLIST_ENV}); the allow_protected_root tool field is no longer honored.",
                     reason.code()
                 ),
             })
@@ -1062,6 +1109,7 @@ fn render_search_text_output(
     is_regex: bool,
     auto_detected_regex: bool,
     auto_corrected_regex: bool,
+    hidden_test_matches: Option<usize>,
 ) -> String {
     // The zero-hit untracked sweep reads this server's git root; the rest of
     // the rendering is the shared engine the embedded facade also runs.
@@ -1091,6 +1139,7 @@ fn render_search_text_output(
         auto_detected_regex,
         auto_corrected_regex,
         &matching_untracked_paths,
+        hidden_test_matches,
     )
 }
 
@@ -1574,7 +1623,7 @@ impl SymForgeServer {
     /// NOT for edit preparation (use get_symbol_context with bundle=true).
     #[tool(
         name = "get_symbol",
-        description = "Return a symbol's full source plus docs. Prefer when you already know file+name (batch via targets[]); not callers/edit-prep (get_symbol_context, bundle=true) or raw files (get_file_content).",
+        description = "Batch-read symbols: targets[] returns several symbols' source plus docs in one call (or name+path for one). Not callers/edit-prep (get_symbol_context, bundle=true) or raw files (get_file_content).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn get_symbol_tool(
@@ -1596,6 +1645,7 @@ impl SymForgeServer {
             return refusal;
         }
 
+        let line_numbers = params.0.line_numbers;
         // Batch mode: targets[] provided
         if let Some(ref targets) = params.0.targets {
             if targets.is_empty() {
@@ -1678,17 +1728,23 @@ impl SymForgeServer {
                         name,
                         kind,
                         symbol_line,
-                    } => format::symbol_detail_from_indexed_file(
+                    } => format::symbol_detail_from_indexed_file_with(
                         file.as_ref(),
                         &name,
                         kind.as_deref(),
                         symbol_line,
+                        line_numbers,
                     ),
                     CapturedGetSymbolsEntry::CodeSlice {
                         file,
                         start_byte,
                         end_byte,
-                    } => format::code_slice_from_indexed_file(file.as_ref(), start_byte, end_byte),
+                    } => format::code_slice_from_indexed_file_with(
+                        file.as_ref(),
+                        start_byte,
+                        end_byte,
+                        line_numbers,
+                    ),
                     CapturedGetSymbolsEntry::FileNotFound { path } => format::not_found_file(&path),
                 })
                 .collect::<Vec<_>>()
@@ -1697,8 +1753,8 @@ impl SymForgeServer {
             // steering (2026-07-03 spike gate, B5) — tips stay rare + contextual.
             self.record_tool_savings_named(
                 "get_symbol",
-                format::estimate_tokens_from_chars(batch_baseline_chars),
-                (output.len() / 4) as u64,
+                crate::stel::handler::estimate_tokens_from_bytes(batch_baseline_chars as u64),
+                crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
             );
             self.bump_frecency(&bump_paths);
             return output;
@@ -1778,7 +1834,8 @@ impl SymForgeServer {
             &params.0.path,
             &params.0.name,
             params_hash,
-            force_refresh,
+            // The cached body was rendered under another gutter choice.
+            force_refresh || line_numbers.is_some(),
         ) && let Some(hit) = self.format_read_cache_hit(&meta, "session_repeat_read")
         {
             // Only a selected symbol is recorded for repeat hits (below).
@@ -1814,12 +1871,18 @@ impl SymForgeServer {
         // Estimate mode: return token cost without full content
         if params.0.estimate == Some(true) {
             if let Some(ref file) = file {
-                let file_tokens = file.content.len() / 4;
+                let file_tokens =
+                    crate::stel::handler::estimate_tokens_from_bytes(file.content.len() as u64)
+                        as usize;
                 let sym_tokens = file
                     .symbols
                     .iter()
                     .find(|s| s.name == params.0.name)
-                    .map(|s| (s.byte_range.1 - s.byte_range.0) as usize / 4)
+                    .map(|s| {
+                        crate::stel::handler::estimate_tokens_from_bytes(u64::from(
+                            s.byte_range.1 - s.byte_range.0,
+                        )) as usize
+                    })
                     .unwrap_or(0);
                 record_read_outcome(ReadOutcome::Found);
                 return format!(
@@ -1854,11 +1917,12 @@ impl SymForgeServer {
                 };
                 record_read_outcome(outcome);
                 let raw_chars = file.content.len();
-                let body = format::symbol_detail_from_indexed_file(
+                let body = format::symbol_detail_from_indexed_file_with(
                     file.as_ref(),
                     &params.0.name,
                     params.0.kind.as_deref(),
                     params.0.symbol_line,
+                    params.0.line_numbers,
                 );
                 let output = match &resolved_from_bare_name {
                     Some(path) => format!(
@@ -1870,12 +1934,15 @@ impl SymForgeServer {
                 let max_tokens = format::resolve_read_max_tokens(params.0.max_tokens, raw_chars);
                 self.record_tool_savings_named(
                     "get_symbol",
-                    format::estimate_tokens_from_chars(format::competent_manual_baseline_chars(
-                        raw_chars,
-                    )),
-                    (output.len() / 4) as u64,
+                    crate::stel::handler::estimate_tokens_from_bytes(
+                        format::competent_manual_baseline_chars(raw_chars) as u64,
+                    ),
+                    crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
                 );
-                let tokens = (output.len() / 4) as u32;
+                let tokens = u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                    output.len() as u64,
+                ))
+                .unwrap_or(u32::MAX);
                 let prior_dedup = if force_refresh {
                     self.session_context.prior_fetch_for_dedup(
                         crate::protocol::session::FetchKind::Symbol,
@@ -1924,8 +1991,8 @@ impl SymForgeServer {
         }
     }
 
-    /// Start here. Project overview with adjustable detail level. Modes: (1) default/compact: ~500 token
-    /// overview with file count, languages, and directory tree. (2) detail='full': complete symbol outline
+    /// Start here. Project overview with adjustable detail level. Modes: (1) default/compact: bounded
+    /// overview with file count, languages, and directory tree (include_knowledge=true adds docs digests). (2) detail='full': complete symbol outline
     /// of every file — warning: large output. (3) detail='tree': browsable file tree with per-file symbol
     /// counts and language tags — supports path and depth params for subtree browsing.
     /// NOT for file details (use get_file_context) or finding symbols (use search_symbols).
@@ -1954,22 +2021,6 @@ impl SymForgeServer {
             loading_guard!(guard);
         }
         let published = self.capture_local_response_generation();
-        if params.0.estimate == Some(true) {
-            let file_count = published.live.file_count();
-            let detail = params.0.detail.as_deref().unwrap_or("compact");
-            let est = match detail {
-                "full" => {
-                    let max = params.0.max_files.unwrap_or(200) as usize;
-                    max.min(file_count) * 30
-                }
-                "tree" => file_count * 10,
-                _ => 500,
-            };
-            return format!(
-                "Estimate for get_repo_map: ~{} tokens (detail={}, files={})",
-                est, detail, file_count
-            );
-        }
         let detail = if let Some(ref d) = params.0.detail {
             d.as_str()
         } else if let Some(max_tokens) = params.0.max_tokens {
@@ -2079,22 +2130,34 @@ impl SymForgeServer {
                 Err(other) => format!("Repository map failed: HTTP {}", other.as_u16()),
             },
         };
-        let knowledge_map =
-            crate::protocol::knowledge_model::render_repository_knowledge_map(&published);
-        output.push_str("\n\n");
-        output.push_str(&knowledge_map);
+        // The knowledge digests cost ~2,500 tokens per call; opt-in only.
+        if params.0.include_knowledge == Some(true) {
+            output.push_str("\n\n");
+            output.push_str(
+                &crate::protocol::knowledge_model::render_repository_knowledge_map(&published),
+            );
+        }
         let output = with_withheld_note(&published.live, None, output);
+        if params.0.estimate == Some(true) {
+            // Measured, not assumed: the same view this call would render.
+            return format!(
+                "Estimate for get_repo_map: ~{} tokens (detail={}, files={}; length of the rendered response / 4)",
+                crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
+                detail,
+                published.live.file_count()
+            );
+        }
         self.session_context.record_summary_output(
             "get_repo_map",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                output.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
         );
-        let budget_summary = with_withheld_note(
-            &published.live,
-            None,
-            format!(
-                "Repository orientation budget summary\noutput_coverage=degraded\n{knowledge_map}\n\nCode topology omitted from the bounded summary; retrieve the full map through the CCR handle."
-            ),
-        );
+        // Over budget: the summary is the code map itself, cut at the budget
+        // by `enforce_token_budget`; the full output stays behind the CCR handle.
+        let budget_summary =
+            format!("Repository orientation budget summary\noutput_coverage=degraded\n{output}");
         self.apply_ccr_budget_with_summary(
             "get_repo_map",
             output,
@@ -2227,7 +2290,9 @@ impl SymForgeServer {
         );
         if params.0.estimate == Some(true) {
             if let Some(file) = published.live.capture_shared_file(&params.0.path) {
-                let file_tokens = file.content.len() / 4;
+                let file_tokens =
+                    crate::stel::handler::estimate_tokens_from_bytes(file.content.len() as u64)
+                        as usize;
                 let outline_tokens = file.content.len() / 50; // ~5-10% of raw
                 return format!(
                     "Estimate for get_file_context(path=\"{}\"):\n  Outline: ~{} tokens\n  Raw file: ~{} tokens\n  Savings: ~{}%",
@@ -2316,7 +2381,10 @@ impl SymForgeServer {
                 knowledge_section.as_deref(),
                 context_max_tokens,
             );
-            let tokens = (output.len() / 4) as u32;
+            let tokens = u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                output.len() as u64,
+            ))
+            .unwrap_or(u32::MAX);
             let handle = self.ccr_store.lock().insert(
                 "get_file_context",
                 output.clone(),
@@ -2338,7 +2406,8 @@ impl SymForgeServer {
             max_tokens: context_max_tokens,
             sections: sections.clone(),
         };
-        match outline_tool_text_for_generation(&state, &published, &outline) {
+        // The test-module collapse runs before the byte budget (SF-DOG-01).
+        match outline_tool_text_for_generation(&state, &published, &outline, include_tests) {
             Ok(result) => {
                 let mut result =
                     format::collapse_large_test_modules(result, include_tests, sections.as_deref());
@@ -2421,7 +2490,10 @@ impl SymForgeServer {
                     // (dogfood 2026-07-11).
                     output = format::downgrade_full_completeness_after_truncation(&output);
                 }
-                let tokens = (output.len() / 4) as u32;
+                let tokens = u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                    output.len() as u64,
+                ))
+                .unwrap_or(u32::MAX);
                 let prior_dedup = if force_refresh {
                     self.session_context.prior_fetch_for_dedup(
                         crate::protocol::session::FetchKind::FileContext,
@@ -2585,7 +2657,11 @@ impl SymForgeServer {
                     .symbols
                     .iter()
                     .find(|s| s.name == params.0.name)
-                    .map(|s| (s.byte_range.1 - s.byte_range.0) as usize / 4)
+                    .map(|s| {
+                        crate::stel::handler::estimate_tokens_from_bytes(u64::from(
+                            s.byte_range.1 - s.byte_range.0,
+                        )) as usize
+                    })
                     .unwrap_or(0);
                 let ref_count = file
                     .references
@@ -2693,8 +2769,14 @@ impl SymForgeServer {
                 raw_chars,
             ));
             let output = format!("{result}{footer}");
-            self.session_context
-                .record_symbol(&path, &params.0.name, (output.len() / 4) as u32);
+            self.session_context.record_symbol(
+                &path,
+                &params.0.name,
+                u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                    output.len() as u64,
+                ))
+                .unwrap_or(u32::MAX),
+            );
             // Frecency bump — commitment tool, bundle-mode happy path.
             // Collection policy is resolved inside bump_frecency.
             self.bump_frecency(&[PathBuf::from(&path)]);
@@ -2761,7 +2843,10 @@ impl SymForgeServer {
                 self.session_context.record_symbol(
                     &path,
                     &params.0.name,
-                    (output.len() / 4) as u32,
+                    u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                        output.len() as u64,
+                    ))
+                    .unwrap_or(u32::MAX),
                 );
                 self.bump_frecency(&[PathBuf::from(&path)]);
                 return output;
@@ -2820,7 +2905,10 @@ impl SymForgeServer {
             self.session_context.record_symbol(
                 &path,
                 &params.0.name,
-                (trace_result.len() / 4) as u32,
+                u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                    trace_result.len() as u64,
+                ))
+                .unwrap_or(u32::MAX),
             );
             // Frecency bump — commitment tool, trace-mode happy path.
             // Collection policy is resolved inside bump_frecency.
@@ -2984,13 +3072,19 @@ impl SymForgeServer {
                         self.session_context.record_symbol(
                             p,
                             &params.0.name,
-                            (output.len() / 4) as u32,
+                            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                                output.len() as u64,
+                            ))
+                            .unwrap_or(u32::MAX),
                         );
                     } else if let Some(ref p) = params.0.path {
                         self.session_context.record_symbol(
                             p,
                             &params.0.name,
-                            (output.len() / 4) as u32,
+                            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                                output.len() as u64,
+                            ))
+                            .unwrap_or(u32::MAX),
                         );
                     }
                     // Frecency bump — commitment tool, fallback-definition
@@ -3097,7 +3191,10 @@ impl SymForgeServer {
 
         self.session_context.record_summary_output(
             "analyze_file_impact",
-            (result.len() / 4).min(u32::MAX as usize) as u32,
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                result.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
         );
         result
     }
@@ -3181,14 +3278,17 @@ impl SymForgeServer {
         let result = execution.result;
         self.record_tool_savings_named(
             "search_symbols",
-            format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
-                output.len(),
-            )),
-            (output.len() / 4) as u64,
+            crate::stel::handler::estimate_tokens_from_bytes(
+                (format::estimate_listing_baseline_chars(output.len())) as u64,
+            ),
+            crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
         );
         self.session_context.record_summary_output(
             "search_symbols",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                output.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
         );
         // Session tracking: record each symbol hit as list-only until its body is fetched.
         for hit in &result.hits {
@@ -3208,7 +3308,7 @@ impl SymForgeServer {
     /// NOT for symbol name search (use search_symbols). NOT for file path search (use search_files).
     #[tool(
         name = "search_text",
-        description = "CODE-scoped search with context (literal/regex/AST); tests excluded unless include_tests=true. For indexed call sites, prefer find_references. Not docs, names, or paths.",
+        description = "CODE-scoped search with context (literal/regex/AST); group_by='count' for exact per-file counts; tests excluded unless include_tests=true. Call sites: find_references. Not docs, names, or paths.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn search_text_tool(
@@ -3486,6 +3586,7 @@ impl SymForgeServer {
             execution.is_regex,
             execution.auto_detected_regex,
             execution.auto_corrected_regex,
+            execution.hidden_test_matches,
         );
         if execution.auto_corrected_regex {
             output.push_str(&format!(
@@ -3496,7 +3597,10 @@ impl SymForgeServer {
         }
         self.session_context.record_summary_output(
             "search_text",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                output.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
         );
         // Discovery stays neutral: only loaded context and mutations record frecency.
         self.apply_ccr_budget(
@@ -3544,7 +3648,10 @@ impl SymForgeServer {
         self.session_context.record_symbol(
             &params.0.path,
             &params.0.name,
-            (output.len() / 4) as u32,
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                output.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
         );
         output
     }
@@ -3588,7 +3695,10 @@ impl SymForgeServer {
         let output = format::inspect_match_result_view(&view);
         self.session_context.record_summary_output(
             "inspect_match",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                output.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
         );
         format::enforce_token_budget(output, params.0.max_tokens)
     }
@@ -3745,7 +3855,10 @@ impl SymForgeServer {
             let result = format::enforce_token_budget(result, params.0.max_tokens);
             self.session_context.record_summary_output(
                 "search_files",
-                (result.len() / 4).min(u32::MAX as usize) as u32,
+                u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                    result.len() as u64,
+                ))
+                .unwrap_or(u32::MAX),
             );
             return result;
         }
@@ -3923,7 +4036,10 @@ impl SymForgeServer {
         );
         self.session_context.record_summary_output(
             "search_files",
-            (result.len() / 4).min(u32::MAX as usize) as u32,
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                result.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
         );
         // Intentionally NO frecency bump here — search_files is a discovery
         // tool, and bumping on discovery creates a positive feedback loop
@@ -4135,6 +4251,7 @@ impl SymForgeServer {
                 placement.as_ref(),
                 persistence,
             ),
+            settled_unreadable: self.index.data_plane().settled_unreadable_paths(),
         };
 
         let mut after_runtime = self.health_trust_diagnostics();
@@ -4250,6 +4367,7 @@ impl SymForgeServer {
                 placement.as_ref(),
                 persistence,
             ),
+            settled_unreadable: self.index.data_plane().settled_unreadable_paths(),
         };
 
         let mut after_runtime = self.health_trust_diagnostics();
@@ -4276,7 +4394,7 @@ impl SymForgeServer {
                 snap.read_fires + snap.edit_fires + snap.write_fires + snap.grep_fires;
             if total_fires > 0 {
                 after_runtime.push_str(&format!(
-                    "\nToken savings: ~{} tokens saved across {} hook fires",
+                    "\nToken savings (estimated vs assumed windowed-read and grep+window baselines, not measured): ~{} tokens estimated saved across {} hook fires",
                     total_saved, total_fires
                 ));
             }
@@ -4364,8 +4482,13 @@ impl SymForgeServer {
             input.quarantine_limit(),
         );
         let result = self.health_for_runtime(self.local_runtime_mode(), None, None, None, window);
-        self.session_context
-            .record_summary_output("health", (result.len() / 4).min(u32::MAX as usize) as u32);
+        self.session_context.record_summary_output(
+            "health",
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                result.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
+        );
         result
     }
 
@@ -4387,7 +4510,10 @@ impl SymForgeServer {
         let result = self.health_compact_for_runtime(self.local_runtime_mode(), None, None, None);
         self.session_context.record_summary_output(
             "health_compact",
-            (result.len() / 4).min(u32::MAX as usize) as u32,
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                result.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
         );
         result
     }
@@ -4573,6 +4699,9 @@ impl SymForgeServer {
             // cannot detect an N/N+1 aggregate.
             generation: generation.publication_generation,
             index_state: published.status_label().to_string(),
+            trust: crate::live_index::store::TrustHeadline::of(generation)
+                .label()
+                .to_string(),
             load_source,
             index_files: published.file_count,
             index_symbols: published.symbol_count,
@@ -4826,7 +4955,6 @@ impl SymForgeServer {
                 to open multiple projects in one session."
                 .to_string();
         }
-        let allow_protected_root = input.allow_protected_root == Some(true);
         let binding = match resolve_index_folder_binding(&input) {
             Ok(binding) => binding,
             Err(error) => return error,
@@ -4858,7 +4986,7 @@ impl SymForgeServer {
                     &root,
                     raw_key,
                     reset_requested,
-                    allow_protected_root,
+                    explicit_protected,
                     // Local mode is single-project: reaching here means
                     // `add:true` already refused, so the default reload IS
                     // the activation (it rebinds this process's one index).
@@ -4953,7 +5081,10 @@ impl SymForgeServer {
                 if let Some(response) = replay_response {
                     self.session_context.record_summary_output(
                         "index_folder",
-                        (response.len() / 4).min(u32::MAX as usize) as u32,
+                        u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                            response.len() as u64,
+                        ))
+                        .unwrap_or(u32::MAX),
                     );
                     return response;
                 }
@@ -5002,7 +5133,10 @@ impl SymForgeServer {
                 }
                 self.session_context.record_summary_output(
                     "index_folder",
-                    (output.len() / 4).min(u32::MAX as usize) as u32,
+                    u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                        output.len() as u64,
+                    ))
+                    .unwrap_or(u32::MAX),
                 );
                 output
             }
@@ -5153,7 +5287,10 @@ impl SymForgeServer {
                             let result = format!("{envelope}\n\n{output}");
                             self.session_context.record_summary_output(
                                 "what_changed",
-                                (result.len() / 4).min(u32::MAX as usize) as u32,
+                                u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                                    result.len() as u64,
+                                ))
+                                .unwrap_or(u32::MAX),
                             );
                             result
                         }
@@ -5161,7 +5298,10 @@ impl SymForgeServer {
                             record_read_outcome(ReadOutcome::InvalidRequest);
                             self.session_context.record_summary_output(
                                 "what_changed",
-                                (error.len() / 4).min(u32::MAX as usize) as u32,
+                                u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                                    error.len() as u64,
+                                ))
+                                .unwrap_or(u32::MAX),
                             );
                             error
                         }
@@ -5170,7 +5310,10 @@ impl SymForgeServer {
                     let result = format::what_changed_timestamp_view(&view, *since_ts);
                     self.session_context.record_summary_output(
                         "what_changed",
-                        (result.len() / 4).min(u32::MAX as usize) as u32,
+                        u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                            result.len() as u64,
+                        ))
+                        .unwrap_or(u32::MAX),
                     );
                     result
                 }
@@ -5291,7 +5434,12 @@ impl SymForgeServer {
                                 let result = format!("{envelope}\n\n{output}");
                                 self.session_context.record_summary_output(
                                     "what_changed",
-                                    (result.len() / 4).min(u32::MAX as usize) as u32,
+                                    u32::try_from(
+                                        crate::stel::handler::estimate_tokens_from_bytes(
+                                            result.len() as u64,
+                                        ),
+                                    )
+                                    .unwrap_or(u32::MAX),
                                 );
                                 format::enforce_token_budget(result, params.0.max_tokens)
                             }
@@ -5419,7 +5567,12 @@ impl SymForgeServer {
                                 let result = format!("{envelope}\n\n{output}");
                                 self.session_context.record_summary_output(
                                     "what_changed",
-                                    (result.len() / 4).min(u32::MAX as usize) as u32,
+                                    u32::try_from(
+                                        crate::stel::handler::estimate_tokens_from_bytes(
+                                            result.len() as u64,
+                                        ),
+                                    )
+                                    .unwrap_or(u32::MAX),
                                 );
                                 result
                             }
@@ -5653,7 +5806,10 @@ impl SymForgeServer {
         );
         self.session_context.record_summary_output(
             "detect_impact",
-            (result.len() / 4).min(u32::MAX as usize) as u32,
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                result.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
         );
         result
     }
@@ -5718,7 +5874,9 @@ impl SymForgeServer {
                 guard.capture_shared_file(&input.path)
             };
             if let Some(file) = indexed {
-                let file_tokens = file.content.len() / 4;
+                let file_tokens =
+                    crate::stel::handler::estimate_tokens_from_bytes(file.content.len() as u64)
+                        as usize;
                 let line_count = file.content.iter().filter(|&&b| b == b'\n').count();
                 record_read_outcome(ReadOutcome::Found);
                 return format!(
@@ -5734,7 +5892,9 @@ impl SymForgeServer {
                 match edit::safe_repo_path(&root, &input.path) {
                     Ok(canon_path) if canon_path.is_file() => {
                         if let Ok(metadata) = std::fs::metadata(&canon_path) {
-                            let file_tokens = metadata.len() as usize / 4;
+                            let file_tokens =
+                                crate::stel::handler::estimate_tokens_from_bytes(metadata.len())
+                                    as usize;
                             record_read_outcome(ReadOutcome::Found);
                             return format!(
                                 "Estimate for get_file_content(path=\"{}\"):\n  ~{} tokens (raw disk read; not indexed)",
@@ -5853,16 +6013,19 @@ impl SymForgeServer {
                 );
                 self.record_tool_savings_named(
                     "get_file_content",
-                    format::estimate_tokens_from_chars(format::competent_manual_baseline_chars(
-                        raw_chars,
-                    )),
-                    (output.len() / 4) as u64,
+                    crate::stel::handler::estimate_tokens_from_bytes(
+                        format::competent_manual_baseline_chars(raw_chars) as u64,
+                    ),
+                    crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
                 );
                 let capped =
                     format::cap_file_content_output(format!("{}{}", mode_annotation, output));
                 let with_warning = format::append_nul_byte_warning(capped, &file.as_ref().content);
                 let mut final_output = format::enforce_token_budget(with_warning, max_tokens);
-                let tokens = (final_output.len() / 4) as u32;
+                let tokens = u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                    final_output.len() as u64,
+                ))
+                .unwrap_or(u32::MAX);
                 let prior_dedup = if force_refresh {
                     self.session_context.prior_fetch_for_dedup(
                         crate::protocol::session::FetchKind::FileContent,
@@ -6046,7 +6209,10 @@ impl SymForgeServer {
             let output = format::validate_file_syntax_result(&input.path, file.as_ref());
             self.session_context.record_summary_output(
                 "validate_file_syntax",
-                (output.len() / 4).min(u32::MAX as usize) as u32,
+                u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                    output.len() as u64,
+                ))
+                .unwrap_or(u32::MAX),
             );
             return output;
         }
@@ -6108,7 +6274,10 @@ impl SymForgeServer {
         let output = format::validate_file_syntax_result(&input.path, &file);
         self.session_context.record_summary_output(
             "validate_file_syntax",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                output.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
         );
         output
     }
@@ -6419,14 +6588,17 @@ impl SymForgeServer {
 
                 self.record_tool_savings_named(
                     "find_references",
-                    format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
-                        output.len(),
-                    )),
-                    (output.len() / 4) as u64,
+                    crate::stel::handler::estimate_tokens_from_bytes(
+                        (format::estimate_listing_baseline_chars(output.len())) as u64,
+                    ),
+                    crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
                 );
                 self.session_context.record_summary_output(
                     "find_references",
-                    (output.len() / 4).min(u32::MAX as usize) as u32,
+                    u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                        output.len() as u64,
+                    ))
+                    .unwrap_or(u32::MAX),
                 );
                 self.session_context.record_listed_symbol("", &input.name);
                 let result = match envelope {
@@ -6540,7 +6712,10 @@ impl SymForgeServer {
         };
         self.session_context.record_summary_output(
             "find_dependents",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                output.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
         );
         format::enforce_token_budget(output, params.0.max_tokens)
     }
@@ -6662,13 +6837,18 @@ impl SymForgeServer {
 
         self.record_tool_savings_named(
             "explore",
-            format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
-                output.len(),
-            )),
-            (output.len() / 4) as u64,
+            crate::stel::handler::estimate_tokens_from_bytes(
+                (format::estimate_listing_baseline_chars(output.len())) as u64,
+            ),
+            crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
         );
-        self.session_context
-            .record_summary_output("explore", (output.len() / 4).min(u32::MAX as usize) as u32);
+        self.session_context.record_summary_output(
+            "explore",
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                output.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
+        );
         self.apply_ccr_budget("explore", output, params.0.max_tokens)
     }
 
@@ -6726,7 +6906,10 @@ impl SymForgeServer {
         );
         self.session_context.record_summary_output(
             "conventions",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                output.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
         );
         output
     }
@@ -6750,7 +6933,10 @@ impl SymForgeServer {
         let output = crate::protocol::edit_plan::plan_edit(&guard, &temporal, &params.0.target);
         self.session_context.record_summary_output(
             "edit_plan",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                output.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
         );
         output
     }
@@ -6784,7 +6970,10 @@ impl SymForgeServer {
         );
         self.session_context.record_summary_output(
             "investigation_suggest",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                output.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
         );
         output
     }
@@ -7178,8 +7367,13 @@ impl SymForgeServer {
                 may_use_local_project_state,
                 routed_project.as_deref(),
             );
-            self.session_context
-                .record_summary_output("symforge", handler::estimate_tokens(&output));
+            self.session_context.record_summary_output(
+                "symforge",
+                u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                    output.len() as u64,
+                ))
+                .unwrap_or(u32::MAX),
+            );
             return statused_tool_result(output, OutcomeClass::Found);
         }
 
@@ -7412,8 +7606,13 @@ impl SymForgeServer {
             may_use_local_project_state,
             routed_project.as_deref(),
         );
-        self.session_context
-            .record_summary_output("symforge", handler::estimate_tokens(&output));
+        self.session_context.record_summary_output(
+            "symforge",
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                output.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
+        );
         statused_tool_result(output, outcome_class)
     }
 
@@ -7475,7 +7674,6 @@ impl SymForgeServer {
             run_pre_apply_gates,
         };
         use crate::stel::edit_planner::{build_edit_plan, edit_plan_summary_line};
-        use crate::stel::handler;
         use crate::stel::planner::confidence_label;
 
         if let Err(error) = crate::stel::edit_planner::validate_edit_request(request) {
@@ -7541,7 +7739,10 @@ impl SymForgeServer {
                         Ok(Some(stored_response)) => {
                             self.session_context.record_summary_output(
                                 "symforge_edit",
-                                handler::estimate_tokens(&stored_response),
+                                u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                                    stored_response.len() as u64,
+                                ))
+                                .unwrap_or(u32::MAX),
                             );
                             // A probe hit can be an unservable record's
                             // "Error: Idempotency replay unavailable" refusal;
@@ -7608,8 +7809,13 @@ impl SymForgeServer {
                         // path, so no tuning applies here.
                         None,
                     );
-                    self.session_context
-                        .record_summary_output("symforge_edit", handler::estimate_tokens(&output));
+                    self.session_context.record_summary_output(
+                        "symforge_edit",
+                        u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                            output.len() as u64,
+                        ))
+                        .unwrap_or(u32::MAX),
+                    );
                     return statused_tool_result(output, OutcomeClass::Found);
                 }
                 Err(error) => {
@@ -7685,8 +7891,13 @@ impl SymForgeServer {
             // Edits are byte-grounded, not floor-tuned (see above).
             None,
         );
-        self.session_context
-            .record_summary_output("symforge_edit", handler::estimate_tokens(&output));
+        self.session_context.record_summary_output(
+            "symforge_edit",
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                output.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
+        );
 
         let outcome_class = Self::classify_symforge_edit_outcome(&tool_body, apply, &body);
         // Mutation exit: a preview or apply that found nothing to change is a
@@ -7877,6 +8088,8 @@ impl SymForgeServer {
         };
 
         let guard = self.index.data_plane().read();
+        // SF-DOG-04: the index lines come from ONE published generation.
+        let published = self.index.data_plane().published_generation();
         let ledger = self.stel_ledger.lock();
         // 012 D6-a bound-root visibility: surface WHICH workspace answered. This
         // is the root bound on THIS server — on the daemon side it is the warm
@@ -7912,9 +8125,11 @@ impl SymForgeServer {
                 orphaned_daemon_pid: crate::daemon::unrecorded_daemon_pid(),
                 project_name: &self.project_name,
                 project_root,
-                index_ready: guard.is_ready(),
-                index_files: guard.file_count(),
-                index_symbols: guard.symbol_count(),
+                index_ready: published.health.status
+                    == crate::live_index::PublishedIndexStatus::Ready,
+                index_trust: crate::live_index::store::TrustHeadline::of(&published).label(),
+                index_files: published.health.file_count,
+                index_symbols: published.health.symbol_count,
                 ledger: &ledger,
                 session_tokens: self.session_context.snapshot().total_tokens,
                 store: self.stel_ledger_store.as_deref(),
@@ -8391,6 +8606,7 @@ impl SymForgeServer {
                         structural: None,
                         project: nested_project.clone(),
                         projects: None,
+                        include_body: None,
                     };
                     self.search_text(Parameters(input)).await
                 }
@@ -8406,6 +8622,7 @@ impl SymForgeServer {
                         projects: None,
                         limit: None,
                         max_tokens: params.0.max_tokens,
+                        include_archived: None,
                     };
                     self.search_knowledge(Parameters(input)).await
                 }
@@ -8417,6 +8634,7 @@ impl SymForgeServer {
                         depth: None,
                         max_files: None,
                         estimate: None,
+                        include_knowledge: None,
                         max_tokens: params.0.max_tokens,
                     }))
                     .await
@@ -8483,8 +8701,13 @@ impl SymForgeServer {
         record_read_outcome(ReadOutcome::Found);
 
         let output = smart_query::render_answer(&intent, assessment, original_q, q, &result);
-        self.session_context
-            .record_summary_output("ask", (output.len() / 4).min(u32::MAX as usize) as u32);
+        self.session_context.record_summary_output(
+            "ask",
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                output.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
+        );
         format::enforce_token_budget(output, params.0.max_tokens)
     }
 
@@ -8578,14 +8801,17 @@ impl SymForgeServer {
         );
         self.record_tool_savings_named(
             "diff_symbols",
-            format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
-                output.len(),
-            )),
-            (output.len() / 4) as u64,
+            crate::stel::handler::estimate_tokens_from_bytes(
+                (format::estimate_listing_baseline_chars(output.len())) as u64,
+            ),
+            crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
         );
         self.session_context.record_summary_output(
             "diff_symbols",
-            (output.len() / 4).min(u32::MAX as usize) as u32,
+            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                output.len() as u64,
+            ))
+            .unwrap_or(u32::MAX),
         );
         format::enforce_token_budget(output, params.0.max_tokens)
     }
@@ -8596,6 +8822,7 @@ impl SymForgeServer {
 #[cfg(test)]
 mod tests {
     mod find_references;
+    mod search_text_count;
 
     use std::collections::HashMap;
     use std::ffi::OsString;
@@ -8720,6 +8947,7 @@ mod tests {
             canonical_root: Some(root.path().display().to_string()),
             generation: 4,
             index_state: "Ready".to_string(),
+            trust: "Ready".to_string(),
             load_source: "home-seed".to_string(),
             index_files: 2,
             index_symbols: 3,
@@ -9016,6 +9244,53 @@ mod tests {
             !out.contains("durable_ledger:"),
             "the overlay must NOT inject a durable line into a compact body:\n{out}"
         );
+    }
+
+    #[test]
+    fn status_and_project_evidence_qualify_a_stale_ready_index() {
+        let server = make_server(make_live_index_ready(vec![make_file(
+            "src/lib.rs",
+            b"fn a() {}\n",
+            vec![],
+        )]));
+        let request = |detail| crate::stel::StelStatusRequest {
+            detail,
+            reset_calibration: None,
+            connection_surface: None,
+        };
+        let current = server.render_stel_status_body(&request(None));
+        assert!(current.contains("index_ready: true"), "{current}");
+        assert!(!current.contains("index_trust:"), "{current}");
+
+        let generation = server
+            .index
+            .data_plane()
+            .published_generation()
+            .content_generation;
+        server
+            .index
+            .data_plane()
+            .set_freshness_status(crate::domain::FreshnessStatus::Degraded {
+                last_valid_content_generation: generation,
+                reason_codes: vec![crate::domain::FreshnessReason::ObservationFailed],
+            });
+        for detail in [
+            None,
+            Some(crate::stel::StelStatusDetail::Full),
+            Some(crate::stel::StelStatusDetail::Projects),
+        ] {
+            let body = server.render_stel_status_body(&request(detail));
+            assert!(
+                body.contains("index_trust: Ready (stale)")
+                    || body.contains("trust=\"Ready (stale)\""),
+                "{detail:?}: {body}"
+            );
+        }
+        let evidence = server
+            .local_project_evidence()
+            .expect("local project evidence");
+        assert_eq!(evidence.index_state, "Ready");
+        assert_eq!(evidence.trust, "Ready (stale)");
     }
 
     /// End-to-end at the proxy boundary: a `new_daemon_proxy` server WITH a
@@ -10311,6 +10586,7 @@ mod tests {
 
     fn get_symbol_input(path: &str, name: &str) -> super::GetSymbolInput {
         super::GetSymbolInput {
+            line_numbers: None,
             project: None,
             path: path.to_string(),
             name: name.to_string(),
@@ -10505,6 +10781,7 @@ mod tests {
         // Any non-health tool should return the empty guard message
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: "anything.rs".to_string(),
                 name: "anything".to_string(),
@@ -10538,6 +10815,7 @@ mod tests {
                 depth: None,
                 max_files: None,
                 estimate: None,
+                include_knowledge: None,
                 max_tokens: None,
             }))
             .await;
@@ -10556,6 +10834,7 @@ mod tests {
                 depth: None,
                 max_files: None,
                 estimate: None,
+                include_knowledge: None,
                 max_tokens: None,
             }))
             .await;
@@ -10574,6 +10853,7 @@ mod tests {
                 depth: None,
                 max_files: None,
                 estimate: None,
+                include_knowledge: None,
                 max_tokens: None,
             }))
             .await;
@@ -10606,6 +10886,7 @@ mod tests {
                 depth: None,
                 max_files: None,
                 estimate: None,
+                include_knowledge: None,
                 max_tokens: None,
             })),
         )
@@ -10636,6 +10917,7 @@ mod tests {
         let result = crate::protocol::surface_probe::with_connection_surface(
             Some(crate::protocol::surface_probe::SurfaceProfile::Full),
             server.get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: "anything.rs".to_string(),
                 name: "anything".to_string(),
@@ -10672,6 +10954,7 @@ mod tests {
         let result = crate::protocol::surface_probe::with_connection_surface(
             None,
             server.get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: "anything.rs".to_string(),
                 name: "anything".to_string(),
@@ -10701,6 +10984,7 @@ mod tests {
         let server = make_server(make_live_index_tripped());
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: "anything.rs".to_string(),
                 name: "anything".to_string(),
@@ -10770,6 +11054,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: "src/lib.rs".to_string(),
                 name: "foo".to_string(),
@@ -10804,6 +11089,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: String::new(),
                 name: "foo".to_string(),
@@ -11032,6 +11318,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                include_knowledge: None,
                 project: None,
                 detail: Some("full".to_string()),
                 path: None,
@@ -11052,6 +11339,7 @@ mod tests {
         let server = make_server(make_live_index_empty());
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                include_knowledge: None,
                 project: None,
                 detail: Some("full".to_string()),
                 path: None,
@@ -11113,6 +11401,7 @@ mod tests {
 
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                include_knowledge: None,
                 project: None,
                 detail: Some("full".to_string()),
                 path: None,
@@ -11233,6 +11522,7 @@ mod tests {
 
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                include_knowledge: None,
                 project: None,
                 detail: None,
                 path: None,
@@ -12353,6 +12643,186 @@ mod tests {
                 "include_tests=true should not render collapse summary; got:\n{result}"
             );
         }
+
+        #[tokio::test]
+        async fn explicit_outline_section_still_collapses_test_module() {
+            let file = nested_test_module_fixture("src/lib.rs", 5);
+            let server = make_server(make_live_index_ready(vec![file]));
+
+            let input: super::super::GetFileContextInput =
+                serde_json::from_value(serde_json::json!({
+                    "path": "src/lib.rs",
+                    "sections": ["outline"],
+                    "max_tokens": 1800
+                }))
+                .expect("input should deserialize");
+            let result = server.get_file_context(Parameters(input)).await;
+
+            assert!(
+                result.contains("test module `tests` collapsed: 5 functions not shown"),
+                "outline request without include_tests must collapse the test module; got:\n{result}"
+            );
+            assert!(
+                !result.contains("test_4"),
+                "no test function may be listed; got:\n{result}"
+            );
+        }
+
+        #[tokio::test]
+        async fn collapsed_test_symbols_do_not_trigger_budget_omission_advice() {
+            let file = nested_test_module_fixture("src/lib.rs", 200);
+            let server = make_server(make_live_index_ready(vec![file]));
+
+            let input: super::super::GetFileContextInput =
+                serde_json::from_value(serde_json::json!({
+                    "path": "src/lib.rs",
+                    "sections": ["outline"],
+                    "max_tokens": 1800
+                }))
+                .expect("input should deserialize");
+            let result = server.get_file_context(Parameters(input)).await;
+
+            assert!(
+                result.contains("test module `tests` collapsed: 200 functions not shown (pass include_tests=true to expand)"),
+                "{result}"
+            );
+            assert!(!result.contains("omitted"), "{result}");
+            assert!(!result.contains("higher max_tokens"), "{result}");
+        }
+
+        #[tokio::test]
+        async fn collapsed_test_module_does_not_consume_the_byte_budget() {
+            // ~100 production symbols + ~90 tests: expanded it exceeds the 1800-token
+            // (7200-byte) budget, collapsed it must fit with nothing cut.
+            let mut content = String::new();
+            let mut symbols = Vec::new();
+            for i in 0..100u32 {
+                let start = content.len() as u32;
+                content.push_str(&format!("fn prod_{i:03}() {{}}\n"));
+                symbols.push(make_symbol_with_depth(
+                    &format!("prod_{i:03}"),
+                    SymbolKind::Function,
+                    0,
+                    i,
+                    i,
+                    (start, content.len() as u32),
+                ));
+            }
+            let module_start = content.len() as u32;
+            content.push_str("mod tests {\n");
+            symbols.push(make_symbol_with_depth(
+                "tests",
+                SymbolKind::Module,
+                0,
+                100,
+                191,
+                (module_start, module_start),
+            ));
+            for i in 0..90u32 {
+                let start = content.len() as u32;
+                content.push_str(&format!("    fn long_test_name_for_budget_{i:03}() {{}}\n"));
+                symbols.push(make_symbol_with_depth(
+                    &format!("long_test_name_for_budget_{i:03}"),
+                    SymbolKind::Function,
+                    1,
+                    101 + i,
+                    101 + i,
+                    (start, content.len() as u32),
+                ));
+            }
+            content.push_str("}\n");
+            let file = make_file("src/big.rs", content.as_bytes(), symbols);
+            let server = make_server(make_live_index_ready(vec![file]));
+
+            let input: super::super::GetFileContextInput =
+                serde_json::from_value(serde_json::json!({
+                    "path": "src/big.rs",
+                    "sections": ["outline"],
+                    "max_tokens": 1800
+                }))
+                .expect("input should deserialize");
+            let result = server.get_file_context(Parameters(input)).await;
+
+            assert!(
+                result.contains("prod_000") && result.contains("prod_099"),
+                "{result}"
+            );
+            assert!(
+                result.contains("test module `tests` collapsed: 90 functions not shown"),
+                "{result}"
+            );
+            assert!(!result.contains("long_test_name_for_budget"), "{result}");
+            assert!(!result.contains("Truncated"), "{result}");
+            assert!(!result.contains("budget-limited"), "{result}");
+            assert!(!result.contains("omitted"), "{result}");
+        }
+
+        #[tokio::test]
+        async fn compact_repo_map_lists_source_directories_before_dot_directories_and_docs() {
+            let files = vec![
+                large_outline_fixture(".claude/x.rs", 1, 3),
+                large_outline_fixture("docs/d.rs", 1, 3),
+                large_outline_fixture("src/a.rs", 6, 8),
+            ];
+            let server = make_server(make_live_index_ready(files));
+
+            let result = server
+                .get_repo_map(Parameters(super::super::GetRepoMapInput {
+                    project: None,
+                    detail: None,
+                    path: None,
+                    depth: None,
+                    max_files: None,
+                    estimate: None,
+                    include_knowledge: None,
+                    max_tokens: None,
+                }))
+                .await;
+
+            let row = |dir: &str| {
+                result
+                    .find(&format!("\n  {dir} "))
+                    .unwrap_or_else(|| panic!("no `{dir}` row in:\n{result}"))
+            };
+            assert!(row("src") < row(".claude"), "{result}");
+            assert!(row("src") < row("docs"), "{result}");
+        }
+
+        #[tokio::test]
+        async fn get_symbol_batch_targets_are_numbered_per_target() {
+            let server = make_server(make_live_index_ready(vec![large_outline_fixture(
+                "src/big.rs",
+                30,
+                40,
+            )]));
+            let input: super::super::GetSymbolInput = serde_json::from_value(serde_json::json!({
+                "targets": [
+                    {"path": "src/big.rs", "name": "large"},
+                    {"path": "src/big.rs", "start_byte": 0, "end_byte": 800},
+                    {"path": "src/big.rs", "name": "function_000"}
+                ],
+                "max_tokens": 4000
+            }))
+            .expect("input should deserialize");
+            let result = server.get_symbol(Parameters(input)).await;
+
+            let parts: Vec<&str> = result.split("\n---\n").collect();
+            assert_eq!(parts.len(), 3, "{result}");
+            assert!(
+                parts[0].starts_with("1: mod large {\n2:     fn function_000"),
+                "{result}"
+            );
+            assert!(
+                parts[1].starts_with("src/big.rs\n1: mod large {\n2: "),
+                "{result}"
+            );
+            // Short bodies keep the raw form.
+            assert!(
+                parts[2].starts_with("    fn function_000() {}")
+                    || parts[2].starts_with("fn function_000"),
+                "{result}"
+            );
+        }
     }
 
     mod get_symbol_context {
@@ -13080,33 +13550,51 @@ mod tests {
         fs::create_dir(&protected).expect("create modeled protected root");
         fs::write(protected.join("lib.rs"), "pub fn protected_symbol() {}\n")
             .expect("write protected-root source");
+        let request = |allow_protected_root| {
+            Parameters(super::IndexFolderInput {
+                path: protected.display().to_string(),
+                idempotency_key: None,
+                add: None,
+                allow_protected_root,
+            })
+        };
 
         let server = make_server(make_live_index_empty());
-        let refused = server
-            .index_folder(Parameters(super::IndexFolderInput {
-                path: protected.display().to_string(),
-                idempotency_key: None,
-                add: None,
-                allow_protected_root: None,
-            }))
-            .await;
-        assert!(
-            refused.contains("protected_root_requires_explicit_override"),
-            "direct protected roots must fail closed without the explicit override: {refused}"
-        );
+        let _operator = EnvVarGuard::remove(super::PROTECTED_ROOT_OVERRIDE_ENV);
+        let _allowlist = EnvVarGuard::remove(super::PROTECTED_ROOT_ALLOWLIST_ENV);
+        for allow_protected_root in [None, Some(true)] {
+            let refused = server.index_folder(request(allow_protected_root)).await;
+            assert!(
+                refused.contains("protected_root_requires_explicit_override")
+                    && refused.contains(super::PROTECTED_ROOT_OVERRIDE_ENV)
+                    && !refused.contains("Indexed"),
+                "the tool field alone must not lift the refusal ({allow_protected_root:?}): {refused}"
+            );
+        }
         assert!(!protected.join(".symforge").exists());
 
-        let indexed = server
-            .index_folder(Parameters(super::IndexFolderInput {
-                path: protected.display().to_string(),
-                idempotency_key: None,
-                add: None,
-                allow_protected_root: Some(true),
-            }))
-            .await;
+        let _operator = EnvVarGuard::set(super::PROTECTED_ROOT_OVERRIDE_ENV, "1");
+        let other = fixture.path().join("other");
+        fs::create_dir(&other).expect("create allow-list entry");
+        let _allowlist = EnvVarGuard::set_path(super::PROTECTED_ROOT_ALLOWLIST_ENV, &other);
+        let refused = server.index_folder(request(Some(true))).await;
+        assert!(
+            refused.contains("protected_root_requires_explicit_override"),
+            "a protected root outside the operator allow-list must be refused: {refused}"
+        );
+
+        let _allowlist = EnvVarGuard::set_path(super::PROTECTED_ROOT_ALLOWLIST_ENV, &protected);
+        let indexed = server.index_folder(request(Some(true))).await;
         assert!(
             indexed.contains("Indexed 1 files"),
-            "the exact direct protected root should index with explicit authority: {indexed}"
+            "the allow-listed protected root should index under operator authority: {indexed}"
+        );
+
+        let _allowlist = EnvVarGuard::remove(super::PROTECTED_ROOT_ALLOWLIST_ENV);
+        let indexed = server.index_folder(request(None)).await;
+        assert!(
+            indexed.contains("Indexed 1 files"),
+            "operator authority, not the tool field, admits the protected root: {indexed}"
         );
         assert!(
             !protected.join(".symforge").exists(),
@@ -13121,6 +13609,7 @@ mod tests {
     #[tokio::test]
     async fn index_folder_refuses_credential_directory_roots_even_with_override() {
         let fixture = TempDir::new().expect("credential-root fixture parent");
+        let _operator = EnvVarGuard::set(super::PROTECTED_ROOT_OVERRIDE_ENV, "1");
         for store in [
             ".aws",
             ".kube",
@@ -13735,7 +14224,6 @@ mod tests {
         l1_planner: wired\n\
         l2_economics: wired\n\
         l3_bypass: wired\n\
-        l4_ledger: in_memory\n\
         handler_symforge: wired\n\
         handler_status: wired\n\
         handler_symforge_edit: preview-and-apply\n\
@@ -13743,12 +14231,13 @@ mod tests {
         project_root: {root}\n\
         index_ready: true\n\
         index_files: 1\n\
-        deferred: b_results\n\
-        superseded: multi_step_planner (client agentic loop + find-fusion)\n\
         ──\n\
         project: {project}\n\
         index_symbols: 1\n\
         session_tokens: 0\n\
+        build_fact_l4_ledger: in_memory\n\
+        build_fact_deferred: b_results\n\
+        build_fact_superseded: multi_step_planner (client agentic loop + find-fusion)\n\
         last_ledger_decision: none\n\
         last_ledger_route: none\n\
         durable_ledger: events=0 net_vs_manual=0 sessions=0\n\
@@ -14438,7 +14927,8 @@ mod tests {
             "first idempotent index_folder should index once, got: {first}"
         );
 
-        let override_conflict = server
+        // The tool field grants nothing, so changing only it is the same request.
+        let field_only = server
             .index_folder(Parameters(super::IndexFolderInput {
                 path: first_repo.path().display().to_string(),
                 idempotency_key: Some("local-conflict-key".to_string()),
@@ -14447,8 +14937,8 @@ mod tests {
             }))
             .await;
         assert!(
-            override_conflict.contains("Idempotency conflict"),
-            "same key with a changed protected-root override must conflict: {override_conflict}"
+            !field_only.contains("Idempotency conflict"),
+            "a field-only change must replay, not conflict: {field_only}"
         );
 
         let conflict = server
@@ -15458,6 +15948,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
         assert!(
@@ -15468,11 +15959,10 @@ mod tests {
             result.contains("Trust: constrained (literal)"),
             "search_text should expose trust envelope, got: {result}"
         );
+        // SF-TE-06: the default scope is the one-line envelope's silent default.
         assert!(
-            result.contains(
-                "Scope: repo-wide; tests filter active (heuristic); generated filter active (heuristic)"
-            ),
-            "search_text should expose applied scope, got: {result}"
+            !result.contains("Scope: "),
+            "a default-scope search_text omits the scope line, got: {result}"
         );
         // B5 (2026-07-03 spike gate): success paths carry no always-on tip.
         assert!(
@@ -15527,6 +16017,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -15649,6 +16140,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
 
         assert!(
@@ -15677,6 +16169,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
         assert!(
             !rendered_current.contains("untracked file may match"),
@@ -15734,6 +16227,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -15775,6 +16269,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -15837,6 +16332,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -15886,6 +16382,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
         assert!(
@@ -15940,6 +16437,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -15986,6 +16484,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -16044,6 +16543,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -16102,6 +16602,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -16152,6 +16653,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -16205,6 +16707,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -16249,6 +16752,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -16305,6 +16809,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -16347,6 +16852,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -16395,9 +16901,10 @@ mod tests {
             result.contains("Trust: constrained (tiered path relevance)"),
             "search_files should expose trust envelope, got: {result}"
         );
+        // SF-TE-06: the default path ranking is the one-line envelope's default.
         assert!(
-            result.contains("Scope: ranked indexed file paths"),
-            "search_files should expose search scope, got: {result}"
+            !result.contains("Scope: "),
+            "default search_files omits the scope line, got: {result}"
         );
         assert!(result.contains("── Basename matches ──"), "got: {result}");
         assert!(result.contains("src/protocol/tools.rs"), "got: {result}");
@@ -18170,6 +18677,7 @@ mod tests {
         let server = make_server(index);
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: "src/lib.rs".to_string(),
                 name: "foo".to_string(),
@@ -18227,6 +18735,7 @@ mod tests {
 
         let symbol = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: "src/held.rs".to_string(),
                 name: "held".to_string(),
@@ -18600,6 +19109,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: String::new(),
                 name: String::new(),
@@ -18635,6 +19145,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                line_numbers: None,
                 project: None,
                 path: String::new(),
                 name: String::new(),
@@ -21227,6 +21738,7 @@ mod tests {
                     projects: None,
                     limit: None,
                     max_tokens: Some(128),
+                    include_archived: None,
                 }))
                 .await,
         );
@@ -25297,6 +25809,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                include_knowledge: None,
                 project: None,
                 detail: Some("tree".to_string()),
                 path: None,
@@ -25321,6 +25834,7 @@ mod tests {
         let server = make_server(make_live_index_empty());
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                include_knowledge: None,
                 project: None,
                 detail: Some("tree".to_string()),
                 path: None,
@@ -26248,6 +26762,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
         assert!(
@@ -26295,6 +26810,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -26349,6 +26865,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
         // With group_by: "symbol", should show symbol name and match count
@@ -26396,6 +26913,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -26456,6 +26974,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
         // Should exclude the "use" import line
@@ -26502,6 +27021,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -26558,6 +27078,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
 
@@ -26650,6 +27171,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
         // Should show that connect() is called by handler() in src/api.rs
@@ -26698,6 +27220,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
         // follow_refs ran but found no cross-references — should signal this explicitly
@@ -28758,6 +29281,7 @@ mod tests {
                 structural: None,
                 project: None,
                 projects: None,
+                include_body: None,
             };
             let search_result = server.search_text(Parameters(search_input)).await;
             assert!(
@@ -34106,6 +34630,7 @@ mod tests {
                 include_personal_tooling: None,
                 project: None,
                 projects: None,
+                include_body: None,
             }))
             .await;
         assert!(

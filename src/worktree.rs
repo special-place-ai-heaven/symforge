@@ -79,6 +79,9 @@ pub enum WorktreeError {
         indexed_root: PathBuf,
     },
 
+    #[error("NetworkPathRefused: working_directory `{}` is a network path and is never used", cwd.display())]
+    NetworkPathRefused { cwd: PathBuf },
+
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -100,6 +103,24 @@ pub enum WorktreeError {
 /// platform canonicalizer both normalize this away.
 pub fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
     dunce::canonicalize(path)
+}
+
+/// Refuse the whole request when any caller-supplied `working_directory` is a
+/// network path. String-only, so it is safe to run before any write or
+/// filesystem call.
+pub fn refuse_network_working_directories<'a>(
+    directories: impl IntoIterator<Item = Option<&'a Path>>,
+) -> Result<(), WorktreeError> {
+    match directories
+        .into_iter()
+        .flatten()
+        .find(|directory| crate::paths::is_network_path(directory))
+    {
+        Some(directory) => Err(WorktreeError::NetworkPathRefused {
+            cwd: directory.to_path_buf(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Best-effort canonicalize. Falls back to the input when the target
@@ -250,6 +271,9 @@ pub fn resolve_target_path(
         });
     };
 
+    // String-only and first: no filesystem call may wait on a remote host.
+    refuse_network_working_directories([Some(raw_wd)])?;
+
     let canonical_indexed_abs = canonicalize_or_identity(indexed_abs);
     let canonical_indexed_root = canonicalize(indexed_root)?;
 
@@ -269,6 +293,7 @@ pub fn resolve_target_path(
         }
         Err(e) => return Err(WorktreeError::Io(e)),
     };
+    refuse_network_working_directories([Some(canonical_wd.as_path())])?;
     if canonical_wd == canonical_indexed_root {
         return Ok(ResolvedTarget {
             target_path: canonical_indexed_abs.clone(),
@@ -546,6 +571,36 @@ mod tests {
         (dir, main_canon, wt_canon)
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn working_directory_network_path_is_refused_without_filesystem_access() {
+        let mut cache = WorktreeCache::new();
+        for unc in [
+            r"\\nonexistent-host.invalid\share",
+            "//nonexistent-host.invalid/share",
+            r"\\?\UNC\nonexistent-host.invalid\share",
+            r"\\.\UNC\nonexistent-host.invalid\share",
+            "//./UNC/nonexistent-host.invalid/share",
+            r"\??\UNC\nonexistent-host.invalid\share",
+            r"\\?\GLOBALROOT\Device\Mup\nonexistent-host.invalid\share",
+            "//?/GLOBALROOT/Device/Mup/nonexistent-host.invalid/share",
+            r"\\?\Global\UNC\nonexistent-host.invalid\share",
+        ] {
+            let started = std::time::Instant::now();
+            let err = resolve_target_path(
+                Path::new(r"C:\repo\a.rs"),
+                Path::new(r"C:\repo"),
+                Some(Path::new(unc)),
+                &mut cache,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, WorktreeError::NetworkPathRefused { .. }),
+                "{unc}: {err}"
+            );
+            assert!(started.elapsed() < std::time::Duration::from_millis(250));
+        }
+    }
     #[test]
     fn canonicalize_strips_trailing_separator() {
         let tmp = tempfile::tempdir().unwrap();

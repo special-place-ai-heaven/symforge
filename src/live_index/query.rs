@@ -6542,6 +6542,7 @@ impl Actor for MyActor {
             last_overflow_at: Some(now),
             stale_files_found: 9,
             last_reconcile_at: Some(now),
+            last_degraded_publication: None,
         };
         let stats = index.health_stats_with_watcher(&watcher);
         assert_eq!(stats.watcher_state, WatcherState::Active);

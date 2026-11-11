@@ -121,6 +121,9 @@ pub fn register(hook: Box<dyn EditHook>) {
 /// holds no source-observation or publication authority. The write it routes
 /// lands through `edit.rs::atomic_write_file`'s permit lane (C2).
 pub fn resolve(ctx: &EditContext) -> Result<ResolvedTarget, String> {
+    // Before any hook can stat or canonicalize the caller's directory.
+    crate::worktree::refuse_network_working_directories([ctx.working_directory])
+        .map_err(|error| error.to_string())?;
     let reg = registry().read();
     let mut passthrough: Option<ResolvedTarget> = None;
     for hook in reg.iter().rev() {

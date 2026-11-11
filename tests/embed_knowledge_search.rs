@@ -35,6 +35,7 @@ fn request(query: &str) -> SearchKnowledgeRequest {
         projects: None,
         limit: Some(10),
         max_tokens: None,
+        include_archived: None,
     }
 }
 

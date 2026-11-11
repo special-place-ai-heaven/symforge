@@ -394,11 +394,12 @@ impl QuerySession {
             output: cached_output.unwrap_or(output),
         })
         .expect("bounded query output fields serialize");
-        let tokens = (serde_json::to_vec(output)
-            .expect("query output serializes")
-            .len()
-            / 4)
-        .min(u32::MAX as usize) as u32;
+        let tokens = crate::stel::handler::estimate_tokens_from_bytes(
+            serde_json::to_vec(output)
+                .expect("query output serializes")
+                .len() as u64,
+        )
+        .min(u64::from(u32::MAX)) as u32;
         let state = self.inner.lock();
         let handle = state.cache.preview_insert(
             operation_name(request.operation()),
@@ -748,6 +749,11 @@ fn record_context(context: &mut SessionContext, output: &QueryOutput, tokens: u3
                     }
                 }
                 TextRows::Names(_) => {}
+                TextRows::Counts(rows) => {
+                    for row in rows {
+                        context.record_listed_file(&row.path, 0);
+                    }
+                }
             }
         }
         QueryOutput::Files(files) => {

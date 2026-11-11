@@ -27,6 +27,24 @@ pub fn symbol_detail_from_indexed_file(
     kind_filter: Option<&str>,
     symbol_line: Option<u32>,
 ) -> String {
+    symbol_detail_from_indexed_file_with(file, name, kind_filter, symbol_line, Some(false))
+}
+
+/// Bodies longer than this many lines are prefixed with file line numbers
+/// unless the caller passes `line_numbers=false`.
+const NUMBERED_BODY_MIN_LINES: usize = 20;
+
+/// Like [`symbol_detail_from_indexed_file`], with the `get_symbol`
+/// `line_numbers` option: `None` numbers bodies over 20 lines, `Some(true)`
+/// always numbers, `Some(false)` never does. The gutter (`{n}: {line}`)
+/// is the one `get_file_content` uses, so both tools cite identically.
+pub fn symbol_detail_from_indexed_file_with(
+    file: &IndexedFile,
+    name: &str,
+    kind_filter: Option<&str>,
+    symbol_line: Option<u32>,
+    line_numbers: Option<bool>,
+) -> String {
     use crate::live_index::query::{SymbolSelectorMatch, resolve_symbol_selector};
 
     match resolve_symbol_selector(file, name, kind_filter, symbol_line) {
@@ -35,8 +53,20 @@ pub fn symbol_detail_from_indexed_file(
             let end = sym.byte_range.1 as usize;
             let clamped_end = end.min(file.content.len());
             let clamped_start = start.min(clamped_end);
-            let body =
+            let mut body =
                 String::from_utf8_lossy(&file.content[clamped_start..clamped_end]).into_owned();
+            if line_numbers.unwrap_or_else(|| body.lines().count() > NUMBERED_BODY_MIN_LINES) {
+                let first_line = 1 + file.content[..clamped_start]
+                    .iter()
+                    .filter(|b| **b == b'\n')
+                    .count();
+                body = body
+                    .lines()
+                    .enumerate()
+                    .map(|(offset, line)| format!("{}: {line}", first_line + offset))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
             let byte_count = end.saturating_sub(start);
             format!(
                 "{}\n[{}, lines {}-{}, {} bytes]",
@@ -166,6 +196,42 @@ pub fn code_slice_from_indexed_file(
     // `code_slice_view` decodes via `String::from_utf8_lossy`. Keep `content` as
     // `Vec<u8>` (not `String`) to preserve this no-panic invariant.
     code_slice_view(&file.relative_path, &file.content[start..end])
+}
+
+/// Byte-slice read with the `get_symbol` `line_numbers` rule (see
+/// [`symbol_detail_from_indexed_file_with`]): slices over 20 lines carry
+/// file line numbers unless `line_numbers=Some(false)`.
+pub fn code_slice_from_indexed_file_with(
+    file: &IndexedFile,
+    start_byte: usize,
+    end_byte: Option<usize>,
+    line_numbers: Option<bool>,
+) -> String {
+    let (start, end) = clamp_code_slice_range(file.content.len(), start_byte, end_byte);
+    code_slice_view_with(&file.relative_path, &file.content, start, end, line_numbers)
+}
+
+/// `code_slice_view` over `content[start..end]` (already clamped), numbering
+/// lines by their position in the whole file.
+pub fn code_slice_view_with(
+    path: &str,
+    content: &[u8],
+    start: usize,
+    end: usize,
+    line_numbers: Option<bool>,
+) -> String {
+    let text = String::from_utf8_lossy(&content[start..end]).into_owned();
+    if !line_numbers.unwrap_or_else(|| text.lines().count() > NUMBERED_BODY_MIN_LINES) {
+        return format!("{path}\n{text}");
+    }
+    let first_line = 1 + content[..start].iter().filter(|b| **b == b'\n').count();
+    let numbered = text
+        .lines()
+        .enumerate()
+        .map(|(offset, line)| format!("{}: {line}", first_line + offset))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{path}\n{numbered}")
 }
 
 /// Format results of `inspect_match`.

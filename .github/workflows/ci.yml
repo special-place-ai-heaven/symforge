@@ -580,6 +580,25 @@ jobs:
       - name: Run portable coupling calibration smoke
         run: cargo test --release --test coupling_calibration calibrate_current_repo_smoke -- --ignored --test-threads=1 --nocapture
 
+      - name: Run ignored large-file indexing timing test
+        run: cargo test --release --lib large_rust_file_indexing_is_linear_and_unchanged -- --ignored --test-threads=1
+
+  advisories:
+    needs: release-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: bash execution/ensure_rustup.sh
+
+      - name: Install dependency advisory checker
+        run: cargo install cargo-deny --locked
+
+      - name: Check dependency advisories
+        run: cargo deny check advisories
+
   npm:
     needs: release-version
     runs-on: ubuntu-latest

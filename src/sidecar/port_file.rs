@@ -331,6 +331,7 @@ fn read_descriptors_at(dir: &Path) -> Vec<SessionDescriptor> {
 struct SelectedSidecar {
     status: SidecarStatus,
     session_id: Option<String>,
+    daemon_started_at: Option<u64>,
 }
 
 fn select_descriptor_status(
@@ -373,6 +374,7 @@ fn select_descriptor_status_with_budget(
                         ),
                     },
                     session_id: None,
+                    daemon_started_at: None,
                 });
             }
         },
@@ -408,6 +410,7 @@ fn select_descriptor_status_with_budget(
                 )),
             },
             session_id: None,
+            daemon_started_at: None,
         });
     }
 
@@ -439,6 +442,7 @@ fn select_descriptor_status_with_budget(
             )),
         },
         session_id: best.session_id.clone(),
+        daemon_started_at: best.daemon_started_at,
     };
 
     let mut probed = 0usize;
@@ -793,10 +797,36 @@ pub fn read_sidecar_endpoint(
     bind_host: &str,
     expected_project_root: Option<&Path>,
 ) -> io::Result<(u16, Option<String>)> {
+    read_sidecar_endpoint_identity(control_state_dir, bind_host, expected_project_root)
+        .map(|identity| (identity.port, identity.session_id))
+}
+
+/// The selected sidecar endpoint plus the lifetime identity of the process
+/// behind it: the descriptor pid and, for daemon-backed descriptors, the
+/// daemon boot epoch. Legacy fixed files carry neither.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidecarEndpointIdentity {
+    pub port: u16,
+    pub session_id: Option<String>,
+    pub pid: Option<u32>,
+    pub daemon_started_at: Option<u64>,
+}
+
+/// [`read_sidecar_endpoint`] returning the descriptor's lifetime identity too.
+pub fn read_sidecar_endpoint_identity(
+    control_state_dir: &ControlStateDir,
+    bind_host: &str,
+    expected_project_root: Option<&Path>,
+) -> io::Result<SidecarEndpointIdentity> {
     let dir = resolve_symforge_dir(control_state_dir);
     if let Some(selected) = select_descriptor_status(&dir, bind_host, expected_project_root) {
         if let Some(port) = selected.status.port {
-            return Ok((port, selected.session_id));
+            return Ok(SidecarEndpointIdentity {
+                port,
+                session_id: selected.session_id,
+                pid: selected.status.pid,
+                daemon_started_at: selected.daemon_started_at,
+            });
         }
         // Fail closed: modern descriptors EXISTED but were all
         // identity-rejected for this root. Falling through to the legacy
@@ -821,7 +851,12 @@ pub fn read_sidecar_endpoint(
     let session_id = read_runtime_file(&dir, &session_file_name(), LEGACY_SESSION_FILE)
         .ok()
         .map(|contents| contents.trim().to_string());
-    Ok((port, session_id))
+    Ok(SidecarEndpointIdentity {
+        port,
+        session_id,
+        pid: None,
+        daemon_started_at: None,
+    })
 }
 
 /// Remove both port and PID files. Ignores all errors.

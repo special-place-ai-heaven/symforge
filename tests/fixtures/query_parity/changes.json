@@ -173,7 +173,7 @@
       "input": {
         "query": "find symbol changed"
       },
-      "expected": "Route confidence: exact\nChosen tool: search_symbols\nInvocation: search_symbols(query=\"changed\")\nRationale: matched explicit definition/lookup phrasing\n[Routed to: search_symbols(query=\"changed\")]\n\nTrust: exact | current index | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)\nScope: repo-wide; tests filter active (heuristic); generated filter active (heuristic); vendor filter active (heuristic); personal tooling filtered\nEvidence: symbol anchors `src/lib.rs:2`\n\n1 matches in 1 files\n── Exact matches ──\n  2: fn changed  (src/lib.rs)  [1.00]\n\nText path fallback (sparse symbol hits):\nsrc/caller.rs:1"
+      "expected": "Route confidence: exact\nChosen tool: search_symbols\nInvocation: search_symbols(query=\"changed\")\nRationale: matched explicit definition/lookup phrasing\n[Routed to: search_symbols(query=\"changed\")]\n\nTrust: exact | current index | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)\n\n1 matches in 1 files\n── Exact matches ──\n  2: fn changed  (src/lib.rs)  [1.00]\n\nText path fallback (sparse symbol hits):\nsrc/caller.rs:1"
     },
     {
       "name": "ask tool help",

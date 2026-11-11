@@ -209,7 +209,10 @@ fn status_banner_uses_no_blanket_active_or_pending_literal() {
     );
     // Honest static labels are present.
     assert!(status.contains("l1_planner: wired"), "{status}");
-    assert!(status.contains("l4_ledger: in_memory"), "{status}");
+    assert!(
+        status.contains("build_fact_l4_ledger: in_memory"),
+        "{status}"
+    );
 }
 
 #[test]
