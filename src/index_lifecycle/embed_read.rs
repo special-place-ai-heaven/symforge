@@ -338,7 +338,7 @@ pub(super) fn content(
         }));
     }
     admit(snapshot, &input.path, None, budget)?;
-    let (rendered, hash, authority, raw_len, nul_warning) = if let Some(file) = indexed {
+    let (rendered, hash, authority, nul_warning) = if let Some(file) = indexed {
         verify_indexed_content(snapshot, &input.path, file)?;
         selected_range(file, &options.content_context)?;
         if let Some(session) = session
@@ -370,7 +370,6 @@ pub(super) fn content(
             output,
             crate::hash::digest_hex(&file.content),
             ReadAuthority::PublishedGeneration,
-            file.content.len(),
             crate::domain::index::nul_byte_warning_line(&crate::domain::index::scan_nul_bytes(
                 &file.content,
             )),
@@ -405,7 +404,6 @@ pub(super) fn content(
             body,
             hash,
             ReadAuthority::DiskObservation,
-            bytes.len(),
             crate::domain::index::nul_byte_warning_line(&crate::domain::index::scan_nul_bytes(
                 &bytes,
             )),
@@ -420,7 +418,16 @@ pub(super) fn content(
     };
     let combined = format!("{annotation}{rendered}");
     let file_capped = combined.len() > file_read::GET_FILE_CONTENT_MAX_BYTES;
-    let capped = file_read::cap_file_content_output(combined);
+    let capped = file_read::cap_file_content_output_for(
+        combined,
+        &input.path,
+        options.content_context.start_line.unwrap_or(1),
+        options.content_context.show_line_numbers
+            || options.content_context.around_line.is_some()
+            || options.content_context.around_match.is_some()
+            || options.content_context.around_symbol.is_some()
+            || options.content_context.chunk_index.is_some(),
+    );
     let warned = match nul_warning {
         Some(warning) if capped.is_empty() => warning,
         Some(warning) => format!("{capped}\n{warning}"),
@@ -428,10 +435,9 @@ pub(super) fn content(
     };
     let (mut rendered, token_capped) = source::enforce_token_budget_flagged(
         warned.clone(),
-        Some(file_read::resolve_read_max_tokens(
-            input.max_tokens,
-            raw_len,
-        )),
+        // FR-024: only an explicit `max_tokens` budgets the output; the byte cap above
+        // is the hard limit.
+        input.max_tokens.filter(|limit| *limit > 0),
     );
     if input.force_refresh == Some(true)
         && let Some(prior) = session.and_then(|session| {

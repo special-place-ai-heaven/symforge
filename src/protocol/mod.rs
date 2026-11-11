@@ -28,6 +28,7 @@ pub(crate) mod secret_remediate;
 pub mod session;
 pub mod smart_query;
 pub mod surface_probe;
+pub(crate) mod tool_contract;
 pub mod tools;
 pub mod withheld;
 

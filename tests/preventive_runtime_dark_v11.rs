@@ -1148,9 +1148,9 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Same 89 paths; no new lifecycle/server-API bridge. Review and dual-surface proof:
 // docs/reviews/2026-10-25-differential-overlap-review.md.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "98d3a2a89bda317098bd520da28349a5de1f33e594723411f9be64d7b1519632",
+    "68dd39c571d012f75fd9f10049214476074ae6895d12e9db0cae2fa440bdc9f9",
     89,
-    2292037,
+    2328767,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1325,10 +1325,16 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // byte-precise callers, bounded evidence, and paired server/embed regressions.
 // Same 312 files; independently reviewed and recomputed; no new boundary bridge.
 // docs/reviews/2026-10-25-differential-overlap-review.md.
+// Refreshed 2026-11-11 for feature 036 T003/T004: new `protocol/tool_contract.rs`
+// (a static per-tool table and its tests; no bridge) and `SYMFORGE_TOOL_NAMES`
+// widened to `pub(crate)`. 315 files.
+// Refreshed for feature 036 slice A1 (output budgets, repo-map scope, all-words symbol
+// search, documentation zero-hit note, porcelain path count): new functions and one
+// inherent impl on an in-set type, no bridge, registration or re-export. 315 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "1428d4a0127024cdbc640bb8c94ac72f1781af4dd8f373a80149b7cd658b97c1",
-    314,
-    12535200,
+    "c53d0a0e2287834034ab3afbb177552e0c24591273fee80eddb5120fe87d7ea0",
+    315,
+    12602790,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

@@ -1014,9 +1014,27 @@ async fn file_context_knowledge_section_preserves_only_default_and_empty_section
 async fn default_file_context_budgets_prioritize_code_and_keep_explicit_sections() {
     let fixture = KnowledgeFixture::large_context();
 
+    // FR-024 (feature 036): without a caller `max_tokens` (0 counts as none) no budget is
+    // derived from the input size, so the answer is not cut and keeps both sections.
     for request in [
         json!({"path": "src/lib.rs", "force_refresh": true}),
         json!({"path": "src/lib.rs", "max_tokens": 0, "force_refresh": true}),
+    ] {
+        let output = fixture
+            .server
+            .dispatch_tool_for_tests("get_file_context", request)
+            .await;
+        assert!(
+            output.contains("checkpoint_anchor") && output.contains("Knowledge evidence:"),
+            "default context lost a section: {output}"
+        );
+        assert!(
+            !output.contains("Original output is ~"),
+            "a default must not truncate: {output}"
+        );
+    }
+
+    for request in [
         json!({"path": "src/lib.rs", "max_tokens": 900, "force_refresh": true}),
         json!({"path": "src/lib.rs", "sections": [], "max_tokens": 900, "force_refresh": true}),
         json!({"path": "src/lib.rs", "include_tests": true, "max_tokens": 900, "force_refresh": true}),

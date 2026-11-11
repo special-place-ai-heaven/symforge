@@ -1,0 +1,10 @@
+# Frozen fixture crate for specs/036-tool-reliability (answer table: ANSWERS.md).
+# Not a workspace member: the repository root Cargo.toml declares no [workspace].
+[package]
+name = "reliability-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"

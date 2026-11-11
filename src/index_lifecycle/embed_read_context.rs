@@ -21,6 +21,11 @@ fn bound_project(snapshot: &EmbeddedQuerySnapshot, selector: Option<&str>) -> bo
 
 pub(super) fn validate_repo_map(request: &RepoMapRequest) -> Result<(), QueryRefusalKind> {
     if let Some(path) = &request.path {
+        // A leading `./` is normalised away (as on the server lane) before the path rules.
+        let mut path = path.as_str();
+        while let Some(rest) = path.strip_prefix("./") {
+            path = rest;
+        }
         validate_path(path, true)?;
     }
     if request.max_tokens == Some(0) {
@@ -39,6 +44,14 @@ pub(super) fn repo_map(
         return Err(QueryRefusalKind::AdmissionUnavailable);
     }
     budget.cap_tokens(request.max_tokens);
+    // `./src` names `src` at every detail level, as on the server lane.
+    let normalized_path: Option<String> = request.path.as_deref().map(|path| {
+        let mut path = path;
+        while let Some(rest) = path.strip_prefix("./") {
+            path = rest;
+        }
+        path.to_string()
+    });
     let published = snapshot.generation.as_ref();
     let view = published.outline.as_ref();
     let file_count = published.live.file_count();
@@ -65,8 +78,7 @@ pub(super) fn repo_map(
                 .files
                 .iter()
                 .filter(|file| {
-                    request
-                        .path
+                    normalized_path
                         .as_ref()
                         .is_none_or(|path| file.relative_path.starts_with(path))
                 })
@@ -82,7 +94,7 @@ pub(super) fn repo_map(
             };
             let mut text = read_context::repo_outline_view(&filtered, project_name);
             if truncated > 0 {
-                let hint = if request.path.is_some() {
+                let hint = if normalized_path.is_some() {
                     "increase max_files= to see more"
                 } else {
                     "use path= to scope or increase max_files="
@@ -93,7 +105,7 @@ pub(super) fn repo_map(
             (text, shown)
         }
         "tree" => {
-            let path = request.path.as_deref().unwrap_or("");
+            let path = normalized_path.as_deref().unwrap_or("");
             let depth = request.depth.unwrap_or(2).min(5);
             let skipped = published.live.compatibility_skipped_files();
             let shown = view
@@ -111,7 +123,11 @@ pub(super) fn repo_map(
             )
         }
         _ => {
-            let mut text = read_context::repo_map_text_for_generation(published);
+            let mut text = read_context::repo_map_text_scoped(
+                published,
+                normalized_path.as_deref(),
+                request.depth,
+            );
             text.push_str("\nDoctrine: the map orients; the tools prove. Completeness: ranked and truncated by result cap - absence from the map is not absence from the repo; confirm with search_symbols / search_text before concluding something is missing.");
             (text, 0)
         }
@@ -268,7 +284,12 @@ pub(super) fn file_context(
         .as_ref()
         .is_some_and(|sections| sections.len() == 1 && sections[0] == "knowledge");
     let sections = if is_small_file && default_sections {
-        Some(vec!["outline".to_string()])
+        // Same default as the server lane: outline, imports and consumers.
+        Some(vec![
+            "outline".to_string(),
+            "imports".to_string(),
+            "consumers".to_string(),
+        ])
     } else if large_default_summary {
         Some(vec!["outline".to_string(), "imports".to_string()])
     } else {
@@ -280,13 +301,8 @@ pub(super) fn file_context(
                 .collect::<Vec<_>>()
         })
     };
-    let context_max_tokens = Some(file_read::resolve_read_max_tokens(
-        request
-            .max_tokens
-            .or_else(|| knowledge_requested.then_some(1000))
-            .or_else(|| large_default_summary.then_some(1000)),
-        raw_chars,
-    ));
+    // FR-024: only the caller's `max_tokens` budgets the output.
+    let context_max_tokens = request.max_tokens.filter(|limit| *limit > 0);
     budget.cap_tokens(context_max_tokens);
     let knowledge = knowledge_requested
         .then(|| {
@@ -301,11 +317,28 @@ pub(super) fn file_context(
         .flatten();
     let mut truncated = false;
     let mut rendered = if knowledge_only {
-        knowledge_model::render_budgeted_code_knowledge_only(
+        let text = knowledge_model::render_budgeted_code_knowledge_only(
             published,
             knowledge.as_deref(),
             context_max_tokens,
-        )
+        );
+        // The server lane's default hard cap and continuation (no `max_tokens`).
+        if context_max_tokens.is_none() {
+            let cut = text.len() > file_read::GET_FILE_CONTENT_MAX_BYTES;
+            truncated |= cut;
+            source::enforce_default_output_cap(text, |bytes| {
+                source::file_context_continuation(
+                    &request.path,
+                    request.sections.as_deref(),
+                    request.include_tests,
+                    &[],
+                    true,
+                    bytes,
+                )
+            })
+        } else {
+            text
+        }
     } else {
         let params = read_context::OutlineProjectionParams {
             path: request.path.clone(),
@@ -345,7 +378,27 @@ pub(super) fn file_context(
             body.push_str(knowledge);
         }
         let footer = read_context::compact_savings_footer(body.len(), raw_chars);
-        let (output, limited) = if default_sections {
+        // The server lane's default hard cap and continuation line (no `max_tokens`).
+        let optional: Vec<(&str, &str)> = knowledge
+            .as_deref()
+            .map(|knowledge| ("knowledge", knowledge))
+            .into_iter()
+            .collect();
+        let default_capped = if context_max_tokens.is_none() {
+            source::cap_default_file_context(
+                &request.path,
+                request.sections.as_deref(),
+                request.include_tests,
+                &body[..code_context_len],
+                &optional,
+                body.len() + footer.len(),
+            )
+        } else {
+            None
+        };
+        let (output, limited) = if let Some(capped) = default_capped {
+            (capped, true)
+        } else if default_sections {
             knowledge_model::enforce_budgeted_code_context_prioritizing_code(
                 published,
                 format!("{body}{footer}"),

@@ -438,6 +438,7 @@ pub(super) fn render_search(
                 Ok(executed) => executed,
                 Err(_) => return Some(Err(QueryRefusalKind::InvalidRequest)),
             };
+            let hidden_documentation_note = executed.hidden_documentation_note();
             let mut rendered = search::render_search_text_output(
                 generation,
                 executed.result,
@@ -458,6 +459,10 @@ pub(super) fn render_search(
                     shared.query.as_deref().unwrap_or_default(),
                     executed.effective_query.as_deref().unwrap_or_default()
                 ));
+            }
+            if let Some(note) = hidden_documentation_note {
+                rendered.push('\n');
+                rendered.push_str(&note);
             }
             budget(
                 "search_text",

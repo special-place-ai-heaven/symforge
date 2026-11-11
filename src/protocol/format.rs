@@ -364,9 +364,10 @@ pub(crate) use crate::index_lifecycle::guidance::file_read::{
     ContentSelectionMiss, content_selection, render_file_content_bytes,
 };
 pub use crate::index_lifecycle::guidance::file_read::{
-    GET_FILE_CONTENT_MAX_BYTES, append_nul_byte_warning, cap_file_content_output, file_content,
-    file_content_from_indexed_file, file_content_from_indexed_file_with_context, file_content_view,
-    not_found_file, not_found_file_match, not_found_symbol, validate_file_syntax_result,
+    GET_FILE_CONTENT_MAX_BYTES, append_nul_byte_warning, cap_file_content_output,
+    cap_file_content_output_for, file_content, file_content_from_indexed_file,
+    file_content_from_indexed_file_with_context, file_content_view, not_found_file,
+    not_found_file_match, not_found_symbol, validate_file_syntax_result,
 };
 
 /// Explicit "outside the repository root" error for a path that escapes the
@@ -795,7 +796,8 @@ pub fn is_small_indexed_file(content_len: usize, line_count: usize) -> bool {
 /// Default read budget when callers omit `max_tokens` (~50-line competent window).
 pub use crate::index_lifecycle::guidance::file_read::default_read_max_tokens;
 
-/// Resolve an explicit or default token budget for read-like tools.
+/// Resolve an explicit or default token budget for read-like tools (test-only since 036).
+#[cfg(test)]
 pub use crate::index_lifecycle::guidance::file_read::resolve_read_max_tokens;
 
 pub fn saved_tokens_whole_file(response_chars: usize, raw_chars: usize) -> u64 {

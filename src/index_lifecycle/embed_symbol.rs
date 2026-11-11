@@ -273,12 +273,26 @@ pub(super) fn read(
             budget.cache_output = Some(QueryOutput::SymbolRead(full.clone()));
             budget.cache_truncated = budget.truncated;
         }
-        let token_limit = super::guidance::file_read::resolve_read_max_tokens(
-            request.max_tokens,
-            full.rendered.len(),
-        );
-        let (rendered, truncated) =
-            source::enforce_token_budget_flagged(full.rendered, Some(token_limit));
+        // FR-024: only an explicit `max_tokens` budgets a named symbol; without one the
+        // hard cap and its continuation line are those of the server lane.
+        let explicit = request.max_tokens.filter(|limit| *limit > 0);
+        let (rendered, truncated) = match (explicit, request.targets.is_none()) {
+            (None, true) => {
+                let cut =
+                    full.rendered.len() > super::guidance::file_read::GET_FILE_CONTENT_MAX_BYTES;
+                let capped = source::enforce_default_output_cap(full.rendered, |bytes| {
+                    source::symbol_read_continuation(
+                        &targets[0].path,
+                        targets[0].name.as_deref().unwrap_or(&request.name),
+                        request.kind.as_deref(),
+                        request.symbol_line,
+                        bytes,
+                    )
+                });
+                (capped, cut)
+            }
+            _ => source::enforce_token_budget_flagged(full.rendered, explicit),
+        };
         full.rendered = rendered;
         budget.truncated |= truncated;
     }

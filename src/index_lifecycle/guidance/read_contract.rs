@@ -124,6 +124,14 @@ pub(crate) fn normalize_file_content_aliases(
     Ok(())
 }
 
+/// A ranged line read is numbered unless the caller said `show_line_numbers=false`
+/// (FR-027); an unranged read stays raw so whole-file reads keep their exact bytes.
+fn ranged_line_numbers(input: &GetFileContentInput) -> bool {
+    input
+        .show_line_numbers
+        .unwrap_or(input.start_line.is_some() || input.end_line.is_some())
+}
+
 pub(crate) fn file_content_options_from_input(
     input: &GetFileContentInput,
 ) -> Result<search::FileContentOptions, String> {
@@ -301,7 +309,7 @@ pub(crate) fn file_content_options_from_input(
             input.path.clone(),
             input.start_line,
             input.end_line,
-            show_line_numbers,
+            ranged_line_numbers(input),
             header,
         ),
     };
@@ -402,7 +410,7 @@ fn validate_lines_mode(input: &GetFileContentInput) -> Result<search::FileConten
             input.path.clone(),
             input.start_line,
             input.end_line,
-            show_line_numbers,
+            ranged_line_numbers(input),
             header,
         ),
     })

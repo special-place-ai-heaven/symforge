@@ -389,27 +389,64 @@ pub(crate) fn is_intra_workspace_path(path: &str) -> bool {
         .split('/')
         .any(|segment| segment == "..")
 }
-fn get_dir_2level(path: &str) -> String {
-    let p = std::path::Path::new(path);
-    let components: Vec<_> = p.components().collect();
-
-    if components.len() <= 1 {
-        // Root-level file.
-        return "(root)".to_string();
-    }
-
-    // Take at most 2 directory components (exclude the file name).
-    let dir_components: Vec<_> = components[..components.len() - 1].iter().take(2).collect();
-    dir_components
-        .iter()
-        .map(|c| c.as_os_str().to_string_lossy().to_string())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 pub(crate) fn repo_map_text_for_generation(
     generation: &crate::live_index::PublishedGeneration,
 ) -> String {
+    repo_map_text_scoped(generation, None, None)
+}
+
+/// Directory a file is grouped under in the compact map: at most `depth` directory
+/// components, counted from the project root or, when `scope` is given, from `scope`
+/// (files outside it are not part of the map). Root-level files group under `(root)`.
+fn map_dir_key(file_path: &str, scope: Option<&str>, depth: usize) -> Option<String> {
+    let normalized = file_path.replace('\\', "/");
+    let rest = match scope {
+        Some(prefix) if normalized == prefix => return Some(prefix.to_string()),
+        Some(prefix) => normalized.strip_prefix(prefix)?.strip_prefix('/')?,
+        None => normalized.as_str(),
+    };
+    let mut components: Vec<&str> = rest.split('/').collect();
+    components.pop(); // the file name
+    let tail = components[..components.len().min(depth)].join("/");
+    Some(match (scope, tail.is_empty()) {
+        (Some(prefix), true) => prefix.to_string(),
+        (Some(prefix), false) => format!("{prefix}/{tail}"),
+        (None, true) => "(root)".to_string(),
+        (None, false) => tail,
+    })
+}
+
+/// Ranking class of a map row (FR-028): source roots first, then tests, then
+/// documentation, specifications, research and vendored trees.
+fn map_dir_rank(dir: &str) -> u8 {
+    match dir.split('/').next().unwrap_or("") {
+        "tests" | "test" | "benches" | "examples" | "(root)" => 1,
+        "docs" | "doc" | "research" | "specs" | "spec" | "vendor" | "third_party"
+        | "node_modules" => 2,
+        first if first.starts_with('.') => 2,
+        _ => 0,
+    }
+}
+
+/// The compact map, optionally limited to `path` and grouped `depth` directory levels
+/// deep (default 2).
+pub(crate) fn repo_map_text_scoped(
+    generation: &crate::live_index::PublishedGeneration,
+    path_scope: Option<&str>,
+    depth: Option<u32>,
+) -> String {
+    let scope = path_scope
+        .map(|p| p.replace('\\', "/"))
+        .map(|p| {
+            let mut p = p.as_str();
+            while let Some(rest) = p.strip_prefix("./") {
+                p = rest;
+            }
+            p.trim_matches('/').to_string()
+        })
+        .filter(|p| !p.is_empty() && p != ".");
+    let scope = scope.as_deref();
+    let depth = depth.unwrap_or(2).min(5) as usize;
     let guard = generation.live.as_ref();
 
     let total_files = guard.file_count();
@@ -429,13 +466,15 @@ pub(crate) fn repo_map_text_for_generation(
         if !is_intra_workspace_path(path) {
             continue;
         }
+        // `path` limits the map to its subtree; `depth` sets the grouping level.
+        let Some(dir) = map_dir_key(path, scope, depth) else {
+            continue;
+        };
 
         // Language breakdown.
         let lang = format!("{:?}", file.language);
         *lang_counts.entry(lang).or_insert(0) += 1;
 
-        // Directory (up to 2 levels).
-        let dir = get_dir_2level(path);
         *dir_file_counts.entry(dir.clone()).or_insert(0) += 1;
         *dir_symbol_counts.entry(dir).or_insert(0) += file.symbols.len();
     }
@@ -447,9 +486,25 @@ pub(crate) fn repo_map_text_for_generation(
         .collect();
     lang_parts.sort();
 
+    if let Some(scope) = scope
+        && dir_file_counts.is_empty()
+    {
+        return format!(
+            "No entries under {scope} (paths are relative to the project root and case-sensitive); get_repo_map(detail=\"tree\", depth=1) lists the top-level directories."
+        );
+    }
+    let (total_files, total_symbols) = match scope {
+        // Counts of the subtree, not of the index.
+        Some(_) => (
+            dir_file_counts.values().sum(),
+            dir_symbol_counts.values().sum(),
+        ),
+        None => (total_files, total_symbols),
+    };
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!(
-        "Index: {} files, {} symbols  [{}]",
+        "Index{}: {} files, {} symbols  [{}]",
+        scope.map(|p| format!(" under {p}")).unwrap_or_default(),
         total_files,
         total_symbols,
         lang_parts.join(", ")
@@ -458,11 +513,12 @@ pub(crate) fn repo_map_text_for_generation(
 
     // Sort directories and emit tree.
     let mut dirs: Vec<String> = dir_file_counts.keys().cloned().collect();
-    // Code-symbol count DESC so source directories precede dot-directories
-    // and docs under the byte budget; name ASC keeps the order total.
+    // Source roots, then tests, then documentation and specifications (FR-028); within
+    // a class code-symbol count DESC; name ASC keeps the order total.
     dirs.sort_by(|a, b| {
-        dir_symbol_counts[b]
-            .cmp(&dir_symbol_counts[a])
+        map_dir_rank(a)
+            .cmp(&map_dir_rank(b))
+            .then_with(|| dir_symbol_counts[b].cmp(&dir_symbol_counts[a]))
             .then_with(|| a.cmp(b))
     });
 
@@ -474,6 +530,8 @@ pub(crate) fn repo_map_text_for_generation(
             dir, file_count, sym_count
         ));
     }
+    // Rows from here on belong to the key-types section.
+    let dir_rows_end = lines.len();
 
     // Key entry points: top-level structs/traits/interfaces/enums in src/ (depth 0, limit 10).
     {
@@ -482,7 +540,7 @@ pub(crate) fn repo_map_text_for_generation(
             // Exclude paths from other indexed workspaces — same guard as the
             // directory-stats loop above; without it the key-types section
             // leaks symbols from unrelated projects.
-            if !is_intra_workspace_path(path) {
+            if !is_intra_workspace_path(path) || map_dir_key(path, scope, depth).is_none() {
                 continue;
             }
             // Only source code, skip docs/tests/vendor
@@ -604,7 +662,32 @@ pub(crate) fn repo_map_text_for_generation(
 
     // Apply budget (1000 tokens = 4000 bytes).
     // Medium repos (up to ~70 directories) fit without truncation.
-    let (text, _) = build_with_budget(&lines, 4000);
+    let (mut text, remaining) = build_with_budget(&lines, 4000);
+    if remaining > 0 {
+        // FR-026: say what was omitted, by kind. The tail of `lines` is cut, so the omitted
+        // rows are the last directory rows and/or the key-types section.
+        let kept = lines.len() - remaining;
+        let omitted_dirs = dir_rows_end.saturating_sub(kept);
+        let omitted_types = remaining - omitted_dirs;
+        let mut parts = Vec::new();
+        if omitted_dirs > 0 {
+            parts.push(format!("{omitted_dirs} directory row(s)"));
+        }
+        if omitted_types > 0 {
+            parts.push(format!("{omitted_types} line(s) of the key-types section"));
+        }
+        text.push_str(&format!(
+            "\nOmitted at the 1000-token limit: {}.",
+            parts.join(" and ")
+        ));
+        if omitted_dirs > 0 {
+            // The tree lists every directory down to the level this map groups by.
+            let next_path = scope.map(|p| format!("path=\"{p}\", ")).unwrap_or_default();
+            text.push_str(&format!(
+                " get_repo_map(detail=\"tree\", {next_path}depth={depth}) lists every directory to that level."
+            ));
+        }
+    }
 
     text
 }
@@ -821,7 +904,9 @@ pub(crate) fn outline_text_for_generation_with(
     if include_section("outline") {
         let symbol_cap = params
             .max_tokens
-            .map(|tokens| ((tokens as usize).saturating_div(12)).clamp(25, 500));
+            // ponytail: no upper clamp (it was 500): a caller who budgets for the whole outline
+            // gets it, which is what the continuation of a cut context relies on.
+            .map(|tokens| ((tokens as usize).saturating_div(12)).max(25));
         // The cap counts production symbols only: children of a test module
         // are not charged to it (the caller collapses them unless
         // include_tests=true), so a test module can never use up the budget
@@ -1016,8 +1101,8 @@ pub(crate) fn outline_text_for_generation_with(
     }
 
     // Apply budget enforcement.
-    // `Some(n)` is used by `get_file_context` (which always resolves a concrete
-    // token budget via `resolve_read_max_tokens`) and by explicit `max_tokens` callers.
+    // `Some(n)` is an explicit caller `max_tokens`; `get_file_context` passes one only when
+    // the caller gave it (no budget is derived from the input size since feature 036).
     // `None if include_savings_footer` is the compact sidecar hook default (200 * 4 bytes).
     // `None` (when `include_savings_footer` is false) is unbudgeted (0) for direct
     // projection callers that omit `max_tokens`.

@@ -222,16 +222,17 @@ fn what_changed_report(
         )
         .map_err(|_| QueryRefusalKind::UnsupportedOption)
     };
-    let envelope = |match_type: &str, parse_state: &str, total: usize, filtered: &[String]| {
-        search_envelope::format_search_envelope(
-            match_type,
-            shared::what_changed_source_authority(mode, &snapshot.generation.freshness),
-            parse_state,
-            &shared::changed_paths_completeness_label(total, filtered.len()),
-            &shared::what_changed_scope_summary(options, mode),
-            &shared::search_paths_evidence(filtered.iter().map(String::as_str)),
-        )
-    };
+    let envelope =
+        |match_type: &str, parse_state: &str, total: usize, listed: usize, filtered: &[String]| {
+            search_envelope::format_search_envelope(
+                match_type,
+                shared::what_changed_source_authority(mode, &snapshot.generation.freshness),
+                parse_state,
+                &shared::changed_paths_completeness_label(total, listed),
+                &shared::what_changed_scope_summary(options, mode),
+                &shared::search_paths_evidence(filtered.iter().map(String::as_str)),
+            )
+        };
     let message = |total_paths: usize, rendered: String| WhatChangedReport {
         mode: change_mode.clone(),
         paths: Vec::new(),
@@ -326,7 +327,20 @@ fn what_changed_report(
                 ),
             };
             let paths = paths.map_err(|_| QueryRefusalKind::GitUnavailable)?;
-            let total_paths = paths.len();
+            // Counted and listed as git status does: an untracked directory is one
+            // entry (FR-031). A ref diff has no untracked directories.
+            let untracked_dirs = if matches!(mode, WhatChangedMode::GitRef(_)) {
+                Vec::new()
+            } else {
+                repo.untracked_dir_roots()
+            };
+            // Total and listing use the same rule (same prefix): shown is a subset of total.
+            let total_paths = crate::git::collapse_into_untracked_dirs(
+                &paths,
+                &untracked_dirs,
+                options.path_prefix,
+            )
+            .len();
             let filtered = filter(paths, code_only)?;
             if filtered.is_empty() {
                 let rendered = match mode {
@@ -351,13 +365,19 @@ fn what_changed_report(
                 };
                 return Ok(message(total_paths, rendered));
             }
+            let listed = crate::git::collapse_into_untracked_dirs(
+                &filtered,
+                &untracked_dirs,
+                options.path_prefix,
+            );
             let envelope = envelope(
                 match_type,
                 shared::what_changed_parse_state_label(mode, include_symbol_diff),
                 total_paths,
+                listed.len(),
                 &filtered,
             );
-            let mut output = shared::what_changed_paths_result(&filtered, &empty);
+            let mut output = shared::what_changed_paths_result(&listed, &empty);
             let mut symbol_diff_commits = None;
             let base_tree_oid = resolved_ref.map(|resolved| resolved.tree_oid.to_string());
             let base_commit = resolved_ref
