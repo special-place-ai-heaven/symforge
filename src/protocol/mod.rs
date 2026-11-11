@@ -2203,10 +2203,29 @@ impl ServerHandler for SymForgeServer {
     /// serve path dispatch through the same `ServerHandler::call_tool`.
     async fn call_tool(
         &self,
-        request: rmcp::model::CallToolRequestParams,
+        mut request: rmcp::model::CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         surface_probe::enforce_compact_surface(request.name.as_ref())?;
+        // Feature 036 (FR-001/FR-002): an argument the tool does not define, or one
+        // outside its mode, refuses the call here, BEFORE the repeat tracker observes it,
+        // so a refused call can never count toward the repeat notice. A mode that a lone
+        // argument selects is written into the arguments for the handler.
+        let selected_modes =
+            match self.refuse_invalid_arguments(request.name.as_ref(), &mut request.arguments) {
+                Ok(selected) => selected,
+                Err(mut refusal) => {
+                    // Like every other result, a refusal names the project it was judged for.
+                    let evidence = self
+                        .initial_project_evidence_for_call(request.arguments.as_ref())
+                        .await;
+                    result_status::with_project_evidence_scope(evidence, async {
+                        result_status::attach_project_evidence_meta(&mut refusal.meta);
+                    })
+                    .await;
+                    return Ok(rmcp::model::CallToolResponse::Complete(refusal));
+                }
+            };
         // The admitted A-019 relay deliberately returns exact legacy renderer
         // bytes with no semantic result status. Record that fact from the typed
         // request before the router consumes it: the central plain-String
@@ -2341,6 +2360,11 @@ impl ServerHandler for SymForgeServer {
                                     });
                             }
                         }
+                        // Feature 036: a mode the server chose for the caller is named in
+                        // the answer. After the error classification above (the note
+                        // must not reach `is_error_output`), before the repeat tracker
+                        // reads the body.
+                        tool_contract::append_selection_note(&mut result, &selected_modes);
                         // Feature 032 (US1): AFTER evidence attachment (the
                         // tracker reads the evidence this response actually
                         // carries) and AFTER the error reclassification (the

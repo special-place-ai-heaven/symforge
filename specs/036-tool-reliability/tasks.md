@@ -46,7 +46,7 @@ Rules for every slice:
 - [ ] T018 [US3] Read `vendor/rmcp/src/handler/server/wrapper/parameters.rs` and wire the server lane to `decode_strict` through a SymForge parameter wrapper used in handler signatures (preferred) or a recorded vendor patch (`vendor/rmcp/SYMFORGE-PATCH.md`); the refusal is produced before `RepeatKey::observe` (`src/protocol/mod.rs:2243`) and lists valid arguments from `self.tool_router.get(..)`.
 - [ ] T019 [US3] Use `decode_strict` in the daemon lane's `decode_params` (`src/daemon.rs:7588`), after its internal alias translation.
 - [ ] T020 [US3] Implement the mode-condition check from the contract table (select the mode or refuse naming it) and bring the doc comments at `src/protocol/read_tools.rs:162, 279, 281, 284, 361` and `src/protocol/tools.rs:416` in line with the code; add a test that compares the doc phrases with the table.
-- [ ] T021 [US3] Align the embed lane's unknown-field refusal text with the server lane (`src/embed/parity/*.rs`) and pin it in `tests/embed_parity.rs`.
+- [ ] T021 [US3] Not applicable as written (found 2026-11-11): the embed lane refuses unknown fields with a typed `HostRefusal { InvalidRequest }` that carries no text, and caller arguments never reach it as free-form maps, so there is no refusal text to align. Giving embed hosts the names of the refused keys needs a wire change and is left to the outcome slice (A5).
 - [ ] T022 [US3] Check this repository's own callers send no ignored arguments: hook scripts, `npm/`, `scripts/verify-tools.cjs` cases, `src/cli/init.rs` templates. Fix any that do.
 - [ ] T023 [US3] Gates, tools/list byte budgets, independent review with cfg sweep, commit, push, PR. The PR body states the behaviour change for clients that send unknown arguments.
 

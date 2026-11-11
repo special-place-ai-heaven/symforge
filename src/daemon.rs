@@ -5712,6 +5712,24 @@ async fn call_tool_handler(
             ));
         }
     };
+    // Feature 036: the daemon route is independently callable, so it applies the same mode
+    // rules as the front end (a lone argument selects its mode; an argument outside its
+    // mode is refused naming it). Unknown keys are refused by `decode_params`.
+    //
+    // The rows belong to the registered tool, so a backward-compat alias is judged under the
+    // name it translates to. The daemon adds no "Mode:" note: the front end has already
+    // applied any selection (and written the mode into the arguments it forwards), so the
+    // daemon sees no selection to report, and a direct caller of this route reads plain text.
+    let judged_as = match tool_name.as_str() {
+        "detect_changes" => "detect_impact",
+        "trace_symbol" => "get_symbol_context",
+        other => other,
+    };
+    if let serde_json::Value::Object(object) = &mut params
+        && let Err(text) = crate::protocol::tool_contract::apply_conditions(judged_as, object)
+    {
+        return Err(bad_request(anyhow::anyhow!(text)));
+    }
     if tool_name == "index_folder" {
         if params
             .as_object()
@@ -5724,7 +5742,8 @@ async fn call_tool_handler(
                     .into_response(),
             ));
         }
-        let input = decode_params::<IndexFolderInput>(params).map_err(bad_request)?;
+        let input = decode_params::<IndexFolderInput>(params)
+            .map_err(|e| bad_request(name_unknown_arguments(&tool_name, e)))?;
         let state_for_index = state.clone();
         let session_id_owned = session_id.clone();
         return state
@@ -5747,7 +5766,8 @@ async fn call_tool_handler(
     // repository observation. The protocol front-end performs the same guard,
     // but the daemon HTTP route is independently callable and must fail closed.
     if tool_name == "curate_knowledge" {
-        let input = decode_params::<CurateKnowledgeInput>(params.clone()).map_err(bad_request)?;
+        let input = decode_params::<CurateKnowledgeInput>(params.clone())
+            .map_err(|e| bad_request(name_unknown_arguments(&tool_name, e)))?;
         if let Err(message) = crate::protocol::knowledge_curation::validate_input(&input) {
             return Ok(message.into_response());
         }
@@ -5798,16 +5818,16 @@ async fn call_tool_handler(
     if cross_project_selector_tool {
         let (project, projects) = match tool_name.as_str() {
             "search_knowledge" => {
-                let input =
-                    decode_params::<SearchKnowledgeInput>(params.clone()).map_err(bad_request)?;
+                let input = decode_params::<SearchKnowledgeInput>(params.clone())
+                    .map_err(|e| bad_request(name_unknown_arguments(&tool_name, e)))?;
                 if let Err(message) = crate::protocol::knowledge_search::validate_input(&input) {
                     return Ok(message.into_response());
                 }
                 (raw_project.clone(), raw_projects.clone())
             }
             "review_knowledge" => {
-                let input =
-                    decode_params::<ReviewKnowledgeInput>(params.clone()).map_err(bad_request)?;
+                let input = decode_params::<ReviewKnowledgeInput>(params.clone())
+                    .map_err(|e| bad_request(name_unknown_arguments(&tool_name, e)))?;
                 if let Err(message) = crate::protocol::knowledge_review::validate_input(&input) {
                     return Ok(message.into_response());
                 }
@@ -7342,6 +7362,58 @@ fn strip_cross_project_targeting(mut params: serde_json::Value) -> serde_json::V
 async fn execute_tool_call(
     runtime: SessionRuntime,
     tool_name: &str,
+    params: serde_json::Value,
+) -> anyhow::Result<String> {
+    execute_tool_call_decoded(runtime, tool_name, params)
+        .await
+        .map_err(|error| name_unknown_arguments(tool_name, error))
+}
+
+/// An `UnknownArguments` error from `decode_params`, worded as the front end words it:
+/// the tool, the keys, the valid arguments. Any other error passes through.
+fn name_unknown_arguments(tool_name: &str, error: anyhow::Error) -> anyhow::Error {
+    match error.downcast::<crate::protocol::tool_contract::UnknownArguments>() {
+        Ok(unknown) => anyhow::anyhow!(crate::protocol::tool_contract::unknown_arguments_refusal(
+            tool_name,
+            &unknown.0,
+            &valid_argument_names_for(tool_name)
+        )),
+        Err(other) => other,
+    }
+}
+
+/// The arguments `tool_name` accepts, for a refusal. The backward-compat aliases are not
+/// registered tools: `detect_changes` decodes as `detect_impact`, and `trace_symbol` has
+/// its own input struct.
+fn valid_argument_names_for(tool_name: &str) -> Vec<String> {
+    let keys = |schema: &serde_json::Map<String, serde_json::Value>| {
+        schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .map(|p| p.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    if tool_name == "trace_symbol" {
+        return serde_json::to_value(schemars::schema_for!(TraceSymbolInput))
+            .ok()
+            .and_then(|v| v.as_object().map(keys))
+            .unwrap_or_default();
+    }
+    let registered = if tool_name == "detect_changes" {
+        "detect_impact"
+    } else {
+        tool_name
+    };
+    SymForgeServer::tool_definitions()
+        .into_iter()
+        .find(|tool| tool.name == registered)
+        .map(|tool| keys(&tool.input_schema))
+        .unwrap_or_default()
+}
+
+async fn execute_tool_call_decoded(
+    runtime: SessionRuntime,
+    tool_name: &str,
     mut params: serde_json::Value,
 ) -> anyhow::Result<String> {
     runtime.token_stats.record_tool_call(tool_name);
@@ -7585,11 +7657,22 @@ fn sidecar_state_for_runtime(runtime: &SessionRuntime) -> SidecarState {
     }
 }
 
+/// Decode a tool's parameters, refusing keys the tool's argument struct does not consume
+/// (feature 036, FR-001). Runs after the alias translation in `execute_tool_call`, on the
+/// struct each alias decodes into. An unknown key surfaces as `UnknownArguments`, which
+/// `execute_tool_call` words with the tool name.
 fn decode_params<T>(params: serde_json::Value) -> anyhow::Result<T>
 where
     T: serde::de::DeserializeOwned,
 {
-    serde_json::from_value(params).context("invalid tool parameters")
+    use crate::protocol::tool_contract::{StrictError, decode_strict};
+    match decode_strict(params) {
+        Ok(decoded) => Ok(decoded),
+        Err(StrictError::Unknown(unknown)) => Err(anyhow::Error::new(unknown)),
+        Err(StrictError::Decode(error)) => {
+            Err(anyhow::Error::new(error).context("invalid tool parameters"))
+        }
+    }
 }
 
 fn bad_request(error: anyhow::Error) -> (axum::http::StatusCode, String) {
@@ -16698,6 +16781,40 @@ mod tests {
         .await;
     }
 
+    #[test]
+    fn unknown_arguments_are_worded_with_the_tool_name_on_the_daemon_lane() {
+        let refused = decode_params::<SearchSymbolsInput>(serde_json::json!({
+            "query": "x", "zz_unknown": 1
+        }))
+        .err()
+        .expect("an unknown key is refused");
+        let text = name_unknown_arguments("search_symbols", refused).to_string();
+        assert!(
+            text.starts_with(
+                "invalid_request: search_symbols does not accept \"zz_unknown\". Valid arguments:"
+            ),
+            "{text}"
+        );
+        // The backward-compat alias is worded with its own name and the arguments it accepts.
+        let refused = decode_params::<DetectImpactInput>(serde_json::json!({ "zz": 1 }))
+            .err()
+            .expect("an unknown key is refused");
+        let text = name_unknown_arguments("detect_changes", refused).to_string();
+        assert!(
+            text.contains("detect_changes does not accept \"zz\"") && text.contains("base_branch"),
+            "{text}"
+        );
+        // The accepting control, and a failure that is not an unknown key passes through.
+        assert!(decode_params::<SearchSymbolsInput>(serde_json::json!({ "query": "x" })).is_ok());
+        let other = decode_params::<SearchSymbolsInput>(serde_json::json!({ "query": 5 }))
+            .err()
+            .expect("a mistyped value is refused");
+        assert!(
+            name_unknown_arguments("search_symbols", other)
+                .to_string()
+                .contains("invalid tool parameters")
+        );
+    }
     #[tokio::test]
     async fn test_tool_receipt_carries_project_evidence() {
         let _env_lock = env_lock().await;

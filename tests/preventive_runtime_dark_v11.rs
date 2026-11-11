@@ -1331,10 +1331,14 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Refreshed for feature 036 slice A1 (output budgets, repo-map scope, all-words symbol
 // search, documentation zero-hit note, porcelain path count): new functions and one
 // inherent impl on an in-set type, no bridge, registration or re-export. 315 files.
+// Refreshed for feature 036 slice A2 (request contract): `decode_strict`, the per-tool
+// decoder table and `apply_conditions` in `protocol/tool_contract.rs`, called from
+// `call_tool` and the daemon's `decode_params`; visitor-based `SingleEdit`/`InsertTarget`
+// deserializers; `deny_unknown_fields` on three types. No bridge. 315 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "c53d0a0e2287834034ab3afbb177552e0c24591273fee80eddb5120fe87d7ea0",
+    "d757767315249544c38c7752ad999afee116eadac2b4f87e93ec5eac9bbe13fc",
     315,
-    12602790,
+    12652940,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

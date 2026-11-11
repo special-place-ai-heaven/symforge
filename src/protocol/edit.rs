@@ -620,33 +620,53 @@ impl<'de> serde::Deserialize<'de> for SingleEdit {
     {
         use serde::de::Error;
 
+        // Not an untagged enum: untagged buffers the object, which hides the keys it
+        // does not consume from `serde_ignored` (the strict request check, feature 036).
+        // The visitor hands the map straight to the derived struct instead.
         #[derive(serde::Deserialize)]
-        #[serde(untagged)]
+        struct EditFields {
+            path: String,
+            #[serde(alias = "symbol")]
+            name: String,
+            #[serde(default)]
+            kind: Option<String>,
+            #[serde(default, deserialize_with = "super::tools::lenient_u32")]
+            symbol_line: Option<u32>,
+            operation: EditOperation,
+            #[serde(default)]
+            working_directory: Option<String>,
+        }
         enum EditOrStr {
-            Struct {
-                path: String,
-                #[serde(alias = "symbol")]
-                name: String,
-                #[serde(default)]
-                kind: Option<String>,
-                #[serde(default, deserialize_with = "super::tools::lenient_u32")]
-                symbol_line: Option<u32>,
-                operation: EditOperation,
-                #[serde(default)]
-                working_directory: Option<String>,
-            },
+            Struct(EditFields),
             Str(String),
         }
+        struct EditVisitor;
+        impl<'de> serde::de::Visitor<'de> for EditVisitor {
+            type Value = EditOrStr;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a SingleEdit object or a string")
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<EditOrStr, E> {
+                Ok(EditOrStr::Str(s.to_owned()))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<EditOrStr, A::Error> {
+                EditFields::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(EditOrStr::Struct)
+            }
+        }
 
-        match EditOrStr::deserialize(deserializer)? {
-            EditOrStr::Struct {
+        match deserializer.deserialize_any(EditVisitor)? {
+            EditOrStr::Struct(EditFields {
                 path,
                 name,
                 kind,
                 symbol_line,
                 operation,
                 working_directory,
-            } => Ok(SingleEdit {
+            }) => Ok(SingleEdit {
                 path,
                 name,
                 kind,
@@ -659,6 +679,9 @@ impl<'de> serde::Deserialize<'de> for SingleEdit {
                 if let Ok(edit) = serde_json::from_str::<serde_json::Value>(&s)
                     && edit.is_object()
                 {
+                    // The strict request check must see keys this object carries that
+                    // `EditFields` does not consume; the extraction below is lenient.
+                    super::tool_contract::note_keys_of::<EditFields>(&edit);
                     // Re-deserialize with the struct variant logic
                     // We need manual extraction since we can't recurse
                     let path = edit
@@ -717,8 +740,10 @@ impl<'de> serde::Deserialize<'de> for SingleEdit {
     }
 }
 
+// `deny_unknown_fields`: an internally tagged enum buffers its fields, which hides a stray
+// key from `serde_ignored`; the unknown-field error is what refuses it (feature 036).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum EditOperation {
     /// Replace the entire symbol definition.
     #[serde(rename = "replace")]
@@ -1537,30 +1562,48 @@ impl<'de> serde::Deserialize<'de> for InsertTarget {
     {
         use serde::de::Error;
 
+        // Visitor, not an untagged enum: see `SingleEdit`'s deserializer.
         #[derive(serde::Deserialize)]
-        #[serde(untagged)]
+        struct TargetFields {
+            path: String,
+            #[serde(alias = "symbol")]
+            name: String,
+            kind: Option<String>,
+            #[serde(default, deserialize_with = "super::tools::lenient_u32")]
+            symbol_line: Option<u32>,
+            #[serde(default)]
+            working_directory: Option<String>,
+        }
         enum TargetOrStr {
-            Struct {
-                path: String,
-                #[serde(alias = "symbol")]
-                name: String,
-                kind: Option<String>,
-                #[serde(default, deserialize_with = "super::tools::lenient_u32")]
-                symbol_line: Option<u32>,
-                #[serde(default)]
-                working_directory: Option<String>,
-            },
+            Struct(TargetFields),
             Str(String),
         }
+        struct TargetVisitor;
+        impl<'de> serde::de::Visitor<'de> for TargetVisitor {
+            type Value = TargetOrStr;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an InsertTarget object or a string")
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<TargetOrStr, E> {
+                Ok(TargetOrStr::Str(s.to_owned()))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<TargetOrStr, A::Error> {
+                TargetFields::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(TargetOrStr::Struct)
+            }
+        }
 
-        match TargetOrStr::deserialize(deserializer)? {
-            TargetOrStr::Struct {
+        match deserializer.deserialize_any(TargetVisitor)? {
+            TargetOrStr::Struct(TargetFields {
                 path,
                 name,
                 kind,
                 symbol_line,
                 working_directory,
-            } => Ok(InsertTarget {
+            }) => Ok(InsertTarget {
                 path,
                 name,
                 kind,
