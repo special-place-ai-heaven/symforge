@@ -1,0 +1,93 @@
+===== full
+protocol 2025-06-18 server {'name': 'symforge', 'version': '11.11.0'} instructions bytes 0 init result bytes 141 caps ['prompts', 'resources', 'tools']
+tools 40 result bytes 69295 ~tokens 17323 keys ['ttlMs', 'cacheScope', 'tools']
+sum desc 6464 sum schema 57459 sum other 3064
+top12
+('search_text', 4622, 169, 4341, 59)
+('curate_knowledge', 3713, 150, 3400, 105)
+('get_file_content', 3549, 157, 3275, 59)
+('search_files', 3366, 150, 3103, 59)
+('batch_edit', 3064, 173, 2733, 106)
+('find_references', 2926, 196, 2614, 59)
+('get_symbol', 2911, 191, 2609, 59)
+('get_symbol_context', 2576, 151, 2306, 59)
+('search_symbols', 2487, 175, 2197, 59)
+('edit_within_symbol', 2396, 172, 2057, 107)
+('batch_insert', 2247, 145, 1941, 107)
+('replace_symbol_body', 2170, 158, 1845, 106)
+bottom5
+('validate_file_syntax', 548, 163, 264, 59)
+('symforge_retrieve', 407, 153, 136, 59)
+('health_compact', 307, 159, 33, 59)
+('context_inventory', 299, 148, 33, 59)
+('conventions', 292, 147, 33, 59)
+resources/list 1251 
+resources/templates/list 1127 
+prompts/list 1926 
+res+tmpl+prompts total 4304
+schema json bytes 57522
+$defs count/bytes 9 7926
+type-null unions 244 5988
+anyOf null 251
+"format":"uint32" 48 816
+"format":"uint" 0 0
+"format":"int32" 0 0
+"format":"uint64" 17 289
+"format":"int64" 1 16
+"minimum":0 66 726
+"format":"double" 0 0
+"format":"float" 0 0
+"format":"uint8" 1 16
+"format":"uint16" 0 0
+"default":null 0 0
+"additionalProperties":false 11 308
+"$schema" 0 0
+"title" 0 0
+param desc count 316 bytes 30610
+by param name top10 [('project', 3905), ('working_directory', 1620), ('path', 928), ('estimate', 923), ('projects', 833), ('idempotency_key', 782), ('limit', 723), ('symbol_line', 672), ('max_tokens', 621), ('query', 614)]
+repeated desc (text,count,total bytes) [('Optional open-project ID or unique name (daemon). Omit for the active\nproject; l', 15, 1980), ('Optional open-project ID or unique name (daemon). Omit for the active\nproject. E', 7, 1400), ('When true, estimate token cost instead of returning content.', 12, 720), ('Optional replay guard for committed mutations. Dry runs do not reserve or replay', 7, 567), ("Caller's working directory (absolute path). Consumed by the\n`worktree-awareness`", 3, 441), ('Feature 012 (Phase 3): target an EXPLICIT subset of open projects by\nid/alias, o', 2, 376), ('Source scopes advertised by `search_knowledge` and `review_knowledge`\n(Gate L): ', 2, 338), ('Optional canonical language name such as `Rust`, `TypeScript`, `C#`, or `C++`.', 4, 312)] total dup bytes 6614
+project/projects params 31 desc bytes 4738
+longest param descs [('search_files/properties/rank_by', 478), ('index_folder/properties/add', 437), ('replace_symbol_body/properties/if_match', 412), ('get_symbol_context/properties/verbosity', 318), ('get_file_content/properties/offset', 260)]
+project(s) property entries 34 bytes incl key 6670
+pretty-printed tools/list bytes 111642
+===== compact
+protocol 2025-06-18 server {'name': 'symforge', 'version': '11.11.0'} instructions bytes 0 init result bytes 141 caps ['prompts', 'resources', 'tools']
+tools 3 result bytes 4630 ~tokens 1157 keys ['ttlMs', 'cacheScope', 'tools']
+sum desc 197 sum schema 4167 sum other 63
+top12
+('symforge', 1963, 83, 1771, 59)
+('symforge_edit', 1566, 69, 1441, 2)
+('status', 1049, 45, 955, 2)
+bottom5
+('symforge', 1963, 83, 1771, 59)
+('symforge_edit', 1566, 69, 1441, 2)
+('status', 1049, 45, 955, 2)
+resources/list 1251 
+resources/templates/list 1127 
+prompts/list 1926 
+res+tmpl+prompts total 4304
+schema json bytes 4184
+$defs count/bytes 3 835
+type-null unions 14 341
+anyOf null 18
+"format":"uint32" 1 17
+"format":"uint" 0 0
+"format":"int32" 0 0
+"format":"uint64" 0 0
+"format":"int64" 0 0
+"minimum":0 0 0
+"format":"double" 0 0
+"format":"float" 0 0
+"format":"uint8" 0 0
+"format":"uint16" 0 0
+"default":null 0 0
+"additionalProperties":false 0 0
+"$schema" 0 0
+"title" 3 21
+param desc count 16 bytes 2322
+by param name top10 [('project', 447), ('query', 367), ('status/$defs/StelStatusDetail/oneOf[1]', 241), ('reset_calibration', 238), ('projects', 210), ('body', 205), ('apply', 91), ('idempotency_key', 77), ('if_match', 76), ('symforge_edit/$defs/StelEditIntent', 70)]
+repeated desc (text,count,total bytes) [] total dup bytes 0
+project/projects params 2 desc bytes 657
+longest param descs [('symforge/properties/project', 447), ('symforge/properties/query', 367), ('status/$defs/StelStatusDetail/oneOf[1]', 241), ('status/properties/reset_calibration', 238), ('symforge/properties/projects', 210)]
+project(s) property entries 2 bytes incl key 791
+pretty-printed tools/list bytes 7761
