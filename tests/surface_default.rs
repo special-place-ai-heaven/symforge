@@ -232,3 +232,66 @@ async fn full_surface_advertises_exactly_40_tools() {
         "full surface must be the registered router minus only the `symforge` facade"
     );
 }
+
+// ---- SF-TE-05: opt-in core profile (`SYMFORGE_SURFACE=core`) ----
+
+fn core_names() -> BTreeSet<String> {
+    symforge::stel::CORE_TOOL_NAMES
+        .iter()
+        .map(|n| n.to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn surface_core_resolves_core_and_advertises_core_tools() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("CORE");
+    let profile = surface_profile_from_env();
+    assert_eq!(profile, SurfaceProfile::Core);
+    assert_eq!(advertised_names(profile), core_names());
+}
+
+#[tokio::test]
+async fn unknown_surface_value_resolves_full() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("everything");
+    assert_eq!(surface_profile_from_env(), SurfaceProfile::Full);
+}
+
+/// Every core name is a registered tool, and core is a strict subset of full.
+#[tokio::test]
+async fn core_tools_are_registered_and_a_subset_of_full() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let full = advertised_names(SurfaceProfile::Full);
+    let core = advertised_names(SurfaceProfile::Core);
+    assert_eq!(
+        core,
+        core_names(),
+        "every core name must be a registered tool"
+    );
+    assert!(core.is_subset(&full) && core.len() < full.len());
+}
+
+/// Listing only: on core every full-surface tool outside the core list passes
+/// the production dispatch gate. The compact `symforge` facade is not one of
+/// them: its own handler refuses it off compact (asserted over HTTP in
+/// `serve_http_attach.rs`).
+#[tokio::test]
+async fn core_still_dispatches_unlisted_tools() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("core");
+    assert_eq!(surface_profile_from_env(), SurfaceProfile::Core);
+
+    let core = advertised_names(SurfaceProfile::Core);
+    let unlisted: Vec<String> = advertised_names(SurfaceProfile::Full)
+        .difference(&core)
+        .cloned()
+        .collect();
+    assert!(unlisted.contains(&"detect_impact".to_string()));
+    for name in unlisted.iter().map(String::as_str) {
+        assert!(
+            enforce_compact_surface(name).is_ok(),
+            "core profile must not refuse unlisted tool `{name}`"
+        );
+    }
+}

@@ -476,7 +476,8 @@ fn session_stale_recovery() -> String {
              for the full tool surface"
                 .to_string()
         }
-        crate::protocol::surface_probe::SurfaceProfile::Full
+        crate::protocol::surface_probe::SurfaceProfile::Core
+        | crate::protocol::surface_probe::SurfaceProfile::Full
         | crate::protocol::surface_probe::SurfaceProfile::Meta => {
             "call index_folder to refresh repo_root".to_string()
         }

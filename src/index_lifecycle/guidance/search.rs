@@ -516,9 +516,8 @@ pub(crate) fn untracked_paths_not_in_index(
 pub(crate) fn untracked_file_diagnostic(paths: &[String]) -> Option<String> {
     let first = paths.first()?;
     Some(format!(
-        "untracked file may match: {} untracked path(s) are not indexed. To index the first match, call analyze_file_impact(\"{}\", new_file=true).",
+        "untracked file may match: {} untracked path(s) are not indexed. To index the first match, call analyze_file_impact(\"{first}\", new_file=true), or re-run index_folder.",
         paths.len(),
-        first
     ))
 }
 

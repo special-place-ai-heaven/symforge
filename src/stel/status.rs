@@ -405,6 +405,16 @@ fn format_compact_status(ctx: &StelStatusContext<'_>) -> String {
         format!("index_files: {}", ctx.index_files),
         "──".to_string(),
     ];
+    // SF-TE-05: on the core profile more tools exist than are listed.
+    // A static fact of the profile label, not a runtime observation.
+    if ctx.surface == "core" {
+        lines.insert(
+            2,
+            "more_tools: core profile lists a subset; the operator lists every tool with \
+             SYMFORGE_SURFACE=full"
+                .to_string(),
+        );
+    }
     if let Some(trust) = ctx.index_trust_qualifier() {
         let at = lines.len() - 2;
         lines.insert(at, format!("index_trust: {trust}"));
@@ -602,6 +612,25 @@ mod tests {
             !body.contains("── calibration (observational) ──"),
             "compact detail must not include calibration section"
         );
+    }
+
+    /// SF-TE-05: the core profile says that more tools exist and how they are
+    /// listed; other profiles do not print the line.
+    #[test]
+    fn core_status_names_the_full_surface_opt_in() {
+        let mut ctx = sample_context();
+        ctx.surface = "core";
+        let body = format_stel_status(&StelStatusRequest::default(), &ctx);
+        assert!(body.contains("surface: core"), "{body}");
+        assert!(
+            body.contains("more_tools:") && body.contains("SYMFORGE_SURFACE=full"),
+            "{body}"
+        );
+        for surface in ["full", "compact"] {
+            ctx.surface = surface;
+            let body = format_stel_status(&StelStatusRequest::default(), &ctx);
+            assert!(!body.contains("more_tools:"), "{surface}: {body}");
+        }
     }
 
     #[test]

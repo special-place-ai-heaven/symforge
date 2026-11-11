@@ -2,7 +2,7 @@
 //!
 //! Frozen hand-written schemas for A-005 / A-019 measurement artifacts. Production
 //! `SYMFORGE_SURFACE=compact` `tools/list` is served from [`crate::stel::compact_surface_tools`]
-//! (Phase 1 S3). This module remains for meta-1 A/B, full-surface listing, and byte
+//! (Phase 1 S3). This module remains for meta-1 A/B, core and full listing, and byte
 //! replay against pinned Phase 0 evidence.
 
 use std::borrow::Cow;
@@ -25,13 +25,15 @@ pub fn surface_profile_from_env() -> SurfaceProfile {
     // rejected the then-36-tool full `tools/list`; see docs/reviews). The current
     // full surface has 40 tools. `SYMFORGE_SURFACE=compact`
     // is the documented opt-in escape hatch (the compact-3 facade) for token-
-    // sensitive setups; `meta` keeps its explicit measurement meaning. Only this
-    // fallback arm changed — explicit `full`/`meta`/`compact` values are unchanged,
-    // and the D23 connection-surface task-local still takes precedence over env.
+    // sensitive setups; `core` (SF-TE-05) lists only `CORE_TOOL_NAMES` and
+    // refuses nothing; `meta` keeps its explicit measurement meaning. Unset and
+    // unrecognised values resolve to full, and the D23 connection-surface
+    // task-local still takes precedence over env.
     match std::env::var("SYMFORGE_SURFACE")
         .ok()
         .map(|v| v.to_ascii_lowercase())
     {
+        Some(ref s) if s == "core" => SurfaceProfile::Core,
         Some(ref s) if s == "compact" => SurfaceProfile::Compact,
         Some(ref s) if s == "meta" => SurfaceProfile::Meta,
         _ => SurfaceProfile::Full,
@@ -97,9 +99,9 @@ where
 /// is the pure decision used by the production `ServerHandler::call_tool` (shared
 /// by stdio and the HTTP `/mcp` path): on [`SurfaceProfile::Compact`], any tool
 /// name NOT in the advertised compact-3 set ([`crate::stel::surface::COMPACT_TOOL_NAMES`])
-/// is rejected. `Full` and `Meta` are never gated here — the server default is
-/// full, and `SYMFORGE_SURFACE=full` remains an explicit alias for the same
-/// profile.
+/// is rejected. `Core`, `Full` and `Meta` are never gated here: the server default
+/// is full, and the opt-in core profile only lists fewer tools, it does not
+/// refuse the unlisted ones.
 pub fn compact_surface_blocks(profile: SurfaceProfile, tool_name: &str) -> bool {
     profile == SurfaceProfile::Compact
         && !crate::stel::surface::COMPACT_TOOL_NAMES.contains(&tool_name)
@@ -132,10 +134,15 @@ pub const FULL_SURFACE_INSTRUCTIONS: &str = "SymForge indexes this repository. S
 /// Compact-surface routing hint. Names only the three compact tools.
 pub const COMPACT_SURFACE_INSTRUCTIONS: &str = "SymForge indexes this repository. Ask code questions (find, read, trace, impact) with symforge, edit a symbol with symforge_edit, and check index state with status. For exact literal match counts your own grep is fine.";
 
+/// Core-profile routing hint (opt-in profile). Names only core tools, and says in
+/// one sentence that more exist and how the operator lists them.
+pub const CORE_SURFACE_INSTRUCTIONS: &str = "SymForge indexes this repository. Start with search_symbols to find a function or type, get_symbol to read its body (pass targets[] to fetch several in one call), and find_references for callers and usages. Use search_text for code text. For exact literal match counts your own grep is fine. Read raw files with get_file_content only for docs, configs or exact bytes. The project/projects parameters select an open project by ID or alias, never a path. This is the core profile: tool text may name unlisted tools; the operator lists every tool with SYMFORGE_SURFACE=full.";
+
 /// Instructions for the surface this process serves. The meta probe is a
 /// measurement surface and gets none.
 pub fn server_instructions(profile: SurfaceProfile) -> Option<&'static str> {
     match profile {
+        SurfaceProfile::Core => Some(CORE_SURFACE_INSTRUCTIONS),
         SurfaceProfile::Full => Some(FULL_SURFACE_INSTRUCTIONS),
         SurfaceProfile::Compact => Some(COMPACT_SURFACE_INSTRUCTIONS),
         SurfaceProfile::Meta => None,
@@ -144,24 +151,82 @@ pub fn server_instructions(profile: SurfaceProfile) -> Option<&'static str> {
 
 pub fn list_tools_for_profile(profile: SurfaceProfile) -> Vec<Tool> {
     match profile {
-        SurfaceProfile::Full => SymForgeServer::tool_router()
-            .list_all()
-            .into_iter()
-            .filter(|tool| tool.name.as_ref() != "symforge")
-            .map(|mut tool| {
-                // The `#[tool]` macro builds these schemas via schemars, so they
-                // carry the same inert `$schema` / `"default": null` bytes the
-                // compact surface strips in `schema_object`.
-                let mut schema = (*tool.input_schema).clone();
-                crate::stel::surface_list::strip_schema_noise(&mut schema);
-                shorten_project_selector_text(&mut schema);
-                tool.input_schema = Arc::new(schema);
-                tool
-            })
-            .collect(),
+        SurfaceProfile::Full => slimmed_router_tools(|name| name != "symforge"),
+        SurfaceProfile::Core => {
+            slimmed_router_tools(|name| crate::stel::surface::CORE_TOOL_NAMES.contains(&name))
+                .into_iter()
+                .map(|mut tool| {
+                    if let Some((_, text)) = CORE_DESCRIPTIONS
+                        .iter()
+                        .find(|(name, _)| *name == tool.name)
+                    {
+                        tool.description = Some(Cow::Borrowed(text));
+                    }
+                    tool
+                })
+                .collect()
+        }
         SurfaceProfile::Compact => compact_probe_tools(),
         SurfaceProfile::Meta => meta_probe_tools(),
     }
+}
+
+/// Core-profile descriptions for the core tools whose full-surface text points
+/// at a tool core does not list. Same guidance minus those pointers; the
+/// full surface keeps the original text. A test keeps these free of
+/// off-core names.
+const CORE_DESCRIPTIONS: &[(&str, &str)] = &[
+    (
+        "get_symbol",
+        "Batch-read symbols: targets[] returns several symbols' source plus docs in one call (or name+path for one). Not callers (find_references) or raw files (get_file_content).",
+    ),
+    (
+        "search_symbols",
+        "Find functions/types by name (kind and path_prefix filters; omit query to browse). Not code text (search_text).",
+    ),
+    (
+        "index_folder",
+        "Open or refresh a directory and make it ACTIVE for this connection (add=true opens without switching).",
+    ),
+    (
+        "find_references",
+        "Sites/imports/types; best-effort direct caller/site ranges; may be incomplete. Same-name ambiguity: scope path/symbol_kind. mode=implementations: trait implementors.",
+    ),
+    (
+        "status",
+        "STEL trust envelope plus index state summary. Prefer at session start.",
+    ),
+    (
+        "replace_symbol_body",
+        "Replace a symbol's entire definition; the index resolves the range (no prior read). Not a small inner edit (edit_within_symbol).",
+    ),
+    (
+        "edit_within_symbol",
+        "Find-and-replace inside one symbol's byte range only (replace_all=true for every hit). Not a whole-definition rewrite (replace_symbol_body).",
+    ),
+    (
+        "batch_edit",
+        "Apply many symbol-addressed edits atomically across files (all resolve or none write); dry_run=true previews. Not a single-symbol edit (replace_symbol_body).",
+    ),
+];
+
+/// Registered router tools selected by `keep`, with list-time schema slimming.
+fn slimmed_router_tools(keep: impl Fn(&str) -> bool) -> Vec<Tool> {
+    SymForgeServer::tool_router()
+        .list_all()
+        .into_iter()
+        .filter(|tool| keep(tool.name.as_ref()))
+        .map(|mut tool| {
+            // The `#[tool]` macro builds these schemas via schemars, so they
+            // carry the same inert `$schema` / `"default": null` bytes the
+            // compact surface strips in `schema_object`.
+            let mut schema = (*tool.input_schema).clone();
+            crate::stel::surface_list::strip_schema_noise(&mut schema);
+            shorten_project_selector_text(&mut schema);
+            tool.input_schema = Arc::new(schema);
+            tool
+        })
+        .collect()
 }
 
 /// One-line text for the `project` selector; the full explanation lives in the
@@ -369,7 +434,7 @@ mod tests {
     #[test]
     fn full_surface_tools_list_under_byte_budget() {
         // Measured 69,631 B before list-time slimming, 63,106 B after (40 tools).
-        // The 30,000 B target needs the ~10-tool core default profile; this budget
+        // The 30,000 B target is met by the opt-in core profile; this budget
         // guards the full profile against regrowth. Lower it, never raise it
         // without a reviewed reason.
         const FULL_SURFACE_BUDGET_BYTES: usize = 63_500;
@@ -379,6 +444,63 @@ mod tests {
             bytes <= FULL_SURFACE_BUDGET_BYTES,
             "full tools/list JSON must be <= {FULL_SURFACE_BUDGET_BYTES} B; got {bytes} B"
         );
+    }
+
+    /// SF-TE-05: the opt-in core profile (`SYMFORGE_SURFACE=core`) stays under
+    /// 30,000 B. Same measurement as the full budget test.
+    #[test]
+    fn core_surface_tools_list_under_byte_budget() {
+        const CORE_SURFACE_BUDGET_BYTES: usize = 30_000;
+        let (count, bytes) = list_tools_schema_bytes(SurfaceProfile::Core);
+        eprintln!("core surface tools/list: {count} tools, {bytes} B");
+        assert_eq!(count, crate::stel::surface::CORE_TOOL_NAMES.len());
+        assert!(
+            bytes <= CORE_SURFACE_BUDGET_BYTES,
+            "core tools/list JSON must be <= {CORE_SURFACE_BUDGET_BYTES} B; got {bytes} B"
+        );
+    }
+
+    /// SF-TE-05: no core tool description sends the agent to a tool core does
+    /// not list. Parameter text is reported, not asserted.
+    #[test]
+    fn core_descriptions_name_no_unlisted_tool() {
+        let off_core: Vec<String> = list_tools_for_profile(SurfaceProfile::Full)
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .filter(|n| !crate::stel::surface::CORE_TOOL_NAMES.contains(&n.as_str()))
+            .collect();
+        let named_in = |text: &str| -> Vec<String> {
+            let words: Vec<&str> = text
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .collect();
+            off_core
+                .iter()
+                .filter(|n| words.contains(&n.as_str()))
+                .cloned()
+                .collect()
+        };
+        for (name, _) in CORE_DESCRIPTIONS {
+            assert!(
+                crate::stel::surface::CORE_TOOL_NAMES.contains(name),
+                "{name}"
+            );
+        }
+        for tool in list_tools_for_profile(SurfaceProfile::Core) {
+            let named = named_in(tool.description.as_deref().unwrap_or_default());
+            assert!(
+                named.is_empty(),
+                "core `{}` description names {named:?}",
+                tool.name
+            );
+            let schema = serde_json::to_string(tool.input_schema.as_ref()).unwrap();
+            let named = named_in(&schema);
+            if !named.is_empty() {
+                eprintln!(
+                    "core `{}` parameter text names off-core {named:?}",
+                    tool.name
+                );
+            }
+        }
     }
 
     /// SF-TE-05: list-time slimming rewrites only what is ADVERTISED. Every tool
@@ -450,15 +572,22 @@ mod tests {
             )
         );
         assert_eq!(server_instructions(SurfaceProfile::Meta), None);
+        assert_eq!(
+            server_instructions(SurfaceProfile::Core),
+            Some(CORE_SURFACE_INSTRUCTIONS)
+        );
+        assert!(CORE_SURFACE_INSTRUCTIONS.contains("SYMFORGE_SURFACE=full"));
 
         let names = |tools: Vec<Tool>| -> Vec<String> {
             tools.into_iter().map(|t| t.name.to_string()).collect()
         };
         let full = names(list_tools_for_profile(SurfaceProfile::Full));
+        let core = names(list_tools_for_profile(SurfaceProfile::Core));
         let compact = names(crate::stel::compact_surface_tools());
         let every: Vec<&String> = full.iter().chain(compact.iter()).collect();
         for (profile, served) in [
             (SurfaceProfile::Full, &full),
+            (SurfaceProfile::Core, &core),
             (SurfaceProfile::Compact, &compact),
         ] {
             let text = server_instructions(profile).unwrap();

@@ -5211,7 +5211,8 @@ impl SymForgeServer {
                 crate::protocol::surface_probe::SurfaceProfile::Compact => {
                     "set SYMFORGE_WORKSPACE_ROOT (or run `symforge init`) and reconnect"
                 }
-                crate::protocol::surface_probe::SurfaceProfile::Full
+                crate::protocol::surface_probe::SurfaceProfile::Core
+                | crate::protocol::surface_probe::SurfaceProfile::Full
                 | crate::protocol::surface_probe::SurfaceProfile::Meta => {
                     "call index_folder(path=...)"
                 }
@@ -7069,13 +7070,14 @@ impl SymForgeServer {
         // deliberately NOT advertised on the full surface (surface_probe.rs filters
         // it out of `tools/list`), and the A-019 golden-replay harness special-
         // cases THIS exact string as the "compact surface was not selected" signal
-        // (stel/golden_replay.rs). On full, the caller has the 32 legacy tools the
-        // facade fuses — the message names that path.
+        // (stel/golden_replay.rs), so keep that prefix. On core and full the
+        // caller has the legacy tools the facade fuses; the message names core
+        // tools, which both profiles list.
         if super::surface_probe::surface_profile_from_env()
             != super::surface_probe::SurfaceProfile::Compact
         {
             return Ok(ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
-                "symforge STEL handler requires SYMFORGE_SURFACE=compact; use legacy tools on the full surface",
+                "symforge STEL handler requires SYMFORGE_SURFACE=compact; on this surface call the listed tools (search_symbols, get_symbol, find_references, search_text) directly",
             ));
         }
 
@@ -14626,7 +14628,7 @@ mod tests {
             .await;
         assert!(
             rendered.ends_with(
-                "untracked file may match: 1 untracked path(s) are not indexed. To index the first match, call analyze_file_impact(\"src/late_0.rs\", new_file=true)."
+                "untracked file may match: 1 untracked path(s) are not indexed. To index the first match, call analyze_file_impact(\"src/late_0.rs\", new_file=true), or re-run index_folder."
             ),
             "{rendered}"
         );
@@ -19506,7 +19508,8 @@ mod tests {
                 !result.contains("index_folder"),
                 "compact guidance must not name the gated index_folder tool: {result}"
             ),
-            crate::protocol::surface_probe::SurfaceProfile::Full
+            crate::protocol::surface_probe::SurfaceProfile::Core
+            | crate::protocol::surface_probe::SurfaceProfile::Full
             | crate::protocol::surface_probe::SurfaceProfile::Meta => assert!(
                 result.contains("call index_folder(path=...)"),
                 "full/meta guidance may name index_folder: {result}"

@@ -199,6 +199,73 @@ async fn tools_list_over_http_advertises_active_surface() {
     server.shutdown().await;
 }
 
+/// SF-TE-05 end to end over HTTP: with `SYMFORGE_SURFACE=core` the core
+/// profile lists only the core tools, yet a tool it does not list is still
+/// dispatched (no compact-style refusal).
+#[tokio::test]
+async fn core_over_http_lists_core_and_still_calls_unlisted_tool() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("core");
+    let server = start_server(test_runtime()).await;
+
+    let listed = mcp_call(
+        &server.mcp_url(),
+        jsonrpc(1, "tools/list", serde_json::json!({})),
+    )
+    .await;
+    let names: std::collections::BTreeSet<String> = listed["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect();
+    let core: std::collections::BTreeSet<String> = symforge::stel::CORE_TOOL_NAMES
+        .iter()
+        .map(|n| n.to_string())
+        .collect();
+    assert_eq!(names, core);
+    assert!(!names.contains("health_compact"));
+
+    let called = mcp_call(
+        &server.mcp_url(),
+        jsonrpc(
+            2,
+            "tools/call",
+            serde_json::json!({"name": "health_compact", "arguments": {}}),
+        ),
+    )
+    .await;
+    assert!(
+        called.get("error").is_none(),
+        "unlisted tool must not be refused on core: {called}"
+    );
+    assert!(
+        called["result"]["content"][0]["text"].is_string(),
+        "unlisted tool must return a result: {called}"
+    );
+
+    // The compact facade is the exception: its handler refuses it off compact.
+    let facade = mcp_call(
+        &server.mcp_url(),
+        jsonrpc(
+            3,
+            "tools/call",
+            serde_json::json!({"name": "symforge", "arguments": {"query": "find main"}}),
+        ),
+    )
+    .await;
+    assert_eq!(facade["result"]["isError"], true, "{facade}");
+    let text = facade["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("requires SYMFORGE_SURFACE=compact") && text.contains("search_symbols"),
+        "{facade}"
+    );
+
+    server.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // T018: tools/call parity (HTTP result == in-process dispatch result)
 // ---------------------------------------------------------------------------

@@ -30,7 +30,7 @@
     },
     {
       "outcome": "invalid_request",
-      "rendered": "── stel · find → search_symbols (inferred) · reject · ~104 tok served (est.) ──\n\nStep 1: Route confidence: inferred\nChosen tool: search_symbols\nInvocation: {\"query\":\"locate symbol target\"}\nRationale: symbol locate phrasing\nEconomics: reject (multi-hop chain failed at step 1 tool=search_symbols outcome=empty_result)\n\nNo symbols matching 'locate symbol target'. Try: search_text(query=\"locate symbol target\") for text matches, or explore(query=\"locate symbol target\") for concept-based discovery.\nproject_root: {root}",
+      "rendered": "── stel · find → search_symbols (inferred) · reject · ~87 tok served (est.) ──\n\nStep 1: Route confidence: inferred\nChosen tool: search_symbols\nInvocation: {\"query\":\"locate symbol target\"}\nRationale: symbol locate phrasing\nEconomics: reject (multi-hop chain failed at step 1 tool=search_symbols outcome=empty_result)\n\nNo symbols matching 'locate symbol target'. Try: search_text(query=\"locate symbol target\") for text matches.\nproject_root: {root}",
       "request": {
         "query": "locate symbol target"
       }

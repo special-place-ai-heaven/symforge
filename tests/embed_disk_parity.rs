@@ -26,7 +26,7 @@ const UNINDEXED_SYNTAX_GOLDEN: &str = "Syntax validation: ignored/scratch.rs\nLa
 /// MCP's sweep diagnostic for one late untracked file.
 fn sweep_golden(path: &str) -> String {
     format!(
-        "untracked file may match: 1 untracked path(s) are not indexed. To index the first match, call analyze_file_impact(\"{path}\", new_file=true)."
+        "untracked file may match: 1 untracked path(s) are not indexed. To index the first match, call analyze_file_impact(\"{path}\", new_file=true), or re-run index_folder."
     )
 }
 

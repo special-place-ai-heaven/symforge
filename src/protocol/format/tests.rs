@@ -312,7 +312,7 @@ fn test_search_symbols_no_match() {
     let result = search_symbols_result(&index, "xyz_no_match");
     assert_eq!(
         result,
-        "No symbols matching 'xyz_no_match'. Try: search_text(query=\"xyz_no_match\") for text matches, or explore(query=\"xyz_no_match\") for concept-based discovery."
+        "No symbols matching 'xyz_no_match'. Try: search_text(query=\"xyz_no_match\") for text matches."
     );
 }
 
