@@ -1,0 +1,68 @@
+[
+  {
+    "id": "ripgrep-discovery-max-count",
+    "repo": "ripgrep",
+    "category": "discovery",
+    "status": "anchors_verified",
+    "prompt": "Find where ripgrep defines its --max-count command-line flag (the type that describes the flag, its help text and how it is parsed). Report the file and the line where that type is declared, as path:line.",
+    "oracle": [
+      {"type": "locate", "pattern": "^struct MaxCount;", "glob": "*.rs", "tolerance": 1}
+    ]
+  },
+  {
+    "id": "ripgrep-tracing-globset-builder",
+    "repo": "ripgrep",
+    "category": "tracing",
+    "status": "anchors_verified",
+    "prompt": "Find every place that constructs a globset builder with GlobSetBuilder::new(). List each file (repository-relative path) that does so, with line numbers.",
+    "oracle": [
+      {"type": "files_mentioned", "pattern": "GlobSetBuilder::new\\(\\)", "exclude_line": "pub fn new\\(\\) -> GlobSetBuilder", "glob": "*.rs"}
+    ]
+  },
+  {
+    "id": "ripgrep-unfamiliar-globset-api",
+    "repo": "ripgrep",
+    "category": "unfamiliar-module",
+    "status": "anchors_verified",
+    "prompt": "You have not seen this codebase before. Describe the public API of the GlobSet type in crates/globset/src/lib.rs: list the name of every pub fn in its inherent impl block (impl GlobSet), each with one sentence on what it does.",
+    "oracle": [
+      {"type": "names", "file": "crates/globset/src/lib.rs", "start": "^impl GlobSet \\{", "end": "^\\}", "item": "^    pub fn (\\w+)"}
+    ]
+  },
+  {
+    "id": "ripgrep-edit-first-match",
+    "repo": "ripgrep",
+    "category": "single-file-edit",
+    "status": "draft",
+    "prompt": "Add pub fn first_match<P: AsRef<Path>>(&self, path: P) -> Option<usize> to GlobSet in crates/globset/src/lib.rs. It returns the smallest index of a glob in the set that matches the path, or None when none matches. Change only that file.",
+    "oracle": [
+      {"type": "diff_scope", "allow": ["crates/globset/src/lib.rs"]},
+      {"type": "command", "hidden": ["crates/globset/tests/bench_first_match.rs"], "argv": ["cargo", "test", "-q", "-p", "globset", "--test", "bench_first_match"]}
+    ]
+  },
+  {
+    "id": "ripgrep-edit-literal-globs",
+    "repo": "ripgrep",
+    "category": "cross-module-edit",
+    "status": "draft",
+    "prompt": "In the globset crate, add pub fn is_literal(&self) -> bool to Glob (crates/globset/src/glob.rs): true when the pattern contains no glob metacharacters (*, ?, [ ], { }). Then add pub fn literal_count(&self) -> usize to GlobSet (crates/globset/src/lib.rs) returning how many of the globs the set was built from are literal.",
+    "oracle": [
+      {"type": "diff_scope", "allow": ["crates/globset/src/*.rs"]},
+      {"type": "command", "hidden": ["crates/globset/tests/bench_literal.rs"], "argv": ["cargo", "test", "-q", "-p", "globset", "--test", "bench_literal"]}
+    ]
+  },
+  {
+    "id": "ripgrep-review-matches-all",
+    "repo": "ripgrep",
+    "category": "review",
+    "status": "anchors_verified",
+    "prompt": "Review the uncommitted change in this working tree (see git diff). Report every defect it introduces as path:line with a one-sentence explanation. Do not modify any file.",
+    "seeds": [
+      {"id": "matches-all", "stage": "review", "path": "crates/globset/src/lib.rs", "find": "if !strat.matches_all(path) {", "replace": "if strat.matches_all(path) {"},
+      {"id": "benign-doc", "stage": "review", "path": "crates/globset/src/lib.rs", "find": "/// Returns the number of globs in this set.", "replace": "/// Returns how many globs this set contains.", "benign": true}
+    ],
+    "oracle": [
+      {"type": "seed_located", "seed": "matches-all", "tolerance": 2}
+    ]
+  }
+]

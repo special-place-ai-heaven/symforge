@@ -1,0 +1,68 @@
+[
+  {
+    "id": "flask-discovery-root-path",
+    "repo": "flask",
+    "category": "discovery",
+    "status": "anchors_verified",
+    "prompt": "In this repository, find the function that works out the filesystem directory of a module or package from its import name (it is used to locate an application's root path). Report the file and the line where that function is defined, as path:line.",
+    "oracle": [
+      {"type": "locate", "pattern": "^def get_root_path\\(", "glob": "*.py", "tolerance": 1}
+    ]
+  },
+  {
+    "id": "flask-unfamiliar-config-api",
+    "repo": "flask",
+    "category": "unfamiliar-module",
+    "status": "anchors_verified",
+    "prompt": "You have not seen this codebase before. Describe the public API of the configuration object class in src/flask/config.py: list the name of every public method defined directly on that class (not dunder methods, not inherited ones), each with one sentence on what it does.",
+    "oracle": [
+      {"type": "names", "file": "src/flask/config.py", "start": "^class Config\\(", "end": "^class |\\Z", "item": "^    def ([a-z]\\w*)\\("}
+    ]
+  },
+  {
+    "id": "flask-debug-namespace-case",
+    "repo": "flask",
+    "category": "debugging",
+    "status": "anchors_verified",
+    "prompt": "Bug report: Config.get_namespace(..., lowercase=True) returns keys in upper case, and lowercase=False lowercases them. Find the cause and fix it. The existing test suite in tests/test_config.py must pass.",
+    "seeds": [
+      {"id": "namespace-case", "stage": "base", "path": "src/flask/config.py", "find": "if lowercase:", "replace": "if not lowercase:"}
+    ],
+    "oracle": [
+      {"type": "diff_scope", "allow": ["src/flask/config.py"]},
+      {"type": "command", "argv": ["{python}", "-m", "pytest", "-q", "tests/test_config.py"]}
+    ]
+  },
+  {
+    "id": "flask-edit-config-get-bool",
+    "repo": "flask",
+    "category": "single-file-edit",
+    "status": "draft",
+    "prompt": "Add a method get_bool(self, key, default=False) to flask's Config class. It returns the boolean value of config[key]: booleans are returned unchanged; the strings 'true', '1', 'yes', 'on' (any case) mean True; 'false', '0', 'no', 'off' and the empty string mean False; any other string raises ValueError. A missing key returns default. Change only src/flask/config.py.",
+    "oracle": [
+      {"type": "diff_scope", "allow": ["src/flask/config.py"]},
+      {"type": "command", "hidden": ["tests/test_bench_config_bool.py"], "argv": ["{python}", "-m", "pytest", "-q", "tests/test_bench_config_bool.py", "tests/test_config.py"]}
+    ]
+  },
+  {
+    "id": "flask-edit-config-loaded-signal",
+    "repo": "flask",
+    "category": "cross-module-edit",
+    "status": "draft",
+    "prompt": "Add a blinker signal named config_loaded to flask.signals (alongside the existing signals). Config.from_mapping must send it after it has stored the values, with sender set to the Config instance and a keyword argument keys holding the list of keys it stored, in the order they were stored. Keep the existing behaviour of from_mapping otherwise.",
+    "oracle": [
+      {"type": "diff_scope", "allow": ["src/flask/*.py"]},
+      {"type": "command", "hidden": ["tests/test_bench_config_signal.py"], "argv": ["{python}", "-m", "pytest", "-q", "tests/test_bench_config_signal.py", "tests/test_config.py", "tests/test_signals.py"]}
+    ]
+  },
+  {
+    "id": "flask-rename-endpoint-helper",
+    "repo": "flask",
+    "category": "rename-refactor",
+    "status": "anchors_verified",
+    "prompt": "Rename the private helper _endpoint_from_view_func to _view_func_endpoint everywhere in the repository (definition, imports, call sites, tests, docs). Make no other change.",
+    "oracle": [
+      {"type": "exact_rename", "old": "_endpoint_from_view_func", "new": "_view_func_endpoint"}
+    ]
+  }
+]
