@@ -124,8 +124,7 @@ use crate::protocol::read_gate;
 use crate::protocol::search_format;
 use crate::sidecar::handlers::{
     ImpactParams, OutlineParams, SymbolContextParams, impact_tool_text,
-    outline_tool_text_for_generation, repo_map_text_for_generation,
-    symbol_context_tool_text_for_generation,
+    outline_tool_text_for_generation, symbol_context_tool_text_for_generation,
 };
 use crate::sidecar::{SidecarState, TokenStats};
 
@@ -1931,7 +1930,6 @@ impl SymForgeServer {
                     ),
                     None => body,
                 };
-                let max_tokens = format::resolve_read_max_tokens(params.0.max_tokens, raw_chars);
                 self.record_tool_savings_named(
                     "get_symbol",
                     crate::stel::handler::estimate_tokens_from_bytes(
@@ -1957,7 +1955,24 @@ impl SymForgeServer {
                 // Collection policy is resolved inside bump_frecency. See wiki
                 // `[[SymForge Frecency-Weighted File Ranking]]` §"Bump hooks".
                 self.bump_frecency(&[PathBuf::from(&params.0.path)]);
-                let mut final_output = format::enforce_token_budget(output, Some(max_tokens));
+                // FR-024: a named symbol is never cut by a default; an explicit
+                // `max_tokens` applies, and past the hard cap the answer says how to
+                // get the rest.
+                let mut final_output = match params.0.max_tokens.filter(|limit| *limit > 0) {
+                    Some(limit) => format::enforce_token_budget(output, Some(limit)),
+                    None => crate::index_lifecycle::guidance::source::enforce_default_output_cap(
+                        output,
+                        |bytes| {
+                            crate::index_lifecycle::guidance::source::symbol_read_continuation(
+                                &params.0.path,
+                                &params.0.name,
+                                params.0.kind.as_deref(),
+                                params.0.symbol_line,
+                                bytes,
+                            )
+                        },
+                    ),
+                };
                 if force_refresh && let Some(prior) = prior_dedup {
                     final_output = format::append_dedup_hint_footer(
                         final_output,
@@ -2001,6 +2016,13 @@ impl SymForgeServer {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn get_repo_map(&self, params: Parameters<GetRepoMapInput>) -> String {
+        let mut params = params;
+        // `./src` names `src`: normalise before any level uses the path.
+        if let Some(path) = params.0.path.as_mut() {
+            while let Some(rest) = path.strip_prefix("./") {
+                *path = rest.to_string();
+            }
+        }
         if let Some(result) = self.proxy_tool_call("get_repo_map", &params.0).await {
             return result;
         }
@@ -2115,20 +2137,19 @@ impl SymForgeServer {
                 let skipped = published.live.compatibility_skipped_files();
                 format::file_tree_view_with_skipped(&view.files, &skipped, path, depth)
             }
-            _ => match repo_map_text_for_generation(&published) {
-                Ok(result) => {
-                    let doctrine = "\nDoctrine: the map orients; the tools prove. \
+            _ => {
+                // `path` and `depth` apply here as they do in the tree view (FR-028).
+                let result = crate::index_lifecycle::guidance::read_context::repo_map_text_scoped(
+                    &published,
+                    params.0.path.as_deref(),
+                    params.0.depth,
+                );
+                let doctrine = "\nDoctrine: the map orients; the tools prove. \
                              Completeness: ranked and truncated by result cap - absence \
                              from the map is not absence from the repo; confirm with \
                              search_symbols / search_text before concluding something is missing.";
-                    format!("{result}{doctrine}")
-                }
-                Err(StatusCode::NOT_FOUND) => "Repository map unavailable.".to_string(),
-                Err(StatusCode::INTERNAL_SERVER_ERROR) => {
-                    "Repository map failed: internal error.".to_string()
-                }
-                Err(other) => format!("Repository map failed: HTTP {}", other.as_u16()),
-            },
+                format!("{result}{doctrine}")
+            }
         };
         // The knowledge digests cost ~2,500 tokens per call; opt-in only.
         if params.0.include_knowledge == Some(true) {
@@ -2347,20 +2368,23 @@ impl SymForgeServer {
                 .cloned()
                 .collect::<Vec<_>>()
         });
+        // FR-004/FR-024: the typical call carries outline, imports and consumers; a small
+        // file is not narrowed to its outline alone.
         let sections = if is_small_file && visible_default_sections {
-            Some(vec!["outline".to_string()])
+            Some(vec![
+                "outline".to_string(),
+                "imports".to_string(),
+                "consumers".to_string(),
+            ])
         } else if large_default_summary {
             Some(vec!["outline".to_string(), "imports".to_string()])
         } else {
             requested_code_sections
         };
-        let context_max_tokens = Some(format::resolve_read_max_tokens(
-            params
-                .0
-                .max_tokens
-                .or_else(|| knowledge_requested.then_some(1000)),
-            raw_chars,
-        ));
+        // FR-024: only the caller's `max_tokens` budgets the output. The size of the
+        // input file and the presence of knowledge sections no longer derive one; the
+        // hard cap below applies when nothing was asked for.
+        let context_max_tokens = params.0.max_tokens.filter(|limit| *limit > 0);
         let knowledge_section = knowledge_requested
             .then(|| {
                 crate::protocol::knowledge_model::render_code_knowledge_context(
@@ -2381,6 +2405,25 @@ impl SymForgeServer {
                 knowledge_section.as_deref(),
                 context_max_tokens,
             );
+            // Without a caller budget the default hard cap applies here too; the
+            // continuation repeats the request under an explicit budget.
+            let output = if context_max_tokens.is_none() {
+                crate::index_lifecycle::guidance::source::enforce_default_output_cap(
+                    output,
+                    |bytes| {
+                        crate::index_lifecycle::guidance::source::file_context_continuation(
+                            &params.0.path,
+                            requested_sections.as_deref(),
+                            include_tests,
+                            &[],
+                            true,
+                            bytes,
+                        )
+                    },
+                )
+            } else {
+                output
+            };
             let tokens = u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
                 output.len() as u64,
             ))
@@ -2431,7 +2474,30 @@ impl SymForgeServer {
                     body.push_str(knowledge);
                 }
                 let footer = format::compact_savings_footer(body.len(), raw_chars);
-                let budgeted_context = if requested_sections
+                // No budget asked for and the answer passes the hard cap: optional
+                // knowledge goes first, the code context is primary, and the closing
+                // line names what was left out with the call that returns it.
+                let mut optional: Vec<(&str, &str)> = knowledge_section
+                    .as_deref()
+                    .map(|knowledge| ("knowledge", knowledge))
+                    .into_iter()
+                    .collect();
+                crate::protocol::tool_contract::in_drop_order("get_file_context", &mut optional);
+                let default_capped = if context_max_tokens.is_none() {
+                    crate::index_lifecycle::guidance::source::cap_default_file_context(
+                        &params.0.path,
+                        requested_sections.as_deref(),
+                        include_tests,
+                        &body[..code_context_len],
+                        &optional,
+                        body.len() + footer.len(),
+                    )
+                } else {
+                    None
+                };
+                let budgeted_context = if let Some(capped) = default_capped {
+                    (capped, true)
+                } else if requested_sections
                     .as_ref()
                     .is_none_or(|sections| sections.is_empty())
                 {
@@ -2835,11 +2901,33 @@ impl SymForgeServer {
                 } else {
                     ReadOutcome::NotFound
                 });
+                let knowledge_budget = params.0.max_tokens.filter(|limit| *limit > 0);
                 let output = crate::protocol::knowledge_model::render_budgeted_code_knowledge_only(
                     &published,
                     knowledge.as_deref(),
-                    params.0.max_tokens.or(Some(1000)),
+                    knowledge_budget,
                 );
+                // Default hard cap with a continuation when the caller gave no budget.
+                let output = if knowledge_budget.is_none() {
+                    crate::index_lifecycle::guidance::source::enforce_default_output_cap(
+                        output,
+                        |bytes| {
+                            crate::index_lifecycle::guidance::source::symbol_context_continuation(
+                                &path,
+                                &params.0.name,
+                                params.0.symbol_kind.as_deref(),
+                                params.0.symbol_line,
+                                Some(&requested_sections),
+                                include_tests,
+                                &[],
+                                true,
+                                bytes,
+                            )
+                        },
+                    )
+                } else {
+                    output
+                };
                 self.session_context.record_symbol(
                     &path,
                     &params.0.name,
@@ -2891,17 +2979,45 @@ impl SymForgeServer {
                 knowledge_start = Some(trace_result.len());
                 trace_result.push_str(knowledge);
             }
-            let (trace_result, _) =
-                crate::protocol::knowledge_model::enforce_budgeted_code_context_with_knowledge(
-                    &published,
-                    trace_result,
-                    knowledge_start,
-                    knowledge_start.and(knowledge.as_deref()),
-                    params
-                        .0
-                        .max_tokens
-                        .or_else(|| knowledge_requested.then_some(1000)),
-                );
+            // FR-024/025: callers and callees are primary content. Without a caller
+            // `max_tokens` nothing is derived (the old default of 1,000 tokens halved
+            // the code share until the callee names were gone); only the hard cap
+            // applies, and it drops the optional knowledge section first.
+            let trace_result = match params.0.max_tokens.filter(|limit| *limit > 0) {
+                Some(limit) => {
+                    crate::protocol::knowledge_model::enforce_budgeted_code_context_with_knowledge(
+                        &published,
+                        trace_result,
+                        knowledge_start,
+                        knowledge_start.and(knowledge.as_deref()),
+                        Some(limit),
+                    )
+                    .0
+                }
+                None => {
+                    let code_end =
+                        knowledge_start.map_or(trace_result.len(), |start| start.saturating_sub(2));
+                    let mut optional: Vec<(&str, &str)> = knowledge_start
+                        .map(|start| ("knowledge", &trace_result[start..]))
+                        .into_iter()
+                        .collect();
+                    crate::protocol::tool_contract::in_drop_order(
+                        "get_symbol_context",
+                        &mut optional,
+                    );
+                    crate::index_lifecycle::guidance::source::cap_default_symbol_context(
+                        &path,
+                        &params.0.name,
+                        params.0.symbol_kind.as_deref(),
+                        params.0.symbol_line,
+                        Some(&requested_sections),
+                        include_tests,
+                        &trace_result[..code_end],
+                        &optional,
+                    )
+                    .unwrap_or_else(|| trace_result.clone())
+                }
+            };
             self.session_context.record_symbol(
                 &path,
                 &params.0.name,
@@ -3574,6 +3690,7 @@ impl SymForgeServer {
             Ok(result) if result.files.is_empty() => ReadOutcome::Empty,
             Ok(_) => ReadOutcome::Found,
         });
+        let hidden_documentation_note = execution.hidden_documentation_note();
         let mut output = render_search_text_output(
             self,
             &generation,
@@ -3594,6 +3711,10 @@ impl SymForgeServer {
                 params.0.query.as_deref().unwrap_or_default(),
                 execution.effective_query.as_deref().unwrap_or_default()
             ));
+        }
+        if let Some(note) = hidden_documentation_note {
+            output.push('\n');
+            output.push_str(&note);
         }
         self.session_context.record_summary_output(
             "search_text",
@@ -5338,7 +5459,17 @@ impl SymForgeServer {
                 };
                 match repo.uncommitted_paths() {
                     Ok(paths) => {
-                        let total_paths = paths.len();
+                        // Counted and listed as git status does: an untracked directory
+                        // is one entry (FR-031).
+                        let untracked_dirs = repo.untracked_dir_roots();
+                        // Total and listing use the same rule (same prefix), so the shown
+                        // count is a subset of the total.
+                        let total_paths = crate::git::collapse_into_untracked_dirs(
+                            &paths,
+                            &untracked_dirs,
+                            params.0.path_prefix.as_deref(),
+                        )
+                        .len();
                         match filter_paths_by_prefix_and_language(
                             paths,
                             params.0.path_prefix.as_deref(),
@@ -5372,6 +5503,11 @@ impl SymForgeServer {
                                 }
                                 let include_symbol_diff =
                                     params.0.include_symbol_diff.unwrap_or(false);
+                                let listed = crate::git::collapse_into_untracked_dirs(
+                                    &filtered,
+                                    &untracked_dirs,
+                                    params.0.path_prefix.as_deref(),
+                                );
                                 let envelope = search_format::format_search_envelope(
                                     "exact (uncommitted working tree)",
                                     what_changed_source_authority(
@@ -5379,14 +5515,14 @@ impl SymForgeServer {
                                         &self.index.data_plane().freshness_status(),
                                     ),
                                     what_changed_parse_state_label(&mode, include_symbol_diff),
-                                    &changed_paths_completeness_label(total_paths, filtered.len()),
+                                    &changed_paths_completeness_label(total_paths, listed.len()),
                                     &what_changed_scope_summary(&options, &mode),
                                     &search_paths_evidence(
                                         filtered.iter().map(|path| path.as_str()),
                                     ),
                                 );
                                 let mut output = format::what_changed_paths_result(
-                                    &filtered,
+                                    &listed,
                                     "No uncommitted changes detected.",
                                 );
                                 if include_symbol_diff {
@@ -5984,6 +6120,13 @@ impl SymForgeServer {
             record_read_outcome(ReadOutcome::Found);
             return hit;
         }
+        let first_line = options.content_context.start_line.unwrap_or(1);
+        let ctx = &options.content_context;
+        let numbered = ctx.show_line_numbers
+            || ctx.around_line.is_some()
+            || ctx.around_match.is_some()
+            || ctx.around_symbol.is_some()
+            || ctx.chunk_index.is_some();
         let mode_annotation = match (
             &options.content_context.mode_name,
             options.content_context.mode_explicit,
@@ -6004,10 +6147,10 @@ impl SymForgeServer {
                 let found = selection.is_ok();
                 record_read_outcome(selection_outcome(selection));
                 let raw_chars = file.as_ref().content.len();
-                let max_tokens = Some(format::resolve_read_max_tokens(
-                    explicit_max_tokens,
-                    raw_chars,
-                ));
+                // FR-024: an explicit range is bounded by the hard byte cap only; a
+                // caller's `max_tokens` still applies. No budget is derived from the
+                // file size.
+                let max_tokens = explicit_max_tokens.filter(|limit| *limit > 0);
                 let output = format::file_content_from_indexed_file_with_context(
                     file.as_ref(),
                     options.content_context,
@@ -6019,8 +6162,12 @@ impl SymForgeServer {
                     ),
                     crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
                 );
-                let capped =
-                    format::cap_file_content_output(format!("{}{}", mode_annotation, output));
+                let capped = format::cap_file_content_output_for(
+                    format!("{}{}", mode_annotation, output),
+                    &input.path,
+                    first_line,
+                    numbered,
+                );
                 let with_warning = format::append_nul_byte_warning(capped, &file.as_ref().content);
                 let mut final_output = format::enforce_token_budget(with_warning, max_tokens);
                 let tokens = u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
@@ -6134,13 +6281,14 @@ impl SymForgeServer {
                         self.bump_frecency(&[PathBuf::from(&input.path)]);
                         // NUL-byte guard (raw-disk fallback branch):
                         // mirror the indexed branch — warn after the cap.
-                        let capped =
-                            format::cap_file_content_output(format!("{}{}", mode_annotation, body));
+                        let capped = format::cap_file_content_output_for(
+                            format!("{}{}", mode_annotation, body),
+                            &input.path,
+                            first_line,
+                            numbered,
+                        );
                         let with_warning = format::append_nul_byte_warning(capped, &content);
-                        let max_tokens = Some(format::resolve_read_max_tokens(
-                            explicit_max_tokens,
-                            content.len(),
-                        ));
+                        let max_tokens = explicit_max_tokens.filter(|limit| *limit > 0);
                         return format::enforce_token_budget(with_warning, max_tokens);
                     }
                 }
@@ -22345,7 +22493,8 @@ mod tests {
                 force_refresh: None,
             }))
             .await;
-        assert_eq!(result, "line 2\nline 3");
+        // FR-027: a ranged read is numbered by default.
+        assert_eq!(result, "2: line 2\n3: line 3");
     }
 
     #[tokio::test]
@@ -23916,7 +24065,8 @@ mod tests {
             }))
             .await;
         // offset=1 → start_line=2, limit=2 → end_line=3
-        assert_eq!(result, "line 2\nline 3", "got: {result}");
+        // FR-027: the offset/limit window is a ranged read, numbered by default.
+        assert_eq!(result, "2: line 2\n3: line 3", "got: {result}");
     }
 
     #[tokio::test]

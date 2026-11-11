@@ -236,6 +236,82 @@ pub(crate) struct TextSearchExecution {
     /// Count mode only: matches `include_tests=true` would add, measured by a
     /// second run. `None` when not measured.
     pub hidden_test_matches: Option<usize>,
+    /// Zero-hit code search only: matches the same query has in documentation files.
+    pub hidden_documentation: Option<HiddenDocumentation>,
+}
+
+/// Matches a zero-hit code search missed because they sit in documentation files, which
+/// `search_text` does not search.
+pub(crate) struct HiddenDocumentation {
+    pub matches: usize,
+    /// The count stopped at the scan cap: there may be more.
+    pub capped: bool,
+    pub files: Vec<String>,
+}
+
+/// Matches counted per documentation rerun; a count that reaches it prints as `N+`.
+const HIDDEN_DOCUMENTATION_SCAN_CAP: usize = 1_000;
+
+impl TextSearchExecution {
+    /// One paragraph naming the documentation matches and the call that shows them.
+    pub(crate) fn hidden_documentation_note(&self) -> Option<String> {
+        let hidden = self.hidden_documentation.as_ref()?;
+        let query = self.effective_query.as_deref()?;
+        let count = if hidden.capped {
+            format!("{}+", hidden.matches)
+        } else {
+            hidden.matches.to_string()
+        };
+        let noun = if hidden.matches == 1 && !hidden.capped {
+            "match"
+        } else {
+            "matches"
+        };
+        // `search_knowledge` matches literal text, so a regex gets the count alone.
+        let next = if self.is_regex {
+            "search_knowledge matches literal text, so a regex cannot be passed to it".to_string()
+        } else {
+            format!("Next: search_knowledge(query={})", json_string(query))
+        };
+        Some(format!(
+            "{count} {noun} in documentation ({}); search_text() searches code only. {next}",
+            hidden.files.join(", "),
+        ))
+    }
+}
+
+fn json_string(text: &str) -> String {
+    serde_json::to_string(text).unwrap_or_else(|_| format!("\"{text}\""))
+}
+
+/// Run `rerun` over documentation (knowledge) files with the search's own filters and
+/// count what it finds. `None` when nothing matches or the run failed.
+fn hidden_documentation_matches(
+    options: &search::TextSearchOptions,
+    rerun: impl FnOnce(
+        &search::TextSearchOptions,
+    ) -> Result<search::TextSearchResult, search::TextSearchError>,
+) -> Option<HiddenDocumentation> {
+    let mut docs = options.clone();
+    docs.search_scope = search::SearchScope::Text;
+    docs.language_filter = Some(LanguageId::Markdown);
+    docs.total_limit = HIDDEN_DOCUMENTATION_SCAN_CAP;
+    docs.max_per_file = HIDDEN_DOCUMENTATION_SCAN_CAP;
+    let found = rerun(&docs).ok()?;
+    let matches: usize = found.files.iter().map(|file| file.matches.len()).sum();
+    if matches == 0 {
+        return None;
+    }
+    Some(HiddenDocumentation {
+        matches,
+        capped: matches >= HIDDEN_DOCUMENTATION_SCAN_CAP,
+        files: found
+            .files
+            .iter()
+            .take(3)
+            .map(|file| file.path.clone())
+            .collect(),
+    })
 }
 
 /// Shared request semantics above the indexed text/AST search engine. Transport
@@ -317,6 +393,7 @@ pub(crate) fn execute_text_search(
             auto_corrected_regex: false,
             effective_query: Some(pattern.to_owned()),
             hidden_test_matches,
+            hidden_documentation: None,
         });
     }
     let mut is_regex = input.regex.unwrap_or(false);
@@ -390,6 +467,11 @@ pub(crate) fn execute_text_search(
             })
         })
         .flatten();
+    // FR-029: a code search with no match still says what the documentation holds.
+    let hidden_documentation = (!count_mode
+        && matches!(&result, Ok(found) if found.files.is_empty()))
+    .then(|| hidden_documentation_matches(&options, |opts| run(effective_query.as_deref(), opts)))
+    .flatten();
     Ok(TextSearchExecution {
         result,
         options,
@@ -399,6 +481,7 @@ pub(crate) fn execute_text_search(
         auto_corrected_regex,
         effective_query,
         hidden_test_matches,
+        hidden_documentation,
     })
 }
 
@@ -433,6 +516,9 @@ pub(crate) struct SymbolSearchExecution {
     pub options: search::SymbolSearchOptions,
     pub suppressed_by_noise: usize,
     pub text_fallback: Vec<(String, usize)>,
+    /// Set when no exact match existed and `result` holds the symbols containing all
+    /// these (lower-cased) words.
+    pub all_words_rule: Option<Vec<String>>,
 }
 
 pub(crate) fn execute_symbol_search(
@@ -445,7 +531,18 @@ pub(crate) fn execute_symbol_search(
         return Err("search_symbols requires at least one of: query, kind, or path_prefix".into());
     }
     let options = super::search_contract::search_symbols_options_from_input(input)?;
-    let result = search::search_symbols_with_options(index, query, input.kind.as_deref(), &options);
+    let mut result =
+        search::search_symbols_with_options(index, query, input.kind.as_deref(), &options);
+    // FR-030: a several-word query with no match returns the symbols whose names
+    // contain all the words, and the rendering says so.
+    let mut all_words_rule = None;
+    if result.hits.is_empty() && !is_browse {
+        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        if let Some(found) = all_words_symbol_matches(index, input, &options, &words) {
+            result = found;
+            all_words_rule = Some(words);
+        }
+    }
     let suppressed_by_noise =
         hidden_search_symbols_noise_count(index, query, input.kind.as_deref(), &options, &result);
     let mut text_fallback = Vec::new();
@@ -480,6 +577,55 @@ pub(crate) fn execute_symbol_search(
         options,
         suppressed_by_noise,
         text_fallback,
+        all_words_rule,
+    })
+}
+
+/// Symbols whose name contains every word (case-insensitive, `_` ignored), or `None` for
+/// a single-word query or no such symbol. The first word's substring search supplies the
+/// candidates, widened past the caller's limit so the filter is not starved.
+fn all_words_symbol_matches(
+    index: &LiveIndex,
+    input: &super::search_contract::SearchSymbolsInput,
+    options: &search::SymbolSearchOptions,
+    words: &[String],
+) -> Option<search::SymbolSearchResult> {
+    // ponytail: candidates come from one word's substring search capped at 2,000 rows;
+    // a full all-words index scan if a first word ever matches more symbols than that.
+    const CANDIDATE_LIMIT: usize = 2_000;
+    let strip = |text: &str| text.to_lowercase().replace('_', "");
+    let (first, rest) = words.split_first()?;
+    if rest.is_empty() {
+        return None;
+    }
+    let mut widened = options.clone();
+    widened.result_limit =
+        search::ResultLimit::new(CANDIDATE_LIMIT.max(options.result_limit.get()));
+    let candidates =
+        search::search_symbols_with_options(index, first, input.kind.as_deref(), &widened);
+    let words: Vec<String> = words.iter().map(|word| strip(word)).collect();
+    let mut hits: Vec<_> = candidates
+        .hits
+        .into_iter()
+        .filter(|hit| {
+            let name = strip(&hit.name);
+            words.iter().all(|word| name.contains(word.as_str()))
+        })
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    let overflow_count = hits.len().saturating_sub(options.result_limit.get());
+    hits.truncate(options.result_limit.get());
+    let file_count = hits
+        .iter()
+        .map(|hit| hit.path.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    Some(search::SymbolSearchResult {
+        file_count,
+        hits,
+        overflow_count,
     })
 }
 
@@ -870,6 +1016,13 @@ pub(crate) fn render_symbol_search(
         ))
     };
     let output = super::search_render::search_symbols_result_view(result, query);
+    let output = match &execution.all_words_rule {
+        Some(words) => format!(
+            "No exact match for \"{query}\"; showing symbols whose names contain all words ({}).\n{output}",
+            words.join(", ")
+        ),
+        None => output,
+    };
     let output = match envelope {
         Some(envelope) => format!("{envelope}\n\n{output}"),
         None => output,

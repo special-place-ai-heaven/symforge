@@ -48,6 +48,73 @@ pub(super) fn matches_exact_symbol_qualified_name(
     false
 }
 
+/// The absolute `crate::…` path a Rust `self::…` / `super::…` path written at `reference`
+/// in `file` denotes: the file's module path, plus the inline `mod` blocks enclosing the
+/// reference, with one module dropped per `super`. `None` for any other qualified name
+/// (or when the file's module path cannot be derived).
+fn resolve_rust_relative_path(
+    file: &IndexedFile,
+    reference: &ReferenceRecord,
+    qualified_name: &str,
+) -> Option<String> {
+    if file.language != LanguageId::Rust
+        || !(qualified_name.starts_with("self::") || qualified_name.starts_with("super::"))
+    {
+        return None;
+    }
+    let mut modules: Vec<String> =
+        super::query::resolve_module_path(&file.relative_path, &file.language)?
+            .split("::")
+            .map(str::to_string)
+            .collect();
+    let mut inline: Vec<&SymbolRecord> = file
+        .symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.kind == SymbolKind::Module
+                && symbol.byte_range.0 <= reference.byte_range.0
+                && reference.byte_range.1 <= symbol.byte_range.1
+        })
+        .collect();
+    inline.sort_by_key(|symbol| symbol.byte_range.0);
+    modules.extend(inline.iter().map(|symbol| symbol.name.clone()));
+    let mut rest = qualified_name;
+    loop {
+        if let Some(tail) = rest.strip_prefix("self::") {
+            rest = tail;
+        } else if let Some(tail) = rest.strip_prefix("super::") {
+            modules.pop()?;
+            if modules.is_empty() {
+                return None;
+            }
+            rest = tail;
+        } else {
+            break;
+        }
+    }
+    Some(format!("{}::{rest}", modules.join("::")))
+}
+
+/// [`matches_exact_symbol_qualified_name`] for a reference whose file is known: a Rust
+/// `self::` / `super::` path is resolved against that file's module and must equal the
+/// target's path exactly; every other qualified name matches as before.
+pub(super) fn matches_qualified_name_from(
+    referrer: Option<(&IndexedFile, &ReferenceRecord)>,
+    language: &LanguageId,
+    qualified_name: &str,
+    target_name: &str,
+    module_path: Option<&str>,
+) -> bool {
+    if qualified_name.starts_with("self::") || qualified_name.starts_with("super::") {
+        let (Some((file, reference)), Some(module_path)) = (referrer, module_path) else {
+            return false;
+        };
+        return resolve_rust_relative_path(file, reference, qualified_name)
+            .is_some_and(|resolved| resolved == format!("{module_path}::{target_name}"));
+    }
+    matches_exact_symbol_qualified_name(language, qualified_name, target_name, module_path)
+}
+
 pub(super) fn matches_exact_symbol_reference(
     reference: &ReferenceRecord,
     target_name: &str,
@@ -67,7 +134,8 @@ pub(super) fn matches_exact_symbol_reference(
         .qualified_name
         .as_deref()
         .is_some_and(|qualified_name| {
-            matches_exact_symbol_qualified_name(
+            matches_qualified_name_from(
+                reference_file.map(|file| (file, reference)),
                 target_language,
                 qualified_name,
                 target_name,
@@ -76,6 +144,15 @@ pub(super) fn matches_exact_symbol_reference(
         })
     {
         return true;
+    }
+
+    // A `self::` / `super::` path that resolves to another module is a non-match for every
+    // kind: the bare-name fallbacks below must not claim it.
+    if let (Some(file), Some(qualified_name)) =
+        (reference_file, reference.qualified_name.as_deref())
+        && resolve_rust_relative_path(file, reference, qualified_name).is_some()
+    {
+        return false;
     }
 
     if reference.name != target_name {

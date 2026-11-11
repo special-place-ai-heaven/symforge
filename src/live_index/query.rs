@@ -13,9 +13,11 @@ pub(crate) use super::disambiguation::{
 use crate::domain::index::FileClassification;
 use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolRecord};
 // Consumed by the shared `plan_edit` (guidance::edit_plan) in every build.
+#[cfg(test)]
+use super::disambiguation::matches_exact_symbol_qualified_name;
 pub(crate) use super::disambiguation::symbol_belongs_to_type;
 use super::disambiguation::{
-    is_receiver_method_call, matches_exact_symbol_qualified_name, matches_exact_symbol_reference,
+    is_receiver_method_call, matches_exact_symbol_reference, matches_qualified_name_from,
     parse_reference_kind_filter,
 };
 // Shared file-context rendering consumes this in both native and MCP builds.
@@ -57,7 +59,7 @@ const MAX_REFERENCE_TARGET_BYTES: usize = 6 * 1024;
 /// Examples (JS/TS):
 ///   "src/index.js"            → Some("src")
 ///   "src/utils/index.ts"      → Some("src/utils")
-fn resolve_module_path(file_path: &str, language: &LanguageId) -> Option<String> {
+pub(super) fn resolve_module_path(file_path: &str, language: &LanguageId) -> Option<String> {
     let path = std::path::Path::new(file_path);
 
     match language {
@@ -2331,7 +2333,8 @@ impl LiveIndex {
                 // no separate `use` import and therefore never enters dependent_paths.
                 // Simple name-only matches are excluded to avoid false positives from
                 // unrelated files that happen to use the same function name.
-                if matches_exact_symbol_qualified_name(
+                if matches_qualified_name_from(
+                    self.get_file(ref_path).map(|f| (f, ref_record)),
                     &file.language,
                     qn,
                     target_name,
@@ -3280,7 +3283,8 @@ impl LiveIndex {
                             && (reference.kind == ReferenceKind::TypeUsage
                                 || (reference.kind == ReferenceKind::Call
                                     && (reference.qualified_name.as_deref().is_some_and(|qn| {
-                                        matches_exact_symbol_qualified_name(
+                                        matches_qualified_name_from(
+                                            Some((file, reference)),
                                             &target_language,
                                             qn,
                                             &reference.name,
@@ -3342,7 +3346,8 @@ impl LiveIndex {
                                 target_symbol_names.contains(reference.name.as_str())
                                     && exported_target_symbol_names
                                         .contains(reference.name.as_str())
-                                    && matches_exact_symbol_qualified_name(
+                                    && matches_qualified_name_from(
+                                        Some((file, reference)),
                                         &target_language,
                                         qn,
                                         &reference.name,

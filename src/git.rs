@@ -10,6 +10,38 @@ pub struct GitRepo {
     repo: git2::Repository,
 }
 
+/// List `paths` as git status lists them: the files under an untracked directory in
+/// `untracked_dirs` (see [`GitRepo::untracked_dir_roots`]) collapse into that directory,
+/// written with a trailing `/`. A directory collapses only when it lies inside
+/// `path_prefix` (when given); every other path passes through unchanged.
+pub fn collapse_into_untracked_dirs(
+    paths: &[String],
+    untracked_dirs: &[String],
+    path_prefix: Option<&str>,
+) -> Vec<String> {
+    let prefix = path_prefix
+        .map(|p| p.replace('\\', "/"))
+        .map(|p| p.trim_matches('/').to_string())
+        .filter(|p| !p.is_empty());
+    let dir_in_scope = |dir: &str| {
+        prefix.as_deref().is_none_or(|prefix| {
+            let dir = dir.trim_end_matches('/');
+            dir == prefix || dir.starts_with(&format!("{prefix}/"))
+        })
+    };
+    let mut collapsed: Vec<String> = Vec::new();
+    for path in paths {
+        let shown = untracked_dirs
+            .iter()
+            .find(|dir| path.starts_with(dir.as_str()) && dir_in_scope(dir))
+            .unwrap_or(path);
+        if !collapsed.contains(shown) {
+            collapsed.push(shown.clone());
+        }
+    }
+    collapsed
+}
+
 /// Immutable commits selected by the repository's three-dot comparison rule.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitComparisonRange {
@@ -112,6 +144,25 @@ impl GitRepo {
             .collect();
 
         Ok(paths)
+    }
+
+    /// The untracked directories git status reports as one entry each (default status
+    /// semantics, trailing `/`). Empty if the status cannot be read. Feed it to
+    /// [`collapse_into_untracked_dirs`].
+    pub fn untracked_dir_roots(&self) -> Vec<String> {
+        let mut opts = git2::StatusOptions::new();
+        opts.include_untracked(true)
+            .include_ignored(false)
+            .recurse_untracked_dirs(false);
+        let Ok(statuses) = self.repo.statuses(Some(&mut opts)) else {
+            return Vec::new();
+        };
+        statuses
+            .iter()
+            .filter(|entry| entry.status().is_wt_new())
+            .filter_map(|entry| entry.path().ok().map(|p| p.replace('\\', "/")))
+            .filter(|path| path.ends_with('/'))
+            .collect()
     }
 
     /// Return untracked working-tree paths only, excluding ignored and staged files.

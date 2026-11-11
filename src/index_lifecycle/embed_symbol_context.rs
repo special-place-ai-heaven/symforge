@@ -679,7 +679,26 @@ pub(super) fn project(
                             knowledge.as_deref(),
                             None,
                         );
-                text
+                // The server lane's default hard cap and continuation (no `max_tokens`).
+                if max_tokens.is_none() {
+                    render_truncated |=
+                        text.len() > super::guidance::file_read::GET_FILE_CONTENT_MAX_BYTES;
+                    source::enforce_default_output_cap(text, |bytes| {
+                        source::symbol_context_continuation(
+                            &path,
+                            &request.name,
+                            request.symbol_kind.as_deref(),
+                            request.symbol_line,
+                            request.sections.as_deref(),
+                            request.include_tests,
+                            &[],
+                            true,
+                            bytes,
+                        )
+                    })
+                } else {
+                    text
+                }
             }
             SymbolContextMode::Trace => {
                 let mut text = shared::trace_symbol_result_view(
@@ -698,14 +717,37 @@ pub(super) fn project(
                 } else {
                     None
                 };
-                let (text, truncated) =
+                // The server lane's default hard cap and continuation line.
+                let default_capped = if max_tokens.is_none() {
+                    let code_end = knowledge_start.map_or(text.len(), |s| s.saturating_sub(2));
+                    let optional: Vec<(&str, &str)> = knowledge_start
+                        .map(|start| ("knowledge", &text[start..]))
+                        .into_iter()
+                        .collect();
+                    source::cap_default_symbol_context(
+                        &path,
+                        &request.name,
+                        request.symbol_kind.as_deref(),
+                        request.symbol_line,
+                        request.sections.as_deref(),
+                        request.include_tests,
+                        &text[..code_end],
+                        &optional,
+                    )
+                } else {
+                    None
+                };
+                let (text, truncated) = if let Some(capped) = default_capped {
+                    (capped, true)
+                } else {
                     knowledge_model::enforce_budgeted_code_context_with_knowledge(
                         published,
                         text,
                         knowledge_start,
                         knowledge_start.and(knowledge.as_deref()),
                         max_tokens,
-                    );
+                    )
+                };
                 render_truncated |= truncated;
                 text
             }
@@ -767,12 +809,15 @@ pub(super) fn project(
         );
         (rendered, render_truncated || final_truncated)
     };
-    result.rendered = render(None).0;
+    // The cached answer is the unbudgeted render, which the default hard cap may still cut:
+    // its stored truncation flag says so.
+    let (full_rendered, full_truncated) = render(None);
+    result.rendered = full_rendered;
     budget.cache_output = Some(QueryOutput::SymbolContext(result.clone()));
-    budget.cache_truncated = budget.truncated;
-    let effective_tokens = request
-        .max_tokens
-        .or_else(|| (mode == SymbolContextMode::Trace && knowledge_requested).then_some(1000));
+    budget.cache_truncated = budget.truncated || full_truncated;
+    // FR-024: a trace without a caller `max_tokens` is not budgeted by default; callers
+    // and callees are primary content.
+    let effective_tokens = request.max_tokens;
     let (rendered, render_truncated) = render(effective_tokens);
     result.rendered = rendered;
     budget.truncated |= render_truncated;

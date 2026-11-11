@@ -165,6 +165,19 @@ fn render_ordinary_read(
             .join("\n")
     };
 
+    // FR-027: a numbered range that passes the end of the file says where the file ends.
+    let body = match end_line {
+        Some(end) if show_line_numbers && end as usize > lines.len() => {
+            let note = format!("[range passes the end: file ends at line {}]", lines.len());
+            if body.is_empty() {
+                note
+            } else {
+                format!("{body}\n{note}")
+            }
+        }
+        _ => body,
+    };
+
     if !header {
         return body;
     }
@@ -562,30 +575,91 @@ pub fn append_nul_byte_warning(output: String, content: &[u8]) -> String {
 }
 
 pub fn cap_file_content_output(output: String) -> String {
+    cap_file_content_output_for(output, "", 1, false)
+}
+
+/// [`cap_file_content_output`] for a known file: the footer states how many lines were
+/// left out and gives the literal call that reads the rest (FR-026). `first_line` is the
+/// 1-based line the output starts at when it carries no line numbers.
+pub fn cap_file_content_output_for(
+    output: String,
+    path: &str,
+    first_line: u32,
+    numbered: bool,
+) -> String {
     if output.len() <= GET_FILE_CONTENT_MAX_BYTES {
         return output;
     }
+    // A leading `── mode: … ──` line is not file content: it is kept and not counted.
+    let annotation_len = if output.starts_with("── mode:") {
+        output.find('\n').map_or(0, |end| end + 1)
+    } else {
+        0
+    };
+    let (annotation, body) = output.split_at(annotation_len);
+    let total = body.lines().count() as u32;
     let original_bytes = output.len();
     let original_tokens_est =
         crate::stel::handler::estimate_tokens_from_bytes(original_bytes as u64);
     let cap_tokens_est =
         crate::stel::handler::estimate_tokens_from_bytes(GET_FILE_CONTENT_MAX_BYTES as u64);
-    let detail = format!(
-        "Original output is ~{original_tokens_est} tokens ({original_bytes} bytes), exceeding {GET_FILE_CONTENT_MAX_BYTES}-byte cap. Use chunk_index + max_lines, around_line, around_match, or around_symbol to read a smaller window."
-    );
-    let footer = token_truncation_footer(cap_tokens_est, Some(detail.as_str()));
-
-    // Reserve exactly enough bytes for the footer; align budget to a UTF-8 char boundary.
-    let mut budget = GET_FILE_CONTENT_MAX_BYTES.saturating_sub(footer.len());
-    while budget > 0 && !output.is_char_boundary(budget) {
-        budget -= 1;
-    }
-    let truncate_at = match output[..budget].rfind('\n') {
-        Some(pos) => pos + 1, // keep the newline
-        None => budget,       // no newline — truncate at char boundary
+    let footer_for = |shown: u32, next_start: u32| {
+        let next_call = if path.is_empty() {
+            "use chunk_index + max_lines, around_line, around_match, or around_symbol to read a smaller window".to_string()
+        } else {
+            format!(
+                "get_file_content(path={path:?}, start_line={next_start}, end_line={})",
+                next_start + shown.saturating_sub(1)
+            )
+        };
+        let detail = format!(
+            "Original output is ~{original_tokens_est} tokens ({original_bytes} bytes), exceeding the {GET_FILE_CONTENT_MAX_BYTES}-byte cap; showing {shown} of {total} lines, {} omitted. Next: {next_call}",
+            total.saturating_sub(shown)
+        );
+        token_truncation_footer(cap_tokens_est, Some(detail.as_str()))
     };
-    let truncated = &output[..truncate_at];
-    format!("{truncated}{footer}")
+    // The footer is appended after the cut, so its longest form (every count at its
+    // widest) is reserved first and the result stays within the cap.
+    let reserve = footer_for(total, first_line.saturating_add(total)).len();
+    let mut budget = GET_FILE_CONTENT_MAX_BYTES
+        .saturating_sub(reserve)
+        .saturating_sub(annotation.len());
+    // Cut, build the real footer, and tighten the cut by any overflow until the whole
+    // answer fits: the footer's size depends on the cut (counts, next line), so it is
+    // measured, not assumed.
+    loop {
+        while budget > 0 && !body.is_char_boundary(budget) {
+            budget -= 1;
+        }
+        let truncate_at = match body[..budget].rfind('\n') {
+            Some(pos) => pos + 1, // keep the newline
+            None => budget,       // no newline — truncate at char boundary
+        };
+        let truncated = &body[..truncate_at];
+        let shown = truncated.lines().count() as u32;
+        // Only a numbered rendering carries the gutter; raw content lines such as
+        // `8080: x` must not be read as one.
+        let last_numbered = numbered
+            .then(|| {
+                truncated
+                    .lines()
+                    .next_back()
+                    .and_then(|line| line.split_once(':'))
+                    .and_then(|(n, _)| n.trim().parse::<u32>().ok())
+            })
+            .flatten();
+        let next_start = last_numbered
+            .map(|n| n + 1)
+            .unwrap_or_else(|| first_line + shown);
+        let footer = footer_for(shown, next_start);
+        let total_len = annotation.len() + truncated.len() + footer.len();
+        if total_len <= GET_FILE_CONTENT_MAX_BYTES || budget == 0 {
+            return format!("{annotation}{truncated}{footer}");
+        }
+        budget = budget
+            .saturating_sub(total_len - GET_FILE_CONTENT_MAX_BYTES)
+            .min(truncate_at.saturating_sub(1));
+    }
 }
 
 pub fn not_found_file(path: &str) -> String {
@@ -712,6 +786,9 @@ pub fn default_read_max_tokens() -> u64 {
     crate::stel::handler::estimate_tokens_from_bytes(competent_manual_baseline_chars(4000) as u64)
 }
 
+/// Retired as an output cap (feature 036 FR-024: no output budget is derived from the
+/// input size); kept for the tests that pin its arithmetic.
+#[cfg(test)]
 pub fn resolve_read_max_tokens(explicit: Option<u64>, raw_chars: usize) -> u64 {
     match explicit {
         Some(t) if t > 0 => t,
@@ -812,5 +889,77 @@ mod raw_selection_tests {
         assert!(rendered.contains("chunk 2/2, lines 3-4"));
         assert!(rendered.contains("3: second needle"));
         assert!(!rendered.contains("first needle"));
+    }
+}
+
+#[cfg(test)]
+mod cap_footer_tests {
+    use super::*;
+
+    /// The footer is reserved before the cut: even with a long path the capped answer
+    /// stays within the byte cap, and the annotation line is not counted as content.
+    #[test]
+    fn capped_output_stays_within_the_cap_and_does_not_count_the_annotation() {
+        let path = format!("src/{}/file.rs", "deep".repeat(40));
+        let body: String = (1..=4_000)
+            .map(|n| format!("{n}: line {n} padding padding\n"))
+            .collect();
+        let output = format!("── mode: lines (explicit) ──\n{body}");
+        let capped = cap_file_content_output_for(output, &path, 1, true);
+        assert!(
+            capped.len() <= GET_FILE_CONTENT_MAX_BYTES,
+            "{}",
+            capped.len()
+        );
+        assert!(capped.starts_with("── mode: lines (explicit) ──\n"));
+        assert!(
+            capped.contains("of 4000 lines"),
+            "annotation counted: {capped}"
+        );
+        let shown: u32 = capped
+            .split("showing ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .expect("shown count");
+        assert!(
+            capped.contains(&format!("start_line={}", shown + 1)),
+            "next line skips or repeats"
+        );
+    }
+
+    /// Raw (unnumbered) content lines that look like a gutter must not set the next line.
+    #[test]
+    fn raw_lines_that_look_numbered_do_not_set_the_next_line() {
+        let body: String = (0..4_000)
+            .map(|n| format!("8080: raw line {n} padding padding\n"))
+            .collect();
+        let capped = cap_file_content_output_for(body, "src/raw.txt", 1, false);
+        assert!(!capped.contains("start_line=8081"), "{capped}");
+    }
+}
+
+#[cfg(test)]
+mod cap_footer_boundary_tests {
+    use super::*;
+
+    /// Delta e: numbered gutters far past `first_line + total` (an `around_line` excerpt)
+    /// widen the footer; for every path length and line width the whole answer still fits.
+    #[test]
+    fn capped_answer_fits_the_cap_for_wide_gutters_and_long_paths() {
+        for path_len in 0..48 {
+            for pad in 0..24 {
+                let path = format!("src/{}.rs", "p".repeat(path_len));
+                let body: String = (0..8_000)
+                    .map(|n| format!("{}: {}\n", 900_000 + n, "x".repeat(pad)))
+                    .collect();
+                let capped = cap_file_content_output_for(body, &path, 1, true);
+                assert!(
+                    capped.len() <= GET_FILE_CONTENT_MAX_BYTES,
+                    "path_len={path_len} pad={pad}: {} bytes",
+                    capped.len()
+                );
+            }
+        }
     }
 }

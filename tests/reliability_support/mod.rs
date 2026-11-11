@@ -100,7 +100,7 @@ fn copy_dir(from: &Path, to: &Path) {
 
 /// Run `git` in `dir`, panicking with its stderr on failure; returns stdout.
 pub fn git(dir: &Path, args: &[&str]) -> String {
-    let output = std::process::Command::new("git")
+    let output = symforge::process_util::hidden_command("git")
         .arg("-C")
         .arg(dir)
         .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])

@@ -276,12 +276,12 @@ pub struct GetRepoMapInput {
     /// When true, append the repository knowledge digests (docs map, ~2,500 tokens). Default false.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub include_knowledge: Option<bool>,
-    /// Subtree path to browse (only used when detail="tree", default: project root).
+    /// Limit the map to this subtree, at every detail level (default: project root).
     pub path: Option<String>,
-    /// Max depth levels to expand (only used when detail="tree", default: 2, max: 5).
+    /// Directory levels to group (compact) or expand (tree); default 2, max 5.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub depth: Option<u32>,
-    /// Maximum number of files to include in the output (only used when detail="full", default: 200).
+    /// Files listed by detail="full" (default 200); with max_tokens and no detail it also picks full or compact.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub max_files: Option<u32>,
     /// When true, estimate token cost instead of returning content.

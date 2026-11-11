@@ -77,8 +77,15 @@ async fn symbol_body_longer_than_the_default_budget_is_whole() {
     for token in ["LONG_LINE_0006", "LONG_LINE_0150", "LONG_LINE_0298"] {
         assert!(text.contains(token), "body cut before {token}\n{text}");
     }
+    // The renderer closes every symbol with a metadata line (`[fn, lines 4-300, N bytes]`);
+    // the body proper must end with its closing brace.
+    let body = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('['))
+        .unwrap_or_default();
     assert!(
-        text.trim_end().ends_with('}'),
+        body.trim_end().ends_with('}'),
         "body must end with its closing brace\n{text}"
     );
 }

@@ -11,10 +11,11 @@
 //! Written from the handlers on 2026-11-11. Where a handler's doc comment and its code
 //! disagree (`get_repo_map` `path` and `max_files`, research D2) the row follows the
 //! code, and T010/T020 move the row and the doc together.
-// ponytail: the table has no consumer yet. T007/T008 (sectioned budget) read
-// `primary`, `optional_sections` and `explicit_arguments`; T017-T020 (strict decode and
-// mode check) read `conditions`. The allow goes when T008 lands.
-#![allow(dead_code)]
+// ponytail: only `optional_sections` has a consumer so far (`in_drop_order`, read by the
+// sectioned budget), and only the rows whose handlers implement a drop order list one.
+// `conditions` are declared rules no handler enforces until T017-T020 (strict decode and
+// mode check); `explicit_arguments` and `typical_call` are read by T050. The field-level
+// allows below go then.
 
 /// Stand-in value in [`When::Equals`] for "the controlling argument is absent".
 pub(crate) const ABSENT: &str = "(absent)";
@@ -34,6 +35,7 @@ pub(crate) enum When {
     /// `argument` is one of `values` (use [`ABSENT`] for "not given").
     Equals(&'static str, &'static [&'static str]),
     /// `argument` is given.
+    #[allow(dead_code)] // ponytail: no row uses it yet; the mode check (T020) matches on it
     Present(&'static str),
     /// `argument` is not given.
     Absent(&'static str),
@@ -42,8 +44,11 @@ pub(crate) enum When {
 /// `argument` applies only when `applies_when` holds.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Condition {
+    #[allow(dead_code)] // ponytail: read by the mode check (T020); today only by tests
     pub argument: &'static str,
+    #[allow(dead_code)] // ponytail: as above
     pub applies_when: When,
+    #[allow(dead_code)] // ponytail: as above
     pub on_mismatch: OnMismatch,
 }
 
@@ -51,15 +56,21 @@ pub(crate) struct Condition {
 pub(crate) struct ToolContract {
     /// Registered tool name, without the `mcp__symforge__` client prefix.
     pub tool: &'static str,
+    /// Declared mode rules. NOT enforced by any handler yet: the check lands with T020.
+    #[allow(dead_code)] // ponytail: read by T020
     pub conditions: &'static [Condition],
     /// The content the tool exists to return.
+    #[allow(dead_code)] // ponytail: read by T050
     pub primary: &'static str,
-    /// Sections dropped under pressure, first entry dropped first.
+    /// Sections dropped under pressure, first entry dropped first. Only rows whose
+    /// handlers implement the order list one (`get_file_context`, `get_symbol_context`).
     pub optional_sections: &'static [&'static str],
     /// Arguments whose presence marks content as explicitly requested (FR-024).
+    #[allow(dead_code)] // ponytail: read by T050
     pub explicit_arguments: &'static [&'static str],
     /// JSON object of the typical call, on the reliability fixture. A `{name}` value is a
     /// placeholder the payload test (T050) fills from an earlier call.
+    #[allow(dead_code)] // ponytail: read by T050
     pub typical_call: &'static str,
 }
 
@@ -108,7 +119,6 @@ impl ToolContract {
 pub(crate) static TOOL_CONTRACTS: &[ToolContract] = &[
     // -- lifecycle and health --
     row("health", "index state, counts and watcher state", "{}")
-        .drops(&["quarantine registry", "savings"])
         .explicit(&["quarantine_limit", "quarantine_offset"]),
     row("health_compact", "one-line index and watcher state", "{}"),
     row("checkpoint_now", "snapshot write confirmation", "{}"),
@@ -156,19 +166,20 @@ pub(crate) static TOOL_CONTRACTS: &[ToolContract] = &[
         "{}",
     )
     .when(&[
-        // Code today: `path` also filters detail="full"; two modes use it, so no SelectMode.
-        cond("path", Equals("detail", &["tree", "full"]), Refuse),
-        cond("depth", Equals("detail", &["tree"]), SelectMode),
+        // `path` applies at every detail level (FR-028), so it has no condition.
+        // Intended rule, NOT enforced until T020: `depth` groups the compact map and
+        // expands the tree; the full outline is flat, so `depth` with detail="full"
+        // is to be refused. Today the handler ignores it there.
+        cond("depth", Equals("detail", &["tree", "compact", ABSENT]), Refuse),
         cond("max_files", Equals("detail", &["full"]), SelectMode),
     ])
-    .drops(&["knowledge digests"])
     .explicit(&["detail", "path", "depth"]),
     row(
         "get_file_context",
         "outline of the file",
         r#"{"path":"src/parent/leaf.rs"}"#,
     )
-    .drops(&["git", "references", "consumers", "imports"])
+    .drops(&["knowledge"])
     .explicit(&["sections"]),
     row(
         "get_symbol_context",
@@ -176,7 +187,7 @@ pub(crate) static TOOL_CONTRACTS: &[ToolContract] = &[
         r#"{"name":"target_fn","path":"src/parent/leaf.rs"}"#,
     )
     .when(&[cond("file", Absent("bundle"), Refuse)])
-    .drops(&["git activity", "type dependencies", "siblings", "implementations"])
+    .drops(&["knowledge"])
     .explicit(&["sections", "bundle"]),
     row(
         "search_symbols",
@@ -195,8 +206,7 @@ pub(crate) static TOOL_CONTRACTS: &[ToolContract] = &[
             Refuse,
         ),
         cond("follow_refs_limit", Equals("follow_refs", &["true"]), SelectMode),
-    ])
-    .drops(&["callers of enclosing symbols", "surrounding context"]),
+    ]),
     row(
         "search_files",
         "paths ranked by relevance to the query",
@@ -253,7 +263,6 @@ pub(crate) static TOOL_CONTRACTS: &[ToolContract] = &[
         "enclosing symbol, parent and siblings of the line",
         r#"{"path":"src/parent/leaf.rs","line":8}"#,
     )
-    .drops(&["siblings"])
     .explicit(&["line"]),
     row(
         "analyze_file_impact",
@@ -264,15 +273,13 @@ pub(crate) static TOOL_CONTRACTS: &[ToolContract] = &[
         "co_changes_limit",
         Equals("include_co_changes", &["true"]),
         SelectMode,
-    )])
-    .drops(&["co-changes"]),
+    )]),
     row(
         "what_changed",
         "the changed paths",
         r#"{"uncommitted":true}"#,
     )
-    .when(&[cond("include_symbol_diff", Absent("since"), Refuse)])
-    .drops(&["symbol diff"]),
+    .when(&[cond("include_symbol_diff", Absent("since"), Refuse)]),
     row(
         "diff_symbols",
         "added, removed and modified symbols between the refs",
@@ -288,8 +295,7 @@ pub(crate) static TOOL_CONTRACTS: &[ToolContract] = &[
         "explore",
         "symbols, text patterns and files for the concept",
         r#"{"query":"target function"}"#,
-    )
-    .drops(&["call chains", "signatures"]),
+    ),
     // -- edits --
     row(
         "replace_symbol_body",
@@ -383,6 +389,18 @@ pub(crate) static TOOL_CONTRACTS: &[ToolContract] = &[
 /// The contract of `tool`, if it has one.
 pub(crate) fn contract_for(tool: &str) -> Option<&'static ToolContract> {
     TOOL_CONTRACTS.iter().find(|c| c.tool == tool)
+}
+
+/// Order `sections` as `tool`'s contract drops them under pressure (FR-025): the listed
+/// ones first, in contract order, then any the contract does not name, in the order given.
+pub(crate) fn in_drop_order<'a>(tool: &str, sections: &mut [(&'a str, &'a str)]) {
+    let order = contract_for(tool).map_or(&[][..], |c| c.optional_sections);
+    sections.sort_by_key(|(name, _)| {
+        order
+            .iter()
+            .position(|listed| listed == name)
+            .unwrap_or(order.len())
+    });
 }
 
 #[cfg(test)]
