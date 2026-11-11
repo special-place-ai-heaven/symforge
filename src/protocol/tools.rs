@@ -2855,7 +2855,11 @@ impl SymForgeServer {
                 Some(p) => p.to_string(),
                 None => {
                     record_read_outcome(ReadOutcome::InvalidRequest);
-                    return "Error: sections requires the 'path' parameter.".to_string();
+                    return "invalid_request: \"sections\" (an empty list means all sections) selects \
+                            trace mode, which needs \"path\". Call get_symbol_context(name, \
+                            path=<file from search_symbols>, sections=[...]) or drop \"sections\" \
+                            for the default view."
+                        .to_string();
                 }
             };
 
@@ -7192,6 +7196,17 @@ impl SymForgeServer {
                         "Phase 0 facade relay is restricted to the A-019 source-mutation-safe measurement allowlist; batch_rename additionally requires dry_run=true",
                     ));
             }
+            // Feature 036: the relayed arguments pass the same request check as a direct
+            // `tools/call` (unknown keys and mode rules), so an ignored argument cannot hide
+            // behind the relay. A mode a lone argument selects is applied; the relay adds no
+            // note, since it measures byte parity with the legacy renderer.
+            let mut relay_args = legacy_args.as_object().cloned();
+            if let Err(refusal) = self.refuse_invalid_arguments(legacy_tool, &mut relay_args) {
+                return Ok(refusal);
+            }
+            let legacy_args = relay_args
+                .map(serde_json::Value::Object)
+                .unwrap_or(legacy_args);
             let output = self.dispatch_tool_for_tests(legacy_tool, legacy_args).await;
             // This compatibility relay measures byte parity with the legacy
             // renderer. It deliberately carries no `symforge/result_status`:
@@ -25812,7 +25827,7 @@ mod tests {
             .await;
 
         assert!(
-            result.contains("Error: sections requires"),
+            result.contains("selects trace mode, which needs \"path\""),
             "should require path, got: {result}"
         );
     }

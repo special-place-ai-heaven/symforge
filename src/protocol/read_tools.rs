@@ -116,34 +116,45 @@ where
         /// Entire array serialized as a single JSON string.
         Str(String),
     }
-    match VecOrStr::deserialize(deserializer)? {
-        VecOrStr::Vec(values) => {
-            // Try deserializing each element. If an element is a JSON string
-            // that looks like a JSON object, parse the inner string first.
-            values
-                .into_iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    // First try direct deserialization (normal case: native objects)
-                    match serde_json::from_value::<T>(v.clone()) {
-                        Ok(item) => Ok(item),
-                        Err(direct_err) => {
-                            // If the value is a string, try parsing it as JSON
-                            if let serde_json::Value::String(ref s) = v {
-                                serde_json::from_str::<T>(s).map_err(|_| {
-                                    serde::de::Error::custom(format!("element {i}: {direct_err}"))
+    // Both shapes decode their elements here, so a key `T` does not consume is
+    // recorded for the strict request check whichever way the array arrived (feature 036).
+    fn decode_elements<T: serde::de::DeserializeOwned, E: serde::de::Error>(
+        values: Vec<serde_json::Value>,
+    ) -> Result<Vec<T>, E> {
+        // Try deserializing each element. If an element is a JSON string
+        // that looks like a JSON object, parse the inner string first.
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                // First try direct deserialization (normal case: native objects).
+                // `from_value_noting` is `from_value`, plus a record of keys `T` does
+                // not consume while a strict request check runs.
+                match super::tool_contract::from_value_noting::<T>(v.clone(), i) {
+                    Ok(item) => Ok(item),
+                    Err(direct_err) => {
+                        // If the value is a string, try parsing it as JSON
+                        if let serde_json::Value::String(ref s) = v {
+                            serde_json::from_str::<serde_json::Value>(s)
+                                .map_err(|_| ())
+                                .and_then(|inner| {
+                                    super::tool_contract::from_value_noting::<T>(inner, i)
+                                        .map_err(|_| ())
                                 })
-                            } else {
-                                Err(serde::de::Error::custom(format!(
-                                    "element {i}: {direct_err}"
-                                )))
-                            }
+                                .map_err(|()| E::custom(format!("element {i}: {direct_err}")))
+                        } else {
+                            Err(E::custom(format!("element {i}: {direct_err}")))
                         }
                     }
-                })
-                .collect()
-        }
-        VecOrStr::Str(s) => serde_json::from_str::<Vec<T>>(&s).map_err(serde::de::Error::custom),
+                }
+            })
+            .collect()
+    }
+    match VecOrStr::deserialize(deserializer)? {
+        VecOrStr::Vec(values) => decode_elements(values),
+        VecOrStr::Str(s) => decode_elements(
+            serde_json::from_str::<Vec<serde_json::Value>>(&s).map_err(serde::de::Error::custom)?,
+        ),
     }
 }
 
@@ -156,20 +167,20 @@ pub struct GetSymbolInput {
     pub project: Option<String>,
     /// Optional file path. If omitted, resolve `name` by exact index search; use
     /// `symbol_line`/`kind` to disambiguate. If set, open that file directly.
-    /// Ignored when `targets` is provided.
+    /// Refused with `targets`.
     #[serde(default)]
     pub path: String,
-    /// Symbol name to look up (required for single lookup; ignored when `targets` is provided).
+    /// Symbol name to look up (required for single lookup; refused with `targets`).
     #[serde(default)]
     pub name: String,
-    /// Optional kind filter: "fn", "struct", "enum", "impl", etc.
+    /// Optional kind filter: "fn", "struct", "enum", "impl", etc. Refused with `targets`.
     pub kind: Option<String>,
     /// Disambiguate when multiple symbols share the same name. Pass the 1-based start line of the
-    /// desired symbol (shown in ambiguity errors and search_symbols output).
+    /// desired symbol (shown in ambiguity errors and search_symbols output). Refused with `targets`.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub symbol_line: Option<u32>,
     /// Optional batch mode: provide multiple targets to retrieve 2+ symbols or code slices in one call.
-    /// Each target is a file path + symbol name or byte range. When provided, path/name/kind above are ignored.
+    /// Each target is a file path + symbol name or byte range. Do not combine with path/name/kind/symbol_line (refused).
     #[serde(default, deserialize_with = "lenient_option_vec")]
     #[schemars(with = "Vec<SymbolTarget>")]
     pub targets: Option<Vec<SymbolTarget>>,
@@ -191,7 +202,10 @@ pub struct GetSymbolInput {
 /// A single target in a `get_symbols` batch request.
 ///
 /// Either provide `name` (symbol lookup) or `start_byte`/`end_byte` (code slice).
+// `deny_unknown_fields`: `targets` decodes through `lenient_option_vec`, whose element
+// decode is invisible to `serde_ignored`; the unknown-field error is what refuses a key here.
 #[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SymbolTarget {
     /// Relative file path.
     pub path: String,
@@ -278,7 +292,7 @@ pub struct GetRepoMapInput {
     pub include_knowledge: Option<bool>,
     /// Limit the map to this subtree, at every detail level (default: project root).
     pub path: Option<String>,
-    /// Directory levels to group (compact) or expand (tree); default 2, max 5.
+    /// Directory levels to group (detail=compact) or expand (detail=tree); default 2, max 5. Refused with detail=full.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub depth: Option<u32>,
     /// Files listed by detail="full" (default 200); with max_tokens and no detail it also picks full or compact.
@@ -358,7 +372,7 @@ pub struct GetSymbolContextInput {
     pub project: Option<String>,
     /// Symbol name to inspect.
     pub name: String,
-    /// Optional file filter (ignored when bundle=true; use path instead).
+    /// Optional file filter (with bundle=true use path instead).
     pub file: Option<String>,
     /// File path from `search_symbols`. Required when bundle=true or sections is provided.
     pub path: Option<String>,
