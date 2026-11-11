@@ -1325,10 +1325,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // byte-precise callers, bounded evidence, and paired server/embed regressions.
 // Same 312 files; independently reviewed and recomputed; no new boundary bridge.
 // docs/reviews/2026-10-25-differential-overlap-review.md.
+// Refreshed 2026-11-11 for feature 036 T003/T004: new `protocol/tool_contract.rs`
+// (a static per-tool table and its tests; no bridge) and `SYMFORGE_TOOL_NAMES`
+// widened to `pub(crate)`. 315 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "1428d4a0127024cdbc640bb8c94ac72f1781af4dd8f373a80149b7cd658b97c1",
-    314,
-    12535200,
+    "f2f6fe41db6917be129ced14bcd3ac95103eafb026a539a39e8368bfb2cbd12d",
+    315,
+    12551896,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

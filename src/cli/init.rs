@@ -716,7 +716,7 @@ pub fn merge_hooks_into_settings(
 // Tool name constants
 // ---------------------------------------------------------------------------
 
-const SYMFORGE_TOOL_NAMES: &[&str] = &[
+pub(crate) const SYMFORGE_TOOL_NAMES: &[&str] = &[
     "mcp__symforge__health",
     "mcp__symforge__health_compact",
     "mcp__symforge__checkpoint_now",

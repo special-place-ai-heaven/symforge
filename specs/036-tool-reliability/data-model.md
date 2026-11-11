@@ -23,8 +23,8 @@ Rules: every tool in the registered tool list has exactly one contract (a test e
 |---|---|
 | `path`, `line`, `byte_range` | where the identifier occurs |
 | `text` | the source line |
-| `class` | `Confirmed`, `Probable`, `Unresolved`, `Excluded` |
-| `rule` | confirmed: `ImportPath`, `QualifiedPath`, `ModuleDeclaration`, `IndexedReference`, `SameFileUnshadowed`; probable: `SameFile`, `UniqueName`, `UnnormalisedPath`; excluded: `InComment`, `InString`; unresolved: `NoRule` |
+| `class` | `Definition`, `Confirmed`, `Probable`, `Unresolved`, `Excluded` |
+| `rule` | confirmed: `ImportPath`, `QualifiedPath`, `ModuleDeclaration`, `IndexedReference`, `SameFileUnshadowed`; probable: `SameFile`, `UniqueName`, `UnnormalisedPath`, `MemberAccess` (the name follows a receiver, so it may be a method or field of another type); excluded: `InComment`, `InString`, `OtherDefinition` (the occurrence is itself the definition of a different symbol); unresolved: `NoRule` |
 | `kind` | the `ReferenceKind` of the joined index record, when one exists |
 | `enclosing_symbol` | name of the enclosing symbol, when known |
 | `is_test` | whether the file or enclosing item is test code |
@@ -35,7 +35,7 @@ Rules: every tool in the registered tool list has exactly one contract (a test e
 |---|---|
 | `target` | identifier plus optional defining path |
 | `scope` | paths searched |
-| `sites` | every `CandidateSite` in scope |
+| `sites` | every `CandidateSite` in scope, including the target's own definition (class `Definition`), so the set equals an exact text search |
 | `out_of_scope` | count of sites the scope removed, by class |
 | `unsearched` | count of in-scope files not searched, by reason (policy-withheld, unreadable) |
 
