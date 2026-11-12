@@ -1392,9 +1392,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Review round: capped-value notes on both lanes, the shared symbol-kind matcher, section
 // lowercasing, the include_tests marker skipped on the daemon lane. Calls only. 319 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "a465e60cf1e0256defacbcc1ee22b3a2649d2d1357ca1be39c0875ae4a76ae56",
+    "d64e259bf8b0e837b25974fb20ec1dba9ead6ff9f46d04e2a6febda8b52f8bc0",
     319,
-    12935643,
+    12936672,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

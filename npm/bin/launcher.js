@@ -3,6 +3,7 @@
 
 const childProcess = require("child_process");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { resolveBinary, formatResolveError } = require("../lib/resolve-binary.js");
 
@@ -163,10 +164,56 @@ function maybeWarnPathShadow(consoleMod, env, platform, resolvedBinaryPath, self
   );
 }
 
+// Signals a caller (an agent harness, a container stop) sends to end the server.
+const FORWARDED_SIGNALS = Object.freeze(["SIGTERM", "SIGINT", "SIGHUP"]);
+
+// Run the native binary and settle once it has EXITED, never before (#877).
+// `spawnSync` blocked the event loop, so no signal handler could run: a SIGTERM
+// killed this launcher and orphaned the native child, which then exited
+// unreaped and, under a PID 1 that is not an init, stayed a zombie forever.
+// Forwarding the signal and waiting for `exit` means this process always
+// collects its child. A SIGKILL to the launcher cannot be forwarded; that gap
+// stays. Windows has no zombies and its "signals" (Ctrl+C) already reach the
+// child through the shared console, so nothing is forwarded there.
+function runChildForwardingSignals(command, args, options, spawnFn = childProcess.spawn) {
+  return new Promise((resolve) => {
+    // Handlers go in BEFORE the spawn: a signal landing between spawn() and
+    // the handler install would otherwise still kill this launcher alone. One
+    // that arrives before the child exists is held and delivered right after.
+    let child;
+    let early;
+    const signals = process.platform === "win32" ? [] : FORWARDED_SIGNALS;
+    const forward = (signal) => {
+      if (child) child.kill(signal);
+      else early = signal;
+    };
+    const settle = (result) => {
+      for (const signal of signals) process.removeListener(signal, forward);
+      resolve(result);
+    };
+    for (const signal of signals) process.on(signal, forward);
+    try {
+      child = spawnFn(command, args, options);
+    } catch (error) {
+      // Synchronous spawn failures (EINVAL, E2BIG, EPERM, ...) take the same
+      // path as the 'error' event so exit codes match the old spawnSync ones.
+      settle({ error });
+      return;
+    }
+    if (early) child.kill(early);
+    // 'error' is terminal only when the spawn itself failed (no pid); a failed
+    // kill also emits 'error', and the child is still ours to wait for then.
+    child.on("error", (error) => {
+      if (child.pid === undefined) settle({ error });
+    });
+    child.once("exit", (status, signal) => settle({ status, signal }));
+  });
+}
+
 function createLauncher(overrides = {}) {
   const processMod = overrides.process || process;
   const consoleMod = overrides.console || console;
-  const spawnSyncFn = overrides.spawnSync || childProcess.spawnSync;
+  const runChildFn = overrides.runChild || runChildForwardingSignals;
   const resolveBinaryFn = overrides.resolveBinary || ((opts) => resolveBinary({
     ...opts,
     platform: processMod.platform,
@@ -175,7 +222,7 @@ function createLauncher(overrides = {}) {
   }));
   const selfDir = overrides.selfDir || __dirname;
 
-  function main(args) {
+  async function main(args) {
     const resolved = resolveBinaryFn({ binary: "symforge" });
     if (resolved.reason !== "ok") {
       consoleMod.error(formatResolveError(resolved, {
@@ -199,16 +246,22 @@ function createLauncher(overrides = {}) {
       // Detection failure must not stop symforge from running.
     }
 
-    const result = spawnSyncFn(resolved.binaryPath, args, {
+    const result = await runChildFn(resolved.binaryPath, args, {
       stdio: "inherit",
       env: processMod.env,
       shell: false,
+      // Never a visible console window, even from a console-less parent. It
+      // only sets SW_HIDE on Windows; stdio inheritance is unaffected.
+      windowsHide: true,
     });
     if (result.error) {
       consoleMod.error(`symforge: failed to spawn ${resolved.binaryPath}: ${result.error.code || result.error.message}`);
       return result.error.code === "ENOENT" ? 127 : 126;
     }
-    return result.status ?? 1;
+    if (result.status !== null && result.status !== undefined) return result.status;
+    // Killed by a signal: report it the shell way (128 + signal number).
+    const signalNumber = result.signal ? os.constants.signals[result.signal] : undefined;
+    return signalNumber ? 128 + signalNumber : 1;
   }
 
   return {
@@ -218,11 +271,18 @@ function createLauncher(overrides = {}) {
 
 module.exports = {
   createLauncher,
+  runChildForwardingSignals,
   whichAllSymforge,
   isOwnShim,
   classifyShadow,
 };
 
 if (require.main === module) {
-  process.exit(createLauncher().main(process.argv.slice(2)));
+  createLauncher().main(process.argv.slice(2)).then(
+    (code) => process.exit(code),
+    (err) => {
+      console.error(err.message);
+      process.exit(1);
+    }
+  );
 }

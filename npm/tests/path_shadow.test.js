@@ -152,7 +152,7 @@ test("isOwnShim treats a genuinely foreign install as not ours", (t) => {
   assert.equal(isOwnShim(foreign, selfDir), false);
 });
 
-test("launcher warns when a different symforge dir is first on PATH", (t) => {
+test("launcher warns when a different symforge dir is first on PATH", async (t) => {
   const root = tmpDir(t, "symforge-warn-");
   const shadowDir = path.join(root, "usr", "local", "bin");
   const shadow = writeFakeBinary(shadowDir, "symforge");
@@ -173,19 +173,19 @@ test("launcher warns when a different symforge dir is first on PATH", (t) => {
     resolveBinary() {
       return { reason: "ok", binaryPath: resolvedBinary };
     },
-    spawnSync() {
+    runChild() {
       return { status: 0 };
     },
   });
 
-  assert.equal(launcher.main([]), 0);
+  assert.equal(await launcher.main([]), 0);
   const joined = errors.join("\n");
   assert.match(joined, /different 'symforge'/);
   assert.match(joined, new RegExp(shadow.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(joined, /symforge init/);
 });
 
-test("launcher does NOT warn when its own npm shim is first on PATH", (t) => {
+test("launcher does NOT warn when its own npm shim is first on PATH", async (t) => {
   const root = tmpDir(t, "symforge-noshim-warn-");
   // Realistic global install: <prefix>/lib/node_modules/symforge/bin is selfDir,
   // <prefix>/bin/symforge is the npm shim, and the native binary lives in the
@@ -216,12 +216,12 @@ test("launcher does NOT warn when its own npm shim is first on PATH", (t) => {
     resolveBinary() {
       return { reason: "ok", binaryPath: resolvedBinary };
     },
-    spawnSync() {
+    runChild() {
       return { status: 0 };
     },
   });
 
-  assert.equal(launcher.main([]), 0);
+  assert.equal(await launcher.main([]), 0);
   assert.deepEqual(errors, []);
   // Sanity: the shim really is the first PATH entry and a different path than
   // the resolved binary, so the "no warn" result is from shim recognition, not
@@ -229,7 +229,7 @@ test("launcher does NOT warn when its own npm shim is first on PATH", (t) => {
   assert.notEqual(path.resolve(shim), path.resolve(resolvedBinary));
 });
 
-test("launcher does NOT warn when the resolved native binary is itself first on PATH", (t) => {
+test("launcher does NOT warn when the resolved native binary is itself first on PATH", async (t) => {
   const root = tmpDir(t, "symforge-self-warn-");
   const binDir = path.join(root, "bin");
   const resolvedBinary = writeFakeBinary(binDir, "symforge");
@@ -248,12 +248,12 @@ test("launcher does NOT warn when the resolved native binary is itself first on 
     resolveBinary() {
       return { reason: "ok", binaryPath: resolvedBinary };
     },
-    spawnSync() {
+    runChild() {
       return { status: 0 };
     },
   });
 
-  assert.equal(launcher.main([]), 0);
+  assert.equal(await launcher.main([]), 0);
   assert.deepEqual(errors, []);
 });
 
@@ -276,7 +276,7 @@ function linkedInstall(t, prefix) {
   return { selfDir, binDir, link };
 }
 
-function runLauncher(selfDir, pathDirs, resolvedBinary) {
+async function runLauncher(selfDir, pathDirs, resolvedBinary) {
   const errors = [];
   const launcher = createLauncher({
     process: { platform: "linux", arch: "x64", env: { PATH: pathDirs.join(path.delimiter) } },
@@ -285,15 +285,15 @@ function runLauncher(selfDir, pathDirs, resolvedBinary) {
     resolveBinary() {
       return { reason: "ok", binaryPath: resolvedBinary };
     },
-    spawnSync() {
+    runChild() {
       return { status: 0 };
     },
   });
-  assert.equal(launcher.main([]), 0);
+  assert.equal(await launcher.main([]), 0);
   return errors;
 }
 
-test("launcher does NOT flag itself when first on PATH through a symlinked bin", (t) => {
+test("launcher does NOT flag itself when first on PATH through a symlinked bin", async (t) => {
   const root = tmpDir(t, "symforge-selflink-");
   // The prefix is NOT the npm-configured one and the shim text never names the
   // package, so only the realpath comparison can prove this is the launcher.
@@ -301,10 +301,10 @@ test("launcher does NOT flag itself when first on PATH through a symlinked bin",
   if (!install) return;
   const resolvedBinary = path.join(root, ".npm-global", "lib", "node_modules", "symforge-linux-x64", "bin", "symforge");
 
-  assert.deepEqual(runLauncher(install.selfDir, [install.binDir], resolvedBinary), []);
+  assert.deepEqual(await runLauncher(install.selfDir, [install.binDir], resolvedBinary), []);
 });
 
-test("launcher reached through a symlinked prefix does not flag itself", (t) => {
+test("launcher reached through a symlinked prefix does not flag itself", async (t) => {
   const root = tmpDir(t, "symforge-prefixlink-");
   const install = linkedInstall(t, path.join(root, "real-prefix"));
   if (!install) return;
@@ -317,10 +317,10 @@ test("launcher reached through a symlinked prefix does not flag itself", (t) => 
   }
   const resolvedBinary = path.join(root, "real-prefix", "lib", "node_modules", "symforge-linux-x64", "bin", "symforge");
 
-  assert.deepEqual(runLauncher(install.selfDir, [path.join(aliasPrefix, "bin")], resolvedBinary), []);
+  assert.deepEqual(await runLauncher(install.selfDir, [path.join(aliasPrefix, "bin")], resolvedBinary), []);
 });
 
-test("a genuinely different first copy still warns even when this launcher is also on PATH", (t) => {
+test("a genuinely different first copy still warns even when this launcher is also on PATH", async (t) => {
   const root = tmpDir(t, "symforge-twocopies-");
   const mine = linkedInstall(t, path.join(root, "mine"));
   if (!mine) return;
@@ -328,13 +328,13 @@ test("a genuinely different first copy still warns even when this launcher is al
   if (!other) return;
   const resolvedBinary = path.join(root, "mine", "lib", "node_modules", "symforge-linux-x64", "bin", "symforge");
 
-  const errors = runLauncher(mine.selfDir, [other.binDir, mine.binDir], resolvedBinary);
+  const errors = await runLauncher(mine.selfDir, [other.binDir, mine.binDir], resolvedBinary);
   const joined = errors.join("\n");
   assert.match(joined, /different 'symforge'/);
   assert.ok(joined.includes(other.link), joined);
 });
 
-test("SYMFORGE_NO_SHADOW_WARN suppresses the warning entirely", (t) => {
+test("SYMFORGE_NO_SHADOW_WARN suppresses the warning entirely", async (t) => {
   const root = tmpDir(t, "symforge-suppress-");
   const shadowDir = path.join(root, "usr", "local", "bin");
   writeFakeBinary(shadowDir, "symforge");
@@ -354,16 +354,16 @@ test("SYMFORGE_NO_SHADOW_WARN suppresses the warning entirely", (t) => {
     resolveBinary() {
       return { reason: "ok", binaryPath: resolvedBinary };
     },
-    spawnSync() {
+    runChild() {
       return { status: 0 };
     },
   });
 
-  assert.equal(launcher.main([]), 0);
+  assert.equal(await launcher.main([]), 0);
   assert.deepEqual(errors, []);
 });
 
-test("the shadow warning never writes to stdout", (t) => {
+test("the shadow warning never writes to stdout", async (t) => {
   const root = tmpDir(t, "symforge-stdout-");
   const shadowDir = path.join(root, "usr", "local", "bin");
   writeFakeBinary(shadowDir, "symforge");
@@ -393,16 +393,16 @@ test("the shadow warning never writes to stdout", (t) => {
     resolveBinary() {
       return { reason: "ok", binaryPath: resolvedBinary };
     },
-    spawnSync() {
+    runChild() {
       return { status: 0 };
     },
   });
 
-  assert.equal(launcher.main([]), 0);
+  assert.equal(await launcher.main([]), 0);
   assert.equal(stdoutChunks.join(""), "");
 });
 
-test("a thrown error inside the shadow check does not prevent spawn", (t) => {
+test("a thrown error inside the shadow check does not prevent spawn", async (t) => {
   const selfDir = path.join(os.tmpdir(), "symforge-throw-self");
   const spawnCalls = [];
 
@@ -427,7 +427,7 @@ test("a thrown error inside the shadow check does not prevent spawn", (t) => {
     resolveBinary() {
       return { reason: "ok", binaryPath: "/some/native/symforge" };
     },
-    spawnSync(command, args, options) {
+    runChild(command, args, options) {
       spawnCalls.push({ command, args, options });
       return { status: 0 };
     },
@@ -435,7 +435,7 @@ test("a thrown error inside the shadow check does not prevent spawn", (t) => {
 
   // Spawn still happens and the exit status is returned despite the thrown
   // detection error.
-  assert.equal(launcher.main(["--version"]), 0);
+  assert.equal(await launcher.main(["--version"]), 0);
   assert.equal(spawnCalls.length, 1);
   assert.equal(spawnCalls[0].command, "/some/native/symforge");
 });
