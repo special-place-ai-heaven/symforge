@@ -2484,25 +2484,23 @@ fn required_field_names(tool: &Tool) -> Vec<&str> {
 }
 
 /// A parameter decode failure reaches the caller as serde text alone
-/// (`missing field ...`), which does not say what the tool expects. Append one
-/// line naming the tool's required top-level fields, keeping serde's text first.
-/// Results that are not decode failures, and tools with no required fields, are
+/// (`missing field ...`), which does not say what the tool expects. Reword it through the
+/// shared `decode_failure_text` (the embed lane prints the same bytes): serde's text first,
+/// with every argument VALUE serde quoted in it removed, then one line naming the tool's
+/// required top-level fields when it has any. Results that are not decode failures are
 /// left byte-for-byte untouched.
 fn append_required_fields_hint(tool: Option<&Tool>, result: &mut rmcp::model::CallToolResult) {
-    let Some(tool) = tool else { return };
-    let required = required_field_names(tool);
-    if required.is_empty() {
-        return;
-    }
     for block in &mut result.content {
         if let rmcp::model::ContentBlock::Text(text) = block
-            && text.text.starts_with(PARAMETER_DECODE_ERROR_PREFIX)
+            && let Some(message) = text.text.strip_prefix(PARAMETER_DECODE_ERROR_PREFIX)
         {
-            text.text.push_str(&format!(
-                "\nRequired fields for `{}`: {}.",
-                tool.name,
-                required.join(", ")
-            ));
+            let required = tool.map(required_field_names).unwrap_or_default();
+            let name = tool.map_or("", |tool| tool.name.as_ref());
+            text.text = crate::index_lifecycle::guidance::request_refusal::decode_failure_text(
+                name,
+                message.trim_start(),
+                &required,
+            );
             return;
         }
     }

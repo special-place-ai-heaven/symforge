@@ -1978,7 +1978,7 @@ impl HostRoom {
         // with the MCP text, including on request types that would otherwise drop it.
         let value: serde_json::Value =
             serde_json::from_slice(request_json).map_err(|_| invalid())?;
-        if let Some(text) = request_check::unknown_argument_refusal(&value) {
+        if let Some(text) = request_check::argument_refusal(&value) {
             let mut refusal = invalid();
             refusal.message = Some(text);
             return Err(refusal);

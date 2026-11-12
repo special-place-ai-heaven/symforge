@@ -250,6 +250,75 @@ fn with_bad_key(args: &Value) -> Value {
     bad
 }
 
+/// Tools whose embed request declares exactly the MCP tool's arguments: refusals are
+/// byte-identical. (`checkpoint_now` too; it runs last.)
+const SAME_ARGUMENT_SET: &[&str] = &[
+    "health",
+    "health_compact",
+    "get_repo_map",
+    "get_file_context",
+    "get_symbol",
+    "get_symbol_context",
+    "search_knowledge",
+    "review_knowledge",
+    "find_references",
+    "find_dependents",
+    "inspect_match",
+    "what_changed",
+    "diff_symbols",
+    "ask",
+    "conventions",
+    "context_inventory",
+    "status",
+    "symforge",
+    "symforge_edit",
+];
+
+/// Tools whose embed request declares other arguments than the MCP tool, and the embed
+/// request's fields in declaration order, which its refusal lists.
+const DIFFERENT_ARGUMENT_SET: &[(&str, &str)] = &[
+    (
+        "search_text",
+        "query, terms, regex, structural, path_prefix, language, limit, max_per_file, \
+         include_generated, include_tests, include_vendor, include_personal_tooling, glob, \
+         exclude_glob, context, case_sensitive, whole_word, group_by, include_body, \
+         follow_refs, follow_refs_limit, ranked, estimate, max_tokens",
+    ),
+    (
+        "search_symbols",
+        "query, kind, path_prefix, language, limit, include_generated, include_tests, \
+         include_vendor, include_personal_tooling, estimate, max_tokens",
+    ),
+    (
+        "search_files",
+        "query, limit, current_file, changed_with, resolve, estimate, max_tokens, \
+         debug_ranking, rank_by, anchor_path, include_vendor, include_personal_tooling, \
+         path_prefix",
+    ),
+    (
+        "get_file_content",
+        "path, mode, start_line, end_line, chunk_index, max_lines, around_line, around_match, \
+         match_occurrence, around_symbol, symbol_line, context_lines, show_line_numbers, \
+         header, estimate, offset, limit, max_tokens, force_refresh",
+    ),
+    ("validate_file_syntax", "path"),
+    (
+        "analyze_file_impact",
+        "path, new_file, include_co_changes, co_changes_limit, estimate",
+    ),
+    (
+        "explore",
+        "query, depth, limit, include_noise, include_vendor, include_personal_tooling, \
+         language, path_prefix, estimate, max_tokens",
+    ),
+    ("investigation_suggest", "focus"),
+    ("edit_plan", "target"),
+    (
+        "detect_impact",
+        "base_branch, since, depth, scope, include_untracked, include_data, paths",
+    ),
+];
+
 const QUERY_LIMITS: fn() -> Value = || json!({ "max_results": 100, "max_bytes": 1 << 20 });
 
 /// `QueryRequest` variant of each tool whose embed request decodes the MCP arguments.
@@ -344,8 +413,11 @@ fn assert_mcp_not_refused(result: &Value, label: &str) {
     );
 }
 
-/// Every tool that exists on both lanes with the same arguments: the same call with one
-/// unknown top-level key is refused with byte-identical text; without it, it succeeds.
+/// Every tool that exists on both lanes: the same call with one unknown top-level key is
+/// refused, and without it succeeds, on both lanes. Where the embed request declares the
+/// MCP tool's argument set the text is MCP's byte for byte; where it does not
+/// (`field_set_differences_are_pinned`), the list is the embed request's own fields in
+/// declaration order, so an LLM following it is not refused again.
 #[test]
 fn an_unknown_top_level_key_is_refused_with_the_mcp_text_on_the_embed_lane() {
     let dir = reliability_support::committed_fixture_copy();
@@ -354,60 +426,71 @@ fn an_unknown_top_level_key_is_refused_with_the_mcp_text_on_the_embed_lane() {
     let owner = HostRuntimeOwner::new(ProcessIndexRuntime::acquire().expect("runtime"));
     let room = room_in(&owner, &root, "parity-room");
 
-    let mut failures = Vec::new();
-    let mut compared = Vec::new();
-    let mut calls = concrete_typical_calls(&root.to_string_lossy());
+    let mut calls: std::collections::BTreeMap<&str, Value> =
+        concrete_typical_calls(&root.to_string_lossy())
+            .into_iter()
+            .collect();
+    // The embed `ExploreRequest` and `Checkpoint` require these; MCP accepts them.
+    for (key, value) in [
+        ("depth", json!(1)),
+        ("limit", json!(10)),
+        ("include_noise", json!(false)),
+        ("include_vendor", json!(false)),
+        ("include_personal_tooling", json!(false)),
+    ] {
+        calls.get_mut("explore").expect("explore call")[key] = value;
+    }
+    for key in ["verify_after_write", "export_artifact"] {
+        calls.get_mut("checkpoint_now").expect("checkpoint call")[key] = json!(false);
+    }
     // A checkpoint writes state; it goes last so earlier controls see one index.
-    calls.sort_by_key(|(tool, _)| *tool == "checkpoint_now");
-    for (tool, mut args) in calls {
-        if tool == "explore" {
-            // The embed `ExploreRequest` requires these; MCP accepts them.
-            args["depth"] = json!(1);
-            args["limit"] = json!(10);
-            args["include_noise"] = json!(false);
-            args["include_vendor"] = json!(false);
-            args["include_personal_tooling"] = json!(false);
-        }
-        if tool == "checkpoint_now" {
-            // The embed `Checkpoint` request requires both; MCP accepts them.
-            args["verify_after_write"] = json!(false);
-            args["export_artifact"] = json!(false);
-        }
-        let Some(control_wire) = embed_wire(tool, &args) else {
-            continue;
-        };
-        let control = mcp.call(tool, args.clone());
-        assert_mcp_not_refused(&control, &format!("{tool} control"));
+    let cases = SAME_ARGUMENT_SET
+        .iter()
+        .map(|tool| (*tool, None))
+        .chain(
+            DIFFERENT_ARGUMENT_SET
+                .iter()
+                .map(|(tool, fields)| (*tool, Some(*fields))),
+        )
+        .chain([("checkpoint_now", None)]);
+
+    let mut failures = Vec::new();
+    for (tool, embed_fields) in cases {
+        let args = calls
+            .get(tool)
+            .unwrap_or_else(|| panic!("{tool}: no concrete typical call"))
+            .clone();
+        let control_wire = embed_wire(tool, &args).unwrap_or_else(|| panic!("{tool}: no wire"));
+        assert_mcp_not_refused(&mcp.call(tool, args.clone()), &format!("{tool} control"));
         if let Err(refusal) = wire(&room, &control_wire) {
-            failures.push(format!(
-                "{tool}: embed control refused: {refusal:?} for {control_wire}"
-            ));
+            failures.push(format!("{tool}: embed control refused: {refusal:?}"));
             continue;
         }
         let bad = with_bad_key(&args);
         let mcp_text = text_of(&mcp.call(tool, bad.clone()));
-        let embed_wire_bad = embed_wire(tool, &bad).expect("same shape");
-        match wire(&room, &embed_wire_bad) {
+        let expected = match embed_fields {
+            None => mcp_text.clone(),
+            Some(fields) => format!(
+                "invalid_request: {tool} does not accept \"zz_unknown\". Valid arguments: \
+                 {fields}."
+            ),
+        };
+        match wire(&room, &embed_wire(tool, &bad).expect("same shape")) {
             Ok(_) => failures.push(format!("{tool}: embed accepted the unknown key")),
             Err(refusal) => {
                 if refusal.kind != HostRefusalKind::InvalidRequest {
                     failures.push(format!("{tool}: refusal kind {:?}", refusal.kind));
                 }
                 let embed_text = message_of(&refusal);
-                if embed_text.as_deref() != Some(mcp_text.as_str()) {
+                if embed_text.as_deref() != Some(expected.as_str()) {
                     failures.push(format!(
-                        "{tool}:\n  mcp:   {mcp_text}\n  embed: {embed_text:?}"
+                        "{tool}:\n  mcp:      {mcp_text}\n  expected: {expected}\n  embed:    \
+                         {embed_text:?}"
                     ));
                 }
             }
         }
-        compared.push(tool);
     }
-    assert!(
-        compared.len() >= 20,
-        "too few tools compared: {compared:?}\n{}",
-        failures.join("\n")
-    );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -636,5 +719,259 @@ fn an_enforced_trust_refusal_carries_the_mcp_text() {
     )
     .expect_err("enforced trust refuses the edit");
     assert_eq!(refusal.edit_kind.as_deref(), Some("EditRefused"));
+    assert_eq!(message_of(&refusal).as_deref(), Some(mcp_text.as_str()));
+}
+
+/// The texts both lanes give for one call: MCP's result text and the embed refusal text.
+fn both(
+    mcp: &mut StdioClient,
+    room: &HostRoom,
+    tool: &str,
+    args: &Value,
+) -> (String, Option<String>) {
+    let mcp_text = text_of(&mcp.call(tool, args.clone()));
+    let embed = wire(room, &embed_wire(tool, args).expect("wire"))
+        .err()
+        .and_then(|refusal| message_of(&refusal));
+    (mcp_text, embed)
+}
+
+/// `name=value` from a fixed-grammar answer.
+fn token(text: &str, name: &str) -> String {
+    text.split_whitespace()
+        .find_map(|field| field.strip_prefix(&format!("{name}=")))
+        .map(|value| value.trim_end_matches([',', ']']).to_string())
+        .unwrap_or_else(|| panic!("missing {name}: {text}"))
+}
+
+/// The first string member named `key` anywhere in `value`.
+fn find_string(value: &Value, key: &str) -> Option<String> {
+    match value {
+        Value::Object(map) => map
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| map.values().find_map(|inner| find_string(inner, key))),
+        Value::Array(items) => items.iter().find_map(|inner| find_string(inner, key)),
+        _ => None,
+    }
+}
+
+/// Several unknown keys, in one element or beside it, a long key and a non-ASCII key:
+/// both lanes name every key, in the same order, with the same bytes.
+#[test]
+fn several_unknown_keys_are_named_alike_on_both_lanes() {
+    let dir = reliability_support::committed_fixture_copy();
+    let root = dunce::canonicalize(dir.path()).expect("canonical fixture");
+    let mut mcp = mcp_ready(&root);
+    let owner = HostRuntimeOwner::new(ProcessIndexRuntime::acquire().expect("runtime"));
+    let room = room_in(&owner, &root, "several-room");
+
+    let long_key = "k".repeat(50);
+    let long_named = format!("\"{}...\"", "k".repeat(40));
+    let review = json!({ "mode": "remediation", "source_scope": "current", "limit": 20,
+        "zz_one": 1, "zz_two": 2 });
+    let cases: Vec<(&str, Value, Vec<&str>)> = vec![
+        ("review_knowledge", review, vec!["\"zz_one\"", "\"zz_two\""]),
+        (
+            "get_symbol",
+            json!({ "targets": [{ "path": "src/long.rs", "name": "long_body",
+                "zz_a": 1, "zz_b": 2 }] }),
+            vec!["\"targets.0.zz_a\"", "\"targets.0.zz_b\""],
+        ),
+        (
+            "get_symbol",
+            json!({ "targets": [{ "path": "src/long.rs", "name": "long_body", "zz_a": 1 }],
+                "zzz": 1 }),
+            vec!["\"targets.0.zz_a\"", "\"zzz\""],
+        ),
+        (
+            "get_repo_map",
+            json!({ "zz_one": 1, "zz_two": 2 }),
+            vec!["\"zz_one\", \"zz_two\""],
+        ),
+        (
+            "get_repo_map",
+            json!({ long_key.as_str(): 1 }),
+            vec![long_named.as_str()],
+        ),
+        ("get_repo_map", json!({ "ключ_ü": 1 }), vec!["\"ключ_ü\""]),
+    ];
+    let mut failures = Vec::new();
+    for (tool, args, named) in cases {
+        let (mcp_text, embed) = both(&mut mcp, &room, tool, &args);
+        if embed.as_deref() != Some(mcp_text.as_str()) {
+            failures.push(format!(
+                "{tool} {args}:\n  mcp:   {mcp_text}\n  embed: {embed:?}"
+            ));
+        }
+        for key in named {
+            if !mcp_text.contains(key) {
+                failures.push(format!("{tool} {args}: MCP text lacks {key}: {mcp_text}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A key inside a nested request object is named by its path with the parent hint, never
+/// as a top-level argument; its value is never echoed.
+#[test]
+fn a_key_inside_a_nested_request_object_is_named_by_its_path() {
+    let root = tempfile::tempdir().expect("repository");
+    git2::Repository::init(root.path()).expect("git repository");
+    std::fs::write(
+        root.path().join("lib.rs"),
+        b"pub fn target() -> u32 { 1 }\n",
+    )
+    .expect("source");
+    let root = dunce::canonicalize(root.path()).expect("canonical root");
+    let owner = HostRuntimeOwner::new(ProcessIndexRuntime::acquire().expect("runtime"));
+    let room = room_in(&owner, &root, "nested-object-room");
+    let limits = json!({ "max_files": 1, "max_findings": 1, "max_total_bytes": 4096 });
+    let inspect = |limits: Value| json!({ "InspectSecrets": { "scope": { "Paths": ["lib.rs"] }, "limits": limits } });
+    wire(&room, &inspect(limits.clone())).expect("inspect control");
+    let mut bad = limits;
+    bad["ignored_future_flag"] = json!("untrusted-field-value-must-not-echo");
+    let refusal = wire(&room, &inspect(bad)).expect_err("nested key refused");
+    let text = message_of(&refusal).expect("refusal text");
+    assert_eq!(
+        text,
+        "invalid_request: InspectSecrets does not accept \"limits.ignored_future_flag\". Valid \
+         arguments: scope, limits. Check the fields of \"limits\" against the tool's input \
+         schema."
+    );
+    assert!(
+        !serde_json::to_string(&refusal)
+            .unwrap()
+            .contains("must-not-echo")
+    );
+}
+
+/// A wrong type and a missing required argument get the same text on both lanes, and
+/// neither lane echoes the offending value.
+#[test]
+fn decode_failures_carry_the_same_text_without_values() {
+    let dir = reliability_support::committed_fixture_copy();
+    let root = dunce::canonicalize(dir.path()).expect("canonical fixture");
+    let mut mcp = mcp_ready(&root);
+    let owner = HostRuntimeOwner::new(ProcessIndexRuntime::acquire().expect("runtime"));
+    let room = room_in(&owner, &root, "decode-room");
+
+    let cases = [
+        ("inspect_match", json!({ "line": 1 })),
+        ("inspect_match", json!({ "path": 4242, "line": 1 })),
+        ("find_dependents", json!({})),
+        ("find_dependents", json!({ "path": 4242 })),
+        ("get_symbol_context", json!({})),
+        ("get_symbol_context", json!({ "name": 4242 })),
+    ];
+    let mut failures = Vec::new();
+    for (tool, args) in cases {
+        let (mcp_text, embed) = both(&mut mcp, &room, tool, &args);
+        if !mcp_text.starts_with("failed to deserialize parameters: ") || mcp_text.contains("4242")
+        {
+            failures.push(format!("{tool} {args}: MCP text: {mcp_text}"));
+        }
+        if embed.as_deref() != Some(mcp_text.as_str()) {
+            failures.push(format!(
+                "{tool} {args}:\n  mcp:   {mcp_text}\n  embed: {embed:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The embed edit plan request (`Edit.plan`) has `target` only: its refusal lists that,
+/// where MCP `edit_plan` also lists `project`.
+#[test]
+fn the_edit_plan_request_names_its_own_arguments() {
+    let dir = reliability_support::committed_fixture_copy();
+    let root = dunce::canonicalize(dir.path()).expect("canonical fixture");
+    let mut mcp = mcp_ready(&root);
+    let owner = HostRuntimeOwner::new(ProcessIndexRuntime::acquire().expect("runtime"));
+    let room = room_in(&owner, &root, "edit-plan-room");
+    let plan = |extra: Option<(&str, Value)>| {
+        let mut request = json!({ "kind": "plan", "target": {
+            "path": "src/short.rs", "name": "SHORT_A", "kind": null, "symbol_line": null
+        }});
+        if let Some((key, value)) = extra {
+            request[key] = value;
+        }
+        json!({ "Edit": { "request": request, "operation_key": null } })
+    };
+    wire(&room, &plan(None)).expect("plan control");
+    let refusal = wire(&room, &plan(Some((BAD_KEY, json!(1))))).expect_err("unknown key");
+    assert_eq!(
+        message_of(&refusal).as_deref(),
+        Some("invalid_request: edit_plan does not accept \"zz_unknown\". Valid arguments: target.")
+    );
+    let mcp_text = text_of(&mcp.call("edit_plan", json!({ "target": "SHORT_A", BAD_KEY: 1 })));
+    assert_eq!(
+        mcp_text,
+        "invalid_request: edit_plan does not accept \"zz_unknown\". Valid arguments: project, \
+         target."
+    );
+}
+
+/// `curate_knowledge` with two unknown keys: the same text on both lanes, after a review
+/// that gives each lane its own hashes; without the keys neither lane refuses the call for
+/// its arguments.
+#[test]
+fn curate_knowledge_refuses_unknown_keys_like_mcp() {
+    let dir = reliability_support::committed_fixture_copy();
+    let root = dunce::canonicalize(dir.path()).expect("canonical fixture");
+    let mut mcp = mcp_ready(&root);
+    let owner = HostRuntimeOwner::new(ProcessIndexRuntime::acquire().expect("runtime"));
+    let room = room_in(&owner, &root, "curate-room");
+    let review = json!({ "mode": "remediation", "source_scope": "current", "limit": 20 });
+
+    let reviewed = text_of(&mcp.call("review_knowledge", review.clone()));
+    let mcp_input = json!({
+        "actions": [],
+        "if_source_review_hash": token(&reviewed, "review_hash"),
+        "if_manifest_digest": token(&reviewed, "manifest_digest"),
+        "if_policy_digest": token(&reviewed, "policy_digest"),
+    });
+    let embed_review =
+        wire(&room, &embed_wire("review_knowledge", &review).unwrap()).expect("embed review");
+    let embed_review: Value = serde_json::from_slice(&embed_review).expect("review reply");
+    let rendered = find_string(&embed_review, "rendered").expect("rendered review");
+    let serving = find_string(&embed_review, "serving_publication_identity").expect("serving");
+    let embed_input = json!({
+        "actions": [],
+        "if_source_review_hash": token(&rendered, "review_hash"),
+        "if_manifest_digest": token(&rendered, "manifest_digest"),
+        "if_policy_digest": token(&rendered, "policy_digest"),
+    });
+    let curate = |input: Value| {
+        json!({ "Knowledge": {
+            "request": {
+                "kind": "curate_preview",
+                "input": input,
+                "if_serving_publication_identity": serving,
+            },
+            "operation_key": null,
+        }})
+    };
+
+    assert_mcp_not_refused(
+        &mcp.call("curate_knowledge", mcp_input.clone()),
+        "curate control",
+    );
+    if let Err(refusal) = wire(&room, &curate(embed_input.clone())) {
+        assert!(
+            !message_of(&refusal).is_some_and(|text| text.contains("does not accept")),
+            "embed curate control refused for its arguments: {refusal:?}"
+        );
+    }
+    let with_keys = |mut input: Value| {
+        input["zz_one"] = json!(1);
+        input["zz_two"] = json!(2);
+        input
+    };
+    let mcp_text = text_of(&mcp.call("curate_knowledge", with_keys(mcp_input)));
+    let refusal = wire(&room, &curate(with_keys(embed_input))).expect_err("unknown keys");
+    assert!(mcp_text.contains("\"zz_one\", \"zz_two\""), "{mcp_text}");
     assert_eq!(message_of(&refusal).as_deref(), Some(mcp_text.as_str()));
 }

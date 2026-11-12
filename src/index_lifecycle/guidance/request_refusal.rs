@@ -12,13 +12,43 @@
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
-/// The keys of a call that no argument struct of the tool consumed.
+/// One key of a call that no argument struct consumed, as path segments from the top of
+/// the arguments (`["edits", "0", "zz"]`). Printed joined with `.`; addressed by segment,
+/// so a key that itself contains `.` is still one segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnknownKey(pub Vec<String>);
+
+impl UnknownKey {
+    #[cfg(test)]
+    fn single(key: &str) -> Self {
+        Self(vec![key.to_string()])
+    }
+
+    /// The key as the refusal prints it.
+    pub(crate) fn path(&self) -> String {
+        self.0.join(".")
+    }
+}
+
+/// The keys of a call that no argument struct of the tool consumed, in the order the
+/// decode met them. `incomplete`: the search stopped at [`MAX_DECODE_ROUNDS`] with keys
+/// still unconsumed, so more exist than are listed.
 #[derive(Debug)]
-pub(crate) struct UnknownArguments(pub Vec<String>);
+pub(crate) struct UnknownArguments {
+    pub keys: Vec<UnknownKey>,
+    pub incomplete: bool,
+}
+
+impl UnknownArguments {
+    /// The keys as the refusal prints them.
+    pub(crate) fn paths(&self) -> Vec<String> {
+        self.keys.iter().map(UnknownKey::path).collect()
+    }
+}
 
 impl std::fmt::Display for UnknownArguments {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown arguments: {}", self.0.join(", "))
+        write!(f, "unknown arguments: {}", self.paths().join(", "))
     }
 }
 
@@ -28,22 +58,38 @@ impl std::error::Error for UnknownArguments {}
 #[derive(Debug)]
 pub(crate) enum StrictError {
     /// Keys that serde did not consume (aliases, nested objects and `flatten` are
-    /// honoured by construction), or an `unknown field` error of a
-    /// `deny_unknown_fields` struct, located in the call where it can be.
+    /// honoured by construction), and `unknown field` errors of `deny_unknown_fields`
+    /// structs, each located in the call.
     Unknown(UnknownArguments),
-    /// Any other decode failure. The handler reports it in its own words.
+    /// Any other decode failure: a wrong type, a missing field, or an unknown field whose
+    /// place in the call cannot be established. Worded by [`decode_failure_text`].
     Decode(serde_json::Error),
 }
 
+/// Strip the `element N: ` prefixes a lenient container adds; the innermost index.
+fn element_prefixes(message: &str) -> (Option<usize>, &str) {
+    let mut index = None;
+    let mut rest = message;
+    while let Some(tail) = rest.strip_prefix("element ") {
+        let Some((number, after)) = tail.split_once(": ") else {
+            break;
+        };
+        let Ok(number) = number.parse::<usize>() else {
+            break;
+        };
+        index = Some(number);
+        rest = after;
+    }
+    (index, rest)
+}
+
 /// `element 2: unknown field `x`, expected ...` -> (Some(2), "x"); without the element
-/// prefix -> (None, "x").
+/// prefix -> (None, "x"). Only a message that IS an unknown-field error counts: a type
+/// error whose value happens to contain the words is not one.
 fn unknown_field_in(message: &str) -> Option<(Option<usize>, String)> {
-    let (before, rest) = message.split_once("unknown field `")?;
+    let (index, rest) = element_prefixes(message);
+    let rest = rest.strip_prefix("unknown field `")?;
     let key = rest.split('`').next()?.to_string();
-    let index = before
-        .rsplit_once("element ")
-        .and_then(|(_, tail)| tail.split(':').next())
-        .and_then(|n| n.trim().parse().ok());
     Some((index, key))
 }
 
@@ -52,7 +98,8 @@ fn unknown_field_in(message: &str) -> Option<(Option<usize>, String)> {
 /// -> []. `None` when the error is not an unknown-field error.
 #[cfg(any(feature = "embed", test))]
 pub(crate) fn expected_fields_in(message: &str) -> Option<Vec<String>> {
-    let (_, rest) = message.split_once("unknown field `")?;
+    let (_, rest) = element_prefixes(message);
+    let rest = rest.strip_prefix("unknown field `")?;
     let (_, listed) = rest.split_once("`, ")?;
     if listed.starts_with("there are no fields") {
         return Some(Vec::new());
@@ -71,17 +118,21 @@ pub(crate) fn expected_fields_in(message: &str) -> Option<Vec<String>> {
     )
 }
 
+/// A key a lenient container saw unconsumed: the element index and the key's segments.
+type NestedKey = (usize, Vec<String>);
+
 thread_local! {
     /// Ignored keys of array elements that a lenient container decoded on its own
-    /// (`lenient_vec_required`), where `serde_ignored` cannot see them. `Some` only while
-    /// `decode_strict` runs on this thread; the decode is synchronous.
-    static NESTED_IGNORED: std::cell::RefCell<Option<Vec<String>>> =
+    /// (`lenient_vec_required`), where `serde_ignored` cannot see them: the element index
+    /// and the key's segments inside it. `Some` only while a strict decode runs on this
+    /// thread; the decode is synchronous.
+    static NESTED_IGNORED: std::cell::RefCell<Option<Vec<NestedKey>>> =
         const { std::cell::RefCell::new(None) };
     /// The array element a lenient container is decoding, for `note_value`.
     static ELEMENT_INDEX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Switches the thread's nested-key sink on for one `decode_strict` call.
+/// Switches the thread's nested-key sink on for one decode attempt.
 struct NestedSink;
 
 impl NestedSink {
@@ -90,7 +141,7 @@ impl NestedSink {
         Self
     }
 
-    fn take(&self) -> Vec<String> {
+    fn take(&self) -> Vec<NestedKey> {
         NESTED_IGNORED
             .with(|sink| sink.borrow_mut().take())
             .unwrap_or_default()
@@ -103,9 +154,31 @@ impl Drop for NestedSink {
     }
 }
 
+/// The JSON path a `serde_ignored` path names: map keys and array indices. `Some` and
+/// newtype wrappers have no JSON level of their own and add no segment.
+fn path_segments(path: &serde_ignored::Path<'_>) -> Vec<String> {
+    use serde_ignored::Path;
+    match path {
+        Path::Root => Vec::new(),
+        Path::Seq { parent, index } => {
+            let mut segments = path_segments(parent);
+            segments.push(index.to_string());
+            segments
+        }
+        Path::Map { parent, key } => {
+            let mut segments = path_segments(parent);
+            segments.push(key.clone());
+            segments
+        }
+        Path::Some { parent }
+        | Path::NewtypeStruct { parent }
+        | Path::NewtypeVariant { parent } => path_segments(parent),
+    }
+}
+
 /// `serde_json::from_value::<T>` for element `index` of an array that a lenient container
 /// decodes itself. While a strict decode is running, keys `T` does not consume are
-/// recorded as `[index].key` so the strict decode can refuse them; otherwise it is
+/// recorded under the element so the strict decode can refuse them; otherwise it is
 /// exactly `serde_json::from_value`.
 pub(crate) fn from_value_noting<T: DeserializeOwned>(
     value: Value,
@@ -126,7 +199,7 @@ pub(crate) fn note_value<T: DeserializeOwned>(value: Value) -> Result<T, serde_j
     let index = ELEMENT_INDEX.get();
     let mut ignored = Vec::new();
     let decoded = serde_ignored::deserialize::<_, _, T>(value, |path| {
-        ignored.push(format!("[{index}].{path}"));
+        ignored.push((index, path_segments(&path)));
     });
     NESTED_IGNORED.with(|sink| {
         if let Some(sink) = sink.borrow_mut().as_mut() {
@@ -165,86 +238,278 @@ fn element_object(value: &Value) -> Option<Map<String, Value>> {
     }
 }
 
-/// Dotted path of the first object member named `key`, searching nested objects.
-fn find_key_path(map: &Map<String, Value>, key: &str) -> Option<String> {
+/// Segments of the first object member named `key`, searching nested objects.
+fn find_key_path(map: &Map<String, Value>, key: &str) -> Option<Vec<String>> {
     if map.contains_key(key) {
-        return Some(key.to_string());
+        return Some(vec![key.to_string()]);
     }
     map.iter().find_map(|(name, value)| match value {
-        Value::Object(inner) => find_key_path(inner, key).map(|rest| format!("{name}.{rest}")),
+        Value::Object(inner) => find_key_path(inner, key).map(|rest| {
+            let mut segments = vec![name.clone()];
+            segments.extend(rest);
+            segments
+        }),
         _ => None,
     })
 }
 
-/// Locate `key` (relative to an array element, at `index` when known) in the call:
-/// `edits.1.operation.zz`. When no top-level array holds it, the key as given, or
-/// `[index].key` for a known element.
-fn qualify(index: Option<usize>, key: &str, root: &Value) -> String {
-    let first = key.split('.').next().unwrap_or(key);
-    let found = root.as_object().and_then(|object| {
-        object.iter().find_map(|(field, value)| {
-            let items = array_items(value)?;
-            let range = match index {
-                Some(i) => i..i.saturating_add(1),
-                None => 0..items.len(),
-            };
-            range.into_iter().find_map(|i| {
-                let element = element_object(items.get(i)?)?;
-                let path = if element.contains_key(first) {
-                    key.to_string()
-                } else {
-                    find_key_path(&element, key)?
-                };
-                Some(format!("{field}.{i}.{path}"))
-            })
-        })
-    });
-    match (found, index) {
-        (Some(path), _) => path,
-        (None, Some(i)) => format!("[{i}].{key}"),
-        (None, None) => key.to_string(),
-    }
+/// Locate `key` (segments relative to array element `index`) in the call:
+/// `edits.1.operation.zz`. `None` when no top-level array element holds it.
+fn qualify(index: usize, key: &[String], root: &Value) -> Option<Vec<String>> {
+    let first = key.first()?;
+    root.as_object()?.iter().find_map(|(field, value)| {
+        let items = array_items(value)?;
+        let element = element_object(items.get(index)?)?;
+        let inner = if element.contains_key(first) {
+            key.to_vec()
+        } else if let [single] = key {
+            find_key_path(&element, single)?
+        } else {
+            return None;
+        };
+        let mut segments = vec![field.clone(), index.to_string()];
+        segments.extend(inner);
+        Some(segments)
+    })
 }
 
-/// Decode `value` as `P` and report every key that no field of `P` consumed (FR-001).
+/// A lenient container's key where no array element holds it: `[index].key`, as the
+/// MCP lane has always printed it. Not addressable, so the search stops after it.
+fn unplaced(index: usize, key: Vec<String>) -> UnknownKey {
+    let mut segments = vec![format!("[{index}]")];
+    segments.extend(key);
+    UnknownKey(segments)
+}
+
+/// Every member named `key`, at any depth, in document order: segments from the root.
+/// At most [`MAX_CANDIDATES`].
+fn members_named(value: &Value, key: &str) -> Vec<Vec<String>> {
+    fn walk(value: &Value, key: &str, prefix: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+        if out.len() >= MAX_CANDIDATES {
+            return;
+        }
+        match value {
+            Value::Object(map) => {
+                if map.contains_key(key) {
+                    let mut path = prefix.clone();
+                    path.push(key.to_string());
+                    out.push(path);
+                }
+                for (name, inner) in map {
+                    prefix.push(name.clone());
+                    walk(inner, key, prefix, out);
+                    prefix.pop();
+                }
+            }
+            Value::Array(items) => {
+                for (index, inner) in items.iter().enumerate() {
+                    prefix.push(index.to_string());
+                    walk(inner, key, prefix, out);
+                    prefix.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    // A top-level member first: it is where a caller's key most often is.
+    if value.as_object().is_some_and(|map| map.contains_key(key)) {
+        out.push(vec![key.to_string()]);
+    }
+    let mut found = Vec::new();
+    walk(value, key, &mut Vec::new(), &mut found);
+    for path in found {
+        if !out.contains(&path) && out.len() < MAX_CANDIDATES {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Remove the member at `segments` from `value`; whether one was removed.
+fn remove_member(value: &mut Value, segments: &[String]) -> bool {
+    let Some((last, parents)) = segments.split_last() else {
+        return false;
+    };
+    let mut current = value;
+    for segment in parents {
+        current = match current {
+            Value::Object(map) => match map.get_mut(segment) {
+                Some(next) => next,
+                None => return false,
+            },
+            Value::Array(items) => {
+                match segment.parse::<usize>().ok().and_then(|i| items.get_mut(i)) {
+                    Some(next) => next,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        };
+    }
+    current
+        .as_object_mut()
+        .is_some_and(|map| map.remove(last).is_some())
+}
+
+/// Decode attempts one strict decode makes at most: a `deny_unknown_fields` struct
+/// reports one key per attempt, so each found key is removed and the decode repeated.
+/// Bounds the work on a request of maximum size.
+pub(crate) const MAX_DECODE_ROUNDS: usize = 32;
+
+/// Places a key is tried at when a `deny_unknown_fields` error names it without a path.
+const MAX_CANDIDATES: usize = 8;
+
+/// One decode of `value` (wrapped by `wrap` when the type expects an envelope around it),
+/// with every key `serde_ignored` and the lenient containers saw unconsumed.
+fn attempt<P: DeserializeOwned>(
+    value: &Value,
+    wrap: &dyn Fn(&Value) -> Option<Value>,
+) -> (Result<P, serde_json::Error>, Vec<UnknownKey>) {
+    let mut ignored = Vec::new();
+    let sink = NestedSink::install();
+    let wrapped = wrap(value);
+    let decoded =
+        serde_ignored::deserialize::<_, _, P>(wrapped.as_ref().unwrap_or(value), |path| {
+            ignored.push(UnknownKey(path_segments(&path)));
+        });
+    for (index, key) in sink.take() {
+        ignored.push(match qualify(index, &key, value) {
+            Some(segments) => UnknownKey(segments),
+            None => unplaced(index, key),
+        });
+    }
+    (decoded, ignored)
+}
+
+/// Where in `value` the `deny_unknown_fields` error naming `key` comes from. A lenient
+/// container's element index places it directly; otherwise every member named `key` is a
+/// candidate, and when there are several the one whose removal changes the error is it.
+/// `None` when no place can be established: the refusal then makes no key-level claim.
+fn place_denied<P: DeserializeOwned>(
+    index: Option<usize>,
+    key: &str,
+    value: &Value,
+    wrap: &dyn Fn(&Value) -> Option<Value>,
+) -> Option<UnknownKey> {
+    if let Some(index) = index {
+        return Some(match qualify(index, &[key.to_string()], value) {
+            Some(segments) => UnknownKey(segments),
+            None => unplaced(index, vec![key.to_string()]),
+        });
+    }
+    let candidates = members_named(value, key);
+    if let [only] = candidates.as_slice() {
+        return Some(UnknownKey(only.clone()));
+    }
+    candidates.into_iter().find_map(|candidate| {
+        let mut without = value.clone();
+        remove_member(&mut without, &candidate);
+        let (decoded, _) = attempt::<P>(&without, wrap);
+        let same = decoded
+            .err()
+            .and_then(|error| unknown_field_in(&error.to_string()))
+            .is_some_and(|(i, k)| i.is_none() && k == key);
+        (!same).then_some(UnknownKey(candidate))
+    })
+}
+
+/// Decode `value` as `P` and report every key that no field of `P` consumed (FR-001), in
+/// the order the decode meets them, up to [`MAX_DECODE_ROUNDS`] decodes.
 ///
 /// Leniency about VALUE types lives in `P`'s own deserializers and is untouched; only
 /// keys are judged. Paths are dotted (`edits.0.zz`); the first segment is a top-level
 /// argument.
 pub(crate) fn decode_strict<P: DeserializeOwned>(value: Value) -> Result<P, StrictError> {
-    let mut ignored = Vec::new();
-    let sink = NestedSink::install();
-    let decoded = serde_ignored::deserialize::<_, _, P>(&value, |path| {
-        ignored.push(path.to_string());
-    });
-    ignored.extend(sink.take().iter().map(|entry| {
-        match entry
-            .strip_prefix('[')
-            .and_then(|rest| rest.split_once("]."))
-            .and_then(|(index, key)| Some((index.parse::<usize>().ok()?, key)))
-        {
-            Some((index, key)) => qualify(Some(index), key, &value),
-            None => entry.clone(),
+    decode_strict_wrapped(value, &|_| None)
+}
+
+/// [`decode_strict`] for arguments that `P` reads inside an envelope: `wrap` builds the
+/// decoded value from the arguments (`{variant: args}`); keys are named relative to the
+/// arguments themselves.
+pub(crate) fn decode_strict_wrapped<P: DeserializeOwned>(
+    value: Value,
+    wrap: &dyn Fn(&Value) -> Option<Value>,
+) -> Result<P, StrictError> {
+    let mut work: Option<Value> = None;
+    let mut keys: Vec<UnknownKey> = Vec::new();
+    let unknown = |keys: Vec<UnknownKey>, incomplete| {
+        StrictError::Unknown(UnknownArguments {
+            keys: in_document_order(&value, keys),
+            incomplete,
+        })
+    };
+    for round in 0..=MAX_DECODE_ROUNDS {
+        let current = work.as_ref().unwrap_or(&value);
+        let (decoded, ignored) = attempt::<P>(current, wrap);
+        let found = if ignored.is_empty() {
+            match decoded {
+                Ok(decoded) if keys.is_empty() => return Ok(decoded),
+                Ok(_) => return Err(unknown(keys, false)),
+                Err(error) => {
+                    let placed = unknown_field_in(&error.to_string())
+                        .and_then(|(index, key)| place_denied::<P>(index, &key, current, wrap));
+                    match placed {
+                        Some(key) => vec![key],
+                        None if keys.is_empty() => return Err(StrictError::Decode(error)),
+                        None => return Err(unknown(keys, false)),
+                    }
+                }
+            }
+        } else {
+            ignored
+        };
+        if round == MAX_DECODE_ROUNDS {
+            return Err(unknown(keys, true));
         }
-    }));
-    if !ignored.is_empty() {
-        return Err(StrictError::Unknown(UnknownArguments(ignored)));
+        let work = work.get_or_insert_with(|| value.clone());
+        let removed = found
+            .iter()
+            .filter(|key| remove_member(work, &key.0))
+            .count();
+        keys.extend(found);
+        if removed == 0 {
+            return Err(unknown(keys, false));
+        }
     }
-    decoded.map_err(|error| match unknown_field_in(&error.to_string()) {
-        Some((index, key)) => {
-            let located = if index.is_none() && value.get(&key).is_some() {
-                key
-            } else {
-                qualify(index, &key, &value)
-            };
-            StrictError::Unknown(UnknownArguments(vec![located]))
-        }
-        None => StrictError::Decode(error),
-    })
+    Err(unknown(keys, true))
+}
+
+/// `keys` in the order their members appear in `value`, so both lanes list them alike
+/// however their decoders met them. A key that cannot be placed goes last.
+fn in_document_order(value: &Value, mut keys: Vec<UnknownKey>) -> Vec<UnknownKey> {
+    let position = |key: &UnknownKey| {
+        let mut current = Some(value);
+        key.0
+            .iter()
+            .map(|segment| {
+                let (index, next) = match current {
+                    Some(Value::Object(map)) => map
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (name, _))| *name == segment)
+                        .map_or((usize::MAX, None), |(i, (_, inner))| (i, Some(inner))),
+                    Some(Value::Array(items)) => segment
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| items.get(i).map(|inner| (i, Some(inner))))
+                        .unwrap_or((usize::MAX, None)),
+                    _ => (usize::MAX, None),
+                };
+                current = next;
+                index
+            })
+            .collect::<Vec<_>>()
+    };
+    keys.sort_by_cached_key(position);
+    keys
 }
 
 /// An echoed argument NAME is cut to this many characters.
 const KEY_ECHO_LIMIT: usize = 40;
+
+/// A refusal names at most this many keys, then `(+N more)`.
+const KEY_LIST_LIMIT: usize = 8;
 
 fn capped_key(key: &str) -> String {
     if key.chars().count() <= KEY_ECHO_LIMIT {
@@ -257,14 +522,22 @@ fn capped_key(key: &str) -> String {
 /// Refusal text for keys no tool argument consumed (contracts/tool-outcome.md).
 pub(crate) fn unknown_arguments_refusal(
     tool: &str,
-    unknown: &[String],
+    unknown: &UnknownArguments,
     valid: &[String],
 ) -> String {
-    let named = unknown
+    let mut named = unknown
+        .keys
         .iter()
-        .map(|key| format!("\"{}\"", capped_key(key)))
+        .take(KEY_LIST_LIMIT)
+        .map(|key| format!("\"{}\"", capped_key(&key.path())))
         .collect::<Vec<_>>()
         .join(", ");
+    let beyond = unknown.keys.len().saturating_sub(KEY_LIST_LIMIT);
+    if unknown.incomplete {
+        named.push_str(&format!(" (+{beyond} or more)"));
+    } else if beyond > 0 {
+        named.push_str(&format!(" (+{beyond} more)"));
+    }
     let valid = if valid.is_empty() {
         "none".to_string()
     } else {
@@ -273,17 +546,90 @@ pub(crate) fn unknown_arguments_refusal(
     let mut text =
         format!("invalid_request: {tool} does not accept {named}. Valid arguments: {valid}.");
     if let Some(parent) = unknown
+        .keys
         .iter()
-        .find_map(|k| k.split_once('.').map(|(p, _)| p))
+        .find_map(|key| (key.0.len() > 1).then(|| &key.0[0]))
     {
         text.push_str(&format!(
-            " Check the fields of \"{parent}\" against the tool's input schema."
+            " Check the fields of \"{}\" against the tool's input schema.",
+            capped_key(parent)
         ));
     }
     text
 }
 
-// ── mode-condition refusals (FR-002) ───────────────────────────────────────────────
+// ── decode failures that are not unknown keys ──────────────────────────────────────
+
+/// rmcp's prefix for a tool-argument decode failure (`missing field`, wrong type); the
+/// embed lane uses the same words.
+pub(crate) const DECODE_FAILURE_PREFIX: &str = "failed to deserialize parameters:";
+
+/// `message` with every argument VALUE serde quotes in it removed: `invalid type:
+/// integer `42`` -> `invalid type: integer`, `string "x"` -> `string`, `unknown variant
+/// `x`` -> `unknown variant`. Field names (`missing field `path``) stay.
+pub(crate) fn redact_values(message: &str) -> String {
+    const QUOTED: &[&str] = &[
+        "boolean `",
+        "integer `",
+        "floating point `",
+        "character `",
+        "unknown variant `",
+    ];
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    'scan: while !rest.is_empty() {
+        for prefix in QUOTED {
+            if let Some(tail) = rest.strip_prefix(prefix) {
+                out.push_str(&prefix[..prefix.len() - 2]);
+                // A backtick inside the value (a character value of `) is not its end
+                // only when the closing one follows at once.
+                let end = tail.find("`, ").or_else(|| tail.rfind('`'));
+                rest = end.map_or("", |end| &tail[end + 1..]);
+                continue 'scan;
+            }
+        }
+        if let Some(tail) = rest.strip_prefix("string \"") {
+            out.push_str("string");
+            let mut escaped = false;
+            let mut end = tail.len();
+            for (offset, ch) in tail.char_indices() {
+                match ch {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '"' => {
+                        end = offset + 1;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            rest = &tail[end..];
+            continue;
+        }
+        let mut chars = rest.chars();
+        if let Some(ch) = chars.next() {
+            out.push(ch);
+        }
+        rest = chars.as_str();
+    }
+    out
+}
+
+/// The text a decode failure that is not an unknown key gets on both lanes: rmcp's
+/// prefix, serde's message without values, and the tool's required fields when it has
+/// any.
+pub(crate) fn decode_failure_text(tool: &str, serde_message: &str, required: &[&str]) -> String {
+    let mut text = format!("{DECODE_FAILURE_PREFIX} {}", redact_values(serde_message));
+    if !required.is_empty() {
+        text.push_str(&format!(
+            "\nRequired fields for `{tool}`: {}.",
+            required.join(", ")
+        ));
+    }
+    text
+}
+
+// ── mode-condition refusals (FR-002)───────────────────────────────────────────────
 
 /// Stand-in value in [`When::Equals`] for "the controlling argument is absent".
 pub(crate) const ABSENT: &str = "(absent)";
@@ -991,42 +1337,242 @@ pub(crate) static EMBED_REQUEST_TOOLS: &[(&str, Option<&str>)] = &[
     ("Knowledge.curate_apply", Some("curate_knowledge")),
 ];
 
-/// The refusal an embed request with `unknown` keys gets. `label` is its wire label
-/// ([`EMBED_REQUEST_TOOLS`]); `embed_fields` the fields its request type declares, when
-/// they can be read (`None` for a type that accepts unknown keys, whose fields are the
-/// MCP tool's own). When the request answers for an MCP tool, a key that tool does not
-/// accept either gets the MCP lane's text, byte for byte. A key the MCP tool accepts but
-/// this request does not (`project` on most query requests) gets the text under the MCP
-/// tool's name listing this request's own fields, since the MCP list names that key.
-/// A request answering for no MCP tool is named by its label, with its own fields.
+/// The MCP tool `label` answers for, and whether its request declares exactly that tool's
+/// arguments (`embed_fields` `None`: the request type is the MCP tool's own, which accepts
+/// unknown keys).
 #[cfg(feature = "embed")]
-pub(crate) fn embed_unknown_arguments_refusal(
+fn mcp_counterpart(
     label: &str,
-    unknown: &[String],
     embed_fields: Option<&[String]>,
-) -> String {
+) -> (Option<&'static str>, Option<&'static [&'static str]>) {
     let tool = EMBED_REQUEST_TOOLS
         .iter()
         .find(|(name, _)| *name == label)
         .and_then(|(_, tool)| *tool);
     let published = tool.and_then(tool_arguments);
-    let owned = |names: &[&str]| names.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-    let valid: Vec<String> = match (published, embed_fields) {
-        // A key the MCP tool accepts but this request does not: name what this one takes.
-        (Some(published), Some(fields))
-            if unknown.iter().any(|key| published.contains(&key.as_str())) =>
-        {
-            fields.to_vec()
+    let same = match (published, embed_fields) {
+        (Some(_), None) => published,
+        (Some(published), Some(fields)) => {
+            let mut fields: Vec<&str> = fields.iter().map(String::as_str).collect();
+            let mut names = published.to_vec();
+            fields.sort_unstable();
+            names.sort_unstable();
+            (fields == names).then_some(published)
         }
-        (Some(published), _) => owned(published),
+        (None, _) => None,
+    };
+    (tool, same)
+}
+
+/// The refusal an embed request with `unknown` keys gets. `label` is its wire label
+/// ([`EMBED_REQUEST_TOOLS`]); `embed_fields` the fields its request type declares, when
+/// they can be read. A request that answers for an MCP tool and declares exactly its
+/// arguments gets the MCP lane's text, byte for byte. One that declares other arguments
+/// (`field_set_differences_are_pinned`) is named by the MCP tool but lists its OWN fields,
+/// in their declaration order, so a caller following the list is not refused again. A
+/// request answering for no MCP tool is named by its label, with its own fields.
+#[cfg(feature = "embed")]
+pub(crate) fn embed_unknown_arguments_refusal(
+    label: &str,
+    unknown: &UnknownArguments,
+    embed_fields: Option<&[String]>,
+) -> String {
+    let (tool, same) = mcp_counterpart(label, embed_fields);
+    let valid: Vec<String> = match (same, embed_fields) {
+        (Some(published), _) => published.iter().map(|s| (*s).to_string()).collect(),
         (None, fields) => fields.map(<[String]>::to_vec).unwrap_or_default(),
     };
     unknown_arguments_refusal(tool.unwrap_or(label), unknown, &valid)
 }
 
+/// The text an embed request whose arguments fail to decode (a wrong type, a missing
+/// field) gets: the MCP lane's, byte for byte, where the request declares the MCP tool's
+/// arguments. The required-fields line is the MCP tool's, and is left out wherever it
+/// would not hold for this request: a request with other arguments, or a missing field
+/// the MCP tool does not require.
+#[cfg(feature = "embed")]
+pub(crate) fn embed_decode_failure_text(
+    label: &str,
+    serde_message: &str,
+    embed_fields: Option<&[String]>,
+) -> String {
+    let (tool, same) = mcp_counterpart(label, embed_fields);
+    let required = match (tool, same) {
+        (Some(tool), Some(_)) => tool_required(tool),
+        _ => &[],
+    };
+    let missing = element_prefixes(serde_message)
+        .1
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.split('`').next());
+    let required = match missing {
+        Some(field) if !required.contains(&field) => &[],
+        _ => required,
+    };
+    decode_failure_text(tool.unwrap_or(label), serde_message, required)
+}
+
+/// The required top-level arguments of MCP tool `tool`, in the order the MCP lane prints
+/// them (its schema's `required`).
+#[cfg(feature = "embed")]
+fn tool_required(tool: &str) -> &'static [&'static str] {
+    TOOL_REQUIRED
+        .iter()
+        .find(|(name, _)| *name == tool)
+        .map_or(&[], |(_, required)| *required)
+}
+
+/// Every MCP tool with required arguments, and those arguments as its published schema
+/// lists them. Pinned to the live schemas by `tool_required_match_the_published_schemas`.
+#[cfg(any(feature = "embed", test))]
+pub(crate) static TOOL_REQUIRED: &[(&str, &[&str])] = &[
+    ("analyze_file_impact", &["path"]),
+    ("ask", &["query"]),
+    ("batch_edit", &["edits"]),
+    ("batch_insert", &["content", "position", "targets"]),
+    ("batch_rename", &["path", "name", "new_name"]),
+    (
+        "curate_knowledge",
+        &[
+            "actions",
+            "if_source_review_hash",
+            "if_manifest_digest",
+            "if_policy_digest",
+            "project",
+        ],
+    ),
+    ("delete_symbol", &["path", "name"]),
+    ("edit_plan", &["target"]),
+    (
+        "edit_within_symbol",
+        &["path", "name", "old_text", "new_text"],
+    ),
+    ("explore", &["query"]),
+    ("find_dependents", &["path"]),
+    ("find_references", &["name"]),
+    ("get_file_content", &["path"]),
+    ("get_file_context", &["path"]),
+    ("get_symbol_context", &["name"]),
+    ("index_folder", &["path"]),
+    ("insert_symbol", &["path", "name", "content"]),
+    ("inspect_match", &["path", "line"]),
+    ("replace_symbol_body", &["path", "name", "new_body"]),
+    ("review_knowledge", &["mode"]),
+    ("search_knowledge", &["query"]),
+    ("secret_remediate", &["scope", "finding_ids", "action"]),
+    ("symforge_edit", &["path"]),
+    ("symforge_retrieve", &["hash"]),
+    ("validate_file_syntax", &["path"]),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct Inner {
+        a: Option<u32>,
+    }
+
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct Closed {
+        name: Option<String>,
+        inner: Option<Inner>,
+        items: Option<Vec<Inner>>,
+    }
+
+    fn unknown_of(value: Value) -> UnknownArguments {
+        match decode_strict::<Closed>(value) {
+            Err(StrictError::Unknown(unknown)) => unknown,
+            other => panic!("not an unknown-key refusal: {other:?}"),
+        }
+    }
+
+    fn keys_of(value: Value) -> Vec<String> {
+        unknown_of(value).paths()
+    }
+
+    /// A closed struct reports one key per decode; every key is found, in document order
+    /// (`serde_json::Map` orders members by name in this crate).
+    #[test]
+    fn every_unknown_key_of_a_closed_struct_is_found_in_order() {
+        assert_eq!(
+            keys_of(json!({ "zz": 1, "name": "n", "yy": 2 })),
+            ["yy", "zz"]
+        );
+        assert_eq!(
+            keys_of(json!({ "items": [{ "zz": 1, "yy": 2 }], "top": 3 })),
+            ["items.0.yy", "items.0.zz", "top"]
+        );
+    }
+
+    /// A key inside a nested object is named by its path, not as a top-level argument.
+    #[test]
+    fn a_key_in_a_nested_object_is_named_by_its_path() {
+        assert_eq!(keys_of(json!({ "inner": { "zz": 1 } })), ["inner.zz"]);
+    }
+
+    /// A key containing `.` is one segment: it is removed and the search goes on.
+    #[test]
+    fn a_key_with_a_dot_does_not_stop_the_search() {
+        assert_eq!(keys_of(json!({ "a.b": 1, "zz": 2 })), ["a.b", "zz"]);
+    }
+
+    /// A type error whose VALUE contains the words is not an unknown key.
+    #[test]
+    fn a_value_that_reads_like_an_unknown_field_is_not_a_key() {
+        assert!(matches!(
+            decode_strict::<Closed>(json!({ "inner": { "a": "unknown field `x`" } })),
+            Err(StrictError::Decode(_))
+        ));
+    }
+
+    /// Past the round cap the refusal says more keys exist than it lists.
+    #[test]
+    fn the_key_list_stops_at_its_cap() {
+        let many: Map<String, Value> = (0..40).map(|i| (format!("k{i:02}"), json!(i))).collect();
+        let unknown = unknown_of(Value::Object(many));
+        let text = unknown_arguments_refusal("t", &unknown, &["name".to_string()]);
+        assert_eq!(
+            text,
+            "invalid_request: t does not accept \"k00\", \"k01\", \"k02\", \"k03\", \"k04\", \
+             \"k05\", \"k06\", \"k07\" (+24 or more). Valid arguments: name."
+        );
+    }
+
+    #[test]
+    fn values_are_redacted_from_decode_failures() {
+        assert_eq!(
+            decode_failure_text(
+                "t",
+                "invalid type: integer `4242`, expected a string",
+                &["path"]
+            ),
+            "failed to deserialize parameters: invalid type: integer, expected a string\n\
+             Required fields for `t`: path."
+        );
+        assert_eq!(
+            decode_failure_text(
+                "t",
+                "invalid type: string \"se\\\"cret\", expected u32",
+                &[]
+            ),
+            "failed to deserialize parameters: invalid type: string, expected u32"
+        );
+        assert_eq!(
+            decode_failure_text("t", "unknown variant `SECRET`, expected `a` or `b`", &[]),
+            "failed to deserialize parameters: unknown variant, expected `a` or `b`"
+        );
+        assert_eq!(
+            decode_failure_text("t", "missing field `path`", &["path"]),
+            "failed to deserialize parameters: missing field `path`\nRequired fields for `t`: path."
+        );
+    }
 
     /// Echoed values are cut; the cut keeps the start.
     #[test]
@@ -1034,7 +1580,11 @@ mod tests {
         let long = "x".repeat(500);
         assert!(capped_key(&long).chars().count() < KEY_ECHO_LIMIT + 8);
         assert_eq!(capped_key("zz"), "zz");
-        let text = unknown_arguments_refusal("t", std::slice::from_ref(&long), &["a".to_string()]);
+        let unknown = UnknownArguments {
+            keys: vec![UnknownKey::single(&long)],
+            incomplete: false,
+        };
+        let text = unknown_arguments_refusal("t", &unknown, &["a".to_string()]);
         assert!(!text.contains(&"x".repeat(60)), "{text}");
     }
 
@@ -1069,6 +1619,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The required-fields table equals the published schemas' `required` lists.
+    #[cfg(feature = "server")]
+    #[test]
+    fn tool_required_match_the_published_schemas() {
+        let mut published: Vec<(String, Vec<String>)> =
+            crate::protocol::SymForgeServer::tool_definitions()
+                .into_iter()
+                .filter_map(|tool| {
+                    let required: Vec<String> = tool
+                        .input_schema
+                        .get("required")
+                        .and_then(Value::as_array)
+                        .map(|names| {
+                            names
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (!required.is_empty()).then(|| (tool.name.to_string(), required))
+                })
+                .collect();
+        published.sort();
+        let mut table: Vec<(String, Vec<String>)> = TOOL_REQUIRED
+            .iter()
+            .map(|(tool, required)| {
+                (
+                    (*tool).to_string(),
+                    required.iter().map(|a| (*a).to_string()).collect(),
+                )
+            })
+            .collect();
+        table.sort();
+        let literal = published
+            .iter()
+            .map(|(tool, required)| {
+                let quoted: Vec<String> = required.iter().map(|a| format!("\"{a}\"")).collect();
+                format!("    (\"{tool}\", &[{}]),", quoted.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            table, published,
+            "TOOL_REQUIRED drifted from the published schemas; the table is:\n{literal}"
+        );
     }
 
     /// The table the embed lane prints equals what the MCP lane publishes today, tool by

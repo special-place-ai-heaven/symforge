@@ -1,12 +1,14 @@
 //! The embed lane's request check (feature 036, T021): a wire request whose tool
-//! arguments carry a key the request type does not declare is refused with the text the
-//! MCP lane prints for the same tool and key (`guidance::request_refusal`).
+//! arguments carry a key the request type does not declare, a value of the wrong type,
+//! or no value for a required field, is refused with the text the MCP lane prints for
+//! the same tool and call (`guidance::request_refusal`).
 //!
 //! The wire envelope (`HostRequest`, `Query.request`, `Edit.request`, ...) is walked by
 //! hand to find the object that plays the MCP tool's arguments; only that object is
-//! judged, so a key is named as the MCP lane names it (`zz`, `targets.0.zz`), never with
-//! envelope segments. Envelope-level mistakes (an unknown variant, a bad `limits` key)
-//! have no MCP counterpart and keep the untexted `InvalidRequest`.
+//! judged, by the same strict decode the MCP lane runs, so a key is named as the MCP lane
+//! names it (`zz`, `targets.0.zz`), never with envelope segments. Envelope-level mistakes
+//! (an unknown variant, a bad `limits` key) have no MCP counterpart and keep the
+//! untexted `InvalidRequest`.
 
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -21,33 +23,42 @@ use crate::embed::parity::{
     search, symbol, symbol_context,
 };
 use crate::index_lifecycle::guidance::request_refusal::{
-    StrictError, UnknownArguments, decode_strict, embed_unknown_arguments_refusal,
-    expected_fields_in,
+    StrictError, UnknownArguments, UnknownKey, decode_strict_wrapped, embed_decode_failure_text,
+    embed_unknown_arguments_refusal, expected_fields_in,
 };
 
 /// A key no request type declares: decoding `{SENTINEL: null}` makes a
 /// `deny_unknown_fields` type list the fields it declares. Never echoed.
 const SENTINEL: &str = "\u{1}";
 
-/// Unknown keys found one decode at a time stop after this many rounds.
-const MAX_ROUNDS: usize = 64;
-
-/// Strict and plain decoders of one request type.
+/// Strict and plain decoders of one request type. `strict` takes the struct variant the
+/// arguments are wrapped in, when they are one.
 #[derive(Clone, Copy)]
 struct Codec {
-    strict: fn(Value) -> Result<(), StrictError>,
+    strict: fn(Value, Option<&str>) -> Result<(), StrictError>,
     plain: fn(Value) -> Option<String>,
 }
 
 fn codec<P: DeserializeOwned>() -> Codec {
     Codec {
-        strict: |value| decode_strict::<P>(value).map(drop),
+        strict: |value, variant| {
+            decode_strict_wrapped::<P>(value, &|args| variant.map(|name| json!({ name: args })))
+                .map(drop)
+        },
         plain: |value| {
             serde_json::from_value::<P>(value)
                 .err()
                 .map(|e| e.to_string())
         },
     }
+}
+
+/// What the strict decode found wrong with a request's arguments.
+enum Verdict {
+    Fine,
+    Unknown(UnknownArguments),
+    /// A decode failure that is not an unknown key: serde's message.
+    Decode(String),
 }
 
 /// The part of a wire request that plays an MCP tool's arguments.
@@ -71,35 +82,33 @@ impl Located {
         }
     }
 
-    /// Every key of `args` the request type does not consume, located as the MCP lane
-    /// locates it. A `deny_unknown_fields` type reports one key per decode, so a found
-    /// key is removed and the decode repeated.
-    fn unknown_keys(&self) -> Vec<String> {
+    /// The strict decode's verdict on the arguments; a unit variant takes none.
+    fn verdict(&self) -> Verdict {
         let Some(codec) = self.codec else {
-            return self
+            let keys: Vec<UnknownKey> = self
                 .args
                 .as_object()
-                .map(|object| object.keys().cloned().collect())
+                .map(|object| {
+                    object
+                        .keys()
+                        .map(|key| UnknownKey(vec![key.clone()]))
+                        .collect()
+                })
                 .unwrap_or_default();
-        };
-        let mut args = self.args.clone();
-        let mut found = Vec::new();
-        for _ in 0..MAX_ROUNDS {
-            let Err(StrictError::Unknown(UnknownArguments(keys))) =
-                (codec.strict)(self.decodable(args.clone()))
-            else {
-                break;
+            return if keys.is_empty() {
+                Verdict::Fine
+            } else {
+                Verdict::Unknown(UnknownArguments {
+                    keys,
+                    incomplete: false,
+                })
             };
-            let removed = keys
-                .iter()
-                .filter(|key| remove_path(&mut args, key))
-                .count();
-            found.extend(keys);
-            if removed == 0 {
-                break;
-            }
+        };
+        match (codec.strict)(self.args.clone(), self.variant.as_deref()) {
+            Ok(()) => Verdict::Fine,
+            Err(StrictError::Unknown(unknown)) => Verdict::Unknown(unknown),
+            Err(StrictError::Decode(error)) => Verdict::Decode(error.to_string()),
         }
-        found
     }
 
     /// The fields the request type declares, in declaration order, when it refuses
@@ -116,33 +125,6 @@ impl Located {
         let message = (codec.plain)(self.decodable(Value::Object(probe)))?;
         expected_fields_in(&message)
     }
-}
-
-/// Remove the member at dotted `path` (`targets.0.zz`) from `value`.
-fn remove_path(value: &mut Value, path: &str) -> bool {
-    let mut segments: Vec<&str> = path.split('.').collect();
-    let Some(last) = segments.pop() else {
-        return false;
-    };
-    let mut current = value;
-    for segment in segments {
-        current = match current {
-            Value::Object(object) => match object.get_mut(segment) {
-                Some(next) => next,
-                None => return false,
-            },
-            Value::Array(items) => {
-                match segment.parse::<usize>().ok().and_then(|i| items.get_mut(i)) {
-                    Some(next) => next,
-                    None => return false,
-                }
-            }
-            _ => return false,
-        };
-    }
-    current
-        .as_object_mut()
-        .is_some_and(|object| object.remove(last).is_some())
 }
 
 /// The one `(variant, payload)` of an externally tagged value.
@@ -271,19 +253,23 @@ fn locate(wire: &Value) -> Option<Located> {
 }
 
 /// The refusal text for `wire`, when its tool arguments carry a key the request type
-/// does not declare; `None` otherwise (including every envelope-level mistake).
-pub(super) fn unknown_argument_refusal(wire: &Value) -> Option<String> {
+/// does not declare or fail to decode; `None` otherwise (including every envelope-level
+/// mistake).
+pub(super) fn argument_refusal(wire: &Value) -> Option<String> {
     let located = locate(wire)?;
-    let unknown = located.unknown_keys();
-    if unknown.is_empty() {
-        return None;
+    match located.verdict() {
+        Verdict::Fine => None,
+        Verdict::Unknown(unknown) => Some(embed_unknown_arguments_refusal(
+            &located.label,
+            &unknown,
+            located.declared_fields().as_deref(),
+        )),
+        Verdict::Decode(message) => Some(embed_decode_failure_text(
+            &located.label,
+            &message,
+            located.declared_fields().as_deref(),
+        )),
     }
-    let fields = located.declared_fields();
-    Some(embed_unknown_arguments_refusal(
-        &located.label,
-        &unknown,
-        fields.as_deref(),
-    ))
 }
 
 #[cfg(test)]
@@ -324,7 +310,7 @@ mod tests {
             let located = located.unwrap_or_else(|| panic!("{label} is not located"));
             assert_eq!(located.label, *label);
             assert!(
-                located.unknown_keys().contains(&"zz_unknown".to_string()),
+                matches!(located.verdict(), Verdict::Unknown(u) if u.paths().contains(&"zz_unknown".to_string())),
                 "{label}: the unknown key was not found"
             );
         }
@@ -386,7 +372,7 @@ mod tests {
 
     #[test]
     fn a_unit_request_with_arguments_is_refused_like_a_tool_without_any() {
-        let text = unknown_argument_refusal(&json!({ "Query": {
+        let text = argument_refusal(&json!({ "Query": {
             "request": { "Conventions": { "zz_unknown": 1 } },
             "limits": { "max_results": 1, "max_bytes": 1 }
         }}));
@@ -401,12 +387,9 @@ mod tests {
 
     #[test]
     fn envelope_mistakes_carry_no_text() {
+        assert_eq!(argument_refusal(&json!({ "NoSuchRequest": {} })), None);
         assert_eq!(
-            unknown_argument_refusal(&json!({ "NoSuchRequest": {} })),
-            None
-        );
-        assert_eq!(
-            unknown_argument_refusal(&json!({ "Query": {
+            argument_refusal(&json!({ "Query": {
                 "request": { "RepoMap": {} },
                 "limits": { "max_results": 1, "max_bytes": 1, "zz_unknown": 1 }
             }})),
@@ -416,7 +399,7 @@ mod tests {
 
     #[test]
     fn a_refusal_never_echoes_a_value() {
-        let text = unknown_argument_refusal(&json!({ "Query": {
+        let text = argument_refusal(&json!({ "Query": {
             "request": { "RepoMap": { "zz_unknown": "secret-value-must-not-echo" } },
             "limits": { "max_results": 1, "max_bytes": 1 }
         }}))

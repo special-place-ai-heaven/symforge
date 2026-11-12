@@ -31,8 +31,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 pub(crate) use crate::index_lifecycle::guidance::request_refusal::{
-    ABSENT, ModeSelection, StrictError, UnknownArguments, When, decode_strict, from_value_noting,
-    note_keys_of, unknown_arguments_refusal,
+    ABSENT, ModeSelection, StrictError, When, decode_strict, from_value_noting, note_keys_of,
+    unknown_arguments_refusal,
 };
 use crate::index_lifecycle::guidance::request_refusal::{
     condition_refusal, conflicting_selection_refusal, current_value, literal, normalized,
@@ -661,8 +661,7 @@ impl SymForgeServer {
             ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(text)
         };
         if let Some((_, probe, _)) = PROBES.iter().find(|(name, _, _)| *name == tool)
-            && let Err(StrictError::Unknown(UnknownArguments(unknown))) =
-                probe(Value::Object(args.clone()))
+            && let Err(StrictError::Unknown(unknown)) = probe(Value::Object(args.clone()))
         {
             let valid = self
                 .tool_router
@@ -781,7 +780,7 @@ mod tests {
                 .unwrap()
                 .insert("zz_unknown".into(), Value::from(1));
             assert!(
-                matches!(probe(bad), Err(StrictError::Unknown(ref u)) if u.0 == ["zz_unknown"]),
+                matches!(probe(bad), Err(StrictError::Unknown(ref u)) if u.paths() == ["zz_unknown"]),
                 "{}: an extra key must be reported",
                 contract.tool
             );
@@ -851,7 +850,7 @@ mod tests {
                         "operation": { "type": "delete" }, "zz": 1 }]
         });
         match decode_strict::<BatchEditInput>(nested) {
-            Err(StrictError::Unknown(u)) => assert_eq!(u.0, ["edits.0.zz"]),
+            Err(StrictError::Unknown(u)) => assert_eq!(u.paths(), ["edits.0.zz"]),
             other => panic!("nested key not reported: {:?}", other.err()),
         }
         let aliased = serde_json::json!({
@@ -861,7 +860,7 @@ mod tests {
         // `deny_unknown_fields` structs refuse through serde's own error, normalised.
         let denied = serde_json::json!({ "targets": [{ "path": "a.rs", "zz": 1 }] });
         match decode_strict::<GetSymbolInput>(denied) {
-            Err(StrictError::Unknown(u)) => assert_eq!(u.0, ["targets.0.zz"]),
+            Err(StrictError::Unknown(u)) => assert_eq!(u.paths(), ["targets.0.zz"]),
             other => panic!("deny_unknown_fields not located: {:?}", other.err()),
         }
         // A missing required field is not an unknown key.

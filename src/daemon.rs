@@ -7376,7 +7376,7 @@ fn name_unknown_arguments(tool_name: &str, error: anyhow::Error) -> anyhow::Erro
         Ok(unknown) => anyhow::anyhow!(
             crate::index_lifecycle::guidance::request_refusal::unknown_arguments_refusal(
                 tool_name,
-                &unknown.0,
+                &unknown,
                 &valid_argument_names_for(tool_name)
             )
         ),

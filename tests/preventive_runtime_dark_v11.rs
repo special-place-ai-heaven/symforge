@@ -1167,10 +1167,13 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Round 3: embed search caveats, reason-named not-run states. Same 89 files.
 // Feature 036 T021: new `guidance/request_refusal.rs`, the request check's wording
 // shared by the MCP and embed lanes; its callers are the two new roster rows. 90 files.
+// Feature 036 T021 review round: the strict decode finds every unknown key (remove and
+// retry, by path segments, document order, capped), places keys in nested objects, and
+// words decode failures without values for both lanes. Same 90 files, no new edge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "19dca959aff65ffced6289b57dc73deb23190401b029daf182c34c3ea6e09b70",
+    "90c0aad455daea2d1c76c1d1b7cccf78bb4f0bf88f7ce2f42a593837eeb2779c",
     90,
-    2420890,
+    2443016,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1376,10 +1379,12 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // decode and tool-argument table, moved out of `protocol/tool_contract.rs`) and
 // `embed/parity/host/request_check.rs` (the wire walk), `HostRefusal::message`.
 // Calls and `use` re-exports into the shared module only, no bridge. 318 files.
+// T021 review round: shared strict decode and decode-failure wording, the MCP decode
+// hint routed through it, the embed check on the shared decode. Calls only. 318 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "00bb5559596868c82a60f35924273ec7af26a64d4a9f5445fdffe8e9d0b2f35c",
+    "d0c4f2e7ca7cc430723b7428d6897d40d51a3c8398a664aa734833bb7aa3b723",
     318,
-    12853340,
+    12875327,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
@@ -1513,8 +1518,10 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// boundary: FNV-1a is not collision-resistant, and whoever edits a
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
+// T021 review round: ci.yml gains the server-embed reliability integration step (a
+// `--test`-only invocation, pinned in CARGO_LINES); no doctest lane.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "dde54a23ec6387cc:29612"),
+    ("ci.yml", "17256f610ad504f5:29992"),
     ("release.yml", "b174946ff2c434bb:115022"),
 ];
 
@@ -1700,6 +1707,12 @@ const CARGO_LINES: &[(&str, usize)] = &[
     ),
     (
         "cargo test --features embed,__test-internals --lib server_and_embed_ -- --test-threads=1 2>&1 | tee /tmp/server-embed-parity.log",
+        1,
+    ),
+    // Feature 036 T021: four named integration binaries with both features; `--test name`
+    // selects no doctest.
+    (
+        "run: cargo test --features embed --test reliability_review --test reliability_contract --test reliability_freshness --test reliability_refusal_parity -- --test-threads=1",
         1,
     ),
     (
@@ -2587,8 +2600,8 @@ fn no_gate_builds_doctests() {
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(
         (seen.len(), distinct.len(), files),
-        (68, 52, 2),
-        "the CI workflows hold sixty-eight cargo-mentioning lines, fifty-two \
+        (69, 53, 2),
+        "the CI workflows hold sixty-nine cargo-mentioning lines, fifty-three \
          of them distinct, across two workflow files; this walk saw {:?}. A gate \
          added, removed, reworded, or a workflow file added — reconcile \
          CARGO_LINES with the workflows deliberately, never by loosening this \
