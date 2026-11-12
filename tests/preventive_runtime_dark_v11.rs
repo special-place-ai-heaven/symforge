@@ -1544,7 +1544,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 // and every new cargo-mentioning line is an env assignment, a cache key, a
 // download, or that archive; census 91/53/2.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "cd62e5f505e865af:48510"),
+    ("ci.yml", "be0e2c2d54a19d40:48722"),
     ("release.yml", "b174946ff2c434bb:115022"),
 ];
 

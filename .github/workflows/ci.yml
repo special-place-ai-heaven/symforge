@@ -33,7 +33,10 @@ concurrency:
 # GitHub-hosted runners instead for fork pull requests, the `ci-hosted` label,
 # the repository variable CI_RUNNERS (`hosted` or `hosted-windows`), and, when
 # the optional CI_RUNNER_STATUS_TOKEN secret can read the organization's
-# runners, when no matching self-hosted runner is online. It also decides
+# runners, when no matching self-hosted runner is free. Windows has one
+# self-hosted runner for the whole organization, so it is used only when that
+# token shows it free; otherwise Windows jobs take a hosted runner rather than
+# queue behind another repository's job. It also decides
 # whether anything the heavy jobs test changed; they report "skipped" when it
 # did not, which branch protection counts as passing. `ci-result` is the one
 # stable check to require.

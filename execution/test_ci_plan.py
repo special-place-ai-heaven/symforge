@@ -26,7 +26,12 @@ class RunnerChoice(unittest.TestCase):
     def test_trusted_events_default_to_self_hosted(self):
         chosen = self.choose()
         self.assertEqual(chosen["linux"][0], ci_plan.SELF_HOSTED["linux"])
-        self.assertEqual(chosen["windows"][0], ci_plan.SELF_HOSTED["windows"])
+        # The one Windows runner may be busy; unknown status means hosted.
+        self.assertEqual(chosen["windows"][0], "windows-latest")
+        free = self.choose(online={"linux": True, "windows": True})
+        self.assertEqual(free["windows"][0], ci_plan.SELF_HOSTED["windows"])
+        busy = self.choose(online={"linux": True, "windows": False})
+        self.assertEqual(busy["windows"][0], "windows-latest")
 
     def test_fork_pull_requests_never_reach_self_hosted(self):
         for head in ("someone/symforge", ""):
@@ -47,7 +52,7 @@ class RunnerChoice(unittest.TestCase):
     def test_label_variable_and_offline_pool_choose_hosted(self):
         self.assertEqual(self.choose(event="pull_request", labels=["ci-hosted"])["linux"][0], "ubuntu-latest")
         self.assertEqual(self.choose(setting="hosted")["windows"][0], "windows-latest")
-        only_windows = self.choose(setting="hosted-windows")
+        only_windows = self.choose(setting="hosted-windows", online={"linux": True, "windows": True})
         self.assertEqual(only_windows["windows"][0], "windows-latest")
         self.assertEqual(only_windows["linux"][0], ci_plan.SELF_HOSTED["linux"])
         offline = self.choose(online={"linux": False, "windows": True})

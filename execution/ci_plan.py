@@ -87,10 +87,15 @@ def choose_runners(
         elif os_name == "windows" and event == "schedule":
             reason = "unattended scheduled run: the self-hosted Windows runner is the owner's workstation"
         elif online.get(os_name) is False:
-            reason = "the runners API lists no online self-hosted runner with these labels"
+            reason = "the runners API lists no free self-hosted runner with these labels"
+        # One Windows runner serves the whole organization. A job sent to it
+        # while it is busy waits with no time limit, so without proof that it
+        # is free the hosted image is the slot that is always available.
+        elif os_name == "windows" and not online.get(os_name):
+            reason = "the single self-hosted Windows runner is not known to be free (runner status not checked)"
         else:
             reason = (
-                "self-hosted runner online"
+                "self-hosted runner free"
                 if online.get(os_name)
                 else "default for trusted events (runner status not checked)"
             )
@@ -234,6 +239,7 @@ def runner_status(env: dict[str, str]) -> tuple[dict[str, Optional[bool]], str]:
         need = {label.lower() for label in wanted}
         online[os_name] = any(
             runner.get("status") == "online"
+            and not runner.get("busy")
             and need <= {label.get("name", "").lower() for label in runner.get("labels", [])}
             for runner in runners
         )
