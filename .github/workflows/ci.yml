@@ -392,9 +392,9 @@ jobs:
       # so the slices need the pinned compiler, minimal profile, no build.
       - name: Install rustc only (rust-toolchain.toml channel)
         run: |
+          # Prints the installed version itself; GITHUB_PATH puts rustc on
+          # PATH from the next step on, so it is not called here.
           bash execution/ensure_rustup.sh --minimal
-          # GITHUB_PATH only applies from the next step on.
-          "$HOME/.cargo/bin/rustc" --version
 
       - name: Set up Node for tests that spawn node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
