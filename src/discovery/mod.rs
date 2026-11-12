@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 
+pub(crate) mod os_response;
+
 fn check_scout_cancelled(cancel: Option<&AtomicBool>) -> Result<()> {
     if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
         anyhow::bail!("embedded reload cancelled during scout");
@@ -932,11 +934,11 @@ fn discover_all_files_with_exclusions_and_issues_cancellable(
         let entry = match entry_result {
             Ok(entry) => entry,
             Err(error) => {
-                let kind = error
-                    .io_error()
-                    .map(std::io::Error::kind)
-                    .unwrap_or(std::io::ErrorKind::Other);
-                issues.push(walk_issue_for_error(&root, ignore_error_path(&error), kind));
+                issues.push(walk_issue_for_error(
+                    &root,
+                    ignore_error_path(&error),
+                    error.io_error(),
+                ));
                 continue;
             }
         };
@@ -1209,6 +1211,8 @@ where
         )?;
     }
 
+    // Spec 036 FR-020: one transient-retry budget for the whole scout.
+    let retry_budget = os_response::current_budget();
     for mut entry in discovered {
         check_scout_cancelled(cancel)?;
         let (catalog_path, path_reason) = catalog_path_projection(&entry.relative_os_path);
@@ -1217,7 +1221,7 @@ where
             Ok(metadata) => metadata,
             Err(error) => {
                 degraded = true;
-                let kind = access_error_kind(error.kind());
+                let kind = crate::discovery::os_response::stored_kind_of(&error);
                 let issue = ScoutIssue {
                     path_id: Some(public_id),
                     safe_path: catalog_path.normalized_utf8.clone(),
@@ -1276,16 +1280,24 @@ where
             }
         } else {
             match scout_decision_for_discovered(&entry, None) {
-                ScoutDecision::Ingest { .. } => match probe_reader(
-                    &entry.absolute_path,
-                    crate::domain::index::BINARY_SNIFF_BYTES,
+                ScoutDecision::Ingest { .. } => match os_response::retry_transient(
+                    &retry_budget,
+                    Some(&entry.absolute_path),
+                    || {
+                        probe_reader(
+                            &entry.absolute_path,
+                            crate::domain::index::BINARY_SNIFF_BYTES,
+                        )
+                        .map_err(os_response::AccessFailure::capture)
+                    },
                 ) {
                     Ok(sample) => scout_decision_for_discovered(&entry, Some(&sample)),
-                    Err(error) => {
+                    Err(cause) => {
                         degraded = true;
+                        os_response::record_failure(&entry.absolute_path, &cause);
                         ScoutDecision::Unavailable {
                             stage: AccessStage::Probe,
-                            kind: access_error_kind(error.kind()),
+                            kind: cause.stored_kind(),
                         }
                     }
                 },
@@ -1516,7 +1528,7 @@ fn path_identity_collision_issues(entries: &[ScoutedEntry]) -> Vec<ScoutIssue> {
 fn walk_issue_for_error(
     root: &Path,
     failed_path: Option<&Path>,
-    kind: std::io::ErrorKind,
+    error: Option<&std::io::Error>,
 ) -> ScoutIssue {
     let catalog_path = failed_path
         .and_then(|path| path.strip_prefix(root).ok())
@@ -1525,7 +1537,10 @@ fn walk_issue_for_error(
         path_id: catalog_path.as_ref().map(|path| path.public_id.clone()),
         safe_path: catalog_path.and_then(|path| path.normalized_utf8),
         kind: ScoutIssueKind::DirectoryEntryUnreadable {
-            kind: access_error_kind(kind),
+            kind: error.map_or(
+                AccessErrorKind::Other,
+                crate::discovery::os_response::stored_kind_of,
+            ),
         },
         safe_message: "directory entry unavailable".to_string(),
     }
@@ -1543,18 +1558,6 @@ fn ignore_error_path(error: &ignore::Error) -> Option<&Path> {
         | ignore::Error::Glob { .. }
         | ignore::Error::UnrecognizedFileType(_)
         | ignore::Error::InvalidDefinition => None,
-    }
-}
-
-pub(crate) fn access_error_kind(kind: std::io::ErrorKind) -> AccessErrorKind {
-    match kind {
-        std::io::ErrorKind::NotFound => AccessErrorKind::NotFound,
-        std::io::ErrorKind::PermissionDenied => AccessErrorKind::PermissionDenied,
-        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput => {
-            AccessErrorKind::InvalidData
-        }
-        std::io::ErrorKind::OutOfMemory => AccessErrorKind::ResourceExhausted,
-        _ => AccessErrorKind::Other,
     }
 }
 
@@ -2315,13 +2318,13 @@ where
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(access_error_kind(error.kind())),
+        Err(error) => return Err(crate::discovery::os_response::stored_kind_of(&error)),
     }
 
     prepare(directory)?;
 
-    let metadata =
-        std::fs::symlink_metadata(directory).map_err(|error| access_error_kind(error.kind()))?;
+    let metadata = std::fs::symlink_metadata(directory)
+        .map_err(|error| crate::discovery::os_response::stored_kind_of(&error))?;
     if crate::paths::state_directory_metadata_is_unsafe(&metadata) {
         Err(AccessErrorKind::InvalidData)
     } else {
@@ -2334,12 +2337,13 @@ pub fn resolve_state_placement(binding: &RootBinding) -> StatePlacement {
         .ok()
         .map(|base| base.join("projects").join(&binding.root_id.0));
     resolve_state_placement_with(binding, user_local_directory, |directory| {
-        std::fs::create_dir_all(directory).map_err(|error| access_error_kind(error.kind()))?;
+        std::fs::create_dir_all(directory)
+            .map_err(|error| crate::discovery::os_response::stored_kind_of(&error))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
-                .map_err(|error| access_error_kind(error.kind()))?;
+                .map_err(|error| crate::discovery::os_response::stored_kind_of(&error))?;
         }
         Ok(())
     })
@@ -4751,7 +4755,7 @@ mod tests {
             let issue = walk_issue_for_error(
                 tmp.path(),
                 Some(&failed_path),
-                io::ErrorKind::PermissionDenied,
+                Some(&io::Error::from(io::ErrorKind::PermissionDenied)),
             );
 
             let plan = scout_entries_with_io(
@@ -6087,7 +6091,7 @@ mod tests {
                 resolve_state_placement_with(&binding, Some(user_state.clone()), |candidate| {
                     assert_eq!(candidate, user_state);
                     std::fs::create_dir_all(candidate)
-                        .map_err(|error| access_error_kind(error.kind()))
+                        .map_err(|error| crate::discovery::os_response::stored_kind_of(&error))
                 });
             match placement {
                 crate::domain::StatePlacement::UserLocal {
@@ -6146,7 +6150,7 @@ mod tests {
                         Err(AccessErrorKind::PermissionDenied)
                     } else {
                         std::fs::create_dir_all(candidate)
-                            .map_err(|error| access_error_kind(error.kind()))
+                            .map_err(|error| crate::discovery::os_response::stored_kind_of(&error))
                     }
                 });
 
@@ -6211,9 +6215,9 @@ mod tests {
             let placement =
                 resolve_state_placement_with(&binding, Some(user_state.clone()), |candidate| {
                     std::fs::create_dir_all(candidate)
-                        .map_err(|error| access_error_kind(error.kind()))?;
+                        .map_err(|error| crate::discovery::os_response::stored_kind_of(&error))?;
                     std::fs::write(candidate.join("prepared"), b"prepared\n")
-                        .map_err(|error| access_error_kind(error.kind()))
+                        .map_err(|error| crate::discovery::os_response::stored_kind_of(&error))
                 });
 
             assert_eq!(

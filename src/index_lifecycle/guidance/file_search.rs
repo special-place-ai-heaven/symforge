@@ -991,6 +991,7 @@ pub(crate) fn render_ranked_files(
     input: &SearchFilesInput,
     include_vendor: bool,
     include_personal_tooling: bool,
+    check: &super::freshen::AnswerCheck,
     untracked_paths: impl FnOnce() -> Vec<String>,
 ) -> String {
     let rank_by_path_cochange = input.rank_by.as_deref() == Some("path+cochange");
@@ -1029,7 +1030,7 @@ pub(crate) fn render_ranked_files(
                         "current index + optional frecency history",
                     )
                 } else {
-                    super::search_envelope::SourceAuthority::from_freshness(&generation.freshness)
+                    super::search_envelope::SourceAuthority::from_check(check)
                 },
                 super::reference_read::search_parse_state_for_paths(
                     &generation.live,
@@ -1095,6 +1096,9 @@ pub(crate) fn render_ranked_files(
         let matching_untracked_paths = untracked_paths();
         super::search::append_untracked_file_diagnostic(&mut result, &matching_untracked_paths);
     }
+    let claims_complete =
+        !matches!(view, SearchFilesView::Found { overflow_count, .. } if overflow_count > 0);
+    check.append_notes(&mut result, claims_complete);
     result
 }
 

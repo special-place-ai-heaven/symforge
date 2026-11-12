@@ -238,6 +238,26 @@ impl QueryRequest {
         }
     }
 
+    /// Spec 036 FR-015: the indexed-path prefix (`Some(None)`: every file)
+    /// whose files MCP compares with the disk before answering this request,
+    /// mirroring its `check_answer_files` calls. `None`: no such comparison.
+    pub(crate) fn answer_scope(&self) -> Option<Option<&str>> {
+        match self {
+            Self::TextSearch(input) => Some(input.path_prefix.as_deref()),
+            Self::SymbolSearch(input) => Some(input.path_prefix.as_deref()),
+            Self::FileSearch(input) => Some(input.path_prefix.as_deref()),
+            Self::ReferenceSearch(_) | Self::SymbolContext(_) | Self::Symforge(_) => Some(None),
+            Self::WhatChanged(input)
+                if input.since.is_some()
+                    && input.git_ref.is_none()
+                    && input.uncommitted != Some(true) =>
+            {
+                Some(input.path_prefix.as_deref())
+            }
+            _ => None,
+        }
+    }
+
     pub fn operation(&self) -> QueryOperationKind {
         match self {
             Self::TextSearch(_) => QueryOperationKind::SearchText,

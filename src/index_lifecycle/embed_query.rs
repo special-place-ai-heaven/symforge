@@ -43,6 +43,8 @@ pub(super) struct EmbeddedQuerySnapshot {
     pub control_directory: Option<PathBuf>,
     /// The host's chosen project-config trust mode.
     pub trust_mode: crate::embed::parity::source_options::ProjectConfigTrustMode,
+    /// Spec 036: what the query compared with the disk before this capture.
+    pub answer_check: super::guidance::freshen::AnswerCheck,
 }
 
 /// A process incarnation namespace, separate from the frozen core's counters.
@@ -538,6 +540,15 @@ fn execute_inner(
         }
         budget.stel_store = handle.stel_store(policy);
     }
+    // Spec 036 FR-015: compare the answer's scope with the disk before the
+    // snapshot is captured, as MCP does before its response capture. A lease
+    // read is bound to its leased snapshot and compares nothing.
+    let answer_check = match request.answer_scope() {
+        Some(prefix) if !matches!(snapshot_mode, SnapshotMode::GraphLease(_)) => {
+            Some(handle.check_answer_scope(prefix))
+        }
+        _ => None,
+    };
     if let QueryRequest::FileImpact(input) = request
         && input.estimate != Some(true)
     {
@@ -584,6 +595,10 @@ fn execute_inner(
             .capture_graph_lease_snapshot(lease)
             .map_err(|kind| refuse(kind, RetryAdvice::Never))?,
     };
+    let mut snapshot = snapshot;
+    if let Some(check) = answer_check {
+        snapshot.answer_check = check;
+    }
     debug_assert!(Arc::ptr_eq(
         &snapshot.generation,
         &snapshot.source_set.current_generation()

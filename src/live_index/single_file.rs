@@ -152,9 +152,16 @@ where
         other => return other,
     };
 
+    // Spec 036 FR-020: the vanish waits draw on the enclosing call's retry
+    // budget, so one answer over many deleted files is not blocked for each.
+    let budget = crate::discovery::os_response::current_budget();
     let delays_ms = [50u64, 200, 500];
     for delay_ms in delays_ms {
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let remaining = budget.remaining();
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms).min(remaining));
         let retry =
             read_and_index_with_receipt(relative_path, abs_path, shared, language, expected_gen);
         if retry.observed_at.project_generation != expected_gen {
@@ -729,7 +736,7 @@ where
                 }
                 return ReindexReceipt::observed(ReindexOutcome::PublicationRejected, observed_at);
             }
-            crate::live_index::store::StableReadOutcome::Unreadable { stage, kind } => {
+            crate::live_index::store::StableReadOutcome::Unreadable { stage, kind, .. } => {
                 let publication = shared.publish_terminal_disposition_at_generation(
                     relative_path,
                     scouted,
@@ -1045,6 +1052,12 @@ pub(crate) enum FreshenResult {
     StaleRemoved,
     GenerationMismatch,
     PublicationRejected,
+    /// The file could not be compared with the disk; the cause is classified
+    /// from the operating system's own error (spec 036 FR-019).
+    Unconfirmed(crate::discovery::os_response::OsCause),
+    /// The row records no modification time and no file is on disk: left in
+    /// place as the mtime-only guard did, and never counted as confirmed.
+    UnstampedAbsent,
 }
 
 /// Return the authoritative `LanguageId` for a complete repository path.
@@ -1053,11 +1066,94 @@ pub(crate) fn supported_language(path: &Path) -> Option<LanguageId> {
     path.to_str().and_then(LanguageId::from_path)
 }
 
-/// Mtime-based freshness check for a single file.
+enum DiskComparison {
+    Same,
+    Differs,
+    Unconfirmed(crate::discovery::os_response::OsCause),
+    /// A row with no recorded modification time and no file on disk.
+    UnstampedAbsent,
+}
+
+/// Compare one indexed file with the disk (spec 036 FR-015, FR-016): size and
+/// modification time first; inside the racy window, or when this process never
+/// confirmed the content (a restored or freshly loaded row), by content hash.
+/// A confirmation by hash is remembered, so the next call trusts the stat
+/// again once the window has passed: one hash per file per change.
+fn compare_with_disk(relative_path: &str, abs_path: &Path, shared: &SharedIndex) -> DiskComparison {
+    use crate::discovery::os_response::{AccessFailure, OsClass, current_budget, retry_transient};
+
+    let budget = current_budget();
+    let stat = retry_transient(&budget, Some(abs_path), || {
+        crate::paths::path_must_be_regular_non_link(abs_path).map_err(AccessFailure::capture)
+    });
+    let metadata = match stat {
+        Ok(metadata) => Some(metadata),
+        Err(cause) if cause.class == OsClass::NotFound => None,
+        Err(cause) => return DiskComparison::Unconfirmed(cause),
+    };
+    // Read lock, released before any further I/O.
+    let indexed = shared
+        .read()
+        .get_file(relative_path)
+        .map(|file| (file.byte_len, file.mtime_secs, file.content_hash.clone()));
+    let (metadata, (byte_len, mtime_secs, content_hash)) = match (metadata, indexed) {
+        // Nothing on disk and no row: the reindex below confirms the
+        // absence (and records it), exactly as the mtime-only guard did.
+        (None, None) => return DiskComparison::Differs,
+        // A row that never recorded a modification time and has no file
+        // behind it (rows built in memory, not from a disk walk): left in
+        // place as before, but named for what it is, never "confirmed".
+        (None, Some((_, 0, _))) => return DiskComparison::UnstampedAbsent,
+        (Some(metadata), Some(indexed)) => (metadata, indexed),
+        _ => return DiskComparison::Differs,
+    };
+    let modified = metadata.modified().ok();
+    let disk_mtime_secs = modified
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_secs());
+    // M11: the racy rule reads the filesystem's own clock, the newest
+    // modification time it has shown this index, never the host clock.
+    let filesystem_now = shared.observe_filesystem_time(modified);
+    if metadata.len() != byte_len || disk_mtime_secs != mtime_secs {
+        return DiskComparison::Differs;
+    }
+    if shared
+        .verified_stamp(relative_path)
+        .is_some_and(|stamp| stamp.trusts(byte_len, modified, &content_hash))
+    {
+        return DiskComparison::Same;
+    }
+    // The read goes through the read gate's own reader: regular files only,
+    // no link at the leaf, and a FIFO or device never blocks it (H2).
+    let bytes = match retry_transient(&budget, Some(abs_path), || {
+        crate::index_lifecycle::guidance::read_gate::read_regular_file(abs_path)
+            .map_err(AccessFailure::capture)
+    }) {
+        Ok(bytes) => bytes,
+        Err(cause) if cause.class == OsClass::NotFound => return DiskComparison::Differs,
+        Err(cause) => return DiskComparison::Unconfirmed(cause),
+    };
+    if hash::digest_hex(&bytes) != content_hash {
+        return DiskComparison::Differs;
+    }
+    shared.record_verified_stamp(
+        relative_path,
+        crate::live_index::store::VerifiedStamp {
+            size: byte_len,
+            modified,
+            content_hash,
+            filesystem_now,
+        },
+    );
+    DiskComparison::Same
+}
+
+/// Size, modification-time and racy-content freshness check for one file.
 ///
-/// Compares the file's current mtime on disk against the value stored in the
-/// index. If they differ (or the file is not yet indexed), re-indexes it
-/// immediately before the caller proceeds.
+/// Compares the file on disk with the indexed row ([`compare_with_disk`]).
+/// If they differ (or the file is not yet indexed), re-indexes it
+/// immediately before the caller proceeds. A failed comparison is
+/// [`FreshenResult::Unconfirmed`] with its classified cause, never `Fresh`.
 ///
 /// Returns a structured freshness outcome so callers can distinguish a
 /// confirmed deletion from a stale project-generation mismatch.
@@ -1078,41 +1174,24 @@ pub(crate) fn freshen_file_if_stale(
         return FreshenResult::GenerationMismatch;
     }
 
+    // H2: confinement BEFORE any I/O. A spelling that resolves outside the
+    // repository (a directory swapped for a junction or symlink) is never
+    // read, and is reported as not confirmed, never as fresh.
     if let Some(root) = abs_path
         .ancestors()
         .nth(std::path::Path::new(relative_path).components().count())
         && crate::index_lifecycle::guidance::read_gate::resolve_repo_path(root, relative_path)
             .is_err_and(|message| message.contains("outside the repository"))
     {
-        return FreshenResult::Fresh;
+        return FreshenResult::Unconfirmed(crate::discovery::os_response::OsCause::refused(
+            "resolves outside the repository",
+        ));
     }
-
-    // 1. Stat the file on disk without following a symlink or reparse point.
-    let disk_mtime = match crate::paths::path_must_be_regular_non_link(abs_path) {
-        Ok(meta) => meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(_) => return FreshenResult::Fresh,
-    };
-
-    // 2. Compare against indexed mtime (read lock, released immediately)
-    let indexed_mtime = {
-        let index = shared.read();
-        index
-            .get_file(relative_path)
-            .map(|f| f.mtime_secs)
-            .unwrap_or(u64::MAX)
-    };
-
-    if disk_mtime == 0 && indexed_mtime == 0 {
-        return FreshenResult::Fresh; // both unknown — treat as fresh to avoid churn
-    }
-    if disk_mtime != 0 && disk_mtime == indexed_mtime {
-        return FreshenResult::Fresh; // already fresh
+    match compare_with_disk(relative_path, abs_path, shared) {
+        DiskComparison::Same => return FreshenResult::Fresh,
+        DiskComparison::Unconfirmed(cause) => return FreshenResult::Unconfirmed(cause),
+        DiskComparison::UnstampedAbsent => return FreshenResult::UnstampedAbsent,
+        DiskComparison::Differs => {}
     }
 
     // 3. Stale — re-index
@@ -1146,15 +1225,23 @@ pub(crate) fn freshen_file_if_stale(
     }
 
     match result {
-        ReindexOutcome::HashSkip | ReindexOutcome::Reindexed | ReindexOutcome::ReadError(_) => {
-            FreshenResult::StaleReindexed
-        }
+        ReindexOutcome::HashSkip | ReindexOutcome::Reindexed => FreshenResult::StaleReindexed,
+        // The re-read failed: the stale row was reconciled to a terminal
+        // disposition, but the file itself was not confirmed.
+        ReindexOutcome::ReadError(message) => FreshenResult::Unconfirmed(
+            crate::discovery::os_response::recorded_failure(abs_path).unwrap_or_else(|| {
+                crate::discovery::os_response::classify(&std::io::Error::other(message), None, None)
+            }),
+        ),
         // Admission demoted the file to Tier 2/3: the index WAS reconciled
         // (any prior Tier-1 entry removed, skip record recorded), so the file is
         // no longer parsed/indexed. Report it as a refresh — the caller's stale
         // state has been resolved — without claiming the file is still indexed.
         ReindexOutcome::Skipped => FreshenResult::StaleReindexed,
-        ReindexOutcome::NotFound | ReindexOutcome::Removed => FreshenResult::StaleRemoved,
+        ReindexOutcome::NotFound | ReindexOutcome::Removed => {
+            shared.forget_verified_stamp(relative_path);
+            FreshenResult::StaleRemoved
+        }
         ReindexOutcome::PublicationRejected => FreshenResult::PublicationRejected,
     }
 }
@@ -1878,9 +1965,11 @@ mod tests {
             &authority,
             authority.active_observer(),
         );
+        // Review H2: a path that resolves outside the repository is never
+        // read and never reported fresh; it is not confirmed.
         assert!(
-            matches!(outcome, FreshenResult::Fresh),
-            "outbound path must skip reindex"
+            matches!(outcome, FreshenResult::Unconfirmed(_)),
+            "outbound path must skip reindex and stay unconfirmed"
         );
         assert!(
             shared.read().get_file(link_path).is_none()

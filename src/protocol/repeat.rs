@@ -307,7 +307,7 @@ impl ObservedServe {
 ///
 /// The only constructor is [`RepeatWitness::observe`]; the private field makes
 /// a forged witness unspellable outside this module (the same repair shape as
-/// `SourceAuthority::from_freshness` in `search_format.rs`).
+/// `SourceAuthority::from_check` in `search_envelope.rs`).
 #[derive(Debug)]
 pub struct RepeatWitness {
     generation: u64,

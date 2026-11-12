@@ -211,21 +211,21 @@ async fn search_files_rankings_match_golden() {
 // exact — `search_files` returns strings without a trailing newline.
 
 const GOLDEN_EXACT_PATH_HIT: &str = "\
-Trust: constrained (tiered path relevance) | current index | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
+Trust: constrained (tiered path relevance) | 10 files confirmed against disk | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
 
 1 matching file
 ── Strong path matches ──
   src/protocol/tools.rs  [0.80]";
 
 const GOLDEN_BASENAME_TOOLS_RS: &str = "\
-Trust: constrained (tiered path relevance) | current index | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
+Trust: constrained (tiered path relevance) | 10 files confirmed against disk | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
 
 1 matching file
 ── Basename matches ──
   src/protocol/tools.rs  [0.90]";
 
 const GOLDEN_LOOSE_PROTOCOL: &str = "\
-Trust: heuristic (loose path relevance) | current index | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
+Trust: heuristic (loose path relevance) | 10 files confirmed against disk | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
 
 3 matching files
 ── Loose path matches ──
@@ -234,14 +234,14 @@ Trust: heuristic (loose path relevance) | current index | parsed | full for inde
   src/protocol/format.rs  [0.40]";
 
 const GOLDEN_MULTI_COMPONENT_LIVE_SEARCH: &str = "\
-Trust: constrained (tiered path relevance) | current index | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
+Trust: constrained (tiered path relevance) | 10 files confirmed against disk | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
 
 1 matching file
 ── Strong path matches ──
   src/live_index/search.rs  [0.80]";
 
 const GOLDEN_CURRENT_FILE_BOOST: &str = "\
-Trust: constrained (tiered path relevance) | current index | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
+Trust: constrained (tiered path relevance) | 10 files confirmed against disk | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
 Scope: ranked indexed file paths; current file boost `src/protocol/tools.rs`; filters: vendor filter active (heuristic); personal tooling filtered
 Evidence: paths `src/protocol/mod.rs`, `src/live_index/mod.rs`
 
@@ -251,7 +251,7 @@ Evidence: paths `src/protocol/mod.rs`, `src/live_index/mod.rs`
   src/live_index/mod.rs  [0.90]";
 
 const GOLDEN_GLOB: &str = "\
-Trust: constrained (tiered path relevance) | current index | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
+Trust: constrained (tiered path relevance) | 10 files confirmed against disk | parsed | full for indexed scope (hidden/dotdir paths not indexed — grep those)
 
 3 matching files
 ── Strong path matches ──

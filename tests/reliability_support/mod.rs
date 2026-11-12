@@ -26,7 +26,14 @@ pub fn fixture_root() -> PathBuf {
 
 /// A server whose index was loaded from `root`.
 pub fn server_for(root: &Path) -> SymForgeServer {
-    let shared = LiveIndex::load(root).expect("load index");
+    server_from_shared(root, LiveIndex::load(root).expect("load index"))
+}
+
+/// A server over an index the caller already loaded (and may have adjusted).
+pub fn server_from_shared(
+    root: &Path,
+    shared: symforge::live_index::SharedIndex,
+) -> SymForgeServer {
     SymForgeServer::new(
         shared,
         "reliability".to_string(),
@@ -114,6 +121,13 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// A plain copy of the fixture (no git repository) that a test may modify.
+pub fn fixture_copy() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    copy_dir(&fixture_root(), dir.path());
+    dir
 }
 
 /// A copy of the fixture committed on branch `main` in a fresh git repository.

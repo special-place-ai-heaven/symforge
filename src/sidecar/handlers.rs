@@ -176,11 +176,17 @@ fn freshen_sidecar_path_if_stale_at_generation(
         &authority,
         observer,
     ) {
-        watcher::FreshenResult::Fresh => Ok(ContextSourceAuthority::CurrentIndex),
+        // An unstamped row with no file is served as before: the sidecar
+        // banner is index-wide and carries no per-file claim.
+        watcher::FreshenResult::Fresh | watcher::FreshenResult::UnstampedAbsent => {
+            Ok(ContextSourceAuthority::CurrentIndex)
+        }
         watcher::FreshenResult::StaleReindexed => Ok(ContextSourceAuthority::DiskRefreshed),
         watcher::FreshenResult::StaleRemoved => Ok(ContextSourceAuthority::DiskRefreshed),
         watcher::FreshenResult::GenerationMismatch => Ok(ContextSourceAuthority::CurrentIndex),
         watcher::FreshenResult::PublicationRejected => Err(StatusCode::SERVICE_UNAVAILABLE),
+        // Not compared with the disk: refuse rather than vouch for the index.
+        watcher::FreshenResult::Unconfirmed(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
 }
 

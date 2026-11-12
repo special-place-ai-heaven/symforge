@@ -455,13 +455,14 @@ pub(crate) fn what_changed_scope_summary(
 
 pub(crate) fn what_changed_source_authority(
     mode: &WhatChangedMode,
-    freshness: &crate::domain::FreshnessStatus,
+    check: &super::freshen::AnswerCheck,
 ) -> SourceAuthority {
     match mode {
         // T045: the Timestamp arm used to assert the literal "current index",
         // collapsing the envelope regardless of measured freshness — the same
         // forgeable-axis defect as the context lane, closed the same way.
-        WhatChangedMode::Timestamp(_) => SourceAuthority::from_freshness(freshness),
+        // Spec 036: measured on this answer's files, not index-wide.
+        WhatChangedMode::Timestamp(_) => SourceAuthority::from_check(check),
         WhatChangedMode::Uncommitted => SourceAuthority::never_collapse("git working tree"),
         WhatChangedMode::GitRef(_) => SourceAuthority::never_collapse("git ref diff"),
     }

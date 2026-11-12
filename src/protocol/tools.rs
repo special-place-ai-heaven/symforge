@@ -587,12 +587,21 @@ fn freshen_exact_path_for_targeted_retrieval(
     server: &SymForgeServer,
     path_scope: &search::PathScope,
 ) -> Result<bool, TargetedFreshenRefusal> {
+    freshen_exact_path_with_note(server, path_scope).map(|freshen| freshen.changed)
+}
+
+/// [`freshen_exact_path_for_targeted_retrieval`] plus the caveat line for a
+/// file it could not compare with the disk (review M14).
+fn freshen_exact_path_with_note(
+    server: &SymForgeServer,
+    path_scope: &search::PathScope,
+) -> Result<crate::index_lifecycle::guidance::freshen::TargetedFreshen, TargetedFreshenRefusal> {
     let search::PathScope::Exact(relative_path) = path_scope else {
-        return Ok(false);
+        return Ok(Default::default());
     };
     let expected_gen = server.index.data_plane().current_project_generation();
     let Some(repo_root) = server.capture_repo_root() else {
-        return Ok(false);
+        return Ok(Default::default());
     };
     // V11 observation lane (C4c): a request-path freshen observes under the
     // incarnation current at call time (the C3b synchronous-facade ruling).
@@ -605,6 +614,55 @@ fn freshen_exact_path_for_targeted_retrieval(
         &lane_authority,
         relative_path,
     )
+}
+
+/// Spec 036 FR-015: compare every indexed file under `path_prefix` with the
+/// disk, re-indexing those that differ. Call it BEFORE
+/// `capture_local_response_generation`, so the publication the answer is
+/// rendered from already holds what the check refreshed.
+async fn check_answer_files(
+    server: &SymForgeServer,
+    path_prefix: Option<&str>,
+) -> crate::index_lifecycle::guidance::freshen::AnswerCheck {
+    use crate::index_lifecycle::guidance::freshen::{
+        AnswerCheck, NOT_RUN_INDEX_NOT_READY, NOT_RUN_NO_ROOT, check_answer_scope,
+    };
+    // A loading index is refused by the caller's guard right after; comparing
+    // it would only fence reindexes against the generation being replaced.
+    if !matches!(
+        server
+            .index
+            .data_plane()
+            .published_generation()
+            .live
+            .index_state(),
+        IndexState::Ready
+    ) {
+        return AnswerCheck::not_run(NOT_RUN_INDEX_NOT_READY);
+    }
+    let expected_gen = server.index.data_plane().current_project_generation();
+    let Some(repo_root) = server.capture_repo_root() else {
+        return AnswerCheck::not_run(NOT_RUN_NO_ROOT);
+    };
+    let shared = server.index.shared();
+    let prefix = path_prefix
+        .filter(|prefix| !prefix.is_empty())
+        .map(str::to_owned);
+    // Review H3: stats, hashes and retry sleeps stay off the async workers.
+    tokio::task::spawn_blocking(move || {
+        let lane_authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(&repo_root);
+        check_answer_scope(
+            &shared,
+            expected_gen,
+            &repo_root,
+            &lane_authority,
+            prefix.as_deref(),
+        )
+        .0
+    })
+    .await
+    .unwrap_or_else(|_| AnswerCheck::not_run("the disk comparison did not complete"))
 }
 
 use crate::index_lifecycle::guidance::reference_read::search_parse_state_for_paths;
@@ -1109,6 +1167,7 @@ fn render_search_text_output(
     auto_detected_regex: bool,
     auto_corrected_regex: bool,
     hidden_test_matches: Option<usize>,
+    check: &crate::index_lifecycle::guidance::freshen::AnswerCheck,
 ) -> String {
     // The zero-hit untracked sweep reads this server's git root; the rest of
     // the rendering is the shared engine the embedded facade also runs.
@@ -1139,6 +1198,7 @@ fn render_search_text_output(
         auto_corrected_regex,
         &matching_untracked_paths,
         hidden_test_matches,
+        check,
     )
 }
 
@@ -2653,7 +2713,10 @@ impl SymForgeServer {
             sections.is_empty() || sections.iter().any(|section| section == "knowledge")
         });
         let mut served = None;
-        let output = self.get_symbol_context_unnoted(params, &mut served).await;
+        let mut checked = None;
+        let output = self
+            .get_symbol_context_unnoted(params, &mut served, &mut checked)
+            .await;
         let (output, withheld_files) = match served {
             Some(live) => {
                 let withheld =
@@ -2663,7 +2726,7 @@ impl SymForgeServer {
             }
             None => (output, false),
         };
-        crate::protocol::knowledge_model::bound_final_code_context_output(
+        let mut output = crate::protocol::knowledge_model::bound_final_code_context_output(
             output,
             final_max_tokens,
             &final_target,
@@ -2671,14 +2734,26 @@ impl SymForgeServer {
             knowledge_requested,
             withheld_files,
             None,
-        )
+        );
+        // Spec 036: the files this answer could not confirm, after the bound
+        // so the caveat is never cut. Callers and callees are a complete claim
+        // unless the budget cut them (review M7).
+        if let Some(check) = checked
+            && !is_index_unavailable_output(&output)
+        {
+            let complete = !crate::index_lifecycle::guidance::freshen::answer_was_cut(&output);
+            check.append_notes(&mut output, complete);
+        }
+        output
     }
 
-    /// `served` receives the index the answer is rendered from, once captured.
+    /// `served` receives the index the answer is rendered from, once captured;
+    /// `checked` receives the disk comparison made before that capture.
     async fn get_symbol_context_unnoted(
         &self,
         params: Parameters<GetSymbolContextInput>,
         served: &mut Option<Arc<LiveIndex>>,
+        checked: &mut Option<crate::index_lifecycle::guidance::freshen::AnswerCheck>,
     ) -> String {
         if let Some(result) = self.proxy_tool_call("get_symbol_context", &params.0).await {
             return result;
@@ -2697,8 +2772,12 @@ impl SymForgeServer {
         } else {
             false
         };
+        // Spec 036 FR-015: callers may sit in any file; compare them all
+        // with the disk before the capture.
+        let check = check_answer_files(self, None).await;
         let published = self.capture_local_response_generation();
         *served = Some(Arc::clone(&published.live));
+        *checked = Some(check.clone());
         if let Some(message) = loading_guard_message_from_published(&published.health) {
             record_read_outcome(unavailable_outcome(&published.health));
             return message;
@@ -2812,9 +2891,7 @@ impl SymForgeServer {
                     if refreshed {
                         search_format::SourceAuthority::never_collapse("disk-refreshed")
                     } else {
-                        search_format::SourceAuthority::from_freshness(
-                            &self.index.data_plane().freshness_status(),
-                        )
+                        search_format::SourceAuthority::from_check(&check)
                     },
                     parse_state,
                     &context_bundle_completeness_label(found.as_ref(), &result),
@@ -3358,6 +3435,9 @@ impl SymForgeServer {
         {
             return refusal;
         }
+        // Spec 036 FR-015: compare the scope with the disk first, so the
+        // publication captured next already holds what the check refreshed.
+        let check = check_answer_files(self, params.0.path_prefix.as_deref()).await;
         // Capture only after daemon proxy/recovery has either returned or
         // rebuilt the local index. Rows, trust banner, parse state, and temporal
         // data then share the same fresh publication advertised by the local
@@ -3394,6 +3474,7 @@ impl SymForgeServer {
             &generation,
             &execution,
             query_str,
+            &check,
         );
         let result = execution.result;
         self.record_tool_savings_named(
@@ -3662,6 +3743,8 @@ impl SymForgeServer {
                 est, limit, per_file
             );
         }
+        // Spec 036 FR-015: compare the scope with the disk before the capture.
+        let check = check_answer_files(self, params.0.path_prefix.as_deref()).await;
         let generation = self.capture_local_response_generation();
         if let Some(notice) =
             params.0.path_prefix.as_deref().and_then(|path| {
@@ -3708,6 +3791,7 @@ impl SymForgeServer {
             execution.auto_detected_regex,
             execution.auto_corrected_regex,
             execution.hidden_test_matches,
+            &check,
         );
         if execution.auto_corrected_regex {
             output.push_str(&format!(
@@ -3866,6 +3950,8 @@ impl SymForgeServer {
                 est, limit
             );
         }
+        // Spec 036 FR-015: compare the scope with the disk before the capture.
+        let check = check_answer_files(self, params.0.path_prefix.as_deref()).await;
         // Capture only after daemon proxy/recovery has either returned or
         // rebuilt the local index. The source-free estimate above deliberately
         // remains before publication selection.
@@ -3894,7 +3980,7 @@ impl SymForgeServer {
                     let guard = Arc::clone(&generation.live);
                     Some(search_format::format_search_envelope(
                         search_files_resolve_match_type_label(&view),
-                        search_format::SourceAuthority::from_freshness(&generation.freshness),
+                        search_format::SourceAuthority::from_check(&check),
                         search_parse_state_for_paths(&guard, std::iter::once(path.as_str())),
                         &search_completeness_label(0, hidden_noise_count),
                         &search_files_scope_summary(
@@ -3910,7 +3996,7 @@ impl SymForgeServer {
                     // parse state honestly instead of the misleading "parsed".
                     Some(search_format::format_search_envelope(
                         search_files_resolve_match_type_label(&view),
-                        search_format::SourceAuthority::from_freshness(&generation.freshness),
+                        search_format::SourceAuthority::from_check(&check),
                         "metadata-only (not parsed)",
                         &search_completeness_label(0, hidden_noise_count),
                         &search_files_scope_summary(
@@ -3929,7 +4015,7 @@ impl SymForgeServer {
                     let guard = Arc::clone(&generation.live);
                     Some(search_format::format_search_envelope(
                         search_files_resolve_match_type_label(&view),
-                        search_format::SourceAuthority::from_freshness(&generation.freshness),
+                        search_format::SourceAuthority::from_check(&check),
                         search_parse_state_for_paths(
                             &guard,
                             matches.iter().map(std::string::String::as_str),
@@ -3977,7 +4063,16 @@ impl SymForgeServer {
                 );
                 append_untracked_file_diagnostic(&mut result, &matching_untracked_paths);
             }
-            let result = format::enforce_token_budget(result, params.0.max_tokens);
+            let claims_complete = !matches!(
+                view,
+                SearchFilesResolveView::Ambiguous { overflow_count, .. } if overflow_count > 0
+            );
+            // Review M7: the caveat goes on after the budget so it is never cut,
+            // and a cut answer makes no complete claim.
+            let mut result = format::enforce_token_budget(result, params.0.max_tokens);
+            let claims_complete = claims_complete
+                && !crate::index_lifecycle::guidance::freshen::answer_was_cut(&result);
+            check.append_notes(&mut result, claims_complete);
             self.session_context.record_summary_output(
                 "search_files",
                 u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
@@ -4149,6 +4244,7 @@ impl SymForgeServer {
             &params.0,
             include_vendor,
             include_personal_tooling,
+            &check,
             || {
                 matching_untracked_paths_for_search_files(
                     self,
@@ -5362,6 +5458,15 @@ impl SymForgeServer {
             }
         };
 
+        // Spec 036 FR-015: the timestamp mode lists indexed files, so compare
+        // them with the disk first; the git modes answer from git itself.
+        let check = if matches!(mode, WhatChangedMode::Timestamp(_)) {
+            check_answer_files(self, params.0.path_prefix.as_deref()).await
+        } else {
+            crate::index_lifecycle::guidance::freshen::AnswerCheck::not_run(
+                "git modes answer from git",
+            )
+        };
         match &mode {
             WhatChangedMode::Timestamp(since_ts) => {
                 let view = {
@@ -5388,10 +5493,7 @@ impl SymForgeServer {
                                 let guard = self.index.data_plane().read();
                                 search_format::format_search_envelope(
                                     "exact (timestamp compare)",
-                                    what_changed_source_authority(
-                                        &mode,
-                                        &self.index.data_plane().freshness_status(),
-                                    ),
+                                    what_changed_source_authority(&mode, &check),
                                     search_parse_state_for_paths(
                                         &guard,
                                         filtered.iter().map(|path| path.as_str()),
@@ -5410,7 +5512,8 @@ impl SymForgeServer {
                                 &filtered,
                                 "No indexed files matched the requested filters since the last index load.",
                             );
-                            let result = format!("{envelope}\n\n{output}");
+                            let mut result = format!("{envelope}\n\n{output}");
+                            check.append_notes(&mut result, true);
                             self.session_context.record_summary_output(
                                 "what_changed",
                                 u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
@@ -5514,10 +5617,7 @@ impl SymForgeServer {
                                 );
                                 let envelope = search_format::format_search_envelope(
                                     "exact (uncommitted working tree)",
-                                    what_changed_source_authority(
-                                        &mode,
-                                        &self.index.data_plane().freshness_status(),
-                                    ),
+                                    what_changed_source_authority(&mode, &check),
                                     what_changed_parse_state_label(&mode, include_symbol_diff),
                                     &changed_paths_completeness_label(total_paths, listed.len()),
                                     &what_changed_scope_summary(&options, &mode),
@@ -5650,10 +5750,7 @@ impl SymForgeServer {
                                 }
                                 let envelope = search_format::format_search_envelope(
                                     "exact (git ref diff)",
-                                    what_changed_source_authority(
-                                        &mode,
-                                        &self.index.data_plane().freshness_status(),
-                                    ),
+                                    what_changed_source_authority(&mode, &check),
                                     what_changed_parse_state_label(&mode, include_symbol_diff),
                                     &changed_paths_completeness_label(total_paths, filtered.len()),
                                     &what_changed_scope_summary(&options, &mode),
@@ -5983,6 +6080,29 @@ impl SymForgeServer {
     }
 
     pub(crate) async fn get_file_content(&self, params: Parameters<GetFileContentInput>) -> String {
+        let mut unconfirmed = None;
+        let mut output = self.get_file_content_noted(params, &mut unconfirmed).await;
+        // Review M14: a file served from the index that could not be compared
+        // with the disk is named, after any budget so the line is never cut.
+        if let Some(line) = unconfirmed
+            && !is_error_output(&output)
+        {
+            output.push_str(
+                "
+
+",
+            );
+            output.push_str(&line);
+        }
+        output
+    }
+
+    /// `get_file_content`; `unconfirmed` receives the targeted freshen's caveat.
+    async fn get_file_content_noted(
+        &self,
+        params: Parameters<GetFileContentInput>,
+        unconfirmed: &mut Option<String>,
+    ) -> String {
         let mut input = params.0;
         input.path = normalize_exact_path(&input.path);
         let explicit_max_tokens = input.max_tokens;
@@ -6088,9 +6208,12 @@ impl SymForgeServer {
                 return message;
             }
         };
-        if let Err(refusal) = freshen_exact_path_for_targeted_retrieval(self, &options.path_scope) {
-            record_read_outcome(ReadOutcome::Unavailable { retryable: true });
-            return refusal.message(&input.path);
+        match freshen_exact_path_with_note(self, &options.path_scope) {
+            Ok(freshen) => *unconfirmed = freshen.unconfirmed,
+            Err(refusal) => {
+                record_read_outcome(ReadOutcome::Unavailable { retryable: true });
+                return refusal.message(&input.path);
+            }
         }
 
         // Capture freshness and the immutable publication before consulting the
@@ -6468,11 +6591,29 @@ impl SymForgeServer {
         {
             return refusal;
         }
+        // Spec 036 FR-015: a reference may sit in any file; compare them all
+        // with the disk before the capture.
+        let check = check_answer_files(self, None).await;
+        let mut output = self.find_references_checked(&params.0, &check);
+        // A reference listing is a complete claim for its scope; a refusal
+        // before any capture claims nothing.
+        if !is_index_unavailable_output(&output) {
+            let complete = !crate::index_lifecycle::guidance::freshen::answer_was_cut(&output);
+            check.append_notes(&mut output, complete);
+        }
+        output
+    }
+
+    /// `find_references` after the disk comparison in `check`.
+    fn find_references_checked(
+        &self,
+        input: &FindReferencesInput,
+        check: &crate::index_lifecycle::guidance::freshen::AnswerCheck,
+    ) -> String {
         // Capture only after daemon proxy/recovery has either returned or
         // rebuilt the local index so the rendered body and local fallback
         // ProjectEvidence describe one publication.
         let generation = self.capture_local_response_generation();
-        let input = &params.0;
         if let Some(path) = input.path.as_deref() {
             let repo_root = self.capture_repo_root();
             let degraded = {
@@ -6504,7 +6645,7 @@ impl SymForgeServer {
                 let guard = Arc::clone(&generation.live);
                 Some(search_format::format_search_envelope(
                     find_references_match_type_label(input, mode),
-                    search_format::SourceAuthority::from_freshness(&generation.freshness),
+                    search_format::SourceAuthority::from_check(check),
                     implementations_parse_state_for_paths(&guard, &view),
                     &implementations_completeness_label(&view, &limits),
                     &find_references_scope_summary(input, mode),
@@ -6647,7 +6788,7 @@ impl SymForgeServer {
                     }
                     Some(search_format::format_search_envelope(
                         find_references_match_type_label(input, mode),
-                        search_format::SourceAuthority::from_freshness(&generation.freshness),
+                        search_format::SourceAuthority::from_check(check),
                         search_parse_state_for_paths(
                             &guard,
                             view.files.iter().map(|file| file.file_path.as_str()),
@@ -6762,7 +6903,7 @@ impl SymForgeServer {
                 let (result, truncated) = self.apply_ccr_budget_with_truncation_status(
                     "find_references",
                     result,
-                    params.0.max_tokens,
+                    input.max_tokens,
                 );
                 if truncated {
                     format::downgrade_full_completeness_after_truncation(&result)
@@ -10624,6 +10765,24 @@ mod tests {
         make_server_with_root(index, None)
     }
 
+    /// A server whose root holds every indexed file's bytes on disk, so the
+    /// per-answer disk check (spec 036) confirms them and the envelope may
+    /// collapse. Keep the returned directory alive for the test.
+    fn make_server_on_disk(index: LiveIndex) -> (TempDir, SymForgeServer) {
+        let dir = TempDir::new().expect("temp root");
+        for (path, file) in index.all_files() {
+            let target = dir.path().join(path);
+            fs::create_dir_all(target.parent().expect("parent")).expect("create parent");
+            fs::write(&target, &file.content).expect("write indexed bytes");
+        }
+        let root = dir.path().to_path_buf();
+        (dir, make_server_with_root(index, Some(root)))
+    }
+
+    /// What an answer from a [`make_server`] fixture (no bound root) says.
+    const NO_ROOT_NOTE: &str =
+        "Not confirmed against disk: no file was compared (no repository root is bound)";
+
     /// Wait until background publications have quiesced.
     ///
     /// `WatcherState::Active` is NOT a settled fixture. The fresh-instance
@@ -11966,6 +12125,12 @@ mod tests {
             error: "planted disagreement: the index says this file does not parse".to_string(),
         };
         file.mtime_secs = disk_mtime;
+        // Spec 036: freshen now compares content when no stamp confirms it,
+        // so the planted row carries the real hash of the identical bytes.
+        file.content_hash = crate::hash::digest_hex(
+            b"pub fn clean() {}
+",
+        );
 
         let mut index = make_live_index_ready(vec![(key, file)]);
         index.load_source = load_source;
@@ -15385,7 +15550,7 @@ mod tests {
     async fn test_search_symbols_returns_results() {
         let sym = make_symbol("find_user", SymbolKind::Function, 1, 5);
         let (key, file) = make_file("src/lib.rs", b"fn find_user() {}", vec![sym]);
-        let server = make_server(make_live_index_ready(vec![(key, file)]));
+        let (_root, server) = make_server_on_disk(make_live_index_ready(vec![(key, file)]));
         let result = server
             .search_symbols(Parameters(super::SearchSymbolsInput {
                 query: Some("find".to_string()),
@@ -15407,8 +15572,11 @@ mod tests {
             result.contains("find_user"),
             "should find matching symbol, got: {result}"
         );
+        // Spec 036 review L16: the files are on disk, so the check ran and the
+        // collapsed banner names what it confirmed.
+        assert!(result.contains("confirmed against disk |"), "{result}");
         assert!(
-            result.contains("Trust: constrained (prefix tier) | current index | parsed"),
+            result.contains("Trust: constrained (prefix tier) | "),
             "search_symbols should expose the compact trust line, got: {result}"
         );
         // B5 (2026-07-03 spike gate): success paths carry no always-on tip.
@@ -16085,7 +16253,8 @@ mod tests {
     #[tokio::test]
     async fn test_search_text_returns_results() {
         let (key, file) = make_file("src/lib.rs", b"fn find_user() {}", vec![]);
-        let server = make_server(make_live_index_ready(vec![(key, file)]));
+        // Spec 036: the one-line envelope needs the files confirmed on disk.
+        let (_root, server) = make_server_on_disk(make_live_index_ready(vec![(key, file)]));
         let result = server
             .search_text(Parameters(super::SearchTextInput {
                 query: Some("find".to_string()),
@@ -16306,6 +16475,7 @@ mod tests {
             false,
             false,
             None,
+            &crate::index_lifecycle::guidance::freshen::AnswerCheck::confirmed_for_tests(),
         );
 
         assert!(
@@ -16335,6 +16505,7 @@ mod tests {
             false,
             false,
             None,
+            &crate::index_lifecycle::guidance::freshen::AnswerCheck::confirmed_for_tests(),
         );
         assert!(
             !rendered_current.contains("untracked file may match"),
@@ -16346,7 +16517,13 @@ mod tests {
     async fn test_search_text_non_empty_result_omits_untracked_diagnostic() {
         let dir = init_git_repo();
         fs::create_dir_all(dir.path().join("src")).unwrap();
-        fs::write(dir.path().join("src/lib.rs"), "fn tracked() {}\n").unwrap();
+        // Spec 036: search compares its files with the disk, so the planted
+        // row's bytes are the bytes on disk.
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "fn tracked() { let _ = \"shared_needle\"; }\n",
+        )
+        .unwrap();
         run_git(dir.path(), &["add", "."]);
         run_git(dir.path(), &["commit", "-m", "tracked"]);
         fs::write(
@@ -16406,7 +16583,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_text_structural_envelope_reports_ast_grep_match_type() {
         let (key, file) = make_file("src/lib.rs", b"fn find_user() {}", vec![]);
-        let server = make_server(make_live_index_ready(vec![(key, file)]));
+        let (_root, server) = make_server_on_disk(make_live_index_ready(vec![(key, file)]));
         let result = server
             .search_text(Parameters(super::SearchTextInput {
                 query: Some("fn $NAME($$$) { $$$ }".to_string()),
@@ -16442,8 +16619,11 @@ mod tests {
             result.contains("find_user"),
             "should find matching function, got: {result}"
         );
+        // Spec 036 review L16: the files are on disk, so the check ran and the
+        // collapsed banner names what it confirmed.
+        assert!(result.contains("confirmed against disk |"), "{result}");
         assert!(
-            result.contains("Trust: structural (ast-grep)"),
+            result.contains("Trust: structural (ast-grep) | "),
             "structural search should expose ast-grep match type, got: {result}"
         );
     }
@@ -17033,7 +17213,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_files_returns_ranked_paths() {
-        let server = make_server(make_live_index_ready(vec![
+        // Spec 036: the one-line envelope needs the files confirmed on disk.
+        let (_root, server) = make_server_on_disk(make_live_index_ready(vec![
             make_file("src/protocol/tools.rs", b"fn a() {}", vec![]),
             make_file("src/sidecar/tools.rs", b"fn b() {}", vec![]),
             make_file("src/protocol/tools_helper.rs", b"fn c() {}", vec![]),
@@ -18050,7 +18231,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_files_resolve_includes_vendor_when_flag_true() {
-        let server = make_server(make_live_index_ready_with_vendor_file());
+        let (_root, server) = make_server_on_disk(make_live_index_ready_with_vendor_file());
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
                 projects: None,
@@ -18075,8 +18256,11 @@ mod tests {
             result.contains("vendor/foo/bar.rs"),
             "include_vendor=true should resolve vendor path: {result}"
         );
+        // Spec 036 review L16: the files are on disk, so the check ran and the
+        // collapsed banner names what it confirmed.
+        assert!(result.contains("confirmed against disk |"), "{result}");
         assert!(
-            result.contains("Trust: exact (resolve)"),
+            result.contains("Trust: exact (resolve) | "),
             "include_vendor=true should keep normal resolve envelope: {result}"
         );
         assert!(
@@ -18125,7 +18309,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_files_resolve_returns_exact_match() {
         let (key, file) = make_file("src/protocol/tools.rs", b"fn tool() {}", vec![]);
-        let server = make_server(make_live_index_ready(vec![(key, file)]));
+        let (_root, server) = make_server_on_disk(make_live_index_ready(vec![(key, file)]));
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
                 projects: None,
@@ -18145,8 +18329,11 @@ mod tests {
                 path_prefix: None,
             }))
             .await;
+        // Spec 036 review L16: the files are on disk, so the check ran and the
+        // collapsed banner names what it confirmed.
+        assert!(result.contains("confirmed against disk |"), "{result}");
         assert!(
-            result.contains("Trust: exact (resolve) | current index | parsed"),
+            result.contains("Trust: exact (resolve) | "),
             "got: {result}"
         );
         assert!(
@@ -18158,7 +18345,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_files_resolve_returns_ambiguous_matches() {
-        let server = make_server(make_live_index_ready(vec![
+        let (_root, server) = make_server_on_disk(make_live_index_ready(vec![
             make_file("src/lib.rs", b"fn src_lib() {}", vec![]),
             make_file("tests/lib.rs", b"fn test_lib() {}", vec![]),
         ]));
@@ -18185,8 +18372,11 @@ mod tests {
             result.contains("Ambiguous path hint 'lib.rs'"),
             "got: {result}"
         );
+        // Spec 036 review L16: the files are on disk, so the check ran and the
+        // collapsed banner names what it confirmed.
+        assert!(result.contains("confirmed against disk |"), "{result}");
         assert!(
-            result.contains("Trust: constrained (resolve candidates)"),
+            result.contains("Trust: constrained (resolve candidates) | "),
             "got: {result}"
         );
         assert!(result.contains("src/lib.rs"), "got: {result}");
@@ -19342,7 +19532,7 @@ mod tests {
     #[tokio::test]
     async fn test_what_changed_returns_result() {
         let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
-        let server = make_server(make_live_index_ready(vec![(key, file)]));
+        let (_root, server) = make_server_on_disk(make_live_index_ready(vec![(key, file)]));
         // since=0 (far past) → all files are "newer"
         let result = server
             .what_changed(Parameters(super::WhatChangedInput {
@@ -19362,8 +19552,11 @@ mod tests {
             result.contains("src/lib.rs"),
             "what_changed since epoch should list all files, got: {result}"
         );
+        // Spec 036 review L16: the files are on disk, so the check ran and the
+        // collapsed banner names what it confirmed.
+        assert!(result.contains("confirmed against disk |"), "{result}");
         assert!(
-            result.contains("Trust: exact (timestamp compare) | current index | parsed"),
+            result.contains("Trust: exact (timestamp compare) | "),
             "timestamp mode should report the compact trust line: {result}"
         );
     }
@@ -26131,7 +26324,8 @@ mod tests {
                 Some(1),
             )],
         );
-        let server = make_server(make_live_index_ready(vec![file]));
+        // Spec 036: the compact envelope needs the file confirmed on disk.
+        let (_root, server) = make_server_on_disk(make_live_index_ready(vec![file]));
         let mut input = find_references_input("solitary_fn");
         input.max_tokens = Some(40);
         let result = server.find_references(Parameters(input)).await;
@@ -26423,8 +26617,10 @@ mod tests {
             result.contains("src/service.rs"),
             "expected dependent hit: {result}"
         );
+        // Spec 036: a fixture with no bound root compares no file, so the envelope stays expanded and says so.
+        assert!(result.contains(NO_ROOT_NOTE), "{result}");
         assert!(
-            result.contains("Trust: exact | current index | parsed"),
+            result.contains("Match type: exact"),
             "bundle mode should surface the compact trust line; got: {result}"
         );
         assert!(
@@ -26559,7 +26755,9 @@ mod tests {
             !result.contains("src/other.rs"),
             "unrelated same-name file should be excluded: {result}"
         );
-        assert!(result.contains("Trust: exact"), "got: {result}");
+        // Spec 036: a fixture with no bound root compares no file, so the envelope stays expanded and says so.
+        assert!(result.contains(NO_ROOT_NOTE), "{result}");
+        assert!(result.contains("Match type: exact"), "got: {result}");
         assert!(
             result.contains("Scope: path `src/db.rs`; exact selector line 2; symbol kind `fn`; reference kind `call`"),
             "exact selector scope should be explicit: {result}"

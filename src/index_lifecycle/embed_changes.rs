@@ -226,7 +226,7 @@ fn what_changed_report(
         |match_type: &str, parse_state: &str, total: usize, listed: usize, filtered: &[String]| {
             search_envelope::format_search_envelope(
                 match_type,
-                shared::what_changed_source_authority(mode, &snapshot.generation.freshness),
+                shared::what_changed_source_authority(mode, &snapshot.answer_check),
                 parse_state,
                 &shared::changed_paths_completeness_label(total, listed),
                 &shared::what_changed_scope_summary(options, mode),
@@ -265,7 +265,7 @@ fn what_changed_report(
             }
             let envelope = search_envelope::format_search_envelope(
                 "exact (timestamp compare)",
-                shared::what_changed_source_authority(mode, &snapshot.generation.freshness),
+                shared::what_changed_source_authority(mode, &snapshot.answer_check),
                 super::guidance::reference_read::search_parse_state_for_paths(
                     live,
                     filtered.iter().map(String::as_str),
@@ -278,13 +278,15 @@ fn what_changed_report(
                 &filtered,
                 "No indexed files matched the requested filters since the last index load.",
             );
+            let mut rendered = format!("{envelope}\n\n{output}");
+            snapshot.answer_check.append_notes(&mut rendered, true);
             Ok(WhatChangedReport {
                 mode: change_mode,
                 total_paths: view.paths.len() as u64,
                 paths: filtered,
                 symbol_diff: None,
                 symbol_diff_commits: None,
-                rendered: format!("{envelope}\n\n{output}"),
+                rendered,
             })
         }
         WhatChangedMode::Uncommitted | WhatChangedMode::GitRef(_) => {

@@ -830,10 +830,45 @@ impl EmbeddedBinding {
             &self.root,
             &self.authority,
             relative_path,
-        )? {
+        )?
+        .changed
+        {
             self.publish_freshened();
         }
         Ok(())
+    }
+
+    /// Spec 036 FR-015: MCP's `check_answer_files` on a Current source,
+    /// publishing whatever it refreshed as the next Current publication so
+    /// the snapshot captured after it answers from the disk. Any other phase
+    /// compares nothing and says so.
+    #[cfg(feature = "embed")]
+    fn check_answer_scope(
+        &self,
+        path_prefix: Option<&str>,
+    ) -> super::guidance::freshen::AnswerCheck {
+        if self.shutdown_started.load(Ordering::Acquire)
+            || self.authority.verify_physical_root_anchor().is_err()
+            || self.state.lock().expect("embedded state mutex").phase
+                != super::public_api::SourceRuntimePhase::Current
+        {
+            return super::guidance::freshen::AnswerCheck::not_run(
+                super::guidance::freshen::NOT_RUN_INDEX_NOT_READY,
+            );
+        }
+        let shared = self.runtime.data_plane();
+        let expected_gen = shared.current_project_generation();
+        let (check, changed) = super::guidance::freshen::check_answer_scope(
+            shared,
+            expected_gen,
+            &self.root,
+            &self.authority,
+            path_prefix.filter(|prefix| !prefix.is_empty()),
+        );
+        if changed {
+            self.publish_freshened();
+        }
+        check
     }
 
     /// MCP `analyze_file_impact`'s re-admission and symbol diff on a Current
@@ -1069,6 +1104,9 @@ impl EmbeddedBinding {
             temporal_cache: Arc::clone(&self.temporal_cache),
             control_directory: self.control_directory.clone(),
             trust_mode: self.trust_mode,
+            answer_check: super::guidance::freshen::AnswerCheck::not_run(
+                "no disk comparison ran for this request",
+            ),
         })
     }
 
@@ -2053,6 +2091,23 @@ impl EmbeddedSourceHandle {
         }
     }
 
+    /// Spec 036: compare an answer's scope with the disk; see the binding's
+    /// `check_answer_scope`.
+    #[cfg(feature = "embed")]
+    pub(super) fn check_answer_scope(
+        &self,
+        path_prefix: Option<&str>,
+    ) -> super::guidance::freshen::AnswerCheck {
+        match &self.binding {
+            Some(binding) if !self.closed.load(Ordering::Acquire) => {
+                binding.check_answer_scope(path_prefix)
+            }
+            _ => super::guidance::freshen::AnswerCheck::not_run(
+                super::guidance::freshen::NOT_RUN_INDEX_NOT_READY,
+            ),
+        }
+    }
+
     /// MCP `analyze_file_impact`'s re-admission; see the binding's method.
     #[cfg(feature = "embed")]
     pub(super) fn analyze_file_impact(
@@ -2370,6 +2425,9 @@ impl EmbeddedSourceHandle {
             temporal_cache: Arc::clone(&binding.temporal_cache),
             control_directory: binding.control_directory.clone(),
             trust_mode: binding.trust_mode,
+            answer_check: super::guidance::freshen::AnswerCheck::not_run(
+                "no disk comparison ran for this request",
+            ),
         })
     }
 

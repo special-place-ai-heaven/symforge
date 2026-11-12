@@ -343,9 +343,7 @@ pub(super) fn references(
                 "{}\n\n{body}",
                 search_envelope::format_search_envelope(
                     shared::find_references_match_type_label(request, "implementations"),
-                    search_envelope::SourceAuthority::from_freshness(
-                        &snapshot.generation.freshness
-                    ),
+                    search_envelope::SourceAuthority::from_check(&snapshot.answer_check),
                     shared::implementations_parse_state_for_paths(live, &view),
                     &shared::implementations_completeness_label(&view, &limits),
                     &shared::find_references_scope_summary(request, "implementations"),
@@ -354,6 +352,10 @@ pub(super) fn references(
             )
         };
         result.rendered = shared::with_withheld_note(live, None, result.rendered);
+        let complete = !super::guidance::freshen::answer_was_cut(&result.rendered);
+        snapshot
+            .answer_check
+            .append_notes(&mut result.rendered, complete);
         return finish(result, request, budget);
     }
     let limits = shared::OutputLimits::new(
@@ -479,7 +481,7 @@ pub(super) fn references(
             "{}\n\n{body}",
             search_envelope::format_search_envelope(
                 shared::find_references_match_type_label(request, "references"),
-                search_envelope::SourceAuthority::from_freshness(&snapshot.generation.freshness),
+                search_envelope::SourceAuthority::from_check(&snapshot.answer_check),
                 shared::search_parse_state_for_paths(
                     live,
                     view.files.iter().map(|file| file.file_path.as_str())
@@ -491,6 +493,10 @@ pub(super) fn references(
         )
     };
     result.rendered = shared::with_withheld_note(live, None, result.rendered);
+    let complete = !super::guidance::freshen::answer_was_cut(&result.rendered);
+    snapshot
+        .answer_check
+        .append_notes(&mut result.rendered, complete);
     finish(result, request, budget)
 }
 

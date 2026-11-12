@@ -647,7 +647,7 @@ pub(super) fn project(
                         } else {
                             "constrained"
                         },
-                        search_envelope::SourceAuthority::from_freshness(&published.freshness),
+                        search_envelope::SourceAuthority::from_check(&snapshot.answer_check),
                         read_context::parse_state_label(file),
                         &shared::context_bundle_completeness_label(found, &body),
                         &max_tokens
@@ -807,6 +807,10 @@ pub(super) fn project(
             withheld.is_some(),
             None,
         );
+        // Spec 036: MCP appends the unconfirmed files after the final bound.
+        let mut rendered = rendered;
+        let complete = !super::guidance::freshen::answer_was_cut(&rendered);
+        snapshot.answer_check.append_notes(&mut rendered, complete);
         (rendered, render_truncated || final_truncated)
     };
     // The cached answer is the unbudgeted render, which the default hard cap may still cut:

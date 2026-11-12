@@ -452,6 +452,7 @@ pub(super) fn render_search(
                 executed.auto_corrected_regex,
                 &value.untracked_paths,
                 executed.hidden_test_matches,
+                &snapshot.answer_check,
             );
             if executed.auto_corrected_regex {
                 rendered.push_str(&format!(
@@ -480,6 +481,7 @@ pub(super) fn render_search(
                 generation,
                 &executed,
                 shared.query.as_deref().unwrap_or("").trim(),
+                &snapshot.answer_check,
             );
             budget(
                 "search_symbols",
@@ -504,6 +506,7 @@ pub(super) fn render_search(
                 &shared,
                 shared.include_vendor.unwrap_or(false),
                 shared.include_personal_tooling.unwrap_or(false),
+                &snapshot.answer_check,
                 || value.untracked_paths.clone(),
             )
         }
