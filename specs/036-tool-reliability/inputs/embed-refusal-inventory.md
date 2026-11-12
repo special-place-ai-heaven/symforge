@@ -271,3 +271,24 @@ find_references x2, find_dependents x2, health, review_knowledge), 9 left valid 
 Parity: `out_of_set_values_are_refused_alike_on_both_lanes` pins 29 more argument rows equal on
 both lanes, `an_out_of_set_value_is_refused_and_a_valid_one_is_answered`
 (`tests/reliability_contract.rs`) pins 15 MCP refusals with an accepting control each.
+
+### Review round (argument values)
+
+- Described caps now clamp WITH a note on both lanes, same bytes:
+  `Note: "<argument>" = <n> is above its maximum of <max>; <max> was used.` appended to
+  the answer (MCP last text block; embed wire reply `rendered`/`report`, or
+  `freshness_notes` for symbol/file search). Rows: search_symbols limit 100, search_files
+  limit 50, find_references limit 100 (500 in implementations mode) and max_per_file 50,
+  find_dependents limit 100 and max_per_file 50, health quarantine_limit 1000,
+  review_knowledge limit 100, get_repo_map depth 5 (0 kept: every file grouped under the
+  scope root), search_knowledge limit 100. Values below the minimum are still refused.
+  Typed embed `handle.query` callers get the clamp without the note.
+- Embed refusal kinds: a name outside its closed set keeps `UnsupportedOption` (now with
+  the message); numbers out of range and empty names are `InvalidRequest`.
+- Arguments the selected mode ignores are not judged: search_text limit/max_per_file with
+  group_by=count, follow_refs_limit without follow_refs, find_references kind,
+  symbol_kind, symbol_line and max_per_file in implementations mode, direction outside it.
+- Section names are lowercased before any handler reads them (MCP decoders, embed request
+  decoding); symbol-kind selectors all use `search::symbol_kind_filter_matches`, so every
+  name in `SYMBOL_KINDS` (aliases and `all`) matches on every symbol argument.
+- The daemon route skips the decoder's internal `include_tests` sections marker.

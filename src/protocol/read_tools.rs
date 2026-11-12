@@ -11,12 +11,15 @@ pub(crate) fn lenient_bool_required<'de, D: Deserializer<'de>>(
 ) -> Result<bool, D::Error> {
     lenient_bool(deserializer).map(|value| value.unwrap_or(false))
 }
-const INCLUDE_TESTS_SECTION_MARKER: &str = "__symforge_include_tests";
+use crate::index_lifecycle::guidance::argument_values::INCLUDE_TESTS_SECTION_MARKER;
 
 pub(crate) fn encode_include_tests_marker(
-    mut sections: Option<Vec<String>>,
+    sections: Option<Vec<String>>,
     include_tests: bool,
 ) -> Option<Vec<String>> {
+    // Section names compare caselessly in the value table; the handlers compare them
+    // exactly, so they are lowercased once, here, before any handler reads them.
+    let mut sections = crate::index_lifecycle::guidance::serde_input::lowercase_sections(sections);
     if include_tests {
         sections
             .get_or_insert_with(Vec::new)

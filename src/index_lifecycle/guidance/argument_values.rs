@@ -17,7 +17,7 @@
 
 use serde_json::{Map, Value};
 
-use super::request_refusal::{array_items, capped_key, element_object};
+use super::request_refusal::{array_items, capped_key, current_value, element_object};
 
 /// What an argument accepts.
 #[derive(Clone, Copy, Debug)]
@@ -28,9 +28,28 @@ pub(crate) enum Accepts {
     OneOfCaseless(&'static [&'static str]),
     /// An integer of at least `min`, and at most `max` when one is given.
     Range(u64, Option<u64>),
+    /// An integer of at least `min`; above `max` the tool uses `max`, as its published
+    /// description says, and the answer says so ([`check_values`] returns the note).
+    Capped(u64, u64),
 }
 
-use Accepts::{OneOf, OneOfCaseless, Range};
+use Accepts::{Capped, OneOf, OneOfCaseless, Range};
+
+/// The `sections` element the MCP decoders add for `include_tests=true`
+/// (`protocol::read_tools::encode_include_tests_marker`). A caller never sends it; the
+/// daemon route sees it in the arguments the front end re-serializes, so it is not judged.
+pub(crate) const INCLUDE_TESTS_SECTION_MARKER: &str = "__symforge_include_tests";
+
+/// When a row is judged: the handler reads the argument only in some modes, and an
+/// argument a mode ignores is not judged here (the mode rules own that).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Applies {
+    Always,
+    /// Not when `argument` is `value` (as the mode rules compare it).
+    Unless(&'static str, &'static str),
+    /// Only when `argument` is `value`.
+    If(&'static str, &'static str),
+}
 
 /// At least one: a count, a 1-based line, or a token budget.
 const POSITIVE: Accepts = Range(1, None);
@@ -97,6 +116,7 @@ pub(crate) struct ValueRow {
     pub tool: &'static str,
     pub argument: &'static str,
     pub accepts: Accepts,
+    pub applies: Applies,
 }
 
 const fn row(tool: &'static str, argument: &'static str, accepts: Accepts) -> ValueRow {
@@ -104,6 +124,18 @@ const fn row(tool: &'static str, argument: &'static str, accepts: Accepts) -> Va
         tool,
         argument,
         accepts,
+        applies: Applies::Always,
+    }
+}
+
+impl ValueRow {
+    const fn unless(mut self, argument: &'static str, value: &'static str) -> Self {
+        self.applies = Applies::Unless(argument, value);
+        self
+    }
+    const fn only_if(mut self, argument: &'static str, value: &'static str) -> Self {
+        self.applies = Applies::If(argument, value);
+        self
     }
 }
 
@@ -130,7 +162,8 @@ pub(crate) static ARGUMENT_VALUES: &[ValueRow] = &[
         "detail",
         OneOf(&["compact", "full", "tree"]),
     ),
-    row("get_repo_map", "depth", Range(0, Some(5))),
+    // "default 2, max 5"; 0 groups every file under the scope root (`map_dir_key`).
+    row("get_repo_map", "depth", Capped(0, 5)),
     row("get_repo_map", "max_files", POSITIVE),
     row("get_repo_map", "max_tokens", POSITIVE),
     row(
@@ -153,22 +186,22 @@ pub(crate) static ARGUMENT_VALUES: &[ValueRow] = &[
     ),
     row("get_symbol_context", "max_tokens", POSITIVE),
     row("inspect_match", "max_tokens", POSITIVE),
+    // The daemon's `trace_symbol` alias (judged as `get_symbol_context` plus this row).
+    row("trace_symbol", "kind", OneOfCaseless(SYMBOL_KINDS)),
     // -- search --
     row("search_symbols", "kind", OneOfCaseless(SYMBOL_KINDS)),
-    // Capped at 100 by the published description: a clamp, not a refusal.
-    row("search_symbols", "limit", POSITIVE),
+    row("search_symbols", "limit", Capped(1, 100)),
     row("search_symbols", "max_tokens", POSITIVE),
-    row("search_text", "limit", Range(1, Some(10_000))),
-    row("search_text", "max_per_file", Range(1, Some(10_000))),
-    row("search_text", "follow_refs_limit", POSITIVE),
+    row("search_text", "limit", Range(1, Some(10_000))).unless("group_by", "count"),
+    row("search_text", "max_per_file", Range(1, Some(10_000))).unless("group_by", "count"),
+    row("search_text", "follow_refs_limit", POSITIVE).only_if("follow_refs", "true"),
     row("search_text", "group_by", OneOf(TEXT_GROUPINGS)),
     row("search_text", "max_tokens", POSITIVE),
-    // Capped at 50 by the published description.
-    row("search_files", "limit", POSITIVE),
+    row("search_files", "limit", Capped(1, 50)),
     row("search_files", "max_tokens", POSITIVE),
-    row("search_knowledge", "limit", Range(1, Some(100))),
-    // "Server-bounded" by the published description.
-    row("review_knowledge", "limit", POSITIVE),
+    row("search_knowledge", "limit", Capped(1, 100)),
+    // "Server-bounded" by the published description (`knowledge::review` MAX_LIMIT).
+    row("review_knowledge", "limit", Capped(1, 100)),
     row("explore", "depth", Range(1, Some(3))),
     row("explore", "limit", Range(1, Some(10_000))),
     row("explore", "max_tokens", POSITIVE),
@@ -183,10 +216,11 @@ pub(crate) static ARGUMENT_VALUES: &[ValueRow] = &[
         "symbol_kind",
         OneOfCaseless(SYMBOL_KINDS),
     ),
-    row("find_references", "symbol_line", POSITIVE),
-    // Capped at 100/500 and 50 by the published description.
-    row("find_references", "limit", POSITIVE),
-    row("find_references", "max_per_file", POSITIVE),
+    row("find_references", "symbol_line", POSITIVE).unless("mode", "implementations"),
+    // "capped at 100/500" and "capped at 50" by the published description.
+    row("find_references", "limit", Capped(1, 100)).unless("mode", "implementations"),
+    row("find_references", "limit", Capped(1, 500)).only_if("mode", "implementations"),
+    row("find_references", "max_per_file", Capped(1, 50)).unless("mode", "implementations"),
     row(
         "find_references",
         "mode",
@@ -198,9 +232,8 @@ pub(crate) static ARGUMENT_VALUES: &[ValueRow] = &[
         OneOf(&["trait", "type", "auto"]),
     ),
     row("find_references", "max_tokens", POSITIVE),
-    // Capped at 100 and 50 by the published description.
-    row("find_dependents", "limit", POSITIVE),
-    row("find_dependents", "max_per_file", POSITIVE),
+    row("find_dependents", "limit", Capped(1, 100)),
+    row("find_dependents", "max_per_file", Capped(1, 50)),
     row(
         "find_dependents",
         "format",
@@ -214,8 +247,7 @@ pub(crate) static ARGUMENT_VALUES: &[ValueRow] = &[
     row("ask", "max_tokens", POSITIVE),
     // The published schema's minimum.
     row("symforge", "max_tokens", Range(64, None)),
-    // Capped at 1000 by the published description.
-    row("health", "quarantine_limit", POSITIVE),
+    row("health", "quarantine_limit", Capped(1, 1000)),
     // -- edits (MCP request shapes; the embed edit requests have their own) --
     row("replace_symbol_body", "kind", OneOfCaseless(SYMBOL_KINDS)),
     row("replace_symbol_body", "symbol_line", POSITIVE),
@@ -271,10 +303,65 @@ pub(crate) static NON_EMPTY: &[NonEmptyRow] = &[
     },
 ];
 
-/// The refusal text for the first argument of `args` outside its accepted values, for
-/// MCP tool `tool`; `None` when every judged argument is valid. Null, `""` and `[]` are
-/// absent (FR-003). A value of the wrong JSON type is left to the decoder.
+/// A value outside an argument's set or range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ValueRefusal {
+    pub text: String,
+    /// The value is outside a closed set of names (an unsupported option), rather than
+    /// a number out of range or an empty name.
+    pub closed_set: bool,
+}
+
+/// Judge `args` of MCP tool `tool`: the first argument outside its accepted values is
+/// refused; otherwise every capped value that was above its cap gets one note the answer
+/// must carry (`Note: "limit" = 500 is above its maximum of 100; 100 was used.`). Null,
+/// `""` and `[]` are absent (FR-003); a value of the wrong JSON type is the decoder's.
+pub(crate) fn check_values(
+    tool: &str,
+    args: &Map<String, Value>,
+) -> Result<Vec<String>, ValueRefusal> {
+    if let Some(text) = blank_name_refusal(tool, args) {
+        return Err(ValueRefusal {
+            text,
+            closed_set: false,
+        });
+    }
+    let mut notes = Vec::new();
+    for row in ARGUMENT_VALUES.iter().filter(|row| row.tool == tool) {
+        if !applies(row.applies, args) {
+            continue;
+        }
+        for (path, value) in values_of(row.argument, args) {
+            match judge(tool, &path, row.accepts, &value) {
+                Judged::Valid => {}
+                Judged::Capped(note) => notes.push(note),
+                Judged::Refused(text) => {
+                    return Err(ValueRefusal {
+                        text,
+                        closed_set: matches!(row.accepts, OneOf(_) | OneOfCaseless(_)),
+                    });
+                }
+            }
+        }
+    }
+    Ok(notes)
+}
+
+/// [`check_values`]' refusal text only.
 pub(crate) fn value_refusal(tool: &str, args: &Map<String, Value>) -> Option<String> {
+    check_values(tool, args).err().map(|refusal| refusal.text)
+}
+
+/// The notes [`check_values`] returns, appended to an answer's text.
+pub(crate) fn with_notes(mut text: String, notes: &[String]) -> String {
+    for note in notes {
+        text.push_str("\n\n");
+        text.push_str(note);
+    }
+    text
+}
+
+fn blank_name_refusal(tool: &str, args: &Map<String, Value>) -> Option<String> {
     for rule in NON_EMPTY.iter().filter(|rule| rule.tool == tool) {
         let blank = match args.get(rule.argument) {
             None | Some(Value::Null) => rule.defaulted,
@@ -297,13 +384,18 @@ pub(crate) fn value_refusal(tool: &str, args: &Map<String, Value>) -> Option<Str
             ));
         }
     }
-    ARGUMENT_VALUES
-        .iter()
-        .filter(|row| row.tool == tool)
-        .find_map(|row| row_refusal(tool, row, args))
+    None
 }
 
-/// Every value `row` names in `args`, with the path the refusal prints for it.
+fn applies(applies: Applies, args: &Map<String, Value>) -> bool {
+    match applies {
+        Applies::Always => true,
+        Applies::Unless(argument, value) => current_value(args, argument) != value,
+        Applies::If(argument, value) => current_value(args, argument) == value,
+    }
+}
+
+/// Every value `argument` names in `args`, with the path the refusal prints for it.
 fn values_of(argument: &str, args: &Map<String, Value>) -> Vec<(String, Value)> {
     let Some((array, field)) = argument.split_once("[]") else {
         return args
@@ -318,6 +410,7 @@ fn values_of(argument: &str, args: &Map<String, Value>) -> Vec<(String, Value)> 
     items
         .into_iter()
         .enumerate()
+        .filter(|(_, item)| item.as_str() != Some(INCLUDE_TESTS_SECTION_MARKER))
         .filter_map(|(index, item)| match field {
             None => Some((format!("{array}.{index}"), item)),
             Some(field) => element_object(&item)?
@@ -325,12 +418,6 @@ fn values_of(argument: &str, args: &Map<String, Value>) -> Vec<(String, Value)> 
                 .map(|value| (format!("{array}.{index}.{field}"), value.clone())),
         })
         .collect()
-}
-
-fn row_refusal(tool: &str, row: &ValueRow, args: &Map<String, Value>) -> Option<String> {
-    values_of(row.argument, args)
-        .into_iter()
-        .find_map(|(path, value)| judge(tool, &path, row.accepts, &value))
 }
 
 fn listed(values: &[&str]) -> String {
@@ -341,59 +428,74 @@ fn listed(values: &[&str]) -> String {
         .join(", ")
 }
 
-/// An integer as the lenient decoders read it: a JSON integer or a string of digits
-/// (`"5"`, `"-1"`). `None` for anything else, which the decoder judges.
-fn integer(value: &Value) -> Option<i128> {
+/// An integer exactly as the lenient decoders accept one (`serde_input::lenient_u32`):
+/// a non-negative JSON integer or a string of digits, untrimmed. Anything else is the
+/// decoder's to refuse, in its own words.
+fn integer(value: &Value) -> Option<u64> {
     match value {
-        Value::Number(number) => number
-            .as_u64()
-            .map(i128::from)
-            .or_else(|| number.as_i64().map(i128::from)),
-        Value::String(text) => text.trim().parse::<i128>().ok(),
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.parse::<u64>().ok(),
         _ => None,
     }
 }
 
-fn judge(tool: &str, path: &str, accepts: Accepts, value: &Value) -> Option<String> {
+enum Judged {
+    Valid,
+    Capped(String),
+    Refused(String),
+}
+
+fn range_text(min: u64, max: Option<u64>) -> String {
+    match max {
+        Some(max) => format!("{min} to {max}"),
+        None => format!("{min} or greater"),
+    }
+}
+
+fn judge(tool: &str, path: &str, accepts: Accepts, value: &Value) -> Judged {
+    let refused_number = |number: u64, max: Option<u64>, min: u64| {
+        Judged::Refused(format!(
+            "invalid_request: {tool} does not accept \"{path}\" = {}. Valid range: {}.",
+            capped_key(&number.to_string()),
+            range_text(min, max)
+        ))
+    };
     match accepts {
         OneOf(values) | OneOfCaseless(values) => {
             let Value::String(text) = value else {
-                return None;
+                return Judged::Valid;
             };
             if text.is_empty() {
-                return None;
+                return Judged::Valid;
             }
             let caseless = matches!(accepts, OneOfCaseless(_));
             let known = values.iter().any(|valid| {
                 *valid == text.as_str() || (caseless && valid.eq_ignore_ascii_case(text))
             });
-            (!known).then(|| {
-                format!(
+            if known {
+                Judged::Valid
+            } else {
+                Judged::Refused(format!(
                     "invalid_request: {tool} does not accept that value of \"{path}\". Valid \
                      values: {}.",
                     listed(values)
-                )
-            })
-        }
-        Range(min, max) => {
-            if matches!(value, Value::String(text) if text.is_empty()) {
-                return None;
+                ))
             }
-            let number = integer(value)?;
-            let inside =
-                number >= i128::from(min) && max.is_none_or(|max| number <= i128::from(max));
-            (!inside).then(|| {
-                let range = match max {
-                    Some(max) => format!("{min} to {max}"),
-                    None => format!("{min} or greater"),
-                };
-                format!(
-                    "invalid_request: {tool} does not accept \"{path}\" = {}. Valid range: \
-                     {range}.",
-                    capped_key(&number.to_string())
-                )
-            })
         }
+        Range(min, max) => match integer(value) {
+            Some(number) if number < min || max.is_some_and(|max| number > max) => {
+                refused_number(number, max, min)
+            }
+            _ => Judged::Valid,
+        },
+        Capped(min, max) => match integer(value) {
+            Some(number) if number < min => refused_number(number, None, min),
+            Some(number) if number > max => Judged::Capped(format!(
+                "Note: \"{path}\" = {} is above its maximum of {max}; {max} was used.",
+                capped_key(&number.to_string())
+            )),
+            _ => Judged::Valid,
+        },
     }
 }
 
@@ -522,7 +624,10 @@ mod tests {
 
     #[test]
     fn every_row_names_a_published_argument() {
-        for row in ARGUMENT_VALUES {
+        for row in ARGUMENT_VALUES
+            .iter()
+            .filter(|row| row.tool != "trace_symbol")
+        {
             let top = row.argument.split("[]").next().unwrap_or(row.argument);
             let published = super::super::request_refusal::tool_arguments(row.tool)
                 .unwrap_or_else(|| panic!("{} has no published arguments", row.tool));

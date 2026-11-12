@@ -429,7 +429,7 @@ pub struct ExploreInput {
     pub project: Option<String>,
     /// Natural-language concept or topic to explore (e.g., "error handling", "concurrency", "database").
     pub query: String,
-    /// Maximum number of results per category (default 10).
+    /// Maximum number of results per category (default 10, max 10000).
     #[serde(default, deserialize_with = "lenient_u32")]
     pub limit: Option<u32>,
     /// Exploration depth: 1 (default) = symbol names + text patterns + files.

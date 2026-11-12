@@ -2212,7 +2212,7 @@ impl ServerHandler for SymForgeServer {
         // outside its mode, refuses the call here, BEFORE the repeat tracker observes it,
         // so a refused call can never count toward the repeat notice. A mode that a lone
         // argument selects is written into the arguments for the handler.
-        let selected_modes =
+        let (selected_modes, value_notes) =
             match self.refuse_invalid_arguments(request.name.as_ref(), &mut request.arguments) {
                 Ok(selected) => selected,
                 Err(mut refusal) => {
@@ -2366,6 +2366,7 @@ impl ServerHandler for SymForgeServer {
                         // must not reach `is_error_output`), before the repeat tracker
                         // reads the body.
                         tool_contract::append_selection_note(&mut result, &selected_modes);
+                        tool_contract::append_value_notes(&mut result, &value_notes);
                         // Feature 032 (US1): AFTER evidence attachment (the
                         // tracker reads the evidence this response actually
                         // carries) and AFTER the error reclassification (the

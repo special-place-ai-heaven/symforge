@@ -932,6 +932,14 @@ pub(crate) fn browse_kind_rank(kind: &str) -> u8 {
     }
 }
 
+/// The symbol-kind filter every symbol selector applies (`get_symbol` `kind`, its
+/// `targets`, trace siblings, knowledge selection): `all` in any letter case matches every
+/// kind, otherwise [`kind_filter_matches`]. Its accepted names are
+/// `argument_values::SYMBOL_KINDS` (pinned by a test there).
+pub(crate) fn symbol_kind_filter_matches(filter: &str, kind: &crate::domain::SymbolKind) -> bool {
+    filter.eq_ignore_ascii_case("all") || kind_filter_matches(filter, kind)
+}
+
 /// Returns true when `filter` matches the given `kind`, accepting both the
 /// Display string (e.g. `"let"` for `Variable`, `"fn"` for `Function`) and
 /// common semantic aliases (e.g. `"variable"`, `"function"`, `"method"`).

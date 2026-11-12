@@ -5729,6 +5729,12 @@ async fn call_tool_handler(
     // the front end (`argument_values`).
     if let serde_json::Value::Object(object) = &mut params
         && let Some(text) = crate::protocol::tool_contract::value_refusal(judged_as, object)
+            // The alias's own arguments (`trace_symbol` `kind`) have their own rows.
+            .or_else(|| {
+                (judged_as != tool_name)
+                    .then(|| crate::protocol::tool_contract::value_refusal(&tool_name, object))
+                    .flatten()
+            })
             .map_or_else(
                 || crate::protocol::tool_contract::apply_conditions(judged_as, object).err(),
                 Some,
@@ -18049,6 +18055,161 @@ mod tests {
             LEGACY_DAEMON_PORT_FILE,
         ))
         .await;
+    }
+
+    /// Spec 036 argument values on the daemon lane, through the real proxy path (front-end
+    /// proxy server -> `proxy_tool_call` -> daemon `call_tool_handler`): the daemon judges
+    /// what the caller sent, not the front end's re-serialized form (`include_tests` rides
+    /// in `sections` as an internal marker), and every valid non-default value of a checked
+    /// enum argument is served.
+    #[tokio::test]
+    async fn daemon_proxy_judges_argument_values_the_caller_sent() {
+        use serde_json::json;
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _home_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project = project_dir("argument-values-proxy");
+        std::fs::write(
+            project.path().join("src").join("lib.rs"),
+            "pub fn proxy_target() -> u32 { 1 }\npub fn proxy_caller() -> u32 { proxy_target() }\n",
+        )
+        .expect("write source");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let opened = authed_client(&handle)
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "argument-values-proxy".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let client = DaemonSessionClient::new_for_test_at(
+            base_url.clone(),
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+            test_control_state(daemon_home.path()),
+        )
+        .with_project_root(project.path().to_path_buf());
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+        let indexed = server
+            .index_folder(Parameters(IndexFolderInput {
+                path: project.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+                allow_protected_root: None,
+            }))
+            .await;
+        assert!(indexed.starts_with("Indexed "), "{indexed}");
+
+        let accepted = [
+            (
+                "get_file_context",
+                json!({ "path": "src/lib.rs", "include_tests": true }),
+            ),
+            (
+                "get_file_context",
+                json!({ "path": "src/lib.rs", "sections": ["imports"], "include_tests": true }),
+            ),
+            (
+                "get_symbol_context",
+                json!({ "name": "proxy_target", "path": "src/lib.rs", "sections": ["git"],
+                        "include_tests": true }),
+            ),
+            (
+                "get_symbol_context",
+                json!({ "name": "proxy_target", "path": "src/lib.rs", "verbosity": "signature",
+                        "symbol_kind": "fn", "sections": ["siblings"] }),
+            ),
+            (
+                "get_file_content",
+                json!({ "path": "src/lib.rs", "mode": "lines", "start_line": 1, "end_line": 1 }),
+            ),
+            (
+                "get_symbol",
+                json!({ "path": "src/lib.rs", "name": "proxy_target", "kind": "fn" }),
+            ),
+            ("get_repo_map", json!({ "detail": "tree" })),
+            ("search_symbols", json!({ "query": "proxy", "kind": "fn" })),
+            (
+                "search_text",
+                json!({ "query": "proxy_target", "group_by": "count" }),
+            ),
+            (
+                "find_references",
+                json!({ "name": "proxy_target", "kind": "call", "symbol_kind": "fn" }),
+            ),
+            (
+                "find_references",
+                json!({ "name": "proxy_target", "mode": "implementations", "direction": "trait" }),
+            ),
+            (
+                "find_dependents",
+                json!({ "path": "src/lib.rs", "format": "dot" }),
+            ),
+        ];
+        let mut failures = Vec::new();
+        let http = authed_client(&handle);
+        // The daemon route first: a refusal there makes the proxy below reconnect and
+        // fall back locally, which retires this session.
+        for (tool, args) in accepted.clone() {
+            // A daemon refusal is masked above by the proxy's local fallback, so the
+            // daemon route is also called with exactly the bytes `proxy_tool_call`
+            // sends: the front end's decoded input, re-serialized.
+            let forwarded = match tool {
+                "get_file_context" => serde_json::to_value(
+                    serde_json::from_value::<crate::protocol::tools::GetFileContextInput>(
+                        args.clone(),
+                    )
+                    .expect("decode"),
+                ),
+                "get_symbol_context" => serde_json::to_value(
+                    serde_json::from_value::<crate::protocol::tools::GetSymbolContextInput>(
+                        args.clone(),
+                    )
+                    .expect("decode"),
+                ),
+                _ => Ok(args.clone()),
+            }
+            .expect("serialize");
+            let response = http
+                .post(format!(
+                    "{base_url}/v1/sessions/{}/tools/{tool}",
+                    opened.session_id
+                ))
+                .json(&forwarded)
+                .send()
+                .await
+                .expect("daemon call");
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                failures.push(format!("daemon {tool} {forwarded}: {status} {body}"));
+            }
+        }
+        for (tool, args) in accepted {
+            let text = server.dispatch_tool_for_tests(tool, args.clone()).await;
+            if text.contains("does not accept") || text.contains("invalid_request") {
+                failures.push(format!("{tool} {args}: {text}"));
+            }
+        }
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// F6 regression: a `symforge_edit` apply carrying `working_directory`

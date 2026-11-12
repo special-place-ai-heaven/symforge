@@ -64,6 +64,17 @@ pub(crate) fn lenient_bool<'de, D: Deserializer<'de>>(
     }
 }
 
+/// Section names lowercased (`get_file_context` / `get_symbol_context` `sections`): the
+/// value table accepts them in any letter case and every handler compares them exactly.
+pub(crate) fn lowercase_sections(sections: Option<Vec<String>>) -> Option<Vec<String>> {
+    sections.map(|items| {
+        items
+            .into_iter()
+            .map(|item| item.to_ascii_lowercase())
+            .collect()
+    })
+}
+
 /// Leniently deserialize an `Option<Vec<T>>` — accepts a native JSON array, a
 /// stringified JSON array (as sent by some MCP clients like Kilo Code), or a
 /// native array of stringified JSON objects (as sent by Codex).

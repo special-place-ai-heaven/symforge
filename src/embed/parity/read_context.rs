@@ -31,6 +31,7 @@ pub struct FileContextRequest {
     pub project: Option<String>,
     pub path: String,
     pub max_tokens: Option<u64>,
+    #[serde(default, deserialize_with = "lowercase_sections")]
     pub sections: Option<Vec<String>>,
     #[serde(default)]
     pub include_tests: bool,
@@ -48,4 +49,18 @@ pub struct FileContextResult {
     pub raw_file_tokens: Option<u64>,
     pub selected_sections: Vec<String>,
     pub cache_hit: bool,
+}
+
+/// `sections` lowercased as it is decoded: the value table accepts section names in any
+/// letter case and the handlers compare them exactly, as on the MCP lane.
+pub(crate) fn lowercase_sections<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    let sections: Option<Vec<String>> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(sections.map(|items| {
+        items
+            .into_iter()
+            .map(|item| item.to_ascii_lowercase())
+            .collect()
+    }))
 }

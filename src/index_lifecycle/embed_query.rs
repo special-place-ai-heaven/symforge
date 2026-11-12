@@ -490,10 +490,10 @@ fn execute_inner(
     };
     let mut budget =
         Budget::new(limits, control).map_err(|kind| refuse(kind, RetryAdvice::Never))?;
-    if let Some(text) = typed_value_refusal(request) {
+    if let Some((kind, text)) = typed_value_refusal(request) {
         return Err(QueryRefusal {
             message: Some(text),
-            ..refuse(QueryRefusalKind::InvalidRequest, RetryAdvice::Never)
+            ..refuse(kind, RetryAdvice::Never)
         });
     }
     validate_request(request).map_err(|kind| QueryRefusal {
@@ -1285,13 +1285,21 @@ fn validate_selector(selector: &QuerySymbolSelector) -> Result<(), QueryRefusalK
 /// The argument-value refusal (`argument_values`) for a typed request whose variant
 /// answers for an MCP tool: the same table and text the wire lane and the MCP lane apply,
 /// so a host that dispatches typed requests is held to the same values.
-pub(super) fn typed_value_refusal(request: &QueryRequest) -> Option<String> {
+/// A name outside its closed set keeps the `UnsupportedOption` kind hosts matched on
+/// before the table existed; a number out of range or an empty name is `InvalidRequest`.
+pub(super) fn typed_value_refusal(request: &QueryRequest) -> Option<(QueryRefusalKind, String)> {
     let serde_json::Value::Object(wire) = serde_json::to_value(request).ok()? else {
         return None;
     };
     let (variant, args) = wire.iter().next()?;
     let tool = super::guidance::request_refusal::embed_request_tool(&format!("Query.{variant}"))?;
-    super::guidance::argument_values::value_refusal(tool, args.as_object()?)
+    let refusal = super::guidance::argument_values::check_values(tool, args.as_object()?).err()?;
+    let kind = if refusal.closed_set {
+        QueryRefusalKind::UnsupportedOption
+    } else {
+        QueryRefusalKind::InvalidRequest
+    };
+    Some((kind, refusal.text))
 }
 /// The MCP lane's text for a request [`validate_request`] refuses, where it has one and
 /// the condition MCP prints it for is the one that refused: an unknown language filter,

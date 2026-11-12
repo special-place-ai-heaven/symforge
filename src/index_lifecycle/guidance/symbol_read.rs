@@ -129,7 +129,7 @@ fn render_symbol_detail(
         .filter(|s| {
             s.name == name
                 && kind_filter
-                    .map(|k| s.kind.to_string().eq_ignore_ascii_case(k))
+                    .map(|k| crate::live_index::search::symbol_kind_filter_matches(k, &s.kind))
                     .unwrap_or(true)
         })
         .collect();

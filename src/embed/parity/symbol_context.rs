@@ -15,6 +15,7 @@ pub struct SymbolContextRequest {
     pub symbol_line: Option<u32>,
     pub verbosity: Option<String>,
     pub bundle: Option<bool>,
+    #[serde(default, deserialize_with = "super::read_context::lowercase_sections")]
     pub sections: Option<Vec<String>>,
     #[serde(default)]
     pub include_tests: bool,

@@ -687,7 +687,9 @@ pub(crate) fn resolve_symbol_code_anchor(
     let file = published.live.files.get(path)?;
     let mut matches = file.symbols.iter().filter(|symbol| {
         symbol.name == name
-            && kind.is_none_or(|kind| symbol.kind.to_string().eq_ignore_ascii_case(kind))
+            && kind.is_none_or(|kind| {
+                crate::live_index::search::symbol_kind_filter_matches(kind, &symbol.kind)
+            })
             && symbol_line.is_none_or(|line| symbol.line_range.0.saturating_add(1) == line)
     });
     let symbol = matches.next()?;

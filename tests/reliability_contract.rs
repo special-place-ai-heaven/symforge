@@ -811,7 +811,7 @@ fn an_out_of_set_value_is_refused_and_a_valid_one_is_answered() {
                     "operation": { "type": "replace", "new_body": "pub const SHORT_A: u32 = 1;" } }],
                     "dry_run": true }),
             "\"edits.0.symbol_line\" = 0",
-            json!({ "edits": [{ "path": "src/short.rs", "name": "SHORT_A",
+            json!({ "edits": [{ "path": "src/short.rs", "name": "SHORT_A", "symbol_line": 2,
                     "operation": { "type": "replace", "new_body": "pub const SHORT_A: u32 = 1;" } }],
                     "dry_run": true }),
         ),
@@ -836,4 +836,181 @@ fn an_out_of_set_value_is_refused_and_a_valid_one_is_answered() {
         let answered = client.call(tool, good.clone());
         assert_not_refused(&answered, &format!("{tool} {good}"));
     }
+}
+
+/// Spec 036 argument values, review round: a described cap clamps and says so; section
+/// names and symbol kinds are matched as the table accepts them; an argument the selected
+/// mode ignores is not judged; a padded number is the decoder's to refuse.
+#[test]
+fn capped_values_are_named_and_accepted_values_reach_the_handler() {
+    let (_dir, mut client) = ready_server();
+    for (tool, args, note) in [
+        (
+            "find_references",
+            json!({ "name": "target_fn", "limit": 500 }),
+            "Note: \"limit\" = 500 is above its maximum of 100; 100 was used.",
+        ),
+        (
+            "get_repo_map",
+            json!({ "detail": "tree", "depth": 8 }),
+            "Note: \"depth\" = 8 is above its maximum of 5; 5 was used.",
+        ),
+        (
+            "search_knowledge",
+            json!({ "query": "zebrafish_quorum", "limit": 200 }),
+            "Note: \"limit\" = 200 is above its maximum of 100; 100 was used.",
+        ),
+    ] {
+        let text = text_of(&client.call(tool, args.clone()));
+        assert!(text.ends_with(note), "{tool} {args}: {text}");
+    }
+    // A section named in another letter case is served, knowledge included, with no
+    // unknown-section warning (the handlers see it lowercased).
+    for sections in [
+        json!(["Outline", "KNOWLEDGE"]),
+        json!(["outline", "knowledge"]),
+    ] {
+        let text = text_of(&client.call(
+            "get_file_context",
+            json!({ "path": "src/short.rs", "sections": sections.clone(), "force_refresh": true }),
+        ));
+        assert!(
+            text.contains("Knowledge evidence") && !text.contains("unknown section"),
+            "{sections}: {text}"
+        );
+    }
+    for kind in ["function", "all", "FN"] {
+        let text = text_of(&client.call(
+            "get_symbol",
+            json!({ "path": "src/long.rs", "name": "long_body", "kind": kind }),
+        ));
+        assert!(
+            text.contains("long_body") && !text.starts_with("No symbol"),
+            "{kind}: {text}"
+        );
+    }
+    let count = client.call(
+        "search_text",
+        json!({ "query": "LONG_FIRST", "group_by": "count", "limit": 0 }),
+    );
+    assert_not_refused(&count, "group_by=count ignores limit");
+    let padded = text_of(&client.call(
+        "get_file_content",
+        json!({ "path": "src/short.rs", "start_line": " 0" }),
+    ));
+    assert!(
+        !padded.contains("Valid range"),
+        "the decoder judges a padded number: {padded}"
+    );
+}
+
+/// Spec 036 drift pins: every accepted value of a closed-set argument reaches its own
+/// handler branch (distinct answers), so the table cannot list a name the handler drops
+/// to its default, and the handler cannot grow a name the table refuses.
+#[test]
+fn every_accepted_value_reaches_its_own_handler_branch() {
+    let (_dir, mut client) = ready_server();
+    // Each value's answer differs from the answer without the argument (the default),
+    // except the default value itself, which must equal it.
+    let distinct = |client: &mut StdioClient,
+                    tool: &str,
+                    base: Value,
+                    argument: &str,
+                    values: &[&str]| {
+        let default = text_of(&client.call(tool, base.clone()));
+        for (index, value) in values.iter().enumerate() {
+            let mut args = base.clone();
+            args[argument] = json!(value);
+            let text = text_of(&client.call(tool, args));
+            assert!(
+                !text.starts_with("invalid_request"),
+                "{tool} {argument}={value}: {text}"
+            );
+            assert_eq!(
+                index == 0,
+                text == default,
+                "{tool} {argument}={value}: the first value is the default, every other one                  must change the answer"
+            );
+        }
+    };
+    let leaf = json!({ "name": "target_fn", "path": "src/parent/leaf.rs" });
+    distinct(
+        &mut client,
+        "get_symbol_context",
+        leaf.clone(),
+        "verbosity",
+        &["full", "summary", "signature", "compact"],
+    );
+    distinct(
+        &mut client,
+        "get_repo_map",
+        json!({}),
+        "detail",
+        &["compact", "full", "tree"],
+    );
+    distinct(
+        &mut client,
+        "find_dependents",
+        json!({ "path": "src/parent/leaf.rs" }),
+        "format",
+        &["text", "mermaid", "dot"],
+    );
+    distinct(
+        &mut client,
+        "find_references",
+        json!({ "name": "target_fn" }),
+        "mode",
+        &["references", "implementations"],
+    );
+    // The fixture has no trait, so every direction answers alike; each is accepted.
+    for direction in ["auto", "trait", "type"] {
+        assert_not_refused(
+            &client.call(
+                "find_references",
+                json!({ "name": "target_fn", "mode": "implementations", "direction": direction }),
+            ),
+            direction,
+        );
+    }
+    let sections = |client: &mut StdioClient, tool: &str, base: Value, values: &[&str]| {
+        let all = text_of(&client.call(tool, base.clone()));
+        for value in values {
+            let mut args = base.clone();
+            args["sections"] = json!([value]);
+            let text = text_of(&client.call(tool, args));
+            assert!(
+                !text.starts_with("invalid_request"),
+                "{tool} {value}: {text}"
+            );
+            assert_ne!(
+                text, all,
+                "{tool} sections=[{value}] must narrow the answer"
+            );
+        }
+    };
+    sections(
+        &mut client,
+        "get_file_context",
+        json!({ "path": "src/parent/leaf.rs" }),
+        &[
+            "outline",
+            "imports",
+            "consumers",
+            "references",
+            "git",
+            "knowledge",
+        ],
+    );
+    sections(
+        &mut client,
+        "get_symbol_context",
+        leaf,
+        &[
+            "dependents",
+            "siblings",
+            "implementations",
+            "git",
+            "knowledge",
+        ],
+    );
 }

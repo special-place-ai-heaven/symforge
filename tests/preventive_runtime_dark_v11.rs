@@ -1174,9 +1174,9 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Embed refusal text slice: query refusals carry the MCP lane's text (a budget field
 // and shared guidance builders; edit_plan and suggestions sorted; shared file-content finisher and search error text). Same 90 files, calls only, no new edge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "b21929c8af452cdf256b4f64ce2954fe68415b0e52f45eac7d4df0774913c8eb",
+    "ff0b8a32209810efab714db344c0a944b64e5bf07a43028e517e35f4df038a9e",
     91,
-    2482680,
+    2487631,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1389,10 +1389,12 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Argument-value slice: new `index_lifecycle/guidance/argument_values.rs` (the value
 // table), called from the MCP request check, the daemon route, the embed wire check
 // and the typed embed query lane. Calls and `use` only, no bridge. 319 files.
+// Review round: capped-value notes on both lanes, the shared symbol-kind matcher, section
+// lowercasing, the include_tests marker skipped on the daemon lane. Calls only. 319 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "52b530c8c3c97d0815c6d90c1061f3ddde3a6c9b0b98438d6c43932d46386af3",
+    "beb5922b9423ef27bcdf142fd8edbfa86efce8a66c0174f6b8048c2307171c59",
     319,
-    12914505,
+    12931940,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

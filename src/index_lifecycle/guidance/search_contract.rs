@@ -76,10 +76,10 @@ pub struct SearchTextInput {
     pub path_prefix: Option<String>,
     /// Optional canonical language name such as `Rust`, `TypeScript`, `C#`, or `C++`.
     pub language: Option<String>,
-    /// Optional maximum number of matches to return across all files (default 50).
+    /// Optional maximum number of matches to return across all files (default 50, max 10000).
     #[serde(default, deserialize_with = "lenient_u32")]
     pub limit: Option<u32>,
-    /// Optional maximum number of matches to return per file (default 5).
+    /// Optional maximum number of matches to return per file (default 5, max 10000).
     #[serde(default, deserialize_with = "lenient_u32")]
     pub max_per_file: Option<u32>,
     /// When true, include generated files in the result set.

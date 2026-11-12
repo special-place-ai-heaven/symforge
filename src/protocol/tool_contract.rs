@@ -526,6 +526,23 @@ pub(crate) fn selection_note(selected: &[ModeSelection]) -> String {
         .join("\n")
 }
 
+/// Append each capped-value note (`argument_values::check_values`) to the last text
+/// block of `result`, after the answer, so the caller learns which value was used.
+pub(crate) fn append_value_notes(result: &mut CallToolResult, notes: &[String]) {
+    if notes.is_empty() {
+        return;
+    }
+    for block in result.content.iter_mut().rev() {
+        if let rmcp::model::ContentBlock::Text(text) = block {
+            text.text = crate::index_lifecycle::guidance::argument_values::with_notes(
+                std::mem::take(&mut text.text),
+                notes,
+            );
+            return;
+        }
+    }
+}
+
 /// Append [`selection_note`] to the last text block of `result`.
 /// Only a tool whose output is prose may have a selecting row: a tool with a fixed
 /// grammar (`review_knowledge` prints key=value lines) would be corrupted by the line, so
@@ -654,9 +671,9 @@ impl SymForgeServer {
         &self,
         tool: &str,
         arguments: &mut Option<JsonObject>,
-    ) -> Result<Vec<ModeSelection>, CallToolResult> {
+    ) -> Result<(Vec<ModeSelection>, Vec<String>), CallToolResult> {
         let Some(args) = arguments.as_mut() else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         };
         let refuse = |text: String| {
             ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(text)
@@ -671,10 +688,11 @@ impl SymForgeServer {
                 .unwrap_or_default();
             return Err(refuse(unknown_arguments_refusal(tool, &unknown, &valid)));
         }
-        if let Some(text) = value_refusal(tool, args) {
-            return Err(refuse(text));
-        }
-        apply_conditions(tool, args).map_err(refuse)
+        let notes = crate::index_lifecycle::guidance::argument_values::check_values(tool, args)
+            .map_err(|refusal| refuse(refusal.text))?;
+        apply_conditions(tool, args)
+            .map(|selected| (selected, notes))
+            .map_err(refuse)
     }
 }
 

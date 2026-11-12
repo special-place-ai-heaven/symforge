@@ -1987,7 +1987,16 @@ impl HostRoom {
         }
         let request: HostRequest = serde_json::from_slice(request_json).map_err(|_| invalid())?;
         let response = self.dispatch(&request, control)?;
-        serde_json::to_vec(&response).map_err(|_| HostRefusal::new(HostRefusalKind::EngineFailure))
+        // A capped argument value is named in the answer, as on the MCP lane.
+        let notes = request_check::argument_notes(&value);
+        if notes.is_empty() {
+            return serde_json::to_vec(&response)
+                .map_err(|_| HostRefusal::new(HostRefusalKind::EngineFailure));
+        }
+        let mut reply = serde_json::to_value(&response)
+            .map_err(|_| HostRefusal::new(HostRefusalKind::EngineFailure))?;
+        request_check::append_notes(&mut reply, &notes);
+        serde_json::to_vec(&reply).map_err(|_| HostRefusal::new(HostRefusalKind::EngineFailure))
     }
 
     pub fn dispatch(

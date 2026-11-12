@@ -1269,7 +1269,6 @@ fn out_of_set_values_are_refused_alike_on_both_lanes() {
             "\"symbol_line\" = 0",
         ),
         ("get_repo_map", json!({ "detail": "bogus" }), "\"detail\""),
-        ("get_repo_map", json!({ "depth": 9 }), "\"depth\" = 9"),
         (
             "get_repo_map",
             json!({ "max_files": 0 }),
@@ -1317,8 +1316,8 @@ fn out_of_set_values_are_refused_alike_on_both_lanes() {
         ),
         (
             "search_knowledge",
-            json!({ "query": "x", "limit": 101 }),
-            "1 to 100",
+            json!({ "query": "x", "limit": 0 }),
+            "\"limit\" = 0",
         ),
         (
             "find_references",
@@ -1373,6 +1372,38 @@ fn out_of_set_values_are_refused_alike_on_both_lanes() {
             "\"quarantine_limit\" = 0",
         ),
     ];
+    // A described cap clamps and the answer says so, in the same bytes on both lanes.
+    for (tool, args) in [
+        (
+            "find_references",
+            json!({ "name": "target_fn", "limit": 500 }),
+        ),
+        (
+            "find_dependents",
+            json!({ "path": "src/parent/leaf.rs", "limit": 500 }),
+        ),
+        ("get_repo_map", json!({ "depth": 8 })),
+    ] {
+        let mcp_text = text_of(&mcp.call(tool, args.clone()));
+        let (embed, _) = embed_reply(&room, tool, &args);
+        assert!(
+            mcp_text.contains("is above its maximum of"),
+            "{tool} {args}: no cap note on MCP: {mcp_text}"
+        );
+        let note = mcp_text
+            .rsplit(
+                "
+
+",
+            )
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            embed.ends_with(&note) && embed == mcp_text,
+            "{tool} {args}: embed lacks `{note}`: {embed}"
+        );
+    }
     let mut failures = Vec::new();
     for (tool, args, names) in &cases {
         let mcp_text = text_of(&mcp.call(tool, args.clone()));
