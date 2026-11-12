@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const { createLauncher } = require("../bin/launcher.js");
+const { createLauncher, runChildForwardingSignals } = require("../bin/launcher.js");
 const {
   ALLOWED_BINARIES,
   SUPPORTED_TARGETS,
@@ -145,7 +145,7 @@ test("resolveBinary rejects invalid binary names", () => {
   assert.ok(SUPPORTED_TARGETS.some((target) => target.platform === "win32" && target.arch === "x64"));
 });
 
-test("launcher spawns the resolved native binary directly", () => {
+test("launcher spawns the resolved native binary directly", async () => {
   const spawnCalls = [];
   const errors = [];
   const launcher = createLauncher({
@@ -157,36 +157,36 @@ test("launcher spawns the resolved native binary directly", () => {
         binaryPath: "C:\\\\tools\\\\symforge\\\\symforge.exe",
       };
     },
-    spawnSync(command, args, options) {
+    runChild(command, args, options) {
       spawnCalls.push({ command, args, options });
       return { status: 0 };
     },
   });
 
-  assert.equal(launcher.main(["--version"]), 0);
+  assert.equal(await launcher.main(["--version"]), 0);
   assert.deepEqual(spawnCalls, [{
     command: "C:\\\\tools\\\\symforge\\\\symforge.exe",
     args: ["--version"],
-    options: { stdio: "inherit", env: { A: "B" }, shell: false },
+    options: { stdio: "inherit", env: { A: "B" }, shell: false, windowsHide: true },
   }]);
   assert.deepEqual(errors, []);
 });
 
-test("launcher returns 64 when the platform package is unavailable", () => {
+test("launcher returns 64 when the platform package is unavailable", async () => {
   const errors = [];
   const launcher = createLauncher({
     process: { platform: "linux", arch: "arm64", env: {} },
     console: { error: (message) => errors.push(message) },
-    spawnSync() {
-      throw new Error("spawnSync must not be called");
+    runChild() {
+      throw new Error("runChild must not be called");
     },
   });
 
-  assert.equal(launcher.main([]), 64);
+  assert.equal(await launcher.main([]), 64);
   assert.match(errors.join("\n"), /unsupported platform linux-arm64/);
 });
 
-test("launcher maps spawn failures to process-style error codes", () => {
+test("launcher maps spawn failures to process-style error codes", async () => {
   const errors = [];
   const launcher = createLauncher({
     process: { platform: "linux", arch: "x64", env: {} },
@@ -194,11 +194,73 @@ test("launcher maps spawn failures to process-style error codes", () => {
     resolveBinary() {
       return { reason: "ok", binaryPath: "/usr/local/bin/symforge" };
     },
-    spawnSync() {
+    runChild() {
       return { error: Object.assign(new Error("permission denied"), { code: "EACCES" }) };
     },
   });
 
-  assert.equal(launcher.main([]), 126);
+  assert.equal(await launcher.main([]), 126);
   assert.match(errors.join("\n"), /failed to spawn/);
+});
+
+// #877: a SIGTERM to the launcher must reach the native binary and the
+// launcher must wait for it. Before the fix, `spawnSync` let the signal kill
+// the launcher alone; the orphaned native process exited later unreaped and,
+// under a PID 1 that is not an init, stayed a zombie forever.
+test("launcher forwards SIGTERM to the native binary and exits only after it", { skip: process.platform === "win32" }, async (t) => {
+  const { spawn } = require("node:child_process");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "symforge-signal-"));
+  const pidFile = path.join(dir, "native.pid");
+  const fakeBinary = path.join(dir, "symforge");
+  fs.writeFileSync(fakeBinary, `#!/bin/sh\necho $$ > '${pidFile}'\nexec sleep 300\n`, { mode: 0o755 });
+  let nativePid;
+  let launcher;
+  // Registered first so a failing assert below leaves no process behind.
+  t.after(() => {
+    for (const pid of [launcher && launcher.pid, nativePid]) {
+      if (!pid) continue;
+      try { process.kill(pid, "SIGKILL"); } catch (_err) { /* already gone */ }
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const launcherPath = path.join(__dirname, "..", "bin", "launcher.js");
+  const script = `require(${JSON.stringify(launcherPath)}).createLauncher({`
+    + `resolveBinary: () => ({ reason: "ok", binaryPath: ${JSON.stringify(fakeBinary)} }),`
+    + `}).main([]).then((code) => process.exit(code));`;
+  launcher = spawn(process.execPath, ["-e", script], {
+    stdio: "ignore",
+    env: { ...process.env, SYMFORGE_NO_SHADOW_WARN: "1" },
+  });
+  const exited = new Promise((resolve) => launcher.once("exit", (code, signal) => resolve({ code, signal })));
+
+  const deadline = Date.now() + 10000;
+  const readPid = () => (fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, "utf8").trim()) : 0);
+  while (!(nativePid = readPid())) {
+    assert.ok(Date.now() < deadline, "the fake native binary never started within 10s");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  launcher.kill("SIGTERM");
+  const { code, signal } = await exited;
+
+  assert.throws(() => process.kill(nativePid, 0), { code: "ESRCH" },
+    "the native binary outlived the launcher: the SIGTERM was not forwarded or not waited for");
+  assert.deepEqual({ code, signal }, { code: 128 + os.constants.signals.SIGTERM, signal: null });
+});
+
+test("a synchronous spawn failure maps to the same exit code as before", async () => {
+  const einval = Object.assign(new Error("invalid argument"), { code: "EINVAL" });
+  const result = await runChildForwardingSignals("/x/symforge", [], {}, () => { throw einval; });
+  assert.deepEqual(result, { error: einval });
+
+  const errors = [];
+  const launcher = createLauncher({
+    process: { platform: "linux", arch: "x64", env: {} },
+    console: { error: (message) => errors.push(message) },
+    resolveBinary: () => ({ reason: "ok", binaryPath: "/x/symforge" }),
+    runChild: (command, args, options) => runChildForwardingSignals(command, args, options, () => { throw einval; }),
+  });
+  assert.equal(await launcher.main([]), 126);
+  assert.match(errors.join("\n"), /EINVAL/);
 });

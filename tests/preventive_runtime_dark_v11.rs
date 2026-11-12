@@ -1400,9 +1400,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // (`embed_ask::routed_for`, called from `embed_query`). Calls only. 319 files.
 // Review round: `routed_for` becomes `choose` plus `project_chosen`. Calls only. 319 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "ade8c8295436b75f4ba59128399da3f20ba6eb22e1da4f149748ea065dccbb69",
+    "f1490e623d0aed5a446b04e24e21ea8bb05e35f79780bd6b1dccbc54e8a26bd8",
     319,
-    12938330,
+    12939359,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
