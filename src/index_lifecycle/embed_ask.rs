@@ -16,6 +16,16 @@ pub(super) fn validate(request: &AskRequest) -> Result<(), QueryRefusalKind> {
         .map_err(|_| QueryRefusalKind::AdmissionUnavailable)
 }
 
+/// The request `ask` routes to over this snapshot, as `project` chooses it.
+pub(super) fn routed_for(
+    snapshot: &EmbeddedQuerySnapshot,
+    request: &AskRequest,
+) -> Option<QueryRequest> {
+    let normalized = smart_query::strip_leading_articles(request.query.trim());
+    let (intent, _) = routing::resolve(&snapshot.generation.live, normalized);
+    routed_request(&intent, request.max_tokens).1
+}
+
 fn routed_request(
     intent: &smart_query::QueryIntent,
     max_tokens: Option<u64>,

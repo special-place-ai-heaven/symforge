@@ -350,11 +350,11 @@ fn same_line_delete_and_insert_refuse_overlapping_splices() {
     let request = BatchEditRequest {
         actions: vec![
             BatchEditAction::Delete(DeleteRequest {
-                guard: guard_for("first"),
+                guard: guard_for("second"),
             }),
             BatchEditAction::Insert(InsertRequest {
-                guard: guard_for("second"),
-                position: InsertPosition::Before,
+                guard: guard_for("first"),
+                position: InsertPosition::After,
                 content: "pub fn helper() {}".to_string(),
             }),
         ],

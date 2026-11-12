@@ -628,6 +628,19 @@ fn execute_inner(
             .capture_graph_lease_snapshot(lease)
             .map_err(|kind| refuse(kind, RetryAdvice::Never)),
     };
+    // MCP `ask` answers through the tool it routes to, which checks its own
+    // answer: the route, chosen from the index, supplies the scope and claim.
+    let ask_route = match request {
+        QueryRequest::Ask(input) if !matches!(snapshot_mode, SnapshotMode::GraphLease(_)) => {
+            super::embed_ask::routed_for(&capture()?, input)
+        }
+        _ => None,
+    };
+    let checked_scope = match &ask_route {
+        Some(routed) => routed.answer_scope().map(|scope| scope.map(str::to_owned)),
+        None => checked_scope,
+    };
+    let claim_request = ask_route.as_ref().unwrap_or(request);
     // Round 2 item 3: a native search's rows do not depend on the check, so
     // its provisional projection over the final snapshot IS the answer; only
     // answers that render the check (envelopes, caveats) are projected again.
@@ -690,7 +703,7 @@ fn execute_inner(
                         // nothing is parsed out of rendered text.
                         cited,
                         claim: super::guidance::freshen::Claim::whole_if(
-                            !cut && !matches!(request, QueryRequest::Explore(_)),
+                            !cut && !matches!(claim_request, QueryRequest::Explore(_)),
                         ),
                     }
                 });

@@ -117,24 +117,27 @@ fn symbol_read_supports_global_resolution_batch_exact_bytes_and_ambiguity() {
         Some("// é\r\n".as_bytes())
     );
     assert_eq!(batch.entries[2].refusal, Some(QueryRefusalKind::NotFound));
-    assert!(
-        handle
-            .query(
-                &QueryRequest::SymbolRead(SymbolReadRequest {
-                    targets: Some(vec![SymbolTarget {
-                        path: "lib.rs".into(),
-                        name: None,
-                        kind: None,
-                        symbol_line: None,
-                        start_byte: Some(9),
-                        end_byte: Some(2)
-                    }]),
-                    ..Default::default()
-                }),
-                QueryLimits::default()
-            )
-            .is_err()
-    );
+    // An inverted range clamps to an empty slice, as MCP `get_symbol` does (#786).
+    let inverted = handle
+        .query(
+            &QueryRequest::SymbolRead(SymbolReadRequest {
+                targets: Some(vec![SymbolTarget {
+                    path: "lib.rs".into(),
+                    name: None,
+                    kind: None,
+                    symbol_line: None,
+                    start_byte: Some(9),
+                    end_byte: Some(2),
+                }]),
+                ..Default::default()
+            }),
+            QueryLimits::default(),
+        )
+        .unwrap();
+    let QueryOutput::SymbolRead(inverted) = inverted.value() else {
+        panic!("inverted range read")
+    };
+    assert_eq!(inverted.entries[0].source.as_deref(), Some(&b""[..]));
 }
 
 #[test]

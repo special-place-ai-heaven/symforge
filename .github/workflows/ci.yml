@@ -445,10 +445,11 @@ jobs:
           cargo test --features embed,__test-internals --lib server_and_embed_ -- --test-threads=1 2>&1 | tee /tmp/server-embed-parity.log
           grep -q '^test result: ok\. 2 passed; 0 failed;' /tmp/server-embed-parity.log
 
-      # The embed halves of these integration tests compile only with both features;
-      # no other job builds integration tests with `embed` on.
-      - name: Run server and embed reliability tests
-        run: cargo test --features embed --test reliability_review --test reliability_contract --test reliability_freshness --test reliability_refusal_parity -- --test-threads=1
+      # Every integration test with both features: the `tests/embed_*.rs` binaries
+      # and the embed halves of the reliability tests compile only with `embed` on,
+      # and no other job runs them.
+      - name: Run server and embed integration tests
+        run: cargo test --features embed --test '*' -- --test-threads=1
 
       - name: zccache stats and stop
         if: ${{ always() }}
