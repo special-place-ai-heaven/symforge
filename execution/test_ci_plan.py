@@ -20,8 +20,8 @@ def readers(old: dict[str, str], new: dict[str, str]):
 
 
 class RunnerChoice(unittest.TestCase):
-    def choose(self, event="push", head=REPO, labels=(), setting="", online=None, actor="", head_ref=""):
-        return ci_plan.choose_runners(event, head, REPO, list(labels), setting, online or {}, actor, head_ref)
+    def choose(self, event="push", head=REPO, labels=(), setting="", online=None, actor="", head_ref="", ref_name=""):
+        return ci_plan.choose_runners(event, head, REPO, list(labels), setting, online or {}, actor, head_ref, ref_name)
 
     def test_trusted_events_default_to_self_hosted(self):
         chosen = self.choose()
@@ -38,6 +38,8 @@ class RunnerChoice(unittest.TestCase):
         for chosen in (
             self.choose(event="pull_request", actor="dependabot[bot]", online={"linux": True, "windows": True}),
             self.choose(event="pull_request", head_ref="dependabot/cargo/serde-1.0.300"),
+            self.choose(event="workflow_dispatch", ref_name="dependabot/cargo/serde-1.0.300"),
+            self.choose(event="push", ref_name="dependabot/github_actions/x-2"),
         ):
             self.assertEqual(chosen["linux"][0], "ubuntu-latest")
             self.assertEqual(chosen["windows"][0], "windows-latest")

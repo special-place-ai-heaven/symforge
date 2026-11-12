@@ -62,6 +62,7 @@ jobs:
           REPOSITORY_OWNER: ${{ github.repository_owner }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_REF: ${{ github.head_ref }}
+          REF_NAME: ${{ github.ref_name }}
           ACTOR: ${{ github.actor }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
@@ -388,15 +389,7 @@ jobs:
       # so the slices need the pinned compiler, minimal profile, no build.
       - name: Install rustc only (rust-toolchain.toml channel)
         run: |
-          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
-          test -n "$channel"
-          bin="$HOME/.cargo/bin"
-          if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$bin/rustup" ]; then
-            curl --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-delay 2 --retry-connrefused https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
-          fi
-          export PATH="$bin:$PATH"
-          echo "$bin" >> "$GITHUB_PATH"
-          rustup toolchain install "$channel" --profile minimal --no-self-update
+          bash execution/ensure_rustup.sh --minimal
           rustc --version
 
       - name: Set up Node for tests that spawn node
@@ -1012,8 +1005,22 @@ jobs:
             Write-Output "stopping $($_.Name) ($($_.Id))"
             Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
           }
+          # A root that is itself a junction or symlink is never followed: only
+          # the link is removed, so the directory it points at keeps its files.
+          function Test-Link([string]$path) {
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            [bool]($item -and ($item.LinkType -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)))
+          }
+          foreach ($root in $roots) {
+            if (Test-Link $root) {
+              Write-Output "::warning::$root is a link; removing the link only"
+              [System.IO.Directory]::Delete($root, $false)
+            }
+          }
+          # The runner starts the post-job steps inside the checkout directory.
+          if (-not (Test-Path -LiteralPath $workspace)) { New-Item -ItemType Directory -Path $workspace | Out-Null }
           # The job directory goes entirely; the checkout directory itself stays,
-          # emptied, because the runner starts the post-job steps inside it.
+          # emptied.
           for ($i = 0; $i -lt 5; $i++) {
             Remove-Item -LiteralPath $ciRoot -Recurse -Force -ErrorAction SilentlyContinue
             Get-ChildItem -LiteralPath $workspace -Force -ErrorAction SilentlyContinue |

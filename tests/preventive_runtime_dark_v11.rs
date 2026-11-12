@@ -1544,7 +1544,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 // and every new cargo-mentioning line is an env assignment, a cache key, a
 // download, or that archive; census 91/53/2.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "cfcce38c1e190122:48119"),
+    ("ci.yml", "48693775be6a1b8b:48431"),
     ("release.yml", "b174946ff2c434bb:115022"),
 ];
 
@@ -1623,9 +1623,7 @@ const CARGO_LINES: &[(&str, usize)] = &[
     (r#""CARGO_HOME=$root\cargo-home""#, 1),
     (r#""CARGO_TARGET_DIR=$root\target""#, 1),
     // A path to the machine's rustup binary and a download URL for the
-    // prebuilt nextest binary: data, not commands. The test slices' rustup
-    // directory likewise (they install only rustc, which one test spawns).
-    (r#"bin="$HOME/.cargo/bin""#, 1),
+    // prebuilt nextest binary: data, not commands.
     (
         r#"$userRustup = Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe'"#,
         1,
@@ -2633,8 +2631,8 @@ fn no_gate_builds_doctests() {
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(
         (seen.len(), distinct.len(), files),
-        (92, 54, 2),
-        "the CI workflows hold ninety-two cargo-mentioning lines, fifty-four \
+        (91, 53, 2),
+        "the CI workflows hold ninety-one cargo-mentioning lines, fifty-three \
          of them distinct, across two workflow files; this walk saw {:?}. A gate \
          added, removed, reworded, or a workflow file added — reconcile \
          CARGO_LINES with the workflows deliberately, never by loosening this \

@@ -68,6 +68,7 @@ def choose_runners(
     online: dict[str, Optional[bool]],
     actor: str = "",
     head_ref: str = "",
+    ref_name: str = "",
 ) -> dict[str, tuple[object, str]]:
     """Return `{os: (runs_on, reason)}` for linux and windows."""
     setting = setting.strip().lower()
@@ -75,7 +76,9 @@ def choose_runners(
     for os_name in ("linux", "windows"):
         if event.startswith("pull_request") and head_repo != repository:
             reason = "pull request from another repository: untrusted code never runs on self-hosted runners"
-        elif actor == DEPENDABOT or head_ref.startswith("dependabot/"):
+        # head_ref is empty outside pull requests, so a dispatch or push on a
+        # Dependabot branch is recognized by the ref name.
+        elif actor == DEPENDABOT or head_ref.startswith("dependabot/") or ref_name.startswith("dependabot/"):
             reason = "Dependabot change: an updated dependency's build script never runs on self-hosted runners"
         elif HOSTED_LABEL in labels:
             reason = f"pull request carries the {HOSTED_LABEL} label"
@@ -263,6 +266,7 @@ def main() -> int:
         online,
         env.get("ACTOR", ""),
         env.get("HEAD_REF", ""),
+        env.get("REF_NAME", ""),
     )
     code_changed, code_reason = changed_code(env)
     outputs = {
