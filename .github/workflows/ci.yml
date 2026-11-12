@@ -445,10 +445,12 @@ jobs:
           cargo test --features embed,__test-internals --lib server_and_embed_ -- --test-threads=1 2>&1 | tee /tmp/server-embed-parity.log
           grep -q '^test result: ok\. 2 passed; 0 failed;' /tmp/server-embed-parity.log
 
-      # The embed halves of these integration tests compile only with both features;
-      # no other job builds integration tests with `embed` on.
-      - name: Run server and embed reliability tests
-        run: cargo test --features embed --test reliability_review --test reliability_contract --test reliability_freshness --test reliability_refusal_parity -- --test-threads=1
+      # The integration tests gated on `embed` compile only with it on, and no
+      # other job runs them; the rest already run in the `rust` job.
+      # `__test-internals` is required by the files gated on both features.
+      # tests/ci_embed_selection.rs fails when an embed-gated file is not selected.
+      - name: Run server and embed integration tests
+        run: cargo test --features embed,__test-internals --test 'embed_*' --test reliability_freshness --test reliability_refusal_parity --test reliability_review -- --test-threads=1
 
       - name: zccache stats and stop
         if: ${{ always() }}

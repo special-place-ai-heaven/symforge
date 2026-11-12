@@ -11,6 +11,18 @@ use symforge::embed::parity::source_options::{
 };
 use symforge::embed::{EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase};
 
+/// The host-protected scratch directory `GitPreparationOptions` requires: on
+/// Unix, no group or other access (a fresh tempdir follows the umask).
+fn private_scratch() -> tempfile::TempDir {
+    let scratch = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    scratch
+}
+
 fn commit(root: &Path, body: &str) {
     let repo = git2::Repository::open(root).unwrap();
     fs::write(root.join("lib.rs"), body).unwrap();
@@ -36,7 +48,7 @@ fn commit(root: &Path, body: &str) {
 #[test]
 fn memory_only_git_preparation_uses_only_explicit_bounded_scratch_and_reuses_objects() {
     let root = tempfile::tempdir().unwrap();
-    let scratch = tempfile::tempdir().unwrap();
+    let scratch = private_scratch();
     git2::Repository::init(root.path()).unwrap();
     commit(root.path(), "pub fn first() {}\n");
     let runtime = ProcessIndexRuntime::acquire().unwrap();
@@ -73,7 +85,7 @@ fn memory_only_git_preparation_uses_only_explicit_bounded_scratch_and_reuses_obj
 #[test]
 fn git_preparation_obeys_cancellation_and_capacity_before_publishing_a_view() {
     let root = tempfile::tempdir().unwrap();
-    let scratch = tempfile::tempdir().unwrap();
+    let scratch = private_scratch();
     git2::Repository::init(root.path()).unwrap();
     commit(root.path(), "pub fn bounded() {}\n");
     let runtime = ProcessIndexRuntime::acquire().unwrap();

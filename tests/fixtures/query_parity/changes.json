@@ -167,6 +167,16 @@
       "expected": "Route confidence: exact\nChosen tool: find_references\nInvocation: find_references(name=\"changed\")\nRationale: matched explicit caller/reference phrasing\n[Routed to: find_references(name=\"changed\")]\n\nTrust: constrained (repo-wide name match) | 5 files confirmed against disk | parsed | full for current scope — usage-trace recall is best-effort; dynamic dispatch, macro-generated, reflective, and cross-language usages may be missed\nScope: repo-wide symbol token `changed`\nEvidence: reference anchors `src/caller.rs:1`, `src/caller.rs:4`, `src/caller.rs:1`\n\n3 references to \"changed\" in 1 files\nTarget definition candidates: 1 exact-name indexed symbols; indexed-file parse coverage complete. Unique among indexed records: yes (compiler resolution not available).\n  src/lib.rs:L2 [fn] bytes 20..49\nsrc/caller.rs\n  AST declaration headers for returned sites: 1 distinct (showing 1; 0 omitted by metadata cap; 1 caller headers unavailable; final response token budget may truncate):\n    caller: definition L3-5 bytes 21..58; [function_item] header L3 bytes 21..41; signature start L3\n      caller identity: call bytes 28..32\n  :1 \n  :4   [AST caller function_item definition L3-5 bytes 21..58; header L3 bytes 21..41; signature start L3]\n  :1 [qualified-path scan: confident]"
     },
     {
+      "name": "ask who calls under a small token cap",
+      "repo": "changes",
+      "tool": "ask",
+      "input": {
+        "query": "who calls changed",
+        "max_tokens": 120
+      },
+      "expected": "Route confidence: exact\nChosen tool: find_references\nInvocation: find_references(name=\"changed\")\nRationale: matched explicit caller/reference phrasing\n[Routed to: find_references(name=\"changed\")]\n\nTrust: constrained (repo-wide name match) | 5 files confirmed against disk | parsed | full for current scope — usage-trace recall is best-effort; dynamic dispatch, macro-generated, reflective, and cross-language usages may be missed\nScope: repo-wide symbol token `changed`\n\n[truncated] Truncated at ~120 tokens. Original output is ~318 tokens; budget is 120 tokens.\n"
+    },
+    {
       "name": "ask find symbol",
       "repo": "changes",
       "tool": "ask",

@@ -2,6 +2,18 @@
 
 use std::path::{Path, PathBuf};
 
+/// The host-protected scratch directory `GitPreparationOptions` requires: on
+/// Unix, no group or other access (a fresh tempdir follows the umask).
+fn private_scratch() -> tempfile::TempDir {
+    let scratch = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    scratch
+}
+
 /// Prepare the public Git view for `root` and return the handle that owns it.
 fn prepared_source(
     root: &Path,
@@ -65,7 +77,7 @@ fn child_isolated_git_config() {
         regular.is_err(),
         "ordinary open must observe the malformed global fixture"
     );
-    let scratch = tempfile::tempdir().unwrap();
+    let scratch = private_scratch();
     let (_runtime, source) = prepared_source(&root, scratch.path());
     source
         .prepared_git_repository_for_test()
@@ -74,7 +86,7 @@ fn child_isolated_git_config() {
 
 /// The isolated view keeps the repository's own config and committed blobs.
 fn check_local_config_preserved(root: &Path) {
-    let scratch = tempfile::tempdir().unwrap();
+    let scratch = private_scratch();
     let (_runtime, source) = prepared_source(root, scratch.path());
     let isolated = source.prepared_git_repository_for_test().unwrap();
     assert!(
@@ -115,7 +127,7 @@ fn check_attribute_and_exclude_isolation(root: &Path) {
         ordinary.config().unwrap().get_string("user.name").unwrap(),
         "ambient"
     );
-    let scratch = tempfile::tempdir().unwrap();
+    let scratch = private_scratch();
     let (_runtime, source) = prepared_source(root, scratch.path());
     let isolated = source.prepared_git_repository_for_test().unwrap();
     assert!(

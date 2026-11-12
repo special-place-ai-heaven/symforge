@@ -1173,10 +1173,15 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // words decode failures without values for both lanes. Same 90 files, no new edge.
 // Embed refusal text slice: query refusals carry the MCP lane's text (a budget field
 // and shared guidance builders; edit_plan and suggestions sorted; shared file-content finisher and search error text). Same 90 files, calls only, no new edge.
+// Embed integration tests in CI: embed `ask` takes its disk-check scope and claim
+// from the routed request (`embed_ask::routed_for`), as MCP's routed tool does.
+// Calls only. Same 91 files, no new edge.
+// Review round: the route is chosen once (`embed_ask::choose`), its routed request
+// settles the probe and claim, and `project_chosen` answers over it. Same 91 files.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "72757ee8e99808f7005eed48c17a2df646505bbf8f5575e3f7283474746047ae",
+    "1cd844524a0aa6276b24f0f6979d62c84525de1e7203093d591bf8316fb063ee",
     91,
-    2489922,
+    2492609,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1391,10 +1396,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // and the typed embed query lane. Calls and `use` only, no bridge. 319 files.
 // Review round: capped-value notes on both lanes, the shared symbol-kind matcher, section
 // lowercasing, the include_tests marker skipped on the daemon lane. Calls only. 319 files.
+// Embed integration tests in CI: embed `ask` checks its routed answer against disk
+// (`embed_ask::routed_for`, called from `embed_query`). Calls only. 319 files.
+// Review round: `routed_for` becomes `choose` plus `project_chosen`. Calls only. 319 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "d64e259bf8b0e837b25974fb20ec1dba9ead6ff9f46d04e2a6febda8b52f8bc0",
+    "f1490e623d0aed5a446b04e24e21ea8bb05e35f79780bd6b1dccbc54e8a26bd8",
     319,
-    12936672,
+    12939359,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
@@ -1528,10 +1536,10 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// boundary: FNV-1a is not collision-resistant, and whoever edits a
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
-// T021 review round: ci.yml gains the server-embed reliability integration step (a
-// `--test`-only invocation, pinned in CARGO_LINES); no doctest lane.
+// ci.yml's server-embed integration step runs the embed-gated binaries by name
+// (`--test` selectors only, pinned in CARGO_LINES); no doctest lane.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "17256f610ad504f5:29992"),
+    ("ci.yml", "937360af9738245a:30158"),
     ("release.yml", "b174946ff2c434bb:115022"),
 ];
 
@@ -1719,10 +1727,11 @@ const CARGO_LINES: &[(&str, usize)] = &[
         "cargo test --features embed,__test-internals --lib server_and_embed_ -- --test-threads=1 2>&1 | tee /tmp/server-embed-parity.log",
         1,
     ),
-    // Feature 036 T021: four named integration binaries with both features; `--test name`
-    // selects no doctest.
+    // The embed-gated integration binaries by name (`--test` selects
+    // integration-test targets only, never the lib's doctests); the selection
+    // is checked by tests/ci_embed_selection.rs.
     (
-        "run: cargo test --features embed --test reliability_review --test reliability_contract --test reliability_freshness --test reliability_refusal_parity -- --test-threads=1",
+        "run: cargo test --features embed,__test-internals --test 'embed_*' --test reliability_freshness --test reliability_refusal_parity --test reliability_review -- --test-threads=1",
         1,
     ),
     (

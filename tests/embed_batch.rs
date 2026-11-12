@@ -347,14 +347,16 @@ fn same_line_delete_and_insert_refuse_overlapping_splices() {
             .expect("plan symbol")
             .guard
     };
+    // A mid-line insert-before is refused on its own (2cc08257; its kind became
+    // InvalidReplacement in def781f6), so the overlap pairs an insert-after.
     let request = BatchEditRequest {
         actions: vec![
             BatchEditAction::Delete(DeleteRequest {
-                guard: guard_for("first"),
+                guard: guard_for("second"),
             }),
             BatchEditAction::Insert(InsertRequest {
-                guard: guard_for("second"),
-                position: InsertPosition::Before,
+                guard: guard_for("first"),
+                position: InsertPosition::After,
                 content: "pub fn helper() {}".to_string(),
             }),
         ],

@@ -206,7 +206,7 @@ fn full_read_selectors_keep_mode_alias_and_occurrence_semantics() {
     };
     assert_eq!(
         read.rendered,
-        " let first = \"needle\";\n let second = \"needle\";"
+        "2:  let first = \"needle\";\n3:  let second = \"needle\";"
     );
     let selected = handle
         .query(
