@@ -904,6 +904,8 @@ pub(crate) fn render_search_text_output(
     auto_corrected_regex: bool,
     matching_untracked_paths: &[String],
     hidden_test_matches: Option<usize>,
+    // Spec 036: what this call observed about its files against the disk.
+    check: &super::freshen::AnswerCheck,
 ) -> String {
     use super::search_envelope::{
         SourceAuthority, format_search_envelope, search_completeness_label, search_scope_summary,
@@ -919,7 +921,7 @@ pub(crate) fn render_search_text_output(
                 auto_corrected_regex,
                 options.ranked,
             ),
-            SourceAuthority::from_freshness(&generation.freshness),
+            SourceAuthority::from_check(check),
             super::reference_read::search_parse_state_for_paths(
                 &generation.live,
                 result.files.iter().map(|file| file.path.as_str()),
@@ -971,7 +973,15 @@ pub(crate) fn render_search_text_output(
         None => output,
     };
     append_untracked_file_diagnostic(&mut rendered, matching_untracked_paths);
+    // Spec 036: the caller fits `check`'s notes inside its budget.
     rendered
+}
+
+/// An empty or untruncated text search claims its whole scope (FR-017).
+pub(crate) fn text_search_claim(
+    result: &Result<search::TextSearchResult, search::TextSearchError>,
+) -> super::freshen::Claim {
+    super::freshen::Claim::whole_if(matches!(result, Ok(found) if found.overflow_count == 0))
 }
 
 /// MCP `search_symbols`' rendered answer over one publication: the result
@@ -980,6 +990,7 @@ pub(crate) fn render_symbol_search(
     generation: &crate::live_index::store::PublishedGeneration,
     execution: &SymbolSearchExecution,
     query: &str,
+    check: &super::freshen::AnswerCheck,
 ) -> String {
     use super::search_envelope::{
         SourceAuthority, format_search_envelope, search_completeness_label, search_scope_summary,
@@ -997,7 +1008,7 @@ pub(crate) fn render_symbol_search(
     } else {
         Some(format_search_envelope(
             search_symbols_match_type_label(result, is_browse),
-            SourceAuthority::from_freshness(&generation.freshness),
+            SourceAuthority::from_check(check),
             super::reference_read::search_parse_state_for_paths(
                 &generation.live,
                 result.hits.iter().map(|hit| hit.path.as_str()),
@@ -1027,7 +1038,7 @@ pub(crate) fn render_symbol_search(
         Some(envelope) => format!("{envelope}\n\n{output}"),
         None => output,
     };
-    if execution.text_fallback.is_empty() {
+    let output = if execution.text_fallback.is_empty() {
         output
     } else {
         let paths: Vec<_> = execution
@@ -1039,7 +1050,9 @@ pub(crate) fn render_symbol_search(
             "{output}\n\nText path fallback (sparse symbol hits):\n{}",
             paths.join("\n")
         )
-    }
+    };
+    // Spec 036: the caller fits `check`'s notes inside its budget.
+    output
 }
 
 /// MCP `search_files`' zero-hit diagnostic: untracked worktree paths the

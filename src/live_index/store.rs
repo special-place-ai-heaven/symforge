@@ -730,10 +730,14 @@ struct StableReadPass {
     path_after: crate::domain::FileStamp,
 }
 
+/// The access layer. Failures carry what the failure site observed
+/// ([`AccessFailure`]), so the classifier sees the NT status on Windows.
 trait StableReadAccess {
-    fn first_pass(&self, path: &Path, max_bytes: usize) -> std::io::Result<StableReadPass>;
-    fn second_pass(&self, path: &Path, max_bytes: usize) -> std::io::Result<StableReadPass>;
+    fn first_pass(&self, path: &Path, max_bytes: usize) -> Result<StableReadPass, AccessFailure>;
+    fn second_pass(&self, path: &Path, max_bytes: usize) -> Result<StableReadPass, AccessFailure>;
 }
+
+use crate::discovery::os_response::{AccessFailure, OsCause, RetryBudget};
 
 struct FilesystemStableReadAccess;
 
@@ -747,11 +751,13 @@ fn file_stamp_from_metadata(metadata: &std::fs::Metadata) -> crate::domain::File
 }
 
 impl FilesystemStableReadAccess {
+    /// Every fallible OS call converts its error with `?` on the spot, so
+    /// [`AccessFailure::capture`] runs before any other call on this thread.
     fn read_pass(
         path: &Path,
         max_bytes: usize,
         retain_bytes: bool,
-    ) -> std::io::Result<StableReadPass> {
+    ) -> Result<StableReadPass, AccessFailure> {
         use sha2::{Digest, Sha256};
         use std::io::Read;
 
@@ -762,7 +768,8 @@ impl FilesystemStableReadAccess {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "stable read exceeded its pre-authorized bound",
-            ));
+            )
+            .into());
         }
 
         let mut bytes = retain_bytes.then(Vec::new);
@@ -786,7 +793,8 @@ impl FilesystemStableReadAccess {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "stable read exceeded its pre-authorized bound",
-                ));
+                )
+                .into());
             }
             hasher.update(&buffer[..read]);
             if let Some(bytes) = bytes.as_mut() {
@@ -808,11 +816,11 @@ impl FilesystemStableReadAccess {
 }
 
 impl StableReadAccess for FilesystemStableReadAccess {
-    fn first_pass(&self, path: &Path, max_bytes: usize) -> std::io::Result<StableReadPass> {
+    fn first_pass(&self, path: &Path, max_bytes: usize) -> Result<StableReadPass, AccessFailure> {
         Self::read_pass(path, max_bytes, true)
     }
 
-    fn second_pass(&self, path: &Path, max_bytes: usize) -> std::io::Result<StableReadPass> {
+    fn second_pass(&self, path: &Path, max_bytes: usize) -> Result<StableReadPass, AccessFailure> {
         Self::read_pass(path, max_bytes, false)
     }
 }
@@ -828,17 +836,54 @@ pub(crate) enum StableReadOutcome {
     },
     Unreadable {
         stage: crate::domain::AccessStage,
+        /// The persisted kind ([`OsCause::stored_kind`]).
         kind: crate::domain::AccessErrorKind,
+        /// The classified cause; in memory only.
+        cause: OsCause,
     },
     UnstableDuringRead,
 }
 
+/// A failed pass: torn reads stay `UnstableDuringRead`, every other failure
+/// is classified, recorded for health, and reported with its cause.
+fn failed_pass(path: &Path, cause: OsCause) -> StableReadOutcome {
+    if cause.kind() == std::io::ErrorKind::InvalidData {
+        return StableReadOutcome::UnstableDuringRead;
+    }
+    crate::discovery::os_response::record_failure(path, &cause);
+    StableReadOutcome::Unreadable {
+        stage: crate::domain::AccessStage::FullRead,
+        kind: cause.stored_kind(),
+        cause,
+    }
+}
+
+#[cfg(test)]
 fn stable_read_with_access(
     path: &Path,
     scout_stamp: &crate::domain::FileStamp,
     limits: StableReadLimits,
     access: &impl StableReadAccess,
 ) -> StableReadOutcome {
+    stable_read_with_budget(
+        path,
+        scout_stamp,
+        limits,
+        access,
+        &crate::discovery::os_response::current_budget(),
+    )
+}
+
+/// One stable read whose transient failures retry within `budget`, which the
+/// caller shares across every file of one tool call (FR-020).
+fn stable_read_with_budget(
+    path: &Path,
+    scout_stamp: &crate::domain::FileStamp,
+    limits: StableReadLimits,
+    access: &impl StableReadAccess,
+    budget: &RetryBudget,
+) -> StableReadOutcome {
+    use crate::discovery::os_response::retry_transient;
     let Ok(max_bytes) = usize::try_from(scout_stamp.size) else {
         return StableReadOutcome::HardSkip {
             reason: HardSkipReason::PerFileCeiling,
@@ -850,17 +895,9 @@ fn stable_read_with_access(
         };
     }
 
-    let first = match access.first_pass(path, max_bytes) {
+    let first = match retry_transient(budget, Some(path), || access.first_pass(path, max_bytes)) {
         Ok(first) => first,
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-            return StableReadOutcome::UnstableDuringRead;
-        }
-        Err(error) => {
-            return StableReadOutcome::Unreadable {
-                stage: crate::domain::AccessStage::FullRead,
-                kind: discovery::access_error_kind(error.kind()),
-            };
-        }
+        Err(cause) => return failed_pass(path, cause),
     };
     if &first.handle_before != scout_stamp
         || &first.handle_after != scout_stamp
@@ -878,17 +915,9 @@ fn stable_read_with_access(
         return StableReadOutcome::UnstableDuringRead;
     }
 
-    let second = match access.second_pass(path, max_bytes) {
+    let second = match retry_transient(budget, Some(path), || access.second_pass(path, max_bytes)) {
         Ok(second) => second,
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-            return StableReadOutcome::UnstableDuringRead;
-        }
-        Err(error) => {
-            return StableReadOutcome::Unreadable {
-                stage: crate::domain::AccessStage::FullRead,
-                kind: discovery::access_error_kind(error.kind()),
-            };
-        }
+        Err(cause) => return failed_pass(path, cause),
     };
     if &second.handle_before != scout_stamp
         || &second.handle_after != scout_stamp
@@ -911,10 +940,27 @@ fn stable_read_with_retries(
     limits: StableReadLimits,
     access: &impl StableReadAccess,
 ) -> StableReadOutcome {
+    stable_read_with_retries_in(
+        &crate::discovery::os_response::current_budget(),
+        path,
+        scout_stamp,
+        limits,
+        access,
+    )
+}
+
+/// [`stable_read_with_retries`] under the caller's shared retry budget.
+fn stable_read_with_retries_in(
+    budget: &RetryBudget,
+    path: &Path,
+    scout_stamp: &crate::domain::FileStamp,
+    limits: StableReadLimits,
+    access: &impl StableReadAccess,
+) -> StableReadOutcome {
     const MAX_ATTEMPTS: usize = 3;
 
     for _ in 0..MAX_ATTEMPTS {
-        let outcome = stable_read_with_access(path, scout_stamp, limits, access);
+        let outcome = stable_read_with_budget(path, scout_stamp, limits, access, budget);
         if !matches!(outcome, StableReadOutcome::UnstableDuringRead) {
             return outcome;
         }
@@ -970,6 +1016,88 @@ pub struct IndexedFile {
     /// Used by the freshness guard to detect files that changed on disk after indexing.
     /// Zero means mtime was not recorded (indexed before this field was added).
     pub mtime_secs: u64,
+}
+
+/// When a file's disk content was last found equal to its indexed content by
+/// hash (spec 036 FR-016). Held beside [`IndexedFile`] in memory only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedStamp {
+    pub(crate) size: u64,
+    pub(crate) modified: Option<SystemTime>,
+    pub(crate) content_hash: String,
+    /// The filesystem's own "now" when the content was confirmed: the newest
+    /// modification time it had shown this index (review M11), so a host
+    /// clock that runs ahead of a network mount cannot widen the trust.
+    pub(crate) filesystem_now: Option<SystemTime>,
+}
+
+/// A modification time closer than this to the filesystem's newest observed
+/// modification time may hide a later same-second, same-size edit (git's racy
+/// timestamp rule, measured on the filesystem's clock, not the host's).
+/// Conservative constant until filesystems are probed.
+pub(crate) const RACY_WINDOW: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+mod racy_rule_tests {
+    use super::*;
+
+    /// Review M11: a host clock far ahead of the filesystem's must not make
+    /// a same-second stamp trusted; only the filesystem's own clock counts.
+    #[test]
+    fn trust_reads_the_filesystem_clock_not_the_host() {
+        let fs_now = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+        let stamp = |modified_secs: u64| VerifiedStamp {
+            size: 4,
+            modified: Some(std::time::UNIX_EPOCH + Duration::from_secs(modified_secs)),
+            content_hash: "h".to_string(),
+            filesystem_now: Some(fs_now),
+        };
+        // Same second as the filesystem's newest time: never trusted, however
+        // late the host clock says it is.
+        let same = stamp(1_000);
+        assert!(!same.trusts(4, same.modified, "h"));
+        // Control: modified well before the filesystem's newest time.
+        let old = stamp(990);
+        assert!(old.trusts(4, old.modified, "h"));
+        // No filesystem time observed: never trusted.
+        let unknown = VerifiedStamp {
+            filesystem_now: None,
+            ..old.clone()
+        };
+        assert!(!unknown.trusts(4, unknown.modified, "h"));
+    }
+}
+
+/// Per-project filesystem clock state behind `observe_filesystem_time`.
+#[derive(Default)]
+struct FilesystemClock {
+    /// Project generation the state below belongs to.
+    generation: u64,
+    /// Newest plausible modification time observed.
+    high_water: Option<SystemTime>,
+    /// When the last probe ran, and the modification time it read.
+    probe: Option<(Instant, SystemTime)>,
+}
+
+/// How often the filesystem clock is re-probed; between probes it advances
+/// with the monotonic clock.
+const PROBE_REFRESH: Duration = Duration::from_secs(10);
+/// Tolerance for a modification time just written past the last probe.
+const PROBE_SLACK: Duration = Duration::from_secs(2);
+/// The probe file in the project's state directory.
+const FILESYSTEM_CLOCK_PROBE: &str = "filesystem-clock.probe";
+
+impl VerifiedStamp {
+    /// True when a stat equal to this stamp proves the content unchanged: the
+    /// file was last modified well before its content was confirmed.
+    pub(crate) fn trusts(&self, size: u64, modified: Option<SystemTime>, hash: &str) -> bool {
+        self.size == size
+            && self.modified == modified
+            && self.content_hash == hash
+            && modified
+                .zip(self.filesystem_now)
+                .is_some_and(|(modified, now)| modified + RACY_WINDOW < now)
+    }
 }
 
 /// Identifies a single reference within a specific file.
@@ -2231,6 +2359,14 @@ pub struct SharedIndexHandle {
     /// path has survived, tagged with the project generation they were counted
     /// under. In memory only: after a restart a path re-settles.
     unreadable_sweeps: Mutex<(u64, HashMap<crate::domain::CatalogPath, u32>)>,
+    /// Spec 036 FR-016: files whose disk content was last compared by hash,
+    /// tagged with the project generation. In memory only, never in a
+    /// snapshot, so a restored file has no entry and is hashed on first use.
+    verified_by_content: Mutex<(u64, HashMap<String, VerifiedStamp>)>,
+    /// The filesystem's own clock for the racy-content rule (review M11,
+    /// round 3 item 2): a probe of the project's state directory and the
+    /// newest plausible modification time seen, both reset with the project.
+    filesystem_clock: Mutex<FilesystemClock>,
     /// Id of the watcher reconcile sweep in progress (0: none). A sweep may
     /// publish its plan once per retry attempt; the unreadable count advances
     /// only on the first publication of each sweep.
@@ -2539,6 +2675,8 @@ impl SharedIndexHandle {
             physical_replacement_latched: AtomicBool::new(false),
             rejected_stale_mutations: AtomicU64::new(0),
             unreadable_sweeps: Mutex::new((0, HashMap::new())),
+            verified_by_content: Mutex::new((0, HashMap::new())),
+            filesystem_clock: Mutex::new(FilesystemClock::default()),
             active_reconcile_sweep: AtomicU64::new(0),
             counted_reconcile_sweep: AtomicU64::new(0),
             next_reconcile_sweep: AtomicU64::new(1),
@@ -3318,6 +3456,100 @@ impl SharedIndexHandle {
     pub(crate) fn latch_observer_gap(&self) {
         let _wg = self.write_mutex.lock();
         self.latch_observer_gap_locked();
+    }
+
+    /// Test door: latch the observer gap so an integration test can hold an
+    /// index that reports lost observations (spec 036, FR-017).
+    #[cfg(feature = "__test-internals")]
+    #[doc(hidden)]
+    pub fn latch_observer_gap_for_tests(&self) {
+        self.latch_observer_gap();
+    }
+
+    /// The stamp under which `relative_path`'s disk content was last found equal
+    /// to the indexed content by hash, for this project generation.
+    pub(crate) fn verified_stamp(&self, relative_path: &str) -> Option<VerifiedStamp> {
+        let generation = self.current_project_generation();
+        let table = self.verified_by_content.lock();
+        (table.0 == generation)
+            .then(|| table.1.get(relative_path).cloned())
+            .flatten()
+    }
+
+    /// Fold one observed modification time into the filesystem clock and
+    /// return the newest plausible time seen for this project (round 3 item
+    /// 2). A modification time later than the filesystem's "now" (an archive
+    /// stamped in the future) is ignored, so it can never make the racy
+    /// window look passed for other files. "Now" is a probe of the
+    /// filesystem's own clock; without one, the host clock bounds what is
+    /// plausible, and the racy "now" stays the newest plausible time seen,
+    /// so a stamp inside the window is never trusted.
+    pub(crate) fn observe_filesystem_time(
+        &self,
+        modified: Option<SystemTime>,
+    ) -> Option<SystemTime> {
+        let generation = self.current_project_generation();
+        let now = self
+            .filesystem_now(generation)
+            .unwrap_or_else(SystemTime::now);
+        let mut clock = self.filesystem_clock.lock();
+        if clock.generation != generation {
+            *clock = FilesystemClock {
+                generation,
+                ..FilesystemClock::default()
+            };
+        }
+        if let Some(modified) = modified.filter(|modified| *modified <= now + PROBE_SLACK) {
+            clock.high_water = Some(clock.high_water.map_or(modified, |high| high.max(modified)));
+        }
+        clock.high_water.map(|high| high.min(now))
+    }
+
+    /// The filesystem's current time, from the modification time of a file
+    /// this process writes in the project's state directory, refreshed at
+    /// most every [`PROBE_REFRESH`]; between probes it advances by the
+    /// monotonic clock. `None` without a state directory or when the write
+    /// fails.
+    fn filesystem_now(&self, generation: u64) -> Option<SystemTime> {
+        {
+            let clock = self.filesystem_clock.lock();
+            if clock.generation == generation
+                && let Some((taken, at)) = clock.probe
+                && taken.elapsed() < PROBE_REFRESH
+            {
+                return Some(at + taken.elapsed());
+            }
+        }
+        // The probe's I/O runs without the lock.
+        let state_dir = self.project_state_dir()?;
+        let probe = state_dir.as_path().join(FILESYSTEM_CLOCK_PROBE);
+        std::fs::write(&probe, b"").ok()?;
+        let at = std::fs::metadata(&probe).ok()?.modified().ok()?;
+        let taken = Instant::now();
+        let mut clock = self.filesystem_clock.lock();
+        if clock.generation != generation {
+            *clock = FilesystemClock {
+                generation,
+                ..FilesystemClock::default()
+            };
+        }
+        clock.probe = Some((taken, at));
+        Some(at)
+    }
+
+    /// Drop the content stamp of a path that was removed.
+    pub(crate) fn forget_verified_stamp(&self, relative_path: &str) {
+        self.verified_by_content.lock().1.remove(relative_path);
+    }
+
+    /// Remember that `relative_path` was compared by content under `stamp`.
+    pub(crate) fn record_verified_stamp(&self, relative_path: &str, stamp: VerifiedStamp) {
+        let generation = self.current_project_generation();
+        let mut table = self.verified_by_content.lock();
+        if table.0 != generation {
+            *table = (generation, HashMap::new());
+        }
+        table.1.insert(relative_path.to_string(), stamp);
     }
 
     /// Latch only if the publication still carries `expected_project_generation`.
@@ -6463,6 +6695,9 @@ fn admit_and_parse_entries(
         total.saturating_add(planned.stamp.size)
     });
     let staged_accounting = Arc::new(StagedContentAccounting::new(staged_ceiling));
+    // Review M10: one transient-retry budget for the whole admission, shared
+    // by every worker, so many locked files cost one budget, not one each.
+    let retry_budget = crate::discovery::os_response::current_budget();
 
     // Largest first, one file per task: parse cost grows with size, and one
     // big file started late holds the whole phase on a single core. Rayon
@@ -6561,7 +6796,8 @@ fn admit_and_parse_entries(
                         },
                     );
                 }
-                let stable = stable_read_with_retries(
+                let stable = stable_read_with_retries_in(
+                    &retry_budget,
                     &entry.absolute_path,
                     &planned.stamp,
                     StableReadLimits {
@@ -6583,7 +6819,7 @@ fn admit_and_parse_entries(
                             crate::domain::FileDisposition::HardSkip { reason },
                         );
                     }
-                    StableReadOutcome::Unreadable { stage, kind } => {
+                    StableReadOutcome::Unreadable { stage, kind, .. } => {
                         return terminal_admission_outcome(
                             entry,
                             AdmissionDecision::skip(
@@ -8430,7 +8666,7 @@ mod tests {
                 &self,
                 _path: &Path,
                 _max_bytes: usize,
-            ) -> std::io::Result<StableReadPass> {
+            ) -> Result<StableReadPass, AccessFailure> {
                 panic!("over-ceiling input must be rejected before allocation/read")
             }
 
@@ -8438,7 +8674,7 @@ mod tests {
                 &self,
                 _path: &Path,
                 _max_bytes: usize,
-            ) -> std::io::Result<StableReadPass> {
+            ) -> Result<StableReadPass, AccessFailure> {
                 panic!("over-ceiling input must be rejected before allocation/read")
             }
         }
@@ -8476,7 +8712,7 @@ mod tests {
                 &self,
                 _path: &Path,
                 _max_bytes: usize,
-            ) -> std::io::Result<StableReadPass> {
+            ) -> Result<StableReadPass, AccessFailure> {
                 panic!("over-inflight input must be rejected before allocation/read")
             }
 
@@ -8484,7 +8720,7 @@ mod tests {
                 &self,
                 _path: &Path,
                 _max_bytes: usize,
-            ) -> std::io::Result<StableReadPass> {
+            ) -> Result<StableReadPass, AccessFailure> {
                 panic!("over-inflight input must be rejected before allocation/read")
             }
         }
@@ -8528,7 +8764,7 @@ mod tests {
                 &self,
                 _path: &Path,
                 _max_bytes: usize,
-            ) -> std::io::Result<StableReadPass> {
+            ) -> Result<StableReadPass, AccessFailure> {
                 self.first_calls.set(self.first_calls.get() + 1);
                 Ok(self.first.clone())
             }
@@ -8537,7 +8773,7 @@ mod tests {
                 &self,
                 _path: &Path,
                 _max_bytes: usize,
-            ) -> std::io::Result<StableReadPass> {
+            ) -> Result<StableReadPass, AccessFailure> {
                 self.second_calls.set(self.second_calls.get() + 1);
                 panic!("changed first-pass stamp must reject before the second read")
             }
@@ -8601,19 +8837,20 @@ mod tests {
                 &self,
                 _path: &Path,
                 _max_bytes: usize,
-            ) -> std::io::Result<StableReadPass> {
+            ) -> Result<StableReadPass, AccessFailure> {
                 self.first_calls.set(self.first_calls.get() + 1);
                 Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "injected read refusal",
-                ))
+                )
+                .into())
             }
 
             fn second_pass(
                 &self,
                 _path: &Path,
                 _max_bytes: usize,
-            ) -> std::io::Result<StableReadPass> {
+            ) -> Result<StableReadPass, AccessFailure> {
                 self.second_calls.set(self.second_calls.get() + 1);
                 panic!("failed first read must not attempt a second pass")
             }
@@ -8647,6 +8884,7 @@ mod tests {
             StableReadOutcome::Unreadable {
                 stage: crate::domain::AccessStage::FullRead,
                 kind: crate::domain::AccessErrorKind::PermissionDenied,
+                ..
             }
         ));
         assert_eq!(first_calls.get(), 1);
@@ -8665,7 +8903,7 @@ mod tests {
                 &self,
                 _path: &Path,
                 _max_bytes: usize,
-            ) -> std::io::Result<StableReadPass> {
+            ) -> Result<StableReadPass, AccessFailure> {
                 Ok(self.first.clone())
             }
 
@@ -8673,7 +8911,7 @@ mod tests {
                 &self,
                 _path: &Path,
                 _max_bytes: usize,
-            ) -> std::io::Result<StableReadPass> {
+            ) -> Result<StableReadPass, AccessFailure> {
                 Ok(self.second.clone())
             }
         }
@@ -8722,6 +8960,313 @@ mod tests {
             },
         );
         assert!(matches!(torn, StableReadOutcome::UnstableDuringRead));
+    }
+
+    /// Spec 036 T025 / FR-037: file-access faults injected beside
+    /// `StableReadAccess`, each checked for its classified outcome.
+    mod os_fault_injection {
+        use super::*;
+        use crate::discovery::os_response::{
+            AccessFailure, CALL_RETRY_BUDGET, OsClass, RetryBudget,
+        };
+        use std::cell::{Cell, RefCell};
+        use std::collections::VecDeque;
+
+        /// Sharing violation on Windows, EBUSY on unix: transient on both.
+        const IN_USE: i32 = if cfg!(windows) { 32 } else { 16 };
+
+        fn stamp() -> crate::domain::FileStamp {
+            crate::domain::FileStamp {
+                size: 4,
+                created_hint: None,
+                modified_hint: Some(std::time::UNIX_EPOCH),
+                platform_id: None,
+            }
+        }
+
+        fn pass(bytes: Option<Vec<u8>>) -> StableReadPass {
+            StableReadPass {
+                bytes,
+                length: 4,
+                hash: crate::hash::digest(b"same"),
+                handle_before: stamp(),
+                handle_after: stamp(),
+                path_after: stamp(),
+            }
+        }
+
+        fn failure(code: i32, nt_status: Option<u32>) -> AccessFailure {
+            AccessFailure {
+                error: std::io::Error::from_raw_os_error(code),
+                nt_status,
+            }
+        }
+
+        /// First passes follow `script`, then repeat `then`; second passes succeed.
+        struct Scripted {
+            script: RefCell<VecDeque<Result<StableReadPass, AccessFailure>>>,
+            then: fn() -> Result<StableReadPass, AccessFailure>,
+            first_calls: Cell<usize>,
+        }
+
+        impl Scripted {
+            fn new(
+                script: Vec<Result<StableReadPass, AccessFailure>>,
+                then: fn() -> Result<StableReadPass, AccessFailure>,
+            ) -> Self {
+                Self {
+                    script: RefCell::new(script.into()),
+                    then,
+                    first_calls: Cell::new(0),
+                }
+            }
+        }
+
+        impl StableReadAccess for Scripted {
+            fn first_pass(
+                &self,
+                _path: &Path,
+                _max_bytes: usize,
+            ) -> Result<StableReadPass, AccessFailure> {
+                self.first_calls.set(self.first_calls.get() + 1);
+                self.script
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or_else(|| (self.then)())
+            }
+
+            fn second_pass(
+                &self,
+                _path: &Path,
+                _max_bytes: usize,
+            ) -> Result<StableReadPass, AccessFailure> {
+                Ok(pass(None))
+            }
+        }
+
+        fn limits() -> StableReadLimits {
+            StableReadLimits {
+                per_file_bytes: 1_024,
+                inflight_bytes: 1_024,
+            }
+        }
+
+        fn read(access: &Scripted, budget: &RetryBudget) -> StableReadOutcome {
+            stable_read_with_budget(Path::new("injected.rs"), &stamp(), limits(), access, budget)
+        }
+
+        fn class_of(outcome: &StableReadOutcome) -> Option<OsClass> {
+            match outcome {
+                StableReadOutcome::Unreadable { cause, .. } => Some(cause.class),
+                _ => None,
+            }
+        }
+
+        #[test]
+        fn sharing_violation_then_success_is_retried() {
+            let access = Scripted::new(vec![Err(failure(IN_USE, None))], || {
+                Ok(pass(Some(b"same".to_vec())))
+            });
+            let outcome = read(&access, &RetryBudget::new(CALL_RETRY_BUDGET));
+            assert!(
+                matches!(outcome, StableReadOutcome::Accepted { ref bytes, .. } if bytes == b"same"),
+                "a transient failure followed by success is retried: {outcome:?}"
+            );
+            assert_eq!(access.first_calls.get(), 2);
+
+            // Control: with no budget left the same failure is reported, not retried.
+            let exhausted = Scripted::new(vec![Err(failure(IN_USE, None))], || {
+                Ok(pass(Some(b"same".to_vec())))
+            });
+            let outcome = read(&exhausted, &RetryBudget::new(Duration::ZERO));
+            assert_eq!(class_of(&outcome), Some(OsClass::InUse));
+            assert_eq!(exhausted.first_calls.get(), 1);
+        }
+
+        /// One indexed file `a.rs` in a fresh index: no content stamp, so a
+        /// comparison reads the file after its stat.
+        fn indexed_file() -> (tempfile::TempDir, SharedIndex) {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+            let shared = LiveIndex::load(dir.path()).unwrap();
+            (dir, shared)
+        }
+
+        /// The answer check of an answer citing `a.rs`, through the shared
+        /// comparison, re-index and publication lane.
+        fn check_of_a(
+            dir: &tempfile::TempDir,
+            shared: &SharedIndex,
+        ) -> crate::index_lifecycle::guidance::freshen::AnswerCheck {
+            use crate::index_lifecycle::guidance::freshen::{
+                AnswerDisk, Claim, Rendered, answer_checked,
+            };
+            let authority =
+                crate::live_index::index_lifecycle::activation::project_source_authority(
+                    dir.path(),
+                );
+            let disk = AnswerDisk {
+                shared,
+                expected_gen: shared.current_project_generation(),
+                repo_root: dir.path(),
+                authority: &authority,
+                may_reindex: true,
+                scope: None,
+            };
+            // Like a tool, the answer cites `a.rs` while the publication it
+            // answers from holds it.
+            let (_, _, check) = answer_checked(
+                Ok(disk),
+                || shared.read().get_file("a.rs").is_some(),
+                |holds_a, _| Rendered {
+                    answer: (),
+                    cited: if *holds_a {
+                        vec!["a.rs".to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    claim: Claim::Rows,
+                },
+                || {},
+            );
+            check
+        }
+
+        /// A file that vanishes between the stat and the read is a removal
+        /// the index publishes, never a file left "not confirmed".
+        #[test]
+        fn file_vanishing_between_stat_and_read_is_removed() {
+            let (dir, shared) = indexed_file();
+            let path = dir.path().join("a.rs");
+            crate::live_index::single_file::compare_faults::AFTER_STAT.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || std::fs::remove_file(path).unwrap()));
+            });
+            let check = check_of_a(&dir, &shared);
+            assert!(
+                shared.read().get_file("a.rs").is_none(),
+                "the vanished file is removed from the index"
+            );
+            assert!(
+                check.notes(false).is_empty(),
+                "a confirmed removal is no unconfirmed file: {check:?}"
+            );
+        }
+
+        /// An unknown raw OS code reaches the answer as the not-confirmed
+        /// line carrying the code, and the index keeps its row.
+        #[test]
+        fn unknown_raw_code_names_the_file_with_the_code() {
+            let (dir, shared) = indexed_file();
+            let before = crate::discovery::os_response::unknown_code_count();
+            crate::live_index::single_file::compare_faults::STAT_ERROR
+                .with(|code| code.set(Some(777_123)));
+            let check = check_of_a(&dir, &shared);
+            crate::live_index::single_file::compare_faults::STAT_ERROR.with(|code| code.set(None));
+            let notes = check.notes(false);
+            assert!(
+                notes.starts_with("Not confirmed against disk: a.rs (unrecognised error:")
+                    && notes.contains("777123"),
+                "{notes}"
+            );
+            assert!(crate::discovery::os_response::unknown_code_count() > before);
+            assert!(
+                shared.read().get_file("a.rs").is_some(),
+                "an unconfirmed file is not removed"
+            );
+        }
+
+        /// Windows delete-pending, made with the legacy (non-POSIX) delete
+        /// disposition so the name stays visible while a handle is open, is
+        /// classified at the failure site through the real access layer.
+        #[cfg(windows)]
+        #[test]
+        // Test-only FFI: the legacy delete disposition has no std API, and
+        // only it keeps a delete-pending name visible to the access layer.
+        #[allow(unsafe_code)]
+        fn delete_pending_is_captured_at_the_failure_site() {
+            use std::os::windows::fs::OpenOptionsExt;
+            use std::os::windows::io::AsRawHandle;
+            #[repr(C)]
+            struct FileDispositionInfo {
+                delete_file: u8,
+            }
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn SetFileInformationByHandle(
+                    file: *mut std::ffi::c_void,
+                    class: i32,
+                    info: *const std::ffi::c_void,
+                    size: u32,
+                ) -> i32;
+            }
+            const DELETE: u32 = 0x0001_0000;
+            const GENERIC_READ: u32 = 0x8000_0000;
+            const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+            const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
+            let (dir, shared) = indexed_file();
+            let handle = std::fs::OpenOptions::new()
+                .access_mode(DELETE | GENERIC_READ)
+                .share_mode(SHARE_ALL)
+                .open(dir.path().join("a.rs"))
+                .unwrap();
+            let info = FileDispositionInfo { delete_file: 1 };
+            // SAFETY: `handle` is an open file handle with DELETE access for
+            // the whole call, and `info` is a live FILE_DISPOSITION_INFO of the
+            // size passed.
+            let marked = unsafe {
+                SetFileInformationByHandle(
+                    handle.as_raw_handle(),
+                    FILE_DISPOSITION_INFO_CLASS,
+                    std::ptr::from_ref(&info).cast(),
+                    std::mem::size_of::<FileDispositionInfo>() as u32,
+                )
+            };
+            assert_ne!(marked, 0, "control: the file is marked for deletion");
+            let check = check_of_a(&dir, &shared);
+            drop(handle);
+            let notes = check.notes(false);
+            assert!(
+                notes.starts_with("Not confirmed against disk: a.rs (pending deletion"),
+                "{notes}"
+            );
+        }
+
+        /// The unix counterpart: unlinking a file another process holds open
+        /// removes its name at once, so the answer records a removal.
+        #[cfg(not(windows))]
+        #[test]
+        fn unlinked_open_file_is_removed() {
+            let (dir, shared) = indexed_file();
+            let held = std::fs::File::open(dir.path().join("a.rs")).unwrap();
+            std::fs::remove_file(dir.path().join("a.rs")).unwrap();
+            let check = check_of_a(&dir, &shared);
+            drop(held);
+            assert!(shared.read().get_file("a.rs").is_none());
+            assert!(check.notes(false).is_empty(), "{check:?}");
+        }
+
+        #[test]
+        fn many_failing_files_share_one_call_budget() {
+            const FILES: usize = 40;
+            let budget = RetryBudget::new(CALL_RETRY_BUDGET);
+            let started = std::time::Instant::now();
+            let mut attempts = 0;
+            for _ in 0..FILES {
+                let access = Scripted::new(vec![], || Err(failure(IN_USE, None)));
+                let outcome = read(&access, &budget);
+                assert_eq!(class_of(&outcome), Some(OsClass::InUse));
+                attempts += access.first_calls.get();
+            }
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < CALL_RETRY_BUDGET + Duration::from_millis(500),
+                "{FILES} failing files took {elapsed:?}, over the one-second call budget"
+            );
+            assert!(
+                attempts > FILES,
+                "control: transient failures were retried while the budget lasted"
+            );
+        }
     }
 
     #[test]
@@ -8775,7 +9320,8 @@ mod tests {
             let link = dir.path().join("outbound_link.txt");
             std::os::unix::fs::symlink(outside.path().join("secret.txt"), &link).unwrap();
             let err = FilesystemStableReadAccess::read_pass(&link, 4096, true)
-                .expect_err("leaf symlink must be refused");
+                .expect_err("leaf symlink must be refused")
+                .error;
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
             assert!(!err.to_string().contains(SECRET));
         }
@@ -8794,7 +9340,8 @@ mod tests {
                 String::from_utf8_lossy(&status.stderr)
             );
             let err = FilesystemStableReadAccess::read_pass(&junction, 4096, true)
-                .expect_err("a junction is not a regular file");
+                .expect_err("a junction is not a regular file")
+                .error;
             assert!(!err.to_string().contains(SECRET));
         }
     }
@@ -10077,10 +10624,18 @@ mod tests {
             let line = crate::index_lifecycle::guidance::health::render_unreadable_files_line(
                 &manifest.entries,
                 &settled,
+                None,
             )
             .expect("unreadable line");
+            // Spec 036 FR-023: each name now carries its cause before the tag.
             assert_eq!(
-                line.contains("locked.rs [settled-unreadable]"),
+                line.lines()
+                    .next()
+                    .unwrap_or_default()
+                    .split(", ")
+                    .any(|named| {
+                        named.contains("locked.rs (") && named.ends_with(") [settled-unreadable]")
+                    }),
                 sweep >= UNREADABLE_SETTLE_SWEEPS,
                 "sweep {sweep}: {line}"
             );

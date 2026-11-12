@@ -10,17 +10,21 @@
 /// that reports is not the thing that knows.
 ///
 /// The collapse decision now rides on this type, and the type is honest by
-/// construction: [`SourceAuthority::from_freshness`] is the ONLY constructor
-/// that can produce a collapsible value, and it takes the index's own measured
-/// `FreshnessStatus`. A lying literal is unrepresentable — there is no
-/// constructor that accepts a caller-chosen string and marks it collapsible.
-#[derive(Clone, Copy)]
+/// construction: [`SourceAuthority::from_check`] is the ONLY constructor that
+/// can produce a collapsible value, and it takes the [`AnswerCheck`] of THIS
+/// answer's files against the disk (spec 036 FR-017, FR-018) — not the
+/// index-wide freshness, which let one unreadable file put a caveat on every
+/// answer. A lying literal is unrepresentable — there is no constructor that
+/// accepts a caller-chosen string and marks it collapsible.
+///
+/// [`AnswerCheck`]: super::freshen::AnswerCheck
+#[derive(Clone)]
 pub(crate) struct SourceAuthority {
-    label: &'static str,
+    label: std::borrow::Cow<'static, str>,
     collapsible: bool,
-    /// The measured freshness is degraded (SF-DOG-04): the Completeness line
-    /// must not read as a plain "full".
-    stale: bool,
+    /// In-scope files the check did not compare (past its bound): a "full"
+    /// completeness line must not stand for them.
+    uncompared: usize,
 }
 
 /// The scope [`search_scope_summary`] renders for a search with every filter
@@ -35,32 +39,26 @@ pub(crate) const DEFAULT_SEARCH_FILES_SCOPE: &str = "ranked indexed file paths; 
 const NOISE_SUPPRESSED_FRAGMENT: &str = "noise-filtered match(es) suppressed";
 
 impl SourceAuthority {
-    /// The measured axis. Collapse is permitted exactly when the index itself
-    /// reports `Current`; `Verifying` and `Degraded` stay loud and say so.
-    pub(crate) fn from_freshness(freshness: &crate::domain::FreshnessStatus) -> Self {
-        use crate::live_index::store::TrustHeadline;
-        // Readiness is not visible at this seam, so this passes Ready and keeps
-        // only the freshness-derived qualifier of the headline.
-        let stale = matches!(
-            TrustHeadline::derive(&crate::live_index::PublishedIndexStatus::Ready, freshness),
-            TrustHeadline::ReadyStale | TrustHeadline::Stale
-        );
-        match freshness {
-            crate::domain::FreshnessStatus::Current => Self {
-                label: "current index",
+    /// The measured axis. Collapse is permitted exactly when every file this
+    /// answer may draw on was confirmed against the disk in this call; the
+    /// files that were not are named by [`AnswerCheck::notes`].
+    ///
+    /// [`AnswerCheck::notes`]: super::freshen::AnswerCheck::notes
+    pub(crate) fn from_check(check: &super::freshen::AnswerCheck) -> Self {
+        if check.all_confirmed() {
+            // Review M8: the banner says what this call observed, never that
+            // the whole index is current.
+            Self {
+                label: check.confirmed_label().into(),
                 collapsible: true,
-                stale,
-            },
-            crate::domain::FreshnessStatus::Verifying => Self {
-                label: "index (verifying against disk)",
+                uncompared: 0,
+            }
+        } else {
+            Self {
+                label: "index (not all files confirmed against disk)".into(),
                 collapsible: false,
-                stale,
-            },
-            crate::domain::FreshnessStatus::Degraded { .. } => Self {
-                label: "index (UNVERIFIED against disk)",
-                collapsible: false,
-                stale,
-            },
+                uncompared: check.uncompared(),
+            }
         }
     }
 
@@ -69,14 +67,14 @@ impl SourceAuthority {
     /// cannot buy the compact banner, whatever it says.
     pub(crate) fn never_collapse(label: &'static str) -> Self {
         Self {
-            label,
+            label: label.into(),
             collapsible: false,
-            stale: false,
+            uncompared: 0,
         }
     }
 
-    pub(crate) fn label(&self) -> &'static str {
-        self.label
+    pub(crate) fn label(&self) -> &str {
+        &self.label
     }
 }
 
@@ -110,14 +108,19 @@ pub(crate) fn format_search_envelope(
             format!("{trust}\nScope: {scope}\nEvidence: {evidence}")
         }
     } else {
-        // SF-DOG-04: a "full" answer from a stale index says so.
-        let stale = if source_authority.stale {
-            "; index may be stale (freshness degraded; health names the cause)"
+        // Spec 036: a caveat names the affected files (AnswerCheck::notes)
+        // instead of qualifying every answer with the index-wide freshness.
+        // Past the check bound, no completeness is claimed for the rest.
+        let completeness = if source_authority.uncompared > 0 && completeness.starts_with("full") {
+            format!(
+                "not claimed: {} in-scope files were not compared against disk",
+                source_authority.uncompared
+            )
         } else {
-            ""
+            completeness.to_string()
         };
         format!(
-            "Match type: {match_type}\nSource authority: {label}\nParse state: {parse_state}\nCompleteness: {completeness}{stale}\nScope: {scope}\nEvidence: {evidence}"
+            "Match type: {match_type}\nSource authority: {label}\nParse state: {parse_state}\nCompleteness: {completeness}\nScope: {scope}\nEvidence: {evidence}"
         )
     }
 }
@@ -376,6 +379,7 @@ pub(crate) fn search_files_hidden_noise_note(
 
 #[cfg(test)]
 mod tests {
+    use super::super::freshen::AnswerCheck;
     use super::{SourceAuthority, format_search_envelope};
 
     #[test]
@@ -384,14 +388,16 @@ mod tests {
         // compact `Trust:` line, preserving Scope and Evidence.
         let rendered = format_search_envelope(
             "constrained (literal)",
-            SourceAuthority::from_freshness(&crate::domain::FreshnessStatus::Current),
+            SourceAuthority::from_check(&AnswerCheck::confirmed_for_tests()),
             "parsed",
             "full for current scope",
             "repo-wide; tests filtered; generated filtered",
             "line anchors `src/lib.rs:7`, `src/mod.rs:12`",
         );
 
-        assert!(rendered.contains("Trust: constrained (literal) | current index | parsed | full"));
+        assert!(rendered.contains(
+            "Trust: constrained (literal) | 1 file confirmed against disk | parsed | full"
+        ));
         assert!(!rendered.contains("Source authority:"));
         assert!(!rendered.contains("Parse state:"));
         assert!(!rendered.contains("Completeness:"));
@@ -439,7 +445,7 @@ mod tests {
         );
         assert_eq!(default_scope, super::DEFAULT_SEARCH_SCOPE);
         let completeness = super::search_completeness_label(0, 0);
-        let current = || SourceAuthority::from_freshness(&crate::domain::FreshnessStatus::Current);
+        let current = || SourceAuthority::from_check(&AnswerCheck::confirmed_for_tests());
 
         let one = format_search_envelope(
             "constrained (literal)",
@@ -450,7 +456,9 @@ mod tests {
             "line anchors `src/lib.rs:7`",
         );
         assert_eq!(one.lines().count(), 1, "{one}");
-        assert!(one.starts_with("Trust: constrained (literal) | current index | parsed | full"));
+        assert!(one.starts_with(
+            "Trust: constrained (literal) | 1 file confirmed against disk | parsed | full"
+        ));
 
         let scoped = format_search_envelope(
             "constrained (literal)",
@@ -516,62 +524,48 @@ mod tests {
     }
 
     #[test]
-    fn stale_freshness_qualifies_a_full_completeness_line() {
-        let stale = format_search_envelope(
+    fn index_wide_freshness_no_longer_qualifies_a_confirmed_answer() {
+        // Spec 036 FR-018: the Completeness line carries no index-wide stale
+        // suffix; an answer whose own files were confirmed collapses whatever
+        // other files the index holds.
+        let confirmed = format_search_envelope(
             "exact",
-            SourceAuthority::from_freshness(&crate::domain::FreshnessStatus::Degraded {
-                last_valid_content_generation: 1,
-                reason_codes: vec![crate::domain::FreshnessReason::ObservationFailed],
-            }),
+            SourceAuthority::from_check(&AnswerCheck::confirmed_for_tests()),
             "parsed",
             "full for indexed scope",
             super::DEFAULT_SEARCH_SCOPE,
             "line anchors `src/lib.rs:7`",
         );
         assert!(
-            stale.contains("\nCompleteness: full for indexed scope; index may be stale"),
-            "{stale}"
+            confirmed.starts_with("Trust: exact | 1 file confirmed against disk"),
+            "{confirmed}"
         );
-        let verifying = format_search_envelope(
-            "exact",
-            SourceAuthority::from_freshness(&crate::domain::FreshnessStatus::Verifying),
-            "parsed",
-            "full for indexed scope",
-            super::DEFAULT_SEARCH_SCOPE,
-            "line anchors `src/lib.rs:7`",
-        );
-        assert!(!verifying.contains("index may be stale"), "{verifying}");
+        assert!(!confirmed.contains("index may be stale"), "{confirmed}");
     }
 
     #[test]
-    fn a_measured_degraded_authority_never_collapses_however_clean_the_rest_is() {
-        // The axis that used to be forgeable: parse and completeness are both
-        // pristine, and the ONLY deviation is the measured freshness. The
-        // envelope must stay loud — this is the case the string comparison let
-        // a lane collapse by asserting the literal.
-        for freshness in [
-            crate::domain::FreshnessStatus::Verifying,
-            crate::domain::FreshnessStatus::Degraded {
-                last_valid_content_generation: 1,
-                reason_codes: vec![crate::domain::FreshnessReason::ObservationFailed],
-            },
-        ] {
-            let rendered = format_search_envelope(
-                "exact",
-                SourceAuthority::from_freshness(&freshness),
-                "parsed",
-                "full for current scope",
-                "repo-wide",
-                "line anchors `src/lib.rs:7`",
-            );
-            assert!(
-                rendered.contains("Match type: exact"),
-                "a non-Current measurement keeps the loud envelope: {rendered}"
-            );
-            assert!(
-                !rendered.starts_with("Trust:"),
-                "a non-Current measurement must not buy the compact banner: {rendered}"
-            );
-        }
+    fn an_unconfirmed_file_never_collapses_however_clean_the_rest_is() {
+        // Parse and completeness are pristine; the ONLY deviation is a file of
+        // this answer that could not be compared with the disk. The envelope
+        // stays loud and the note names the file and the cause.
+        let check = AnswerCheck::unconfirmed_for_tests("src/a.rs", "access denied (os error 5)");
+        let rendered = format_search_envelope(
+            "exact",
+            SourceAuthority::from_check(&check),
+            "parsed",
+            "full for current scope",
+            "repo-wide",
+            "line anchors `src/lib.rs:7`",
+        );
+        assert!(
+            rendered.contains("Match type: exact") && !rendered.starts_with("Trust:"),
+            "an unconfirmed file keeps the loud envelope: {rendered}"
+        );
+        assert_eq!(
+            check.notes(true),
+            "Not confirmed against disk: src/a.rs (access denied (os error 5))"
+        );
+        // Control: a confirmed check has no notes at all.
+        assert!(AnswerCheck::confirmed_for_tests().notes(true).is_empty());
     }
 }

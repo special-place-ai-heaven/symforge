@@ -224,16 +224,62 @@ pub enum QueryRequest {
 }
 
 impl QueryRequest {
-    /// The one exact path MCP freshens synchronously before serving this
+    /// Every exact path MCP freshens synchronously before serving this
     /// request (`freshen_exact_path_for_targeted_retrieval`): the read,
-    /// file-context, symbol-context and syntax lanes.
-    pub(crate) fn freshen_path(&self) -> Option<&str> {
+    /// file-context, symbol-context and syntax lanes, and (spec 036 item 3)
+    /// `inspect_match` and each file `get_symbol` reads.
+    pub(crate) fn freshen_paths(&self) -> Vec<&str> {
         match self {
-            Self::FileContent(input) => Some(&input.path),
-            Self::SourcePage(input) => Some(&input.path),
-            Self::FileContext(input) => Some(&input.path),
-            Self::SymbolContext(input) => input.path.as_deref().or(input.file.as_deref()),
-            Self::Syntax { path } => Some(path),
+            Self::FileContent(input) => vec![&input.path],
+            Self::SourcePage(input) => vec![&input.path],
+            Self::FileContext(input) => vec![&input.path],
+            Self::SymbolContext(input) => input
+                .path
+                .as_deref()
+                .or(input.file.as_deref())
+                .into_iter()
+                .collect(),
+            Self::Syntax { path } => vec![path],
+            Self::InspectMatch(input) => vec![&input.path],
+            Self::SymbolRead(input) => match &input.targets {
+                Some(targets) => {
+                    let mut paths: Vec<&str> =
+                        targets.iter().map(|target| target.path.as_str()).collect();
+                    paths.sort_unstable();
+                    paths.dedup();
+                    paths
+                }
+                // ponytail: a bare-name read resolves its path inside the
+                // lane, after this freshen; MCP freshens the resolved path.
+                None => Some(input.path.as_str())
+                    .filter(|path| !path.trim().is_empty())
+                    .into_iter()
+                    .collect(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// Spec 036 FR-015: the indexed-path prefix (`Some(None)`: every file)
+    /// whose answer MCP gives through `answer_checked`; the prefix bounds the
+    /// whole-claim comparison. `None`: no such comparison. The facade
+    /// (`Symforge`) takes its planned steps' scope instead.
+    pub(crate) fn answer_scope(&self) -> Option<Option<&str>> {
+        match self {
+            Self::TextSearch(input) => Some(input.path_prefix.as_deref()),
+            Self::SymbolSearch(input) => Some(input.path_prefix.as_deref()),
+            Self::FileSearch(input) => Some(input.path_prefix.as_deref()),
+            Self::ReferenceSearch(_)
+            | Self::SymbolContext(_)
+            | Self::DependentSearch(_)
+            | Self::Explore(_) => Some(None),
+            Self::WhatChanged(input)
+                if input.since.is_some()
+                    && input.git_ref.is_none()
+                    && input.uncommitted != Some(true) =>
+            {
+                Some(input.path_prefix.as_deref())
+            }
             _ => None,
         }
     }

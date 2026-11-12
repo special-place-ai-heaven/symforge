@@ -77,6 +77,11 @@ pub struct SymbolSearchResult {
     pub file_count: u64,
     pub suppressed_by_noise: u64,
     pub text_fallback: Vec<TextFallback>,
+    /// Spec 036: the freshness caveat lines MCP prints for this answer
+    /// (`Not confirmed against disk: <path> (<cause>)`), byte-identical;
+    /// `None` when every file the answer draws on was confirmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness_notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -180,4 +185,9 @@ pub struct TextSearchResult {
     /// second run. `None` when not measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hidden_test_matches: Option<u64>,
+    /// Spec 036: the freshness caveat lines MCP prints for this answer
+    /// (`Not confirmed against disk: <path> (<cause>)`), byte-identical;
+    /// `None` when every file the answer draws on was confirmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness_notes: Option<String>,
 }

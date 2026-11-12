@@ -264,14 +264,10 @@ fn prepare_control_state_dir(directory: &Path) -> Result<(), AccessErrorKind> {
     Ok(())
 }
 
+/// The persisted kind of a full error, classified through the OS response
+/// table (spec 036 D6).
 fn access_error_kind(error: &io::Error) -> AccessErrorKind {
-    match error.kind() {
-        io::ErrorKind::NotFound => AccessErrorKind::NotFound,
-        io::ErrorKind::PermissionDenied => AccessErrorKind::PermissionDenied,
-        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => AccessErrorKind::InvalidData,
-        io::ErrorKind::OutOfMemory => AccessErrorKind::ResourceExhausted,
-        _ => AccessErrorKind::Other,
-    }
+    crate::discovery::os_response::stored_kind_of(error)
 }
 
 /// User-level SymForge home for runtime files when no safe project root exists.

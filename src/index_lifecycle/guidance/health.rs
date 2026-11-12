@@ -1194,11 +1194,16 @@ pub(crate) fn render_disposition_line(entries: &[CatalogEntry]) -> String {
 /// are none. Paths without a UTF-8 form render as their public id. A file is
 /// tagged `settled-unreadable` only when it is in `settled`, the set of paths
 /// whose sweep counter the store observed reaching the settle threshold.
+///
+/// Spec 036 FR-023: every unreadable file is named with its cause — the OS
+/// response this process classified for it under `root`, or, when this
+/// process never observed the failure (a restored snapshot), the stored kind
+/// and stage, said to be stored rather than observed.
 pub(crate) fn render_unreadable_files_line(
     entries: &[CatalogEntry],
     settled: &std::collections::HashSet<crate::domain::CatalogPath>,
+    root: Option<&std::path::Path>,
 ) -> Option<String> {
-    const MAX_NAMED: usize = 8;
     let unreadable: Vec<&CatalogEntry> = entries
         .iter()
         .filter(|entry| matches!(entry.disposition, FileDisposition::Unreadable { .. }))
@@ -1210,19 +1215,42 @@ pub(crate) fn render_unreadable_files_line(
         .iter()
         .filter(|entry| settled.contains(&entry.path))
         .count();
+    // Review M12: name a bounded number, then count the rest.
+    const MAX_NAMED: usize = 20;
     let names: Vec<String> = unreadable
         .iter()
         .take(MAX_NAMED)
         .map(|entry| {
+            use crate::discovery::os_response::RecordedCause;
             let name = entry
                 .path
                 .normalized_utf8
                 .clone()
                 .unwrap_or_else(|| entry.path.public_id.clone());
+            let observed = entry
+                .path
+                .normalized_utf8
+                .as_deref()
+                .map_or(RecordedCause::NotRecorded, |relative| {
+                    crate::discovery::os_response::recorded_failure_for(root, relative)
+                });
+            let stored = match &entry.disposition {
+                FileDisposition::Unreadable { stage, kind } => {
+                    format!("stored as {kind:?} at {stage:?}")
+                }
+                _ => "cause not recorded".to_string(),
+            };
+            let cause = match observed {
+                RecordedCause::Found(cause) => cause.describe(),
+                RecordedCause::NotRecorded => format!("{stored}; not observed by this process"),
+                RecordedCause::LimitReached => {
+                    format!("{stored}; cause not kept, the failure record limit was reached")
+                }
+            };
             if settled.contains(&entry.path) {
-                format!("{name} [settled-unreadable]")
+                format!("{name} ({cause}) [settled-unreadable]")
             } else {
-                name
+                format!("{name} ({cause})")
             }
         })
         .collect();
@@ -1233,6 +1261,28 @@ pub(crate) fn render_unreadable_files_line(
     );
     if unreadable.len() > MAX_NAMED {
         line.push_str(&format!(" (+{} more)", unreadable.len() - MAX_NAMED));
+    }
+    // Round 3 item 10: counted per project, from this project's own failed
+    // files only (the failure log is keyed by their canonical paths).
+    let unknown: std::collections::BTreeSet<i32> = unreadable
+        .iter()
+        .filter_map(|entry| entry.path.normalized_utf8.as_deref())
+        .filter_map(|relative| {
+            match crate::discovery::os_response::recorded_failure_for(root, relative) {
+                crate::discovery::os_response::RecordedCause::Found(cause)
+                    if cause.class == crate::discovery::os_response::OsClass::Unknown =>
+                {
+                    cause.raw_code
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    if !unknown.is_empty() {
+        line.push_str(&format!(
+            "\nUnknown OS error codes among these files: {} (each reported verbatim)",
+            unknown.len()
+        ));
     }
     Some(line)
 }
@@ -1386,7 +1436,11 @@ pub fn format_repository_knowledge_health(
     if let Some(manifest) = generation.manifest.as_deref() {
         section.push('\n');
         section.push_str(&render_disposition_line(&manifest.entries));
-        if let Some(line) = render_unreadable_files_line(&manifest.entries, settled_unreadable) {
+        if let Some(line) = render_unreadable_files_line(
+            &manifest.entries,
+            settled_unreadable,
+            generation.live.indexed_root.as_deref(),
+        ) {
             section.push('\n');
             section.push_str(&line);
         }

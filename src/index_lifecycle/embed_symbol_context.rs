@@ -647,7 +647,7 @@ pub(super) fn project(
                         } else {
                             "constrained"
                         },
-                        search_envelope::SourceAuthority::from_freshness(&published.freshness),
+                        search_envelope::SourceAuthority::from_check(&snapshot.answer_check),
                         read_context::parse_state_label(file),
                         &shared::context_bundle_completeness_label(found, &body),
                         &max_tokens
@@ -798,14 +798,26 @@ pub(super) fn project(
             rendered.push_str("\n\n");
             rendered.push_str(withheld);
         }
-        let (rendered, final_truncated) = knowledge_model::bound_final_code_context_output_flagged(
-            rendered,
+        // Spec 036 item 4: as on MCP, the unconfirmed files sit inside the
+        // final bound; callers and callees are a complete claim unless cut.
+        let mut final_truncated = false;
+        let rendered = super::guidance::freshen::budget_with_notes(
+            &snapshot.answer_check,
+            super::guidance::freshen::Claim::Whole,
             max_tokens,
-            &format!("symbol:{path}:{}", request.name),
-            request.sections.as_deref(),
-            knowledge_requested,
-            withheld.is_some(),
-            None,
+            |max_tokens| {
+                let (text, truncated) = knowledge_model::bound_final_code_context_output_flagged(
+                    rendered,
+                    max_tokens,
+                    &format!("symbol:{path}:{}", request.name),
+                    request.sections.as_deref(),
+                    knowledge_requested,
+                    withheld.is_some(),
+                    None,
+                );
+                final_truncated = truncated;
+                text
+            },
         );
         (rendered, render_truncated || final_truncated)
     };

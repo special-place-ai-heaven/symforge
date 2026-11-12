@@ -56,6 +56,11 @@ where
             |_, _| crate::live_index::store::StableReadOutcome::Unreadable {
                 stage: crate::domain::AccessStage::FullRead,
                 kind: crate::domain::AccessErrorKind::PermissionDenied,
+                cause: crate::discovery::os_response::classify(
+                    &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                    None,
+                    None,
+                ),
             },
         );
     }
@@ -481,7 +486,9 @@ where
                 FreshenResult::StaleReindexed | FreshenResult::StaleRemoved => stale_count += 1,
                 FreshenResult::Fresh
                 | FreshenResult::GenerationMismatch
-                | FreshenResult::PublicationRejected => {}
+                | FreshenResult::PublicationRejected
+                | FreshenResult::Unconfirmed(_)
+                | FreshenResult::UnstampedAbsent => {}
             }
         }
     }
@@ -660,6 +667,8 @@ where
     const MAX_DEGRADED_ATTEMPTS: usize = 5;
     const INITIAL_DEGRADED_DELAY: Duration = Duration::from_millis(50);
     const MAX_DEGRADED_DELAY: Duration = Duration::from_secs(1);
+    // Review M10: one transient-retry budget for the whole reconcile.
+    let _retry_budget = crate::discovery::os_response::enter_call_budget();
 
     let active_generation = shared.current_project_generation();
     let effective_generation = effective_fence_generation(shared, repo_root, expected_gen);
@@ -2926,6 +2935,11 @@ mod tests {
             |_path, _stamp| crate::live_index::store::StableReadOutcome::Unreadable {
                 stage: crate::domain::AccessStage::FullRead,
                 kind: crate::domain::AccessErrorKind::PermissionDenied,
+                cause: crate::discovery::os_response::classify(
+                    &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                    None,
+                    None,
+                ),
             },
         );
         assert!(matches!(observed, ReindexResult::ReadError(_)));

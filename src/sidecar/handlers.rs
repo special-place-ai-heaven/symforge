@@ -168,19 +168,29 @@ fn freshen_sidecar_path_if_stale_at_generation(
     let authority =
         crate::live_index::index_lifecycle::activation::project_source_authority(repo_root);
     let observer = authority.active_observer();
-    match watcher::freshen_file_if_stale(
-        relative_path,
-        &abs_path,
-        state.index.data_plane(),
-        expected_gen,
-        &authority,
-        observer,
-    ) {
-        watcher::FreshenResult::Fresh => Ok(ContextSourceAuthority::CurrentIndex),
+    // Round 3 item 7: the stat, hash and retry sleeps leave the async worker.
+    let freshened = crate::protocol::tools::off_async_worker(|| {
+        watcher::freshen_file_if_stale(
+            relative_path,
+            &abs_path,
+            state.index.data_plane(),
+            expected_gen,
+            &authority,
+            observer,
+        )
+    });
+    match freshened {
+        // An unstamped row with no file is served as before: the sidecar
+        // banner is index-wide and carries no per-file claim.
+        watcher::FreshenResult::Fresh | watcher::FreshenResult::UnstampedAbsent => {
+            Ok(ContextSourceAuthority::CurrentIndex)
+        }
         watcher::FreshenResult::StaleReindexed => Ok(ContextSourceAuthority::DiskRefreshed),
         watcher::FreshenResult::StaleRemoved => Ok(ContextSourceAuthority::DiskRefreshed),
         watcher::FreshenResult::GenerationMismatch => Ok(ContextSourceAuthority::CurrentIndex),
         watcher::FreshenResult::PublicationRejected => Err(StatusCode::SERVICE_UNAVAILABLE),
+        // Not compared with the disk: refuse rather than vouch for the index.
+        watcher::FreshenResult::Unconfirmed(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
 }
 

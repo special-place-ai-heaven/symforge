@@ -1147,10 +1147,23 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Refreshed 2026-10-25 after independent review of the comparison/impact changes.
 // Same 89 paths; no new lifecycle/server-API bridge. Review and dual-surface proof:
 // docs/reviews/2026-10-25-differential-overlap-review.md.
+// Refreshed for feature 036 slice A3 (disk verification): the per-answer check is
+// threaded through the embed lane's query snapshot and envelopes (`answer_check`,
+// `check_answer_scope`) and the watcher/sidecar matches gain `Unconfirmed`. Same 89
+// excluded files; no new edge into src/index_lifecycle or server_api.rs.
+// Refreshed for the A3 review round (budget guard around reconcile, the
+// `UnstampedAbsent` freshen arm, one doc reference): same 89 files, no new edge.
+// Refreshed for the A3 row-check rework: the embed facade, reference, dependents
+// and symbol-context lanes take the check from the shared `answer_checked` loop
+// and fit its notes inside their budgets; targeted reads carry their caveat. Same
+// 89 files; no new edge into src/index_lifecycle or server_api.rs.
+// Round 2: cited files from structured rows, facade step caveats, probe reuse
+// for native searches. Same 89 files, no new edge.
+// Round 3: embed search caveats, reason-named not-run states. Same 89 files.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "68dd39c571d012f75fd9f10049214476074ae6895d12e9db0cae2fa440bdc9f9",
+    "82c40efc7bff9e7f47a71368850e8e825314bb2a4c8985d43fd9a4b2b4d15f09",
     89,
-    2328767,
+    2384249,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1335,10 +1348,26 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // decoder table and `apply_conditions` in `protocol/tool_contract.rs`, called from
 // `call_tool` and the daemon's `decode_params`; visitor-based `SingleEdit`/`InsertTarget`
 // deserializers; `deny_unknown_fields` on three types. No bridge. 315 files.
+// Refreshed for feature 036 slice A3 (disk verification): new `discovery/os_response.rs`
+// (the OS response table, retry budget and a `cfg(windows)` ntdll declaration), the
+// per-answer check in `guidance/freshen.rs`, size/racy-content comparison in
+// `single_file.rs`, envelopes from `AnswerCheck`. Calls only, no bridge. 316 files.
+// Refreshed for the A3 review round: errno rows from `libc`, keyed failure log,
+// RAII retry budget, confinement before the disk comparison, block_in_place for
+// the check, the targeted caveat. Calls only, no bridge. 316 files.
+// Refreshed for the A3 row-check rework: `answer_checked` (cited rows, whole-claim
+// scope, one batched publication through `publish_snapshot_verify_with_observation`,
+// one re-run), handlers split into checked renders, notes inside budgets, test
+// fault hooks in `single_file.rs`. Calls only, no bridge. 316 files.
+// Round 2: `cited_paths` over structured rows (no text parsing), facade step
+// caveats, probe reuse for native searches. Calls only, no bridge. 316 files.
+// Round 3: filesystem clock probe, comparison generation fence, hash size limit,
+// vanish-wait minimum, bounded re-index, queries once per publication, targeted
+// freshens off the async worker, per-project unknown codes. No bridge. 316 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "d757767315249544c38c7752ad999afee116eadac2b4f87e93ec5eac9bbe13fc",
-    315,
-    12652940,
+    "565d9e6da25ce9735619b12a9a6445d238dec3ab875bcb76d763400b7c4f233b",
+    316,
+    12813022,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
