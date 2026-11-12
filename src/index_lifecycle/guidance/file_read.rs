@@ -670,6 +670,60 @@ pub fn not_found_file_match(path: &str, query: &str) -> String {
     format!("No matches for '{query}' in {path}")
 }
 
+/// Richer "file not found" with suggested similar paths.
+/// Call this from tool handlers where the index is available.
+pub fn not_found_file_with_suggestions(path: &str, suggestions: &[String]) -> String {
+    if suggestions.is_empty() {
+        format!("File not found: {path}. Use search_files to find the correct path.")
+    } else {
+        let top: Vec<&str> = suggestions.iter().take(5).map(|s| s.as_str()).collect();
+        format!("File not found: {path}. Did you mean: {}?", top.join(", "))
+    }
+}
+
+/// Find up to 5 similar file paths for "file not found" suggestions.
+/// Extracts the basename from the failed path and searches the index.
+pub(crate) fn suggest_similar_files(
+    index: &crate::live_index::LiveIndex,
+    path: &str,
+) -> Vec<String> {
+    let basename = std::path::Path::new(path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(path);
+    // Try basename match first
+    let mut suggestions: Vec<String> = index
+        .find_files_by_basename(basename)
+        .into_iter()
+        .take(5)
+        .map(|s| s.to_string())
+        .collect();
+    // If no basename match, try the stem (without extension)
+    if suggestions.is_empty() {
+        let stem = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|f| f.to_str())
+            .unwrap_or(basename);
+        if stem.len() >= 3 {
+            let stem_lower = stem.to_ascii_lowercase();
+            suggestions = index
+                .all_files()
+                .map(|(p, _)| p.as_str())
+                .filter(|p| {
+                    let file_stem = std::path::Path::new(p)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    file_stem.to_ascii_lowercase().contains(&stem_lower)
+                })
+                .take(5)
+                .map(|s| s.to_string())
+                .collect();
+        }
+    }
+    suggestions
+}
+
 fn out_of_range_file_chunk(path: &str, chunk_index: u32, total_chunks: usize) -> String {
     format!("Chunk {chunk_index} out of range for {path} ({total_chunks} chunks)")
 }

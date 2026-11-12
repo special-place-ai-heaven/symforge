@@ -914,6 +914,336 @@ fn the_edit_plan_request_names_its_own_arguments() {
     );
 }
 
+/// The text a host shows its LLM for one embed call: the refusal's `message`, or the
+/// reply's `rendered` text.
+fn embed_text(room: &HostRoom, tool: &str, args: &Value) -> String {
+    match wire(room, &embed_wire(tool, args).expect("wire")) {
+        Ok(bytes) => {
+            let reply: Value = serde_json::from_slice(&bytes).expect("reply json");
+            find_string(&reply, "rendered").unwrap_or_else(|| format!("<no rendered> {reply}"))
+        }
+        Err(refusal) => message_of(&refusal)
+            .unwrap_or_else(|| format!("<no message> {:?}/{:?}", refusal.kind, refusal.query_kind)),
+    }
+}
+
+/// How a row of `specs/036-tool-reliability/inputs/embed-refusal-inventory.md` stands.
+#[derive(Clone, Copy, Debug)]
+enum Row {
+    /// Both lanes give the LLM the same bytes.
+    Same,
+    /// The lanes still differ, for the inventory's stated reason. Asserted so that a
+    /// change which closes the gap also updates the inventory.
+    Differs(&'static str),
+}
+
+/// Runs every case on both lanes and returns one line per row whose standing is not
+/// the expected one.
+fn probe(mcp: &mut StdioClient, room: &HostRoom, cases: &[(&str, Value, Row)]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (tool, args, expected) in cases {
+        let mcp_text = text_of(&mcp.call(tool, args.clone()));
+        let embed = embed_text(room, tool, args);
+        let same = embed == mcp_text;
+        match (expected, same) {
+            (Row::Same, true) | (Row::Differs(_), false) => {}
+            (Row::Same, false) => failures.push(format!(
+                "{tool} {args}:\n  mcp:   {mcp_text:?}\n  embed: {embed:?}"
+            )),
+            (Row::Differs(reason), true) => failures.push(format!(
+                "{tool} {args}: now equal ({reason}); update the inventory and this row"
+            )),
+        }
+    }
+    failures
+}
+
+/// Spec 036 embed refusal inventory: a call that leaves the MCP lane with a refusal,
+/// not-found, ambiguous or invalid answer gives the embed lane the same bytes, in the
+/// refusal `message` or the reply's `rendered` text. Each row is one inventory row.
+#[test]
+fn query_refusals_carry_the_mcp_text_on_the_embed_lane() {
+    use Row::{Differs, Same};
+    const STRICTER: &str = "embed refuses a call MCP answers";
+    const INVALID_TEXT: &str = "invalid-request text not yet carried";
+    const GIT_TEXT: &str = "git failure text not yet carried";
+    const DECODE: &str = "embed decodes the value as a closed enum";
+    let dir = reliability_support::committed_fixture_copy();
+    let root = dunce::canonicalize(dir.path()).expect("canonical fixture");
+    let mut mcp = mcp_ready(&root);
+    let owner = HostRuntimeOwner::new(ProcessIndexRuntime::acquire().expect("runtime"));
+    let room = room_in(&owner, &root, "query-refusal-room");
+    let explore = |query: &str, language: Option<&str>| {
+        json!({ "query": query, "language": language, "depth": 1, "limit": 10,
+            "include_noise": false, "include_vendor": false, "include_personal_tooling": false })
+    };
+    let cases: Vec<(&str, Value, Row)> = vec![
+        (
+            "get_file_context",
+            json!({ "path": "src/missing.rs" }),
+            Same,
+        ),
+        (
+            "get_file_context",
+            json!({ "path": "src/short.rs", "max_tokens": 0 }),
+            Differs(STRICTER),
+        ),
+        (
+            "get_symbol",
+            json!({ "path": "src/missing.rs", "name": "x" }),
+            Same,
+        ),
+        (
+            "get_symbol",
+            json!({ "path": "src/short.rs", "name": "NOPE" }),
+            Same,
+        ),
+        ("get_symbol", json!({ "name": "NOPE_ANYWHERE" }), Same),
+        ("get_symbol", json!({ "name": "target_fn" }), Same),
+        (
+            "get_symbol",
+            json!({ "path": "src/short.rs", "name": "" }),
+            Differs(STRICTER),
+        ),
+        (
+            "get_symbol",
+            json!({ "targets": [{ "path": "src/missing.rs", "name": "x" }] }),
+            Same,
+        ),
+        (
+            "get_symbol_context",
+            json!({ "name": "NOPE_ANYWHERE" }),
+            Same,
+        ),
+        ("get_symbol_context", json!({ "name": "target_fn" }), Same),
+        (
+            "get_symbol_context",
+            json!({ "name": "NOPE", "path": "src/short.rs" }),
+            Same,
+        ),
+        (
+            "get_symbol_context",
+            json!({ "name": "x", "path": "src/missing.rs" }),
+            Same,
+        ),
+        (
+            "get_symbol_context",
+            json!({ "name": "NOPE", "path": "src/short.rs", "bundle": true }),
+            Same,
+        ),
+        (
+            "get_symbol_context",
+            json!({ "name": "target_fn", "verbosity": "bogus" }),
+            Differs(STRICTER),
+        ),
+        (
+            "get_symbol_context",
+            json!({ "name": "target_fn", "bundle": true }),
+            Differs(INVALID_TEXT),
+        ),
+        (
+            "get_symbol_context",
+            json!({ "name": "target_fn", "symbol_line": 0 }),
+            Differs(STRICTER),
+        ),
+        (
+            "get_symbol_context",
+            json!({ "name": "target_fn", "path": "src/parent/leaf.rs",
+            "sections": ["bogus"] }),
+            Differs(STRICTER),
+        ),
+        ("find_references", json!({ "name": "NOPE_ANYWHERE" }), Same),
+        (
+            "find_references",
+            json!({ "name": "target_fn", "kind": "bogus" }),
+            Differs(STRICTER),
+        ),
+        (
+            "find_references",
+            json!({ "name": "target_fn", "path": "src/missing.rs" }),
+            Same,
+        ),
+        (
+            "find_references",
+            json!({ "name": "NOPE", "path": "src/short.rs" }),
+            Same,
+        ),
+        ("find_references", json!({ "name": "" }), Differs(STRICTER)),
+        ("find_dependents", json!({ "path": "src/missing.rs" }), Same),
+        (
+            "find_dependents",
+            json!({ "path": "src/short.rs", "format": "bogus" }),
+            Differs(STRICTER),
+        ),
+        (
+            "inspect_match",
+            json!({ "path": "src/short.rs", "line": 999 }),
+            Same,
+        ),
+        (
+            "inspect_match",
+            json!({ "path": "src/missing.rs", "line": 1 }),
+            Same,
+        ),
+        (
+            "inspect_match",
+            json!({ "path": "src/short.rs", "line": 0 }),
+            Differs(INVALID_TEXT),
+        ),
+        (
+            "get_file_content",
+            json!({ "path": "src/missing.rs" }),
+            Same,
+        ),
+        (
+            "get_file_content",
+            json!({ "path": "src/short.rs", "start_line": 5, "end_line": 2 }),
+            Same,
+        ),
+        (
+            "get_file_content",
+            json!({ "path": "src/short.rs", "start_line": 0 }),
+            Same,
+        ),
+        (
+            "get_file_content",
+            json!({ "path": "src/short.rs", "start_line": 999 }),
+            Same,
+        ),
+        (
+            "get_file_content",
+            json!({ "path": "src/short.rs", "mode": "bogus" }),
+            Differs(DECODE),
+        ),
+        (
+            "get_file_content",
+            json!({ "path": "src/short.rs", "around_symbol": "NOPE" }),
+            Same,
+        ),
+        (
+            "get_file_content",
+            json!({ "path": "src/short.rs", "around_match": "NOPE_TEXT" }),
+            Same,
+        ),
+        (
+            "search_symbols",
+            json!({ "query": "x", "kind": "bogus" }),
+            Differs(STRICTER),
+        ),
+        (
+            "search_symbols",
+            json!({ "query": "x", "language": "Klingon" }),
+            Same,
+        ),
+        ("search_text", json!({ "query": "" }), Differs(INVALID_TEXT)),
+        (
+            "search_text",
+            json!({ "query": "x", "language": "Klingon" }),
+            Same,
+        ),
+        (
+            "search_text",
+            json!({ "query": "(", "regex": true }),
+            Differs(INVALID_TEXT),
+        ),
+        (
+            "search_text",
+            json!({ "query": "x", "group_by": "bogus" }),
+            Differs(DECODE),
+        ),
+        (
+            "search_files",
+            json!({ "query": "" }),
+            Differs(INVALID_TEXT),
+        ),
+        (
+            "get_repo_map",
+            json!({ "max_tokens": 0 }),
+            Differs(STRICTER),
+        ),
+        ("get_repo_map", json!({ "path": "nope/dir" }), Same),
+        ("get_repo_map", json!({ "detail": "bogus" }), Same),
+        (
+            "validate_file_syntax",
+            json!({ "path": "src/missing.rs" }),
+            Same,
+        ),
+        (
+            "analyze_file_impact",
+            json!({ "path": "src/missing.rs" }),
+            Same,
+        ),
+        ("explore", explore("x", Some("Klingon")), Same),
+        ("explore", explore("", None), Differs(INVALID_TEXT)),
+        ("edit_plan", json!({ "target": "NOPE_ANYWHERE" }), Same),
+        ("edit_plan", json!({ "target": "target_fn" }), Same),
+        (
+            "what_changed",
+            json!({ "git_ref": "no-such-ref" }),
+            Differs(GIT_TEXT),
+        ),
+        (
+            "diff_symbols",
+            json!({ "base": "no-such-ref" }),
+            Differs(GIT_TEXT),
+        ),
+        (
+            "search_knowledge",
+            json!({ "query": "" }),
+            Differs(INVALID_TEXT),
+        ),
+        ("ask", json!({ "query": "" }), Differs(INVALID_TEXT)),
+    ];
+    let failures = probe(&mut mcp, &room, &cases);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A path selector that matches two same-named symbols in one file: every tool that
+/// takes one answers with the same text on both lanes.
+#[test]
+fn ambiguous_path_selectors_carry_the_mcp_text_on_the_embed_lane() {
+    let dir = reliability_support::committed_fixture_copy();
+    std::fs::write(
+        dir.path().join("src/dup.rs"),
+        "pub struct A;\npub struct B;\nimpl A {\n    pub fn dup(&self) -> u32 {\n        1\n    }\n}\n\
+         impl B {\n    pub fn dup(&self) -> u32 {\n        2\n    }\n}\n",
+    )
+    .expect("duplicate-name source");
+    let root = dunce::canonicalize(dir.path()).expect("canonical fixture");
+    let mut mcp = mcp_ready(&root);
+    let owner = HostRuntimeOwner::new(ProcessIndexRuntime::acquire().expect("runtime"));
+    let room = room_in(&owner, &root, "ambiguous-selector-room");
+    let cases: Vec<(&str, Value, Row)> = vec![
+        (
+            "get_symbol",
+            json!({ "path": "src/dup.rs", "name": "dup" }),
+            Row::Same,
+        ),
+        (
+            "get_symbol_context",
+            json!({ "name": "dup", "path": "src/dup.rs" }),
+            Row::Same,
+        ),
+        (
+            "get_symbol_context",
+            json!({ "name": "dup", "path": "src/dup.rs", "bundle": true }),
+            Row::Same,
+        ),
+        (
+            "find_references",
+            json!({ "name": "dup", "path": "src/dup.rs" }),
+            Row::Same,
+        ),
+        (
+            "get_file_content",
+            json!({ "path": "src/dup.rs", "around_symbol": "dup" }),
+            Row::Same,
+        ),
+    ];
+    let failures = probe(&mut mcp, &room, &cases);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// `curate_knowledge` with two unknown keys: the same text on both lanes, after a review
 /// that gives each lane its own hashes; without the keys neither lane refuses the call for
 /// its arguments.

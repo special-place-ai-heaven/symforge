@@ -122,6 +122,9 @@ pub fn plan_edit(
         }
     }
 
+    // `all_files` iterates a hash map: without an order the candidates, and the primary
+    // one, differ from process to process and between the two lanes.
+    symbol_hits.sort_by(|a, b| (&a.0, a.3).cmp(&(&b.0, b.3)));
     let symbol_target_name = symbol_hits
         .first()
         .map(|(_, name, _, _)| name.as_str())

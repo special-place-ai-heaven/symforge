@@ -278,6 +278,8 @@ pub(super) fn project(
         let projected = super::embed_query::validate_request(&nested).and_then(|()| {
             super::embed_query::project(snapshot, &nested, budget, observations, session, policy)
         });
+        // A step's refusal text belongs to that step, never to the facade's answer.
+        budget.refusal_text = None;
         // Round 2 item 2: the step's targeted read carries the caveat MCP's
         // dispatched read prints for a file it could not compare.
         let caveats: Vec<String> = nested

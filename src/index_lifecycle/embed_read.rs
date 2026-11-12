@@ -234,12 +234,12 @@ pub(super) fn observe_syntax_in(
         None => authority.verify_exact_spelling_anchor(relative),
     };
     if !spelled.map_err(authority_refusal)? {
-        return Err(QueryRefusalKind::NotFound);
+        return Err(budget.refuse_with(QueryRefusalKind::NotFound, file_read::not_found_file(path)));
     }
     admit_in(live, authority, expected, path, None, budget)?;
-    let bytes = read_beneath(authority, expected, path)
-        .map_err(authority_refusal)?
-        .ok_or(QueryRefusalKind::NotFound)?;
+    let Some(bytes) = read_beneath(authority, expected, path).map_err(authority_refusal)? else {
+        return Err(budget.refuse_with(QueryRefusalKind::NotFound, file_read::not_found_file(path)));
+    };
     admit_in(live, authority, expected, path, Some(&bytes), budget)?;
     let result = crate::parsing::process_file_with_classification(
         path,
@@ -309,7 +309,10 @@ pub(super) fn content(
             )
             .map_err(authority_refusal)?
     {
-        return Err(QueryRefusalKind::NotFound);
+        return Err(budget.refuse_with(
+            QueryRefusalKind::NotFound,
+            file_read::not_found_file(&input.path),
+        ));
     }
     if input.estimate == Some(true) {
         let (size, lines, authority) = if let Some(file) = indexed {
@@ -338,9 +341,23 @@ pub(super) fn content(
         }));
     }
     admit(snapshot, &input.path, None, budget)?;
+    let annotation = match (
+        &options.content_context.mode_name,
+        options.content_context.mode_explicit,
+    ) {
+        (Some(mode), true) => format!("── mode: {mode} (explicit) ──\n"),
+        _ => String::new(),
+    };
     let (rendered, hash, authority, nul_warning) = if let Some(file) = indexed {
         verify_indexed_content(snapshot, &input.path, file)?;
-        selected_range(file, &options.content_context)?;
+        // A selection MCP cannot serve is answered with the shared renderer's text.
+        selected_range(file, &options.content_context).map_err(|kind| {
+            let text = file_read::file_content_from_indexed_file_with_context(
+                file,
+                options.content_context.clone(),
+            );
+            budget.refuse_with(kind, format!("{annotation}{text}"))
+        })?;
         if let Some(session) = session
             && let Some((handle, body)) =
                 session.file_content_cache_hit(snapshot, request, budget.limits())
@@ -385,10 +402,21 @@ pub(super) fn content(
             .map_err(authority_refusal)?
             .ok_or(QueryRefusalKind::NotFound)?;
         admit(snapshot, &input.path, Some(&bytes), budget)?;
-        if options.content_context.around_symbol.is_some() {
-            return Err(QueryRefusalKind::NotFound);
+        if let Some(name) = options.content_context.around_symbol.as_deref() {
+            // An unindexed file has no symbols (MCP's text).
+            return Err(budget.refuse_with(
+                QueryRefusalKind::NotFound,
+                format!("{annotation}Symbol not found in {}: {name}", input.path),
+            ));
         }
-        selected_content_range(&bytes, &options.content_context)?;
+        selected_content_range(&bytes, &options.content_context).map_err(|kind| {
+            let text = file_read::render_file_content_bytes(
+                &input.path,
+                &bytes,
+                options.content_context.clone(),
+            );
+            budget.refuse_with(kind, format!("{annotation}{text}"))
+        })?;
         let body = file_read::render_file_content_bytes(
             &input.path,
             &bytes,
@@ -408,13 +436,6 @@ pub(super) fn content(
                 &bytes,
             )),
         )
-    };
-    let annotation = match (
-        &options.content_context.mode_name,
-        options.content_context.mode_explicit,
-    ) {
-        (Some(mode), true) => format!("── mode: {mode} (explicit) ──\n"),
-        _ => String::new(),
     };
     let combined = format!("{annotation}{rendered}");
     let file_capped = combined.len() > file_read::GET_FILE_CONTENT_MAX_BYTES;

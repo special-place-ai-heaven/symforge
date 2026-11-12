@@ -229,10 +229,20 @@ pub(super) fn file_context(
     }
     super::embed_read::admit(snapshot, &request.path, None, budget)?;
     let published = snapshot.generation.as_ref();
-    let file = published
-        .live
-        .get_file(&request.path)
-        .ok_or(QueryRefusalKind::NotFound)?;
+    let Some(file) = published.live.get_file(&request.path) else {
+        // A path the publication recorded but did not index is not a missing file.
+        if published
+            .live
+            .capture_file_disposition(&request.path)
+            .is_some()
+        {
+            return Err(QueryRefusalKind::NotFound);
+        }
+        return Err(budget.refuse_with(
+            QueryRefusalKind::NotFound,
+            file_read::not_found_file(&request.path),
+        ));
+    };
     let raw_chars = file.content.len();
     let raw_tokens = crate::stel::handler::estimate_tokens_from_bytes(raw_chars as u64);
     if request.estimate {

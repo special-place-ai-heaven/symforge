@@ -66,6 +66,7 @@ fn target(
     target: &SymbolTarget,
     estimate: bool,
     line_numbers: Option<bool>,
+    single: bool,
     budget: &mut Budget,
 ) -> Result<(SymbolReadEntry, String), QueryRefusalKind> {
     let mut row = entry(target.path.clone());
@@ -76,10 +77,17 @@ fn target(
     }
     let Some(file) = snapshot.generation.live.get_file(&target.path) else {
         row.refusal = Some(QueryRefusalKind::NotFound);
-        return Ok((
-            row,
-            super::guidance::file_read::not_found_file(&target.path),
-        ));
+        // MCP's single read suggests similar paths; its batch names the path only.
+        let text = if single {
+            let suggestions = super::guidance::file_read::suggest_similar_files(
+                &snapshot.generation.live,
+                &target.path,
+            );
+            super::guidance::file_read::not_found_file_with_suggestions(&target.path, &suggestions)
+        } else {
+            super::guidance::file_read::not_found_file(&target.path)
+        };
+        return Ok((row, text));
     };
     if let Err(refusal) =
         super::embed_read::admit(snapshot, &target.path, Some(&file.content), budget)
@@ -241,6 +249,7 @@ pub(super) fn read(
                 target_request,
                 estimate,
                 request.line_numbers,
+                request.targets.is_none(),
                 budget,
             )?,
         };
@@ -306,11 +315,12 @@ pub(super) fn inspect(
     budget: &mut Budget,
 ) -> Result<QueryOutput, QueryRefusalKind> {
     super::embed_read::admit(snapshot, &request.path, None, budget)?;
-    let file = snapshot
-        .generation
-        .live
-        .get_file(&request.path)
-        .ok_or(QueryRefusalKind::NotFound)?;
+    let Some(file) = snapshot.generation.live.get_file(&request.path) else {
+        return Err(budget.refuse_with(
+            QueryRefusalKind::NotFound,
+            super::guidance::file_read::not_found_file(&request.path),
+        ));
+    };
     super::embed_read::admit(snapshot, &request.path, Some(&file.content), budget)?;
     let view = snapshot.generation.live.capture_inspect_match_view(
         &request.path,
@@ -320,7 +330,7 @@ pub(super) fn inspect(
     );
     let rendered = symbol_read::inspect_match_result_view(&view);
     let crate::live_index::InspectMatchView::Found(found) = view else {
-        return Err(QueryRefusalKind::InvalidRequest);
+        return Err(budget.refuse_with(QueryRefusalKind::InvalidRequest, rendered));
     };
     let convert = |value: crate::live_index::EnclosingSymbolView| InspectionSymbol {
         name: value.name,

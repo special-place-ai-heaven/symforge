@@ -570,7 +570,8 @@ fn edit_impact(
             // deletion from delete→recreate disk ABA. Retain last-valid state;
             // the watcher retry/reconciliation path owns confirmed removal.
             let prev_symbol_count = pre_symbols.len();
-            let root_display = root.display().to_string();
+            // The embed lane's root carries the `\\?\` verbatim prefix; MCP's does not.
+            let root_display = dunce::simplified(root).display().to_string();
             let has_index_record = published.live.get_file(path).is_some();
             let (status, detail) = if has_index_record {
                 (

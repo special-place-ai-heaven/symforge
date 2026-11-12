@@ -236,9 +236,14 @@ pub struct QueryRefusal {
     operation_identity: String,
     retry: RetryAdvice,
     withheld: Option<crate::embed::parity::read::WithheldMeta>,
+    message: Option<String>,
 }
 
 impl QueryRefusal {
+    /// The text the MCP lane prints for the same call, byte for byte, when it has one.
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
     pub fn withheld(&self) -> Option<&crate::embed::parity::read::WithheldMeta> {
         self.withheld.as_ref()
     }
@@ -292,6 +297,7 @@ pub(super) fn validate_syntax_from_disk(
             RetryAdvice::Never
         },
         withheld,
+        message: None,
     };
     let mut budget = Budget::new(limits, None).map_err(|kind| refuse(kind, None))?;
     validate_request(&request).map_err(|kind| refuse(kind, None))?;
@@ -300,7 +306,10 @@ pub(super) fn validate_syntax_from_disk(
         .ok_or_else(|| refuse(QueryRefusalKind::SourceUnavailable, None))?;
     let file =
         super::embed_read::observe_syntax_in(&generation.live, &authority, None, path, &mut budget)
-            .map_err(|kind| refuse(kind, budget.withheld.take()))?;
+            .map_err(|kind| QueryRefusal {
+                message: budget.refusal_text.take(),
+                ..refuse(kind, budget.withheld.take())
+            })?;
     let syntax = syntax_output(
         path,
         &file,
@@ -477,10 +486,14 @@ fn execute_inner(
         operation_identity: identity.clone(),
         retry,
         withheld: None,
+        message: None,
     };
     let mut budget =
         Budget::new(limits, control).map_err(|kind| refuse(kind, RetryAdvice::Never))?;
-    validate_request(request).map_err(|kind| refuse(kind, RetryAdvice::Never))?;
+    validate_request(request).map_err(|kind| QueryRefusal {
+        message: validation_text(request, kind),
+        ..refuse(kind, RetryAdvice::Never)
+    })?;
     match snapshot_mode {
         SnapshotMode::Strict => {}
         SnapshotMode::AllowRefreshing
@@ -728,6 +741,7 @@ fn execute_inner(
             },
         );
         refusal.withheld = budget.withheld.clone();
+        refusal.message = budget.refusal_text.take();
         refusal
     })?;
     close_targeted_read(&mut value, request, &targeted_caveats);
@@ -1055,6 +1069,8 @@ pub(super) struct Budget {
     pub(super) stel_event: Option<crate::stel::types::StelLedgerEvent>,
     /// Facade steps' targeted-read caveats, by path (round 2 item 2).
     pub(super) targeted_caveats: BTreeMap<String, String>,
+    /// The MCP lane's text for the refusal the projection returns, when it has one.
+    pub(super) refusal_text: Option<String>,
 }
 
 impl Budget {
@@ -1074,6 +1090,7 @@ impl Budget {
             stel_store: None,
             stel_event: None,
             targeted_caveats: BTreeMap::new(),
+            refusal_text: None,
         }
     }
     pub(super) fn limits(&self) -> QueryLimits {
@@ -1099,6 +1116,12 @@ impl Budget {
 
     pub(super) fn remaining_bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Refuse with `kind`, carrying `text`: what the MCP lane prints for the same call.
+    pub(super) fn refuse_with(&mut self, kind: QueryRefusalKind, text: String) -> QueryRefusalKind {
+        self.refusal_text = Some(text);
+        kind
     }
 
     pub(super) fn charge_bytes(&mut self, bytes: usize) -> Result<(), QueryRefusalKind> {
@@ -1143,6 +1166,7 @@ impl Budget {
             stel_store: None,
             stel_event: None,
             targeted_caveats: BTreeMap::new(),
+            refusal_text: None,
         })
     }
 
@@ -1264,6 +1288,21 @@ fn validate_selector(selector: &QuerySymbolSelector) -> Result<(), QueryRefusalK
         return Err(QueryRefusalKind::InvalidRequest);
     }
     Ok(())
+}
+
+/// The MCP lane's text for a request [`validate_request`] refuses, where it has one: the
+/// language filter MCP refuses with the same shared text.
+fn validation_text(request: &QueryRequest, kind: QueryRefusalKind) -> Option<String> {
+    if kind != QueryRefusalKind::UnsupportedOption {
+        return None;
+    }
+    let language = match request {
+        QueryRequest::TextSearch(input) => input.language.as_deref(),
+        QueryRequest::SymbolSearch(input) => input.language.as_deref(),
+        QueryRequest::Explore(input) => input.language.as_deref(),
+        _ => return None,
+    };
+    super::guidance::filters::parse_language_filter(language).err()
 }
 
 pub(super) fn validate_request(request: &QueryRequest) -> Result<(), QueryRefusalKind> {

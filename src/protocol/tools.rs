@@ -536,47 +536,8 @@ use crate::index_lifecycle::guidance::changes::{
     determine_what_changed_mode, filter_paths_by_prefix_and_language, search_paths_evidence,
     what_changed_parse_state_label, what_changed_scope_summary, what_changed_source_authority,
 };
+use crate::index_lifecycle::guidance::file_read::suggest_similar_files;
 use crate::index_lifecycle::guidance::file_search::normalize_exact_path;
-
-/// Find up to 5 similar file paths for "file not found" suggestions.
-/// Extracts the basename from the failed path and searches the index.
-fn suggest_similar_files(index: &crate::live_index::LiveIndex, path: &str) -> Vec<String> {
-    let basename = std::path::Path::new(path)
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or(path);
-    // Try basename match first
-    let mut suggestions: Vec<String> = index
-        .find_files_by_basename(basename)
-        .into_iter()
-        .take(5)
-        .map(|s| s.to_string())
-        .collect();
-    // If no basename match, try the stem (without extension)
-    if suggestions.is_empty() {
-        let stem = std::path::Path::new(path)
-            .file_stem()
-            .and_then(|f| f.to_str())
-            .unwrap_or(basename);
-        if stem.len() >= 3 {
-            let stem_lower = stem.to_ascii_lowercase();
-            suggestions = index
-                .all_files()
-                .map(|(p, _)| p.as_str())
-                .filter(|p| {
-                    let file_stem = std::path::Path::new(p)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("");
-                    file_stem.to_ascii_lowercase().contains(&stem_lower)
-                })
-                .take(5)
-                .map(|s| s.to_string())
-                .collect();
-        }
-    }
-    suggestions
-}
 
 #[cfg(test)]
 use crate::index_lifecycle::guidance::freshen::classify_targeted_freshen_result;
