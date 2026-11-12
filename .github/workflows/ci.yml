@@ -8,15 +8,16 @@ on:
   pull_request:
   workflow_dispatch:
   schedule:
-    - cron: "17 4 * * 1"
+    - cron: "17 4 * * *"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  CARGO_BUILD_JOBS: "2"
   # Reduce disposable Rust artifacts; assertions and release settings stay unchanged.
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
+  # One nextest version for the archive build, every partition, and Windows.
+  NEXTEST_VERSION: "0.9.151"
 
 permissions:
   contents: read
@@ -25,14 +26,68 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# Runners are slots. Linux jobs ask for any self-hosted runner with the
+# `fresh` (ephemeral) label, so every job is sized to fit the smallest one
+# (4 cores, 8 GiB, shared disk); the old single `rust` job is split so the
+# pieces run side by side. The `plan` job, on a GitHub-hosted runner, chooses
+# GitHub-hosted runners instead for fork pull requests, the `ci-hosted` label,
+# the repository variable CI_RUNNERS (`hosted` or `hosted-windows`), and, when
+# the optional CI_RUNNER_STATUS_TOKEN secret can read the organization's
+# runners, when no matching self-hosted runner is free. Windows has one
+# self-hosted runner for the whole organization, so it is used only when that
+# token shows it free; otherwise Windows jobs take a hosted runner rather than
+# queue behind another repository's job. It also decides
+# whether anything the heavy jobs test changed; they report "skipped" when it
+# did not, which branch protection counts as passing. `ci-result` is the one
+# stable check to require.
 jobs:
-  conventional-commits:
+  plan:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      linux: ${{ steps.plan.outputs.linux }}
+      windows: ${{ steps.plan.outputs.windows }}
+      code_changed: ${{ steps.plan.outputs.code_changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Choose runners and detect code changes
+        id: plan
+        # Pull-request fields reach the script only through env, never the run text.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          REF_NAME: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CI_RUNNERS: ${{ vars.CI_RUNNERS }}
+          RUNNER_STATUS_TOKEN: ${{ secrets.CI_RUNNER_STATUS_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 execution/ci_plan.py
+
+  conventional-commits:
+    needs: plan
+    runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      - name: Check runner prerequisites
+        run: bash execution/ci_prepare.sh git > /dev/null
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -53,13 +108,16 @@ jobs:
         run: python execution/conventional_commits.py check-range "HEAD^!"
 
   release-version:
-    needs: conventional-commits
-    runs-on: ubuntu-latest
+    needs: plan
+    runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      - name: Check runner prerequisites
+        run: bash execution/ci_prepare.sh git > /dev/null
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -105,34 +163,28 @@ jobs:
       - name: Verify release metadata stays aligned
         run: python execution/version_sync.py check
 
-  rust:
-    needs: release-version
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+  lint:
+    needs: plan
+    if: needs.plan.outputs.code_changed != 'false'
+    runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Hosted-runner cleanup frees disk space for Rust builds.
-      - name: Free disk space for Rust builds
-        if: runner.environment == 'github-hosted'
-        run: bash execution/free_runner_disk.sh
-
-      - name: Report Rust build storage
+      - name: Check runner prerequisites and size build parallelism
         run: |
-          df -B1 "$GITHUB_WORKSPACE"
-          df -i "$GITHUB_WORKSPACE"
+          jobs="$(bash execution/ci_prepare.sh git curl tar sha256sum cc make cmake python3)"
+          echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
 
       # rust-toolchain.toml is the single source of truth for the toolchain
       # version; rustup resolves it natively (channel + components).
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: bash execution/ensure_rustup.sh
 
-      # Compiler cache: forge-ci/zccache 1.15.6 (tag commit
-      # 15ec9537af0d219e07b72ce2b3f97d5f68d72b5e), release archive checked
-      # against its published SHA-256. Every run restores; only pushes to main
-      # save (step "Save zccache"), so pull requests cannot write entries that
-      # main later reuses. ZCCACHE_MODE=COPY: hits are independent copies,
-      # never an inode shared with the cache.
+      # Every run restores; only pushes to main save (step "Save zccache"), so
+      # pull requests cannot write entries that main later reuses. The second
+      # restore key survives the lockfile change of each release bump; the
+      # cache is content-addressed, so an older entry only means fewer hits.
       - name: Restore zccache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -141,30 +193,13 @@ jobs:
             !${{ runner.temp }}/zccache/**/*.sock
             !${{ runner.temp }}/zccache/**/*.lock
             !${{ runner.temp }}/zccache/**/logs
-          key: zccache-1.15.6-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
           restore-keys: |
-            zccache-1.15.6-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            zccache-1.15.6-${{ runner.os }}-${{ github.job }}-
 
       - name: Install and start zccache 1.15.6
-        env:
-          ZCCACHE_URL: https://github.com/forge-ci/zccache/releases/download/1.15.6/zccache-v1.15.6-x86_64-unknown-linux-musl.tar.gz
-          ZCCACHE_SHA256: 885a109c758808480ebda6b92ac0c55ae55ff2638f0ef850423bb185f28e59f7
-        run: |
-          set -euo pipefail
-          dir="$RUNNER_TEMP/zccache-bin"
-          mkdir -p "$dir"
-          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$dir/zccache.tar.gz" "$ZCCACHE_URL"
-          printf '%s  %s\n' "$ZCCACHE_SHA256" "$dir/zccache.tar.gz" | sha256sum --check --strict
-          tar -xzf "$dir/zccache.tar.gz" -C "$dir" --strip-components=1
-          test "$("$dir/zccache" --version)" = "zccache 1.15.6"
-          echo "$dir" >> "$GITHUB_PATH"
-          {
-            echo "ZCCACHE_CACHE_DIR=$RUNNER_TEMP/zccache"
-            echo "ZCCACHE_MODE=COPY"
-            echo "RUSTC_WRAPPER=$dir/zccache"
-          } >> "$GITHUB_ENV"
-          ZCCACHE_CACHE_DIR="$RUNNER_TEMP/zccache" "$dir/zccache" start
-
+        run: bash execution/zccache_start.sh
 
       - name: Check Rust formatting
         run: cargo fmt --check
@@ -197,45 +232,282 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      # stel_golden_replay needs gitignored phase0 corpora; without this step the
-      # integration tests skip vacuously and CI misses regressions operators see
-      # after cloning per tests/fixtures/phase0-corpus/README.md.
-      - name: Clone phase0 golden-replay corpora
-        run: bash execution/clone_phase0_corpora.sh
+      - name: zccache stats and stop
+        if: ${{ always() }}
+        run: |
+          zccache status || true
+          zccache stop || true
+
+      - name: Save zccache
+        if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/zccache
+            !${{ runner.temp }}/zccache/**/*.sock
+            !${{ runner.temp }}/zccache/**/*.lock
+            !${{ runner.temp }}/zccache/**/logs
+          key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+
+  # Builds every test binary once and hands them to the `test` partitions as a
+  # nextest archive (https://nexte.st/docs/ci-features/archiving/). The test
+  # binaries embed absolute source and binary paths at compile time, so each
+  # partition must check out at this job's path; `workspace` lets it check.
+  test-build:
+    needs: plan
+    if: needs.plan.outputs.code_changed != 'false'
+    runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
+    timeout-minutes: 30
+    outputs:
+      workspace: ${{ steps.archive.outputs.workspace }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check runner prerequisites and size build parallelism
+        run: |
+          jobs="$(bash execution/ci_prepare.sh git curl tar jq sha256sum cc make cmake)"
+          echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: bash execution/ensure_rustup.sh
+
+      - name: Install nextest (prebuilt)
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Restore zccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/zccache
+            !${{ runner.temp }}/zccache/**/*.sock
+            !${{ runner.temp }}/zccache/**/*.lock
+            !${{ runner.temp }}/zccache/**/logs
+          key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            zccache-1.15.6-${{ runner.os }}-${{ github.job }}-
+
+      - name: Install and start zccache 1.15.6
+        run: bash execution/zccache_start.sh
+
+      # The same `--lib --bins --tests` selection as the serial suite: the
+      # criterion bench target (harness = false) has its own job.
+      - name: Build and archive the test binaries
+        id: archive
+        run: |
+          cargo nextest archive --lib --bins --tests --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
+          echo "workspace=$GITHUB_WORKSPACE" >> "$GITHUB_OUTPUT"
+          {
+            echo "- test build workspace: \`$GITHUB_WORKSPACE\`"
+            echo "- target/debug: $(du -sh target/debug | cut -f1), archive: $(du -sh "$RUNNER_TEMP/nextest-archive.tar.zst" | cut -f1)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the test archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Set up Node for the Slice 0 oracle
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      # Slice 0's product is positive controls that MUST fail, so the test
+      # partitions cannot check them: they run the default suite, where every
+      # control is `#[ignore]`d precisely so a deliberate RED does not turn main
+      # red. This runs them, reusing the test build above, and preserves the
+      # outcome as the contract's bounded CI-SLICE0 artifact -- one deterministic
+      # JSON record per case, no unbounded logs. It fails when a control STOPS
+      # failing, which means either a fix landed without its owning slice
+      # removing the attribute, or the control has gone vacuous.
+      - name: Preserve Feature 020 Slice 0 expected failures
+        id: slice0
+        run: node scripts/slice0-oracle-artifact.cjs
+
+      # Uploads whenever the oracle ran, pass or fail; when an earlier step
+      # failed it never ran, and a "no files found" here would bury that error.
+      - name: Upload Slice 0 oracle contract
+        if: ${{ always() && steps.slice0.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: feature-020-slice-0-oracle-contract
+          path: target/ci/lifecycle-v11/slice-0-oracle-contract.json
+          if-no-files-found: error
+
+      - name: zccache stats and stop
+        if: ${{ always() }}
+        run: |
+          zccache status || true
+          zccache stop || true
+
+      - name: Save zccache
+        if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/zccache
+            !${{ runner.temp }}/zccache/**/*.sock
+            !${{ runner.temp }}/zccache/**/*.lock
+            !${{ runner.temp }}/zccache/**/logs
+          key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+
+  # Runs the archived suite in four slices, one process per test (nextest,
+  # .config/nextest.toml: 8 test threads, one reported retry). Needs only a
+  # checkout, git, node and nextest: no Rust toolchain, no build. The serial
+  # `--test-threads=1` gate the constitution names runs in `serial-suite`.
+  test:
+    name: test (${{ matrix.partition }}/4)
+    needs: [plan, test-build]
+    if: needs.plan.outputs.code_changed != 'false'
+    runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check runner prerequisites
+        run: bash execution/ci_prepare.sh git curl tar jq > /dev/null
+
+      - name: Check the checkout path and isolate the test home
+        env:
+          BUILD_WORKSPACE: ${{ needs.test-build.outputs.workspace }}
+        run: |
+          if [ "$BUILD_WORKSPACE" != "$GITHUB_WORKSPACE" ]; then
+            echo "::error::The test binaries were built in $BUILD_WORKSPACE and embed that path at compile time, but this runner checked out to $GITHUB_WORKSPACE. Give the self-hosted runners one work directory, or set the repository variable CI_RUNNERS=hosted."
+            exit 1
+          fi
+          echo "SYMFORGE_HOME=$RUNNER_TEMP/symforge-test-home" >> "$GITHUB_ENV"
+
+      # One test spawns `rustc` to compile a probe file
+      # (src/edit_safety/structural.rs, rust_insert_before_keeps_disabled_code_disabled),
+      # so the slices need the pinned compiler, minimal profile, no build.
+      - name: Install rustc only (rust-toolchain.toml channel)
+        run: |
+          # Prints the installed version itself; GITHUB_PATH puts rustc on
+          # PATH from the next step on, so it is not called here.
+          bash execution/ensure_rustup.sh --minimal
 
       - name: Set up Node for tests that spawn node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
-      - name: Run Rust tests
-        # `--lib --bins --tests`, not `--all-targets`: the trailing libtest
-        # flag is forwarded to EVERY selected binary, and the criterion
-        # bench target (harness = false, T068) rejects `--test-threads`.
-        # The bench's own smoke gate runs it in criterion's --test mode.
-        run: cargo test --lib --bins --tests -- --test-threads=1
+      # stel_golden_replay needs gitignored phase0 corpora; without this step the
+      # integration tests skip vacuously and CI misses regressions operators see
+      # after cloning per tests/fixtures/phase0-corpus/README.md.
+      - name: Clone phase0 golden-replay corpora
+        run: bash execution/clone_phase0_corpora.sh
+
+      - name: Install nextest (prebuilt)
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Download the test archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}
+
+      # --extract-to puts target/ back where the build job had it, inside the
+      # checkout, so the compile-time paths resolve.
+      - name: Run tests (process-per-test, one slice)
+        env:
+          PARTITION: ${{ matrix.partition }}
+        run: cargo-nextest nextest run --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" --extract-to "$GITHUB_WORKSPACE" --partition "slice:$PARTITION/4" --no-fail-fast
+
+  bench:
+    needs: plan
+    if: needs.plan.outputs.code_changed != 'false'
+    runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check runner prerequisites and size build parallelism
+        run: |
+          jobs="$(bash execution/ci_prepare.sh git curl tar sha256sum cc make cmake)"
+          echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: bash execution/ensure_rustup.sh
+
+      - name: Restore zccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/zccache
+            !${{ runner.temp }}/zccache/**/*.sock
+            !${{ runner.temp }}/zccache/**/*.lock
+            !${{ runner.temp }}/zccache/**/logs
+          key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            zccache-1.15.6-${{ runner.os }}-${{ github.job }}-
+
+      - name: Install and start zccache 1.15.6
+        run: bash execution/zccache_start.sh
 
       - name: Smoke the observed-refresh benchmark (criterion --test mode)
         run: cargo bench --bench observed_refresh_gate_v1 -- --test
 
-      # Slice 0's product is positive controls that MUST fail, so the step above
-      # cannot check them: it runs the default suite, where every control is
-      # `#[ignore]`d precisely so a deliberate RED does not turn main red. This
-      # runs them and preserves the outcome as the contract's bounded CI-SLICE0
-      # artifact -- one deterministic JSON record per case, no unbounded logs.
-      # It fails when a control STOPS failing, which means either a fix landed
-      # without its owning slice removing the attribute, or the control has gone
-      # vacuous.
-      - name: Preserve Feature 020 Slice 0 expected failures
-        run: node scripts/slice0-oracle-artifact.cjs
-
-      - name: Upload Slice 0 oracle contract
+      - name: zccache stats and stop
         if: ${{ always() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        run: |
+          zccache status || true
+          zccache stop || true
+
+      - name: Save zccache
+        if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          name: feature-020-slice-0-oracle-contract
-          path: target/ci/lifecycle-v11/slice-0-oracle-contract.json
-          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/zccache
+            !${{ runner.temp }}/zccache/**/*.sock
+            !${{ runner.temp }}/zccache/**/*.lock
+            !${{ runner.temp }}/zccache/**/logs
+          key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+
+  release-build:
+    needs: plan
+    if: needs.plan.outputs.code_changed != 'false'
+    runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check runner prerequisites and size build parallelism
+        run: |
+          jobs="$(bash execution/ci_prepare.sh git curl tar sha256sum cc make cmake)"
+          echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: bash execution/ensure_rustup.sh
+
+      - name: Restore zccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/zccache
+            !${{ runner.temp }}/zccache/**/*.sock
+            !${{ runner.temp }}/zccache/**/*.lock
+            !${{ runner.temp }}/zccache/**/logs
+          key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            zccache-1.15.6-${{ runner.os }}-${{ github.job }}-
+
+      - name: Install and start zccache 1.15.6
+        run: bash execution/zccache_start.sh
 
       - name: Build release binary
         run: cargo build --release
@@ -272,31 +544,24 @@ jobs:
             !${{ runner.temp }}/zccache/**/*.sock
             !${{ runner.temp }}/zccache/**/*.lock
             !${{ runner.temp }}/zccache/**/logs
-          key: zccache-1.15.6-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
 
   embed-build:
-    needs: release-version
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    needs: plan
+    if: needs.plan.outputs.code_changed != 'false'
+    runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Report Rust build storage
+      - name: Check runner prerequisites and size build parallelism
         run: |
-          df -B1 "$GITHUB_WORKSPACE"
-          df -i "$GITHUB_WORKSPACE"
+          jobs="$(bash execution/ci_prepare.sh git curl tar sha256sum cc make cmake)"
+          echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
 
-      # rust-toolchain.toml is the single source of truth for the toolchain
-      # version; rustup resolves it natively (channel + components).
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: bash execution/ensure_rustup.sh
 
-      # Compiler cache: forge-ci/zccache 1.15.6 (tag commit
-      # 15ec9537af0d219e07b72ce2b3f97d5f68d72b5e), release archive checked
-      # against its published SHA-256. Every run restores; only pushes to main
-      # save (step "Save zccache"), so pull requests cannot write entries that
-      # main later reuses. ZCCACHE_MODE=COPY: hits are independent copies,
-      # never an inode shared with the cache.
       - name: Restore zccache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -305,30 +570,13 @@ jobs:
             !${{ runner.temp }}/zccache/**/*.sock
             !${{ runner.temp }}/zccache/**/*.lock
             !${{ runner.temp }}/zccache/**/logs
-          key: zccache-1.15.6-${{ runner.os }}-embed-build-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
           restore-keys: |
-            zccache-1.15.6-${{ runner.os }}-embed-build-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            zccache-1.15.6-${{ runner.os }}-${{ github.job }}-
 
       - name: Install and start zccache 1.15.6
-        env:
-          ZCCACHE_URL: https://github.com/forge-ci/zccache/releases/download/1.15.6/zccache-v1.15.6-x86_64-unknown-linux-musl.tar.gz
-          ZCCACHE_SHA256: 885a109c758808480ebda6b92ac0c55ae55ff2638f0ef850423bb185f28e59f7
-        run: |
-          set -euo pipefail
-          dir="$RUNNER_TEMP/zccache-bin"
-          mkdir -p "$dir"
-          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$dir/zccache.tar.gz" "$ZCCACHE_URL"
-          printf '%s  %s\n' "$ZCCACHE_SHA256" "$dir/zccache.tar.gz" | sha256sum --check --strict
-          tar -xzf "$dir/zccache.tar.gz" -C "$dir" --strip-components=1
-          test "$("$dir/zccache" --version)" = "zccache 1.15.6"
-          echo "$dir" >> "$GITHUB_PATH"
-          {
-            echo "ZCCACHE_CACHE_DIR=$RUNNER_TEMP/zccache"
-            echo "ZCCACHE_MODE=COPY"
-            echo "RUSTC_WRAPPER=$dir/zccache"
-          } >> "$GITHUB_ENV"
-          ZCCACHE_CACHE_DIR="$RUNNER_TEMP/zccache" "$dir/zccache" start
-
+        run: bash execution/zccache_start.sh
 
       # Engine-only build for library embedders (e.g. AAP): no daemon / sidecar /
       # protocol-server / CLI surface. Makes "an embedder can build symforge" a
@@ -352,12 +600,12 @@ jobs:
       - name: Run embed parity and replay contracts
         run: |
           set -euo pipefail
-          cargo test --no-default-features --features embed,__test-internals --test embed_parity --test embed_replay_v1 --test embed_aap_refresh_s14_s16 -- --test-threads=1 2>&1 | tee /tmp/embed-parity-replay.log
-          if grep -E 'running 0 tests' /tmp/embed-parity-replay.log; then
+          cargo test --no-default-features --features embed,__test-internals --test embed_parity --test embed_replay_v1 --test embed_aap_refresh_s14_s16 -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/embed-parity-replay.log"
+          if grep -E 'running 0 tests' "$RUNNER_TEMP/embed-parity-replay.log"; then
             echo 'embed_parity, embed_replay_v1, or embed_aap_refresh_s14_s16 executed zero tests' >&2
             exit 1
           fi
-          matches=$(grep -cE 'test result: ok\. [1-9][0-9]* passed' /tmp/embed-parity-replay.log || true)
+          matches=$(grep -cE 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/embed-parity-replay.log" || true)
           test "$matches" -ge 3
 
       - name: zccache stats and stop
@@ -375,35 +623,24 @@ jobs:
             !${{ runner.temp }}/zccache/**/*.sock
             !${{ runner.temp }}/zccache/**/*.lock
             !${{ runner.temp }}/zccache/**/logs
-          key: zccache-1.15.6-${{ runner.os }}-embed-build-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
 
   server-embed-parity:
-    needs: release-version
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    needs: plan
+    if: needs.plan.outputs.code_changed != 'false'
+    runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Report Rust build storage
+      - name: Check runner prerequisites and size build parallelism
         run: |
-          df -B1 "$GITHUB_WORKSPACE"
-          df -i "$GITHUB_WORKSPACE"
-
-      # Same hosted-only cleanup the rust job uses: all-targets, all-features
-      # clippy plus tests is the widest build in this workflow.
-      - name: Free disk space for Rust builds
-        if: runner.environment == 'github-hosted'
-        run: bash execution/free_runner_disk.sh
+          jobs="$(bash execution/ci_prepare.sh git curl tar sha256sum cc make cmake)"
+          echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: bash execution/ensure_rustup.sh
 
-      # Compiler cache: forge-ci/zccache 1.15.6 (tag commit
-      # 15ec9537af0d219e07b72ce2b3f97d5f68d72b5e), release archive checked
-      # against its published SHA-256. Every run restores; only pushes to main
-      # save (step "Save zccache"), so pull requests cannot write entries that
-      # main later reuses. ZCCACHE_MODE=COPY: hits are independent copies,
-      # never an inode shared with the cache.
       - name: Restore zccache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -412,29 +649,13 @@ jobs:
             !${{ runner.temp }}/zccache/**/*.sock
             !${{ runner.temp }}/zccache/**/*.lock
             !${{ runner.temp }}/zccache/**/logs
-          key: zccache-1.15.6-${{ runner.os }}-server-embed-parity-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
           restore-keys: |
-            zccache-1.15.6-${{ runner.os }}-server-embed-parity-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            zccache-1.15.6-${{ runner.os }}-${{ github.job }}-
 
       - name: Install and start zccache 1.15.6
-        env:
-          ZCCACHE_URL: https://github.com/forge-ci/zccache/releases/download/1.15.6/zccache-v1.15.6-x86_64-unknown-linux-musl.tar.gz
-          ZCCACHE_SHA256: 885a109c758808480ebda6b92ac0c55ae55ff2638f0ef850423bb185f28e59f7
-        run: |
-          set -euo pipefail
-          dir="$RUNNER_TEMP/zccache-bin"
-          mkdir -p "$dir"
-          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$dir/zccache.tar.gz" "$ZCCACHE_URL"
-          printf '%s  %s\n' "$ZCCACHE_SHA256" "$dir/zccache.tar.gz" | sha256sum --check --strict
-          tar -xzf "$dir/zccache.tar.gz" -C "$dir" --strip-components=1
-          test "$("$dir/zccache" --version)" = "zccache 1.15.6"
-          echo "$dir" >> "$GITHUB_PATH"
-          {
-            echo "ZCCACHE_CACHE_DIR=$RUNNER_TEMP/zccache"
-            echo "ZCCACHE_MODE=COPY"
-            echo "RUSTC_WRAPPER=$dir/zccache"
-          } >> "$GITHUB_ENV"
-          ZCCACHE_CACHE_DIR="$RUNNER_TEMP/zccache" "$dir/zccache" start
+        run: bash execution/zccache_start.sh
 
       - name: Run all-targets, all-features Clippy
         run: cargo clippy --all-targets --all-features --keep-going -- -D warnings
@@ -442,11 +663,11 @@ jobs:
       - name: Run server and embed parity tests
         run: |
           set -euo pipefail
-          cargo test --features embed,__test-internals --lib server_and_embed_ -- --test-threads=1 2>&1 | tee /tmp/server-embed-parity.log
-          grep -q '^test result: ok\. 2 passed; 0 failed;' /tmp/server-embed-parity.log
+          cargo test --features embed,__test-internals --lib server_and_embed_ -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/server-embed-parity.log"
+          grep -q '^test result: ok\. 2 passed; 0 failed;' "$RUNNER_TEMP/server-embed-parity.log"
 
       # The integration tests gated on `embed` compile only with it on, and no
-      # other job runs them; the rest already run in the `rust` job.
+      # other job runs them; the rest already run in the `test` partitions.
       # `__test-internals` is required by the files gated on both features.
       # tests/ci_embed_selection.rs fails when an embed-gated file is not selected.
       - name: Run server and embed integration tests
@@ -467,14 +688,20 @@ jobs:
             !${{ runner.temp }}/zccache/**/*.sock
             !${{ runner.temp }}/zccache/**/*.lock
             !${{ runner.temp }}/zccache/**/logs
-          key: zccache-1.15.6-${{ runner.os }}-server-embed-parity-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
 
   embed-musl:
-    needs: release-version
-    runs-on: ubuntu-latest
+    needs: plan
+    if: needs.plan.outputs.code_changed != 'false'
+    runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check runner prerequisites and size build parallelism
+        run: |
+          jobs="$(bash execution/ci_prepare.sh git curl tar sha256sum cc make cmake)"
+          echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
 
       # rust-toolchain.toml is the single source of truth for the toolchain
       # version; rustup resolves it natively. A hardcoded `toolchain:` input
@@ -485,12 +712,6 @@ jobs:
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: bash execution/ensure_rustup.sh target add x86_64-unknown-linux-musl
 
-      # Compiler cache: forge-ci/zccache 1.15.6 (tag commit
-      # 15ec9537af0d219e07b72ce2b3f97d5f68d72b5e), release archive checked
-      # against its published SHA-256. Every run restores; only pushes to main
-      # save (step "Save zccache"), so pull requests cannot write entries that
-      # main later reuses. ZCCACHE_MODE=COPY: hits are independent copies,
-      # never an inode shared with the cache.
       - name: Restore zccache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -499,30 +720,13 @@ jobs:
             !${{ runner.temp }}/zccache/**/*.sock
             !${{ runner.temp }}/zccache/**/*.lock
             !${{ runner.temp }}/zccache/**/logs
-          key: zccache-1.15.6-${{ runner.os }}-embed-musl-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
           restore-keys: |
-            zccache-1.15.6-${{ runner.os }}-embed-musl-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            zccache-1.15.6-${{ runner.os }}-${{ github.job }}-
 
       - name: Install and start zccache 1.15.6
-        env:
-          ZCCACHE_URL: https://github.com/forge-ci/zccache/releases/download/1.15.6/zccache-v1.15.6-x86_64-unknown-linux-musl.tar.gz
-          ZCCACHE_SHA256: 885a109c758808480ebda6b92ac0c55ae55ff2638f0ef850423bb185f28e59f7
-        run: |
-          set -euo pipefail
-          dir="$RUNNER_TEMP/zccache-bin"
-          mkdir -p "$dir"
-          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$dir/zccache.tar.gz" "$ZCCACHE_URL"
-          printf '%s  %s\n' "$ZCCACHE_SHA256" "$dir/zccache.tar.gz" | sha256sum --check --strict
-          tar -xzf "$dir/zccache.tar.gz" -C "$dir" --strip-components=1
-          test "$("$dir/zccache" --version)" = "zccache 1.15.6"
-          echo "$dir" >> "$GITHUB_PATH"
-          {
-            echo "ZCCACHE_CACHE_DIR=$RUNNER_TEMP/zccache"
-            echo "ZCCACHE_MODE=COPY"
-            echo "RUSTC_WRAPPER=$dir/zccache"
-          } >> "$GITHUB_ENV"
-          ZCCACHE_CACHE_DIR="$RUNNER_TEMP/zccache" "$dir/zccache" start
-
+        run: bash execution/zccache_start.sh
 
       # Cross-compile the engine-only embed build to musl. AAP compiles the
       # SymForge engine inside musl guest-agent VMs, so a musl regression must
@@ -531,7 +735,7 @@ jobs:
       # musl-tools provides musl-gcc; the embed build statically links C deps
       # built by the `cc` crate (19 tree-sitter grammars, rusqlite `bundled`
       # sqlite) and by libgit2-sys (git2 `vendored-libgit2`, built via cmake,
-      # which is preinstalled on ubuntu-latest). Both `cc` and cmake-rs honor
+      # which the prerequisites step supplies when missing). Both `cc` and cmake-rs honor
       # the target-scoped CC env var, so pointing it at musl-gcc makes every
       # C-compiled crate link cleanly against musl. All currently pinned
       # tree-sitter grammars ship pure-C scanners; if a future grammar bump
@@ -566,15 +770,54 @@ jobs:
             !${{ runner.temp }}/zccache/**/*.sock
             !${{ runner.temp }}/zccache/**/*.lock
             !${{ runner.temp }}/zccache/**/logs
-          key: zccache-1.15.6-${{ runner.os }}-embed-musl-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+
+  # The constitution (principle IV) names the serial suite as a gate. Pull
+  # requests and pushes run the same tests through nextest partitions; this
+  # runs them the old way, one test thread per binary, every day and on demand.
+  serial-suite:
+    needs: plan
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check runner prerequisites and size build parallelism
+        run: |
+          jobs="$(bash execution/ci_prepare.sh git curl tar sha256sum cc make cmake)"
+          echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: bash execution/ensure_rustup.sh
+
+      - name: Clone phase0 golden-replay corpora
+        run: bash execution/clone_phase0_corpora.sh
+
+      - name: Set up Node for tests that spawn node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Run Rust tests
+        # `--lib --bins --tests`, not `--all-targets`: the trailing libtest
+        # flag is forwarded to EVERY selected binary, and the criterion
+        # bench target (harness = false, T068) rejects `--test-threads`.
+        # The bench's own smoke gate runs it in criterion's --test mode.
+        run: cargo test --lib --bins --tests -- --test-threads=1
 
   performance-smoke:
-    needs: release-version
+    needs: plan
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check runner prerequisites and size build parallelism
+        run: |
+          jobs="$(bash execution/ci_prepare.sh git curl tar sha256sum cc make cmake)"
+          echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
 
       # rust-toolchain.toml is the single source of truth for the toolchain
       # version; rustup resolves it natively (channel + components).
@@ -590,25 +833,32 @@ jobs:
       - name: Run ignored large-file indexing timing test
         run: cargo test --release --lib large_rust_file_indexing_is_linear_and_unchanged -- --ignored --test-threads=1
 
+  # Its only input is the lockfile and the advisory database, which changes
+  # daily, so it runs on every event.
   advisories:
-    needs: release-version
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    needs: plan
+    runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check runner prerequisites
+        run: bash execution/ci_prepare.sh git curl tar jq > /dev/null
 
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: bash execution/ensure_rustup.sh
 
-      - name: Install dependency advisory checker
-        run: cargo install cargo-deny --locked
+      - name: Install dependency advisory checker (prebuilt)
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-deny
 
       - name: Check dependency advisories
         run: cargo deny check advisories
 
   npm:
-    needs: release-version
-    runs-on: ubuntu-latest
+    needs: plan
+    runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -621,39 +871,100 @@ jobs:
         working-directory: npm
         run: npm test
 
+  # The self-hosted Windows runner is the owner's workstation, not an isolated
+  # VM: everything this job writes (toolchain, registry, build output, temp
+  # files, test home, the checkout) stays inside the runner's work directory
+  # and the last step deletes it, even on failure or cancellation. On
+  # GitHub-hosted Windows the VM is discarded, so only the test home moves.
+  # One machine cannot run test partitions in parallel, so the suite is not
+  # split here.
   windows-native:
-    needs: release-version
-    # Runs on GitHub-hosted Windows: the repo is public, so hosted minutes are free.
-    runs-on: windows-latest
-    timeout-minutes: 90
+    needs: plan
+    if: needs.plan.outputs.code_changed != 'false'
+    runs-on: ${{ fromJSON(needs.plan.outputs.windows) }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        # PowerShell, not bash: on the workstation a bare `bash` resolves to
+        # something that is not Git Bash (WSL, found in #854), and the runner
+        # does not honour a quoted shell path (PR #883's first run). The
+        # runner checks only the last native command's exit code, so steps
+        # with several check each one.
+        shell: pwsh
     steps:
-      # Keep test runs off the runner's real control-state home; live daemons
-      # and other processes must never share coordination state with them
-      # (see .config/nextest.toml). `prepare_control_state_dir` creates the
-      # directory on first use. The runner context is not available in
-      # job-level env, so the variable is exported from a step instead.
-      - name: Point SYMFORGE_HOME at a throwaway home
-        shell: bash
-        run: echo "SYMFORGE_HOME=$RUNNER_TEMP/symforge-test-home" >> "$GITHUB_ENV"
+      - name: Keep every file this job writes inside the runner work directory
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'symforge-ci'
+          New-Item -ItemType Directory -Force -Path (Join-Path $root 'bin'), (Join-Path $root 'tmp') | Out-Null
+          $cpus = [Environment]::ProcessorCount
+          $lines = @(
+            "CI_ROOT=$root"
+            "SYMFORGE_HOME=$root\symforge-test-home"
+            # The workstation's commit limit is exhausted by 16-way parallel builds.
+            "CARGO_BUILD_JOBS=$([Math]::Min($cpus, 8))"
+          )
+          if ($env:RUNNER_ENVIRONMENT -eq 'self-hosted') {
+            $lines += @(
+              "TMP=$root\tmp"
+              "TEMP=$root\tmp"
+              "CARGO_HOME=$root\cargo-home"
+              "RUSTUP_HOME=$root\rustup-home"
+              "CARGO_TARGET_DIR=$root\target"
+            )
+          }
+          $lines | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # rust-toolchain.toml is the single source of truth for the toolchain
-      # version; rustup resolves it natively (channel + components).
+      # version; rustup resolves it natively (channel + components). The
+      # machine's rustup binary is used read-only; on the workstation the
+      # toolchain installs into RUSTUP_HOME under the job directory.
       - name: Install Rust toolchain (rust-toolchain.toml)
-        shell: bash
-        run: bash execution/ensure_rustup.sh
+        run: |
+          $rustup = (Get-Command rustup -ErrorAction SilentlyContinue).Source
+          $userRustup = Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe'
+          if (-not $rustup -and (Test-Path -LiteralPath $userRustup)) { $rustup = $userRustup }
+          if (-not $rustup) {
+            Write-Output "::error::rustup is not installed on this Windows runner. Install it, or set the repository variable CI_RUNNERS=hosted-windows."
+            exit 1
+          }
+          $proxies = Split-Path -Parent $rustup
+          $proxies | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $env:PATH = "$proxies;$env:PATH"
+          rustup toolchain install
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-      - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked
+      # Not taiki-e/install-action here: on Windows it writes to
+      # %USERPROFILE%\.install-action and installs next to whichever toolchain
+      # proxy is on PATH, which on the workstation is the owner's own.
+      - name: Install nextest (prebuilt, checksum-verified)
+        env:
+          NEXTEST_URL: https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${{ env.NEXTEST_VERSION }}/cargo-nextest-${{ env.NEXTEST_VERSION }}-x86_64-pc-windows-msvc.tar.gz
+          NEXTEST_SHA256: e51bdb4b5883df48f335381b287378edb244318fac65ae0adaf6b9e69298246b
+        run: |
+          $bin = Join-Path $env:CI_ROOT 'bin'
+          $archive = Join-Path $bin 'nextest.tar.gz'
+          Invoke-WebRequest -Uri $env:NEXTEST_URL -OutFile $archive -MaximumRetryCount 5 -RetryIntervalSec 2
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          if ($actual -ne $env:NEXTEST_SHA256) {
+            Write-Output "::error::nextest archive SHA-256 $actual does not match the pinned $env:NEXTEST_SHA256"
+            exit 1
+          }
+          # Windows' own bsdtar: a GNU tar earlier on PATH reads `C:` as a remote host.
+          & (Join-Path $env:SystemRoot 'System32\tar.exe') -xzf $archive -C $bin
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Remove-Item -LiteralPath $archive
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       - name: Check Rust formatting
         run: cargo fmt --check
 
-      # stel_golden_replay needs gitignored phase0 corpora (see the rust job).
+      # stel_golden_replay needs gitignored phase0 corpora (see the test job).
       - name: Clone phase0 golden-replay corpora
-        shell: bash
-        run: bash execution/clone_phase0_corpora.sh
+        run: ./execution/clone_phase0_corpora.ps1
 
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -670,3 +981,97 @@ jobs:
       - name: Run server and embed parity tests
         # --no-tests=fail makes a stale or misconfigured test filter fail CI.
         run: cargo nextest run --features embed,__test-internals --lib --no-tests=fail -E 'test(server_and_embed_)'
+
+      - name: Delete everything this job wrote (self-hosted)
+        if: ${{ always() && runner.environment == 'self-hosted' }}
+        working-directory: ${{ runner.temp }}
+        # From the runner's own contexts, not from variables earlier steps (or a
+        # build script writing GITHUB_ENV) could have rewritten.
+        env:
+          CLEAN_TEMP: ${{ runner.temp }}
+          CLEAN_WORKSPACE: ${{ github.workspace }}
+        run: |
+          foreach ($base in @($env:CLEAN_TEMP, $env:CLEAN_WORKSPACE)) {
+            if (-not $base -or -not [System.IO.Path]::IsPathRooted($base) -or
+                ([System.IO.Path]::GetPathRoot($base).TrimEnd('\') -eq $base.TrimEnd('\'))) {
+              Write-Output "::error::refusing to delete under '$base': empty, relative or a drive root"
+              exit 1
+            }
+          }
+          $ciRoot = Join-Path $env:CLEAN_TEMP 'symforge-ci'
+          $workspace = $env:CLEAN_WORKSPACE.TrimEnd('\')
+          $roots = @($ciRoot, $workspace)
+          # Test daemons still running from these trees would hold their files open.
+          Get-Process | Where-Object {
+            $path = $_.Path
+            $path -and ($roots | Where-Object { $path.StartsWith($_ + '\', [StringComparison]::OrdinalIgnoreCase) })
+          } | ForEach-Object {
+            Write-Output "stopping $($_.Name) ($($_.Id))"
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+          }
+          # A root that is itself a junction or symlink is never followed: only
+          # the link is removed, so the directory it points at keeps its files.
+          function Test-Link([string]$path) {
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            [bool]($item -and ($item.LinkType -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)))
+          }
+          foreach ($root in $roots) {
+            if (Test-Link $root) {
+              Write-Output "::warning::$root is a link; removing the link only"
+              [System.IO.Directory]::Delete($root, $false)
+            }
+          }
+          # The runner starts the post-job steps inside the checkout directory.
+          if (-not (Test-Path -LiteralPath $workspace)) { New-Item -ItemType Directory -Path $workspace | Out-Null }
+          # The job directory goes entirely; the checkout directory itself stays,
+          # emptied.
+          for ($i = 0; $i -lt 5; $i++) {
+            Remove-Item -LiteralPath $ciRoot -Recurse -Force -ErrorAction SilentlyContinue
+            Get-ChildItem -LiteralPath $workspace -Force -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            $left = @()
+            if (Test-Path -LiteralPath $ciRoot) { $left += $ciRoot }
+            if (Get-ChildItem -LiteralPath $workspace -Force -ErrorAction SilentlyContinue) { $left += "contents of $workspace" }
+            if (-not $left) { break }
+            Start-Sleep -Seconds 3
+          }
+          if ($left) {
+            Write-Output "::error::could not delete: $($left -join ', ')"
+            exit 1
+          }
+          Write-Output "deleted $ciRoot and the contents of $workspace"
+
+  # The one stable check for branch protection: fails unless every job passed
+  # or was skipped by design.
+  ci-result:
+    if: ${{ always() }}
+    needs:
+      - plan
+      - conventional-commits
+      - release-version
+      - lint
+      - test-build
+      - test
+      - bench
+      - release-build
+      - embed-build
+      - server-embed-parity
+      - embed-musl
+      - serial-suite
+      - performance-smoke
+      - advisories
+      - npm
+      - windows-native
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to pass or be skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "- \(.key): \(.value.result)"' <<<"$RESULTS" | tee -a "$GITHUB_STEP_SUMMARY"
+          failed="$(jq -r '[to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key] | join(", ")' <<<"$RESULTS")"
+          if [ -n "$failed" ]; then
+            echo "::error::jobs that did not pass: $failed"
+            exit 1
+          fi

@@ -1538,8 +1538,13 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// silent.
 // ci.yml's server-embed integration step runs the embed-gated binaries by name
 // (`--test` selectors only, pinned in CARGO_LINES); no doctest lane.
+// Refreshed 2026-11-12 for the runner-slot split of ci.yml: the suite moved to
+// a `cargo nextest archive` build plus nextest partitions (nextest never builds
+// doctests), the serial `--lib --bins --tests` gate moved to the scheduled run,
+// and every new cargo-mentioning line is an env assignment, a cache key, a
+// download, or that archive; census 91/53/2.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "937360af9738245a:30158"),
+    ("ci.yml", "3f4a18c2a554b992:48758"),
     ("release.yml", "b174946ff2c434bb:115022"),
 ];
 
@@ -1607,7 +1612,28 @@ const CARGO_LINES: &[(&str, usize)] = &[
         1,
     ),
     ("- name: Run cargo check", 1),
-    ("CARGO_BUILD_JOBS: \"2\"", 2),
+    ("CARGO_BUILD_JOBS: \"2\"", 1),
+    // ci.yml sizes build parallelism per job from the runner's CPUs and
+    // memory (execution/ci_prepare.sh prints a number), and on Windows keeps
+    // the toolchain home and build output inside the runner work directory.
+    // Environment assignments: none starts a process or names a doctest lane.
+    ("echo \"CARGO_BUILD_JOBS=$jobs\" >> \"$GITHUB_ENV\"", 9),
+    // PowerShell string items the Windows job appends to GITHUB_ENV.
+    (r#""CARGO_BUILD_JOBS=$([Math]::Min($cpus, 8))""#, 1),
+    (r#""CARGO_HOME=$root\cargo-home""#, 1),
+    (r#""CARGO_TARGET_DIR=$root\target""#, 1),
+    // A path to the machine's rustup binary and a download URL for the
+    // prebuilt nextest binary: data, not commands.
+    (
+        r#"$userRustup = Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe'"#,
+        1,
+    ),
+    (
+        "NEXTEST_URL: https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${{ env.NEXTEST_VERSION }}/cargo-nextest-${{ env.NEXTEST_VERSION }}-x86_64-pc-windows-msvc.tar.gz",
+        1,
+    ),
+    // taiki-e/install-action input naming a prebuilt binary to download.
+    ("tool: cargo-deny", 1),
     // These workflow-level settings only control Cargo build artifacts; they
     // cannot start Cargo commands or enable doctest compilation.
     ("CARGO_INCREMENTAL: \"0\"", 2),
@@ -1624,40 +1650,17 @@ const CARGO_LINES: &[(&str, usize)] = &[
     ("builder: cargo", 2),
     ("cargo-publish:", 1),
     ("environment: cargo-publish", 1),
-    // zccache cache keys and restore-key prefixes (#831). They name
-    // `Cargo.lock` only as a `hashFiles` input to an actions/cache key; a
-    // cache key starts no process and cannot select a doctest lane.
+    // zccache cache keys and restore-key prefixes (#831), one restore and one
+    // save per caching job, scoped by `github.job`. They name `Cargo.lock`
+    // only as a `hashFiles` input to an actions/cache key; a cache key starts
+    // no process and cannot select a doctest lane.
     (
-        "key: zccache-1.15.6-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}",
-        2,
+        "key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}",
+        14,
     ),
     (
-        "zccache-1.15.6-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-",
-        1,
-    ),
-    (
-        "key: zccache-1.15.6-${{ runner.os }}-embed-build-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}",
-        2,
-    ),
-    (
-        "zccache-1.15.6-${{ runner.os }}-embed-build-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-",
-        1,
-    ),
-    (
-        "key: zccache-1.15.6-${{ runner.os }}-server-embed-parity-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}",
-        2,
-    ),
-    (
-        "zccache-1.15.6-${{ runner.os }}-server-embed-parity-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-",
-        1,
-    ),
-    (
-        "key: zccache-1.15.6-${{ runner.os }}-embed-musl-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}",
-        2,
-    ),
-    (
-        "zccache-1.15.6-${{ runner.os }}-embed-musl-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-",
-        1,
+        "zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-",
+        7,
     ),
     // Commands that invoke no test harness at all.
     ("[\"cargo\", \"metadata\", \"--format-version\", \"1\"],", 1),
@@ -1720,11 +1723,11 @@ const CARGO_LINES: &[(&str, usize)] = &[
         1,
     ),
     (
-        "cargo test --no-default-features --features embed,__test-internals --test embed_parity --test embed_replay_v1 --test embed_aap_refresh_s14_s16 -- --test-threads=1 2>&1 | tee /tmp/embed-parity-replay.log",
+        "cargo test --no-default-features --features embed,__test-internals --test embed_parity --test embed_replay_v1 --test embed_aap_refresh_s14_s16 -- --test-threads=1 2>&1 | tee \"$RUNNER_TEMP/embed-parity-replay.log\"",
         1,
     ),
     (
-        "cargo test --features embed,__test-internals --lib server_and_embed_ -- --test-threads=1 2>&1 | tee /tmp/server-embed-parity.log",
+        "cargo test --features embed,__test-internals --lib server_and_embed_ -- --test-threads=1 2>&1 | tee \"$RUNNER_TEMP/server-embed-parity.log\"",
         1,
     ),
     // The embed-gated integration binaries by name (`--test` selects
@@ -1755,16 +1758,25 @@ const CARGO_LINES: &[(&str, usize)] = &[
         "run: cargo test --release --lib large_rust_file_indexing_is_linear_and_unchanged -- --ignored --test-threads=1",
         1,
     ),
-    // Advisories job: an install and a database check. No test harness runs.
-    ("run: cargo install cargo-deny --locked", 1),
+    // Advisories job: a database check (the checker is a prebuilt download).
+    // No test harness runs.
     ("run: cargo deny check advisories", 1),
     // Windows-native job. No test harness: nextest never builds or runs
-    // doctests, the install line is a binary fetch, and the fmt/clippy
-    // gates cannot reach the doctest lane.
-    ("- name: Install cargo-nextest", 1),
-    ("run: cargo install cargo-nextest --locked", 1),
+    // doctests, and the fmt/clippy gates cannot reach the doctest lane.
     ("run: cargo check --no-default-features --features embed", 1),
     ("run: cargo nextest run --no-fail-fast", 1),
+    // Linux test split. `cargo nextest archive` builds the same
+    // `--lib --bins --tests` selection as the serial gate and nextest never
+    // builds or runs doctests; the partitions run that archive with the
+    // standalone nextest binary, which builds nothing.
+    (
+        "cargo nextest archive --lib --bins --tests --archive-file \"$RUNNER_TEMP/nextest-archive.tar.zst\"",
+        1,
+    ),
+    (
+        "run: cargo-nextest nextest run --archive-file \"$RUNNER_TEMP/nextest-archive.tar.zst\" --extract-to \"$GITHUB_WORKSPACE\" --partition \"slice:$PARTITION/4\" --no-fail-fast",
+        1,
+    ),
 ];
 
 /// Exact ignore rules that justify the two source-tree skips below. This is a
@@ -2619,8 +2631,8 @@ fn no_gate_builds_doctests() {
     let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!(
         (seen.len(), distinct.len(), files),
-        (69, 53, 2),
-        "the CI workflows hold sixty-nine cargo-mentioning lines, fifty-three \
+        (91, 53, 2),
+        "the CI workflows hold ninety-one cargo-mentioning lines, fifty-three \
          of them distinct, across two workflow files; this walk saw {:?}. A gate \
          added, removed, reworded, or a workflow file added — reconcile \
          CARGO_LINES with the workflows deliberately, never by loosening this \

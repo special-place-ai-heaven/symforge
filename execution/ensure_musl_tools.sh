@@ -11,7 +11,7 @@ fi
 prefix="${HOME}/.local/musl-native"
 if [ ! -x "${prefix}/bin/musl-gcc" ]; then
   tmp="$(mktemp -d)"
-  curl -fsSL https://musl.cc/x86_64-linux-musl-native.tgz | tar -xz -C "$tmp"
+  curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused https://musl.cc/x86_64-linux-musl-native.tgz | tar -xz -C "$tmp"
   src="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
   rm -rf "$prefix"
   mkdir -p "${HOME}/.local"

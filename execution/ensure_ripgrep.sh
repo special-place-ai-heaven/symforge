@@ -12,7 +12,7 @@ dest="${HOME}/.local/bin"
 mkdir -p "$dest"
 tmp="$(mktemp -d)"
 url="https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz"
-  curl -fsSL -o "$tmp/rg.tgz" "$url"
+curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused -o "$tmp/rg.tgz" "$url"
 tar -xz -C "$tmp" -f "$tmp/rg.tgz"
 install -m 755 "$tmp"/ripgrep-*/rg "$dest/rg"
 if [ -n "${GITHUB_PATH:-}" ]; then
