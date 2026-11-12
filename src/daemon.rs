@@ -3935,9 +3935,12 @@ fn spawn_daemon_process(executable: Option<&Path>) -> anyhow::Result<()> {
         stop_std_handle_inheritance();
     }
 
-    command
+    let child = command
         .spawn()
         .context("spawning detached symforge daemon")?;
+    // A spawned daemon that loses the bind race (another daemon already owns
+    // this home) exits at once; collect it so it is not left a zombie (#877).
+    crate::process_util::reap_in_background(child);
     Ok(())
 }
 

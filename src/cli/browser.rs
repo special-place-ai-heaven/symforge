@@ -84,6 +84,7 @@ fn run_opener(program: &str, args: &[&str]) -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
+        .map(crate::process_util::reap_in_background)
         .is_ok()
 }
 

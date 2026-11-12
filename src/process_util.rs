@@ -11,7 +11,7 @@
 //! a plain `std::process::Command` everywhere else.
 
 use std::ffi::OsStr;
-use std::process::Command;
+use std::process::{Child, Command};
 
 /// Build a `Command` that never opens a console window on Windows.
 ///
@@ -29,6 +29,21 @@ pub fn hidden_command(program: impl AsRef<OsStr>) -> Command {
         command.creation_flags(CREATE_NO_WINDOW);
     }
     command
+}
+
+/// Collect `child` when it exits, on a detached thread, for a child this
+/// process deliberately does not wait for (a detached daemon, a browser
+/// opener). Dropping a `Child` never waits on Unix: one that exits while this
+/// process lives stays a zombie, and when this process exits it is re-parented
+/// to PID 1 still unreaped, which a PID 1 that is not an init never collects
+/// (#877). A child that outlives this process is re-parented alive instead.
+pub fn reap_in_background(mut child: Child) {
+    // A failed thread spawn drops the child unreaped, exactly as before.
+    let _ = std::thread::Builder::new()
+        .name("symforge-child-reaper".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 #[cfg(test)]
