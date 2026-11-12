@@ -39,6 +39,11 @@ if [ "${#missing[@]}" -gt 0 ]; then
     "${as_root[@]}" apt-get -o Acquire::Retries=3 update -qq >&2
     "${as_root[@]}" apt-get -o Acquire::Retries=3 install -y -qq --no-install-recommends "${packages[@]}" >&2
   fi
+  # cmake has a rootless fallback: a pinned, checksum-verified Kitware release.
+  if ! command -v cmake >/dev/null 2>&1 && [[ " ${missing[*]} " == *" cmake "* ]]; then
+    bash "$(dirname "$0")/ensure_cmake.sh" >&2
+    export PATH="$RUNNER_TEMP/cmake/bin:$PATH"
+  fi
   still=()
   for tool in "${missing[@]}"; do command -v "$tool" >/dev/null 2>&1 || still+=("$tool"); done
   if [ "${#still[@]}" -gt 0 ]; then

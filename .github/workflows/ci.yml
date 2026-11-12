@@ -323,10 +323,13 @@ jobs:
       # failing, which means either a fix landed without its owning slice
       # removing the attribute, or the control has gone vacuous.
       - name: Preserve Feature 020 Slice 0 expected failures
+        id: slice0
         run: node scripts/slice0-oracle-artifact.cjs
 
+      # Uploads whenever the oracle ran, pass or fail; when an earlier step
+      # failed it never ran, and a "no files found" here would bury that error.
       - name: Upload Slice 0 oracle contract
-        if: ${{ always() }}
+        if: ${{ always() && steps.slice0.outcome != 'skipped' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: feature-020-slice-0-oracle-contract
@@ -719,7 +722,7 @@ jobs:
       # musl-tools provides musl-gcc; the embed build statically links C deps
       # built by the `cc` crate (19 tree-sitter grammars, rusqlite `bundled`
       # sqlite) and by libgit2-sys (git2 `vendored-libgit2`, built via cmake,
-      # which the prerequisites step checks for). Both `cc` and cmake-rs honor
+      # which the prerequisites step supplies when missing). Both `cc` and cmake-rs honor
       # the target-scoped CC env var, so pointing it at musl-gcc makes every
       # C-compiled crate link cleanly against musl. All currently pinned
       # tree-sitter grammars ship pure-C scanners; if a future grammar bump
@@ -869,53 +872,57 @@ jobs:
     timeout-minutes: 60
     defaults:
       run:
-        # Git Bash by absolute path: on the workstation a bare `bash` resolves
-        # to WSL (found in #854).
-        shell: '"C:\Program Files\Git\bin\bash.exe" --noprofile --norc -e -o pipefail {0}'
+        # PowerShell, not bash: on the workstation a bare `bash` resolves to
+        # something that is not Git Bash (WSL, found in #854), and the runner
+        # does not honour a quoted shell path (PR #883's first run). The
+        # runner checks only the last native command's exit code, so steps
+        # with several check each one.
+        shell: pwsh
     steps:
       - name: Keep every file this job writes inside the runner work directory
         run: |
-          root="$(cygpath -w "$RUNNER_TEMP")\\symforge-ci"
-          mkdir -p "$(cygpath -u "$root")/bin" "$(cygpath -u "$root")/tmp"
-          cpus="$(nproc)"
-          {
-            echo "CI_ROOT=$root"
-            echo "SYMFORGE_HOME=$root\\symforge-test-home"
+          $root = Join-Path $env:RUNNER_TEMP 'symforge-ci'
+          New-Item -ItemType Directory -Force -Path (Join-Path $root 'bin'), (Join-Path $root 'tmp') | Out-Null
+          $cpus = [Environment]::ProcessorCount
+          $lines = @(
+            "CI_ROOT=$root"
+            "SYMFORGE_HOME=$root\symforge-test-home"
             # The workstation's commit limit is exhausted by 16-way parallel builds.
-            echo "CARGO_BUILD_JOBS=$(( cpus < 8 ? cpus : 8 ))"
-            if [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
-              echo "TMP=$root\\tmp"
-              echo "TEMP=$root\\tmp"
-              echo "CARGO_HOME=$root\\cargo-home"
-              echo "RUSTUP_HOME=$root\\rustup-home"
-              echo "CARGO_TARGET_DIR=$root\\target"
-            fi
-          } >> "$GITHUB_ENV"
+            "CARGO_BUILD_JOBS=$([Math]::Min($cpus, 8))"
+          )
+          if ($env:RUNNER_ENVIRONMENT -eq 'self-hosted') {
+            $lines += @(
+              "TMP=$root\tmp"
+              "TEMP=$root\tmp"
+              "CARGO_HOME=$root\cargo-home"
+              "RUSTUP_HOME=$root\rustup-home"
+              "CARGO_TARGET_DIR=$root\target"
+            )
+          }
+          $lines | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       # rust-toolchain.toml is the single source of truth for the toolchain
-      # version; rustup resolves it natively (channel + components). On the
-      # workstation the machine's rustup binary is used read-only and the
+      # version; rustup resolves it natively (channel + components). The
+      # machine's rustup binary is used read-only; on the workstation the
       # toolchain installs into RUSTUP_HOME under the job directory.
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: |
-          if [ "$RUNNER_ENVIRONMENT" != self-hosted ]; then
-            bash execution/ensure_rustup.sh
-            exit 0
-          fi
-          rustup_exe="$(command -v rustup || true)"
-          user_rustup="$(cygpath -u "$USERPROFILE")/.cargo/bin/rustup.exe"
-          if [ -z "$rustup_exe" ] && [ -x "$user_rustup" ]; then rustup_exe="$user_rustup"; fi
-          if [ -z "$rustup_exe" ]; then
-            echo "::error::rustup is not installed on this self-hosted Windows runner. Install it, or set the repository variable CI_RUNNERS=hosted-windows."
+          $rustup = (Get-Command rustup -ErrorAction SilentlyContinue).Source
+          $userRustup = Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe'
+          if (-not $rustup -and (Test-Path -LiteralPath $userRustup)) { $rustup = $userRustup }
+          if (-not $rustup) {
+            Write-Output "::error::rustup is not installed on this Windows runner. Install it, or set the repository variable CI_RUNNERS=hosted-windows."
             exit 1
-          fi
-          proxies="$(dirname "$rustup_exe")"
-          cygpath -w "$proxies" >> "$GITHUB_PATH"
-          PATH="$proxies:$PATH" rustup toolchain install
+          }
+          $proxies = Split-Path -Parent $rustup
+          $proxies | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $env:PATH = "$proxies;$env:PATH"
+          rustup toolchain install
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       # Not taiki-e/install-action here: on Windows it writes to
       # %USERPROFILE%\.install-action and installs next to whichever toolchain
@@ -925,19 +932,26 @@ jobs:
           NEXTEST_URL: https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${{ env.NEXTEST_VERSION }}/cargo-nextest-${{ env.NEXTEST_VERSION }}-x86_64-pc-windows-msvc.tar.gz
           NEXTEST_SHA256: e51bdb4b5883df48f335381b287378edb244318fac65ae0adaf6b9e69298246b
         run: |
-          bin="$(cygpath -u "$CI_ROOT")/bin"
-          curl --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-delay 2 --retry-connrefused -o "$bin/nextest.tar.gz" "$NEXTEST_URL"
-          printf '%s  %s\n' "$NEXTEST_SHA256" "$bin/nextest.tar.gz" | sha256sum --check --strict
-          tar -xzf "$bin/nextest.tar.gz" -C "$bin"
-          rm "$bin/nextest.tar.gz"
-          cygpath -w "$bin" >> "$GITHUB_PATH"
+          $bin = Join-Path $env:CI_ROOT 'bin'
+          $archive = Join-Path $bin 'nextest.tar.gz'
+          Invoke-WebRequest -Uri $env:NEXTEST_URL -OutFile $archive -MaximumRetryCount 5 -RetryIntervalSec 2
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          if ($actual -ne $env:NEXTEST_SHA256) {
+            Write-Output "::error::nextest archive SHA-256 $actual does not match the pinned $env:NEXTEST_SHA256"
+            exit 1
+          }
+          # Windows' own bsdtar: a GNU tar earlier on PATH reads `C:` as a remote host.
+          & (Join-Path $env:SystemRoot 'System32\tar.exe') -xzf $archive -C $bin
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Remove-Item -LiteralPath $archive
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       - name: Check Rust formatting
         run: cargo fmt --check
 
       # stel_golden_replay needs gitignored phase0 corpora (see the test job).
       - name: Clone phase0 golden-replay corpora
-        run: bash execution/clone_phase0_corpora.sh
+        run: ./execution/clone_phase0_corpora.ps1
 
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -957,7 +971,6 @@ jobs:
 
       - name: Delete everything this job wrote (self-hosted)
         if: ${{ always() && runner.environment == 'self-hosted' }}
-        shell: powershell
         working-directory: ${{ runner.temp }}
         # From the runner's own contexts, not from variables earlier steps (or a
         # build script writing GITHUB_ENV) could have rewritten.

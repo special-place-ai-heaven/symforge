@@ -1544,7 +1544,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 // and every new cargo-mentioning line is an env assignment, a cache key, a
 // download, or that archive; census 91/53/2.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "f61f13650e1363a4:45888"),
+    ("ci.yml", "820fa2967f1f8a34:46769"),
     ("release.yml", "b174946ff2c434bb:115022"),
 ];
 
@@ -1618,13 +1618,14 @@ const CARGO_LINES: &[(&str, usize)] = &[
     // the toolchain home and build output inside the runner work directory.
     // Environment assignments: none starts a process or names a doctest lane.
     ("echo \"CARGO_BUILD_JOBS=$jobs\" >> \"$GITHUB_ENV\"", 9),
-    ("echo \"CARGO_BUILD_JOBS=$(( cpus < 8 ? cpus : 8 ))\"", 1),
-    (r#"echo "CARGO_HOME=$root\\cargo-home""#, 1),
-    (r#"echo "CARGO_TARGET_DIR=$root\\target""#, 1),
+    // PowerShell string items the Windows job appends to GITHUB_ENV.
+    (r#""CARGO_BUILD_JOBS=$([Math]::Min($cpus, 8))""#, 1),
+    (r#""CARGO_HOME=$root\cargo-home""#, 1),
+    (r#""CARGO_TARGET_DIR=$root\target""#, 1),
     // A path to the machine's rustup binary and a download URL for the
     // prebuilt nextest binary: data, not commands.
     (
-        r#"user_rustup="$(cygpath -u "$USERPROFILE")/.cargo/bin/rustup.exe""#,
+        r#"$userRustup = Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe'"#,
         1,
     ),
     (
