@@ -1985,10 +1985,17 @@ impl HostRoom {
             refusal.message = Some(text);
             return Err(refusal);
         }
-        let request: HostRequest = serde_json::from_slice(request_json).map_err(|_| invalid())?;
-        let response = self.dispatch(&request, control)?;
-        // A capped argument value is named in the answer, as on the MCP lane.
+        // A capped argument value is named in the answer, as on the MCP lane, and the
+        // note is paid for inside the caller's budget.
         let notes = request_check::argument_notes(&value);
+        let request: HostRequest = if notes.is_empty() {
+            serde_json::from_slice(request_json).map_err(|_| invalid())?
+        } else {
+            let mut value = value;
+            request_check::reserve_for_notes(&mut value, &notes);
+            serde_json::from_value(value).map_err(|_| invalid())?
+        };
+        let response = self.dispatch(&request, control)?;
         if notes.is_empty() {
             return serde_json::to_vec(&response)
                 .map_err(|_| HostRefusal::new(HostRefusalKind::EngineFailure));

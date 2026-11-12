@@ -18160,28 +18160,28 @@ mod tests {
         ];
         let mut failures = Vec::new();
         let http = authed_client(&handle);
-        // The daemon route first: a refusal there makes the proxy below reconnect and
-        // fall back locally, which retires this session.
-        for (tool, args) in accepted.clone() {
-            // A daemon refusal is masked above by the proxy's local fallback, so the
-            // daemon route is also called with exactly the bytes `proxy_tool_call`
-            // sends: the front end's decoded input, re-serialized.
-            let forwarded = match tool {
-                "get_file_context" => serde_json::to_value(
-                    serde_json::from_value::<crate::protocol::tools::GetFileContextInput>(
-                        args.clone(),
-                    )
-                    .expect("decode"),
-                ),
-                "get_symbol_context" => serde_json::to_value(
-                    serde_json::from_value::<crate::protocol::tools::GetSymbolContextInput>(
-                        args.clone(),
-                    )
-                    .expect("decode"),
-                ),
-                _ => Ok(args.clone()),
+        for (tool, args) in accepted {
+            // Every case decodes through its tool's input type and is re-serialized,
+            // exactly as `proxy_tool_call` forwards it.
+            fn forwarded<T: serde::de::DeserializeOwned + serde::Serialize>(
+                args: &serde_json::Value,
+            ) -> serde_json::Value {
+                serde_json::to_value(serde_json::from_value::<T>(args.clone()).expect("decode"))
+                    .expect("serialize")
             }
-            .expect("serialize");
+            use crate::protocol::tools as t;
+            let forwarded = match tool {
+                "get_file_context" => forwarded::<t::GetFileContextInput>(&args),
+                "get_symbol_context" => forwarded::<t::GetSymbolContextInput>(&args),
+                "get_file_content" => forwarded::<t::GetFileContentInput>(&args),
+                "get_symbol" => forwarded::<t::GetSymbolInput>(&args),
+                "get_repo_map" => forwarded::<t::GetRepoMapInput>(&args),
+                "search_symbols" => forwarded::<t::SearchSymbolsInput>(&args),
+                "search_text" => forwarded::<t::SearchTextInput>(&args),
+                "find_references" => forwarded::<t::FindReferencesInput>(&args),
+                "find_dependents" => forwarded::<t::FindDependentsInput>(&args),
+                other => panic!("no input type for {other}"),
+            };
             let response = http
                 .post(format!(
                     "{base_url}/v1/sessions/{}/tools/{tool}",
@@ -18191,16 +18191,10 @@ mod tests {
                 .send()
                 .await
                 .expect("daemon call");
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            if !status.is_success() || body.contains("does not accept") {
                 failures.push(format!("daemon {tool} {forwarded}: {status} {body}"));
-            }
-        }
-        for (tool, args) in accepted {
-            let text = server.dispatch_tool_for_tests(tool, args.clone()).await;
-            if text.contains("does not accept") || text.contains("invalid_request") {
-                failures.push(format!("{tool} {args}: {text}"));
             }
         }
         let _ = handle.shutdown_tx.send(());

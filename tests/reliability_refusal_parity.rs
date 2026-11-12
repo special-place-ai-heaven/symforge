@@ -955,9 +955,23 @@ fn probe(mcp: &mut StdioClient, room: &HostRoom, cases: &[(&str, Value, Row)]) -
         let (embed, kinds) = embed_reply(room, tool, args);
         match expected {
             Row::Same if embed == mcp_text => {}
-            Row::Same => failures.push(format!(
-                "{tool} {args}:\n  mcp:   {mcp_text:?}\n  embed: {embed:?}"
-            )),
+            Row::Same => {
+                // Show where the two answers part, not only how they start.
+                let at = mcp_text
+                    .char_indices()
+                    .zip(embed.chars())
+                    .find(|((_, m), e)| m != e)
+                    .map_or(mcp_text.len().min(embed.len()), |((index, _), _)| index);
+                let from = at.saturating_sub(80);
+                let window = |text: &str| -> String {
+                    text.get(from..).unwrap_or("").chars().take(240).collect()
+                };
+                failures.push(format!(
+                    "{tool} {args} (part at byte {at}):\n  mcp:   {:?}\n  embed: {:?}",
+                    window(&mcp_text),
+                    window(&embed)
+                ));
+            }
             Row::Differs {
                 why,
                 embed: refusal,
@@ -1075,6 +1089,16 @@ fn query_refusals_carry_the_mcp_text_on_the_embed_lane() {
             Same,
         ),
         ("find_references", json!({ "name": "NOPE_ANYWHERE" }), Same),
+        (
+            "find_references",
+            json!({ "name": "target_fn", "symbol_kind": "all" }),
+            Same,
+        ),
+        (
+            "get_symbol_context",
+            json!({ "name": "target_fn", "path": "src/parent/leaf.rs", "symbol_kind": "all" }),
+            Same,
+        ),
         (
             "find_references",
             json!({ "name": "target_fn", "kind": "bogus" }),

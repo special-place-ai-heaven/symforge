@@ -106,8 +106,18 @@ pub(crate) const FILE_CONTENT_MODES: &[&str] = &["lines", "symbol", "match", "ch
 pub(crate) const TEXT_GROUPINGS: &[&str] =
     &["file", "symbol", "usage", "purpose", "names", "count"];
 
+/// `get_repo_map` `detail` (`tools.rs` / `embed_read_context` dispatch).
+pub(crate) const REPO_MAP_DETAILS: &[&str] = &["compact", "full", "tree"];
+
+/// `find_dependents` `format`.
+pub(crate) const DEPENDENT_FORMATS: &[&str] = &["text", "mermaid", "dot"];
+
+/// `find_references` `mode` and `direction`.
+pub(crate) const REFERENCE_MODES: &[&str] = &["references", "implementations"];
+pub(crate) const REFERENCE_DIRECTIONS: &[&str] = &["trait", "type", "auto"];
+
 /// `get_symbol_context` `verbosity` (`symbol_context::apply_verbosity`).
-const VERBOSITIES: &[&str] = &["full", "summary", "signature", "compact"];
+pub(crate) const VERBOSITIES: &[&str] = &["full", "summary", "signature", "compact"];
 
 /// One argument's accepted values. `argument` is a top-level name, `name[]` for every
 /// element of an array argument, or `name[].field` for a field of every element.
@@ -157,11 +167,7 @@ pub(crate) static ARGUMENT_VALUES: &[ValueRow] = &[
     row("get_symbol", "targets[].kind", OneOfCaseless(SYMBOL_KINDS)),
     row("get_symbol", "targets[].symbol_line", POSITIVE),
     row("get_symbol", "max_tokens", POSITIVE),
-    row(
-        "get_repo_map",
-        "detail",
-        OneOf(&["compact", "full", "tree"]),
-    ),
+    row("get_repo_map", "detail", OneOf(REPO_MAP_DETAILS)),
     // "default 2, max 5"; 0 groups every file under the scope root (`map_dir_key`).
     row("get_repo_map", "depth", Capped(0, 5)),
     row("get_repo_map", "max_files", POSITIVE),
@@ -221,24 +227,12 @@ pub(crate) static ARGUMENT_VALUES: &[ValueRow] = &[
     row("find_references", "limit", Capped(1, 100)).unless("mode", "implementations"),
     row("find_references", "limit", Capped(1, 500)).only_if("mode", "implementations"),
     row("find_references", "max_per_file", Capped(1, 50)).unless("mode", "implementations"),
-    row(
-        "find_references",
-        "mode",
-        OneOf(&["references", "implementations"]),
-    ),
-    row(
-        "find_references",
-        "direction",
-        OneOf(&["trait", "type", "auto"]),
-    ),
+    row("find_references", "mode", OneOf(REFERENCE_MODES)),
+    row("find_references", "direction", OneOf(REFERENCE_DIRECTIONS)),
     row("find_references", "max_tokens", POSITIVE),
     row("find_dependents", "limit", Capped(1, 100)),
     row("find_dependents", "max_per_file", Capped(1, 50)),
-    row(
-        "find_dependents",
-        "format",
-        OneOf(&["text", "mermaid", "dot"]),
-    ),
+    row("find_dependents", "format", OneOf(DEPENDENT_FORMATS)),
     row("find_dependents", "max_tokens", POSITIVE),
     // -- changes, impact, guidance --
     row("analyze_file_impact", "co_changes_limit", POSITIVE),
@@ -319,7 +313,7 @@ pub(crate) struct ValueRefusal {
 pub(crate) fn check_values(
     tool: &str,
     args: &Map<String, Value>,
-) -> Result<Vec<String>, ValueRefusal> {
+) -> Result<Vec<CapNote>, ValueRefusal> {
     if let Some(text) = blank_name_refusal(tool, args) {
         return Err(ValueRefusal {
             text,
@@ -352,13 +346,52 @@ pub(crate) fn value_refusal(tool: &str, args: &Map<String, Value>) -> Option<Str
     check_values(tool, args).err().map(|refusal| refusal.text)
 }
 
-/// The notes [`check_values`] returns, appended to an answer's text.
-pub(crate) fn with_notes(mut text: String, notes: &[String]) -> String {
-    for note in notes {
-        text.push_str("\n\n");
-        text.push_str(note);
+/// A capped value: the caller sent `requested` for `path`, the tool used `max`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CapNote {
+    pub path: String,
+    pub requested: u64,
+    pub max: u64,
+}
+
+impl CapNote {
+    fn sentence(&self) -> String {
+        format!(
+            "Note: \"{}\" = {} is above its maximum of {}; {} was used.",
+            self.path,
+            capped_key(&self.requested.to_string()),
+            self.max,
+            self.max
+        )
     }
-    text
+}
+
+/// The text to append to `tool`'s answer for `notes`, in that answer's grammar: a
+/// `key=value` line for `review_knowledge`, a `//` comment after a dot graph, a `%%`
+/// comment after a mermaid diagram, otherwise a prose line after a blank line. Every
+/// other tool with a capped argument answers in prose. Empty when there are no notes.
+pub(crate) fn notes_suffix(tool: &str, args: &Map<String, Value>, notes: &[CapNote]) -> String {
+    let format = current_value(args, "format");
+    notes
+        .iter()
+        .map(|note| match (tool, format.as_str()) {
+            ("review_knowledge", _) => format!(
+                "\nnote=capped argument={} requested={} used={}",
+                note.path,
+                capped_key(&note.requested.to_string()),
+                note.max
+            ),
+            ("find_dependents", "dot") => format!("\n// {}", note.sentence()),
+            ("find_dependents", "mermaid") => format!("\n%% {}", note.sentence()),
+            _ => format!("\n\n{}", note.sentence()),
+        })
+        .collect()
+}
+
+/// Bytes [`notes_suffix`] adds, as tokens (~4 bytes each), so a caller's `max_tokens`
+/// can be reduced by them before the answer is built and the note fits the budget.
+pub(crate) fn notes_tokens(suffix: &str) -> u64 {
+    (suffix.len() as u64).div_ceil(4)
 }
 
 fn blank_name_refusal(tool: &str, args: &Map<String, Value>) -> Option<String> {
@@ -428,20 +461,25 @@ fn listed(values: &[&str]) -> String {
         .join(", ")
 }
 
-/// An integer exactly as the lenient decoders accept one (`serde_input::lenient_u32`):
-/// a non-negative JSON integer or a string of digits, untrimmed. Anything else is the
-/// decoder's to refuse, in its own words.
-fn integer(value: &Value) -> Option<u64> {
-    match value {
+/// An integer exactly as the field's lenient decoder accepts one
+/// (`serde_input::lenient_u32` / `lenient_u64`): a non-negative JSON integer or a string
+/// of digits, untrimmed, that fits the field's type. Anything else is the decoder's to
+/// refuse, in its own words.
+fn integer(tool: &str, path: &str, value: &Value) -> Option<u64> {
+    let number = match value {
         Value::Number(number) => number.as_u64(),
         Value::String(text) => text.parse::<u64>().ok(),
         _ => None,
-    }
+    }?;
+    // Every judged number is a `u32` field except the `max_tokens` budgets, which are
+    // `u64` everywhere but the `symforge` facade.
+    let wide = path == "max_tokens" && tool != "symforge";
+    (wide || number <= u64::from(u32::MAX)).then_some(number)
 }
 
 enum Judged {
     Valid,
-    Capped(String),
+    Capped(CapNote),
     Refused(String),
 }
 
@@ -482,18 +520,19 @@ fn judge(tool: &str, path: &str, accepts: Accepts, value: &Value) -> Judged {
                 ))
             }
         }
-        Range(min, max) => match integer(value) {
+        Range(min, max) => match integer(tool, path, value) {
             Some(number) if number < min || max.is_some_and(|max| number > max) => {
                 refused_number(number, max, min)
             }
             _ => Judged::Valid,
         },
-        Capped(min, max) => match integer(value) {
+        Capped(min, max) => match integer(tool, path, value) {
             Some(number) if number < min => refused_number(number, None, min),
-            Some(number) if number > max => Judged::Capped(format!(
-                "Note: \"{path}\" = {} is above its maximum of {max}; {max} was used.",
-                capped_key(&number.to_string())
-            )),
+            Some(number) if number > max => Judged::Capped(CapNote {
+                path: path.to_string(),
+                requested: number,
+                max,
+            }),
             _ => Judged::Valid,
         },
     }

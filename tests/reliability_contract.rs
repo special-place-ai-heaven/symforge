@@ -904,6 +904,118 @@ fn capped_values_are_named_and_accepted_values_reach_the_handler() {
     );
 }
 
+/// Spec 036 delta: a cap note keeps the output's grammar, never follows an error, and is
+/// paid for inside the caller's token budget.
+#[test]
+fn a_cap_note_keeps_the_output_grammar_and_the_budget() {
+    let (_dir, mut client) = ready_server();
+    let review = text_of(&client.call(
+        "review_knowledge",
+        json!({ "mode": "summary", "limit": 500 }),
+    ));
+    assert!(
+        review.contains("note=capped argument=limit requested=500 used=100"),
+        "{review}"
+    );
+    // Every line carries key=value fields (the first after a "Review knowledge |" title),
+    // and the note is one more such line, last.
+    for line in review.lines().filter(|line| !line.trim().is_empty()) {
+        assert!(
+            line.contains('='),
+            "review_knowledge line without key=value: {line:?}"
+        );
+    }
+    assert!(
+        review
+            .trim_end()
+            .ends_with("note=capped argument=limit requested=500 used=100"),
+        "{review}"
+    );
+    let dot = text_of(&client.call(
+        "find_dependents",
+        json!({ "path": "src/parent/leaf.rs", "format": "dot", "limit": 500 }),
+    ));
+    let close = dot.rfind('}').expect("dot graph");
+    assert!(
+        dot[close + 1..]
+            .lines()
+            .all(|line| line.trim().is_empty() || line.trim_start().starts_with("//")),
+        "dot has text after the graph: {dot}"
+    );
+    assert!(
+        dot[close + 1..].contains("// Note: \"limit\" = 500"),
+        "{dot}"
+    );
+    let mermaid = text_of(&client.call(
+        "find_dependents",
+        json!({ "path": "src/parent/leaf.rs", "format": "mermaid", "limit": 500 }),
+    ));
+    let last = mermaid
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    assert!(last.starts_with("%% Note: \"limit\" = 500"), "{mermaid}");
+    let failed = text_of(&client.call(
+        "search_symbols",
+        json!({ "query": "x", "limit": 4294967296u64 }),
+    ));
+    assert!(
+        !failed.contains("was used"),
+        "a failed call claims a used value: {failed}"
+    );
+    let budget = 60u64;
+    let capped = text_of(&client.call(
+        "find_references",
+        json!({ "name": "target_fn", "limit": 500, "max_tokens": budget }),
+    ));
+    assert!(capped.contains("was used"), "{capped}");
+    // The same call at the cap: the note was paid for inside the budget, so the capped
+    // answer is not the uncapped one plus the note.
+    let plain = text_of(&client.call(
+        "find_references",
+        json!({ "name": "target_fn", "limit": 100, "max_tokens": budget }),
+    ));
+    let note = capped
+        .rsplit(
+            "
+
+",
+        )
+        .next()
+        .unwrap_or_default();
+    assert!(
+        capped.len() < plain.len() + note.len() + 2,
+        "the note overran the budget: {} bytes with it, {} without",
+        capped.len(),
+        plain.len()
+    );
+}
+
+/// A value list of the shared argument-value table
+/// (`src/index_lifecycle/guidance/argument_values.rs`), read from its source so a drift
+/// test checks the table itself, not a copy of it.
+fn table_values(name: &str) -> Vec<String> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/index_lifecycle/guidance/argument_values.rs"
+    );
+    let source = std::fs::read_to_string(path).expect("argument_values.rs");
+    let start = source
+        .find(&format!("const {name}: &[&str] = &["))
+        .unwrap_or_else(|| panic!("{name} is not in the table"));
+    let list = &source[start..];
+    let list = &list[..list.find("];").expect("list end")];
+    let values: Vec<String> = list
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(String::from)
+        .collect();
+    assert!(!values.is_empty(), "{name} is empty");
+    values
+}
+
 /// Spec 036 drift pins: every accepted value of a closed-set argument reaches its own
 /// handler branch (distinct answers), so the table cannot list a name the handler drops
 /// to its default, and the handler cannot grow a name the table refuses.
@@ -929,7 +1041,7 @@ fn every_accepted_value_reaches_its_own_handler_branch() {
             assert_eq!(
                 index == 0,
                 text == default,
-                "{tool} {argument}={value}: the first value is the default, every other one                  must change the answer"
+                "{tool} {argument}={value}: the first value is the default, every other one must change the answer"
             );
         }
     };
@@ -939,37 +1051,49 @@ fn every_accepted_value_reaches_its_own_handler_branch() {
         "get_symbol_context",
         leaf.clone(),
         "verbosity",
-        &["full", "summary", "signature", "compact"],
+        &table_values("VERBOSITIES")
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
     );
     distinct(
         &mut client,
         "get_repo_map",
         json!({}),
         "detail",
-        &["compact", "full", "tree"],
+        &table_values("REPO_MAP_DETAILS")
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
     );
     distinct(
         &mut client,
         "find_dependents",
         json!({ "path": "src/parent/leaf.rs" }),
         "format",
-        &["text", "mermaid", "dot"],
+        &table_values("DEPENDENT_FORMATS")
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
     );
     distinct(
         &mut client,
         "find_references",
         json!({ "name": "target_fn" }),
         "mode",
-        &["references", "implementations"],
+        &table_values("REFERENCE_MODES")
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
     );
     // The fixture has no trait, so every direction answers alike; each is accepted.
-    for direction in ["auto", "trait", "type"] {
+    for direction in table_values("REFERENCE_DIRECTIONS") {
         assert_not_refused(
             &client.call(
                 "find_references",
                 json!({ "name": "target_fn", "mode": "implementations", "direction": direction }),
             ),
-            direction,
+            &direction,
         );
     }
     let sections = |client: &mut StdioClient, tool: &str, base: Value, values: &[&str]| {
@@ -992,25 +1116,18 @@ fn every_accepted_value_reaches_its_own_handler_branch() {
         &mut client,
         "get_file_context",
         json!({ "path": "src/parent/leaf.rs" }),
-        &[
-            "outline",
-            "imports",
-            "consumers",
-            "references",
-            "git",
-            "knowledge",
-        ],
+        &table_values("FILE_CONTEXT_SECTIONS")
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
     );
     sections(
         &mut client,
         "get_symbol_context",
         leaf,
-        &[
-            "dependents",
-            "siblings",
-            "implementations",
-            "git",
-            "knowledge",
-        ],
+        &table_values("SYMBOL_CONTEXT_SECTIONS")
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
     );
 }

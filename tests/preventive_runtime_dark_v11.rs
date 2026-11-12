@@ -1174,9 +1174,9 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Embed refusal text slice: query refusals carry the MCP lane's text (a budget field
 // and shared guidance builders; edit_plan and suggestions sorted; shared file-content finisher and search error text). Same 90 files, calls only, no new edge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "ff0b8a32209810efab714db344c0a944b64e5bf07a43028e517e35f4df038a9e",
+    "72757ee8e99808f7005eed48c17a2df646505bbf8f5575e3f7283474746047ae",
     91,
-    2487631,
+    2489922,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1392,9 +1392,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Review round: capped-value notes on both lanes, the shared symbol-kind matcher, section
 // lowercasing, the include_tests marker skipped on the daemon lane. Calls only. 319 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "beb5922b9423ef27bcdf142fd8edbfa86efce8a66c0174f6b8048c2307171c59",
+    "a465e60cf1e0256defacbcc1ee22b3a2649d2d1357ca1be39c0875ae4a76ae56",
     319,
-    12931940,
+    12935643,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

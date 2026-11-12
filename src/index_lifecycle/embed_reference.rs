@@ -180,7 +180,7 @@ fn capture(
                         .symbol_line
                         .is_some_and(|line| symbol.line_range.0 + 1 != line)
                     || request.symbol_kind.as_deref().is_some_and(|kind| {
-                        !crate::live_index::search::kind_filter_matches(kind, &symbol.kind)
+                        !crate::live_index::search::symbol_kind_filter_matches(kind, &symbol.kind)
                     })
                 {
                     continue;
@@ -203,10 +203,9 @@ fn capture(
     refs.sort_by_key(|(path, reference)| (*path, reference.byte_range));
     refs.dedup_by_key(|(path, reference)| (*path, reference.byte_range));
     let mut view = live.build_find_references_view(&refs, limits.total_hits, &request.name);
-    if shared::should_collect_qualified_usages(request)
-        && request.symbol_kind.is_none()
-        && request.symbol_line.is_none()
-    {
+    // The same condition as the MCP lane (`tools.rs` find_references), which collects
+    // qualified usages whatever `symbol_kind` / `symbol_line` select.
+    if shared::should_collect_qualified_usages(request) {
         let seen = refs
             .iter()
             .map(|(path, reference)| ((*path).to_owned(), reference.byte_range))

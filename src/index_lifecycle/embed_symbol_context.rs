@@ -267,7 +267,7 @@ fn candidates(
                     .symbol_line
                     .is_some_and(|line| line != symbol.line_range.0 + 1)
                 || request.symbol_kind.as_deref().is_some_and(|kind| {
-                    !crate::live_index::search::kind_filter_matches(kind, &symbol.kind)
+                    !crate::live_index::search::symbol_kind_filter_matches(kind, &symbol.kind)
                 })
             {
                 continue;
