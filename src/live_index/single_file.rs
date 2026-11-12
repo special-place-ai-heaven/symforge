@@ -154,10 +154,14 @@ where
 
     // Spec 036 FR-020: the vanish waits draw on the enclosing call's retry
     // budget, so one answer over many deleted files is not blocked for each.
+    // Round 3 item 4: they keep a small minimum of their own, so a locked
+    // file that spent the call's budget cannot turn an editor's
+    // delete-then-rename save into an eviction.
     let budget = crate::discovery::os_response::current_budget();
+    let own = crate::discovery::os_response::RetryBudget::new(VANISH_WAIT_MINIMUM);
     let delays_ms = [50u64, 200, 500];
     for delay_ms in delays_ms {
-        let remaining = budget.remaining();
+        let remaining = budget.remaining().max(own.remaining());
         if remaining.is_zero() {
             break;
         }
@@ -181,6 +185,10 @@ where
         last_absence_fence,
     )
 }
+
+/// The vanish waits every missing file gets whatever the call's retry budget
+/// has left: enough for an atomic save's delete-then-rename (round 3 item 4).
+const VANISH_WAIT_MINIMUM: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn finalize_missing_file(
     shared: &SharedIndex,
@@ -378,10 +386,6 @@ pub(crate) fn admit_and_index_single_path_with_receipt(
 /// publication of its own (exclusion eviction, unreadable, unstable, missing),
 /// and the caller sends that path through the canonical seam instead. `base`
 /// is the row the stat pass saw; matching bytes reuse it without a parse.
-#[cfg(all(feature = "server", not(feature = "embed")))]
-// Staged snapshot-verify parity work, see the `health` row of
-// docs/contracts/embed-parity-v1-coverage.md; no caller until it lands.
-#[allow(dead_code)]
 pub(crate) fn prepare_snapshot_verify_admission(
     relative_path: &str,
     abs_path: &Path,
@@ -1066,9 +1070,12 @@ pub(crate) fn supported_language(path: &Path) -> Option<LanguageId> {
     path.to_str().and_then(LanguageId::from_path)
 }
 
-enum DiskComparison {
+pub(crate) enum DiskComparison {
     Same,
     Differs,
+    /// The project was retargeted during the comparison (round 3 item 3):
+    /// nothing is confirmed and no stamp is saved.
+    GenerationChanged,
     Unconfirmed(crate::discovery::os_response::OsCause),
     /// A row with no recorded modification time and no file on disk.
     UnstampedAbsent,
@@ -1079,13 +1086,28 @@ enum DiskComparison {
 /// confirmed the content (a restored or freshly loaded row), by content hash.
 /// A confirmation by hash is remembered, so the next call trusts the stat
 /// again once the window has passed: one hash per file per change.
-fn compare_with_disk(relative_path: &str, abs_path: &Path, shared: &SharedIndex) -> DiskComparison {
+pub(crate) fn compare_with_disk(
+    relative_path: &str,
+    abs_path: &Path,
+    shared: &SharedIndex,
+    expected_gen: u64,
+) -> DiskComparison {
     use crate::discovery::os_response::{AccessFailure, OsClass, current_budget, retry_transient};
 
     let budget = current_budget();
     let stat = retry_transient(&budget, Some(abs_path), || {
+        #[cfg(test)]
+        if let Some(code) = compare_faults::STAT_ERROR.with(std::cell::Cell::get) {
+            return Err(AccessFailure::capture(std::io::Error::from_raw_os_error(
+                code,
+            )));
+        }
         crate::paths::path_must_be_regular_non_link(abs_path).map_err(AccessFailure::capture)
     });
+    #[cfg(test)]
+    if let Some(hook) = compare_faults::AFTER_STAT.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     let metadata = match stat {
         Ok(metadata) => Some(metadata),
         Err(cause) if cause.class == OsClass::NotFound => None,
@@ -1096,6 +1118,10 @@ fn compare_with_disk(relative_path: &str, abs_path: &Path, shared: &SharedIndex)
         .read()
         .get_file(relative_path)
         .map(|file| (file.byte_len, file.mtime_secs, file.content_hash.clone()));
+    // Round 3 item 3: a row read after a retarget belongs to another root.
+    if shared.current_project_generation() != expected_gen {
+        return DiskComparison::GenerationChanged;
+    }
     let (metadata, (byte_len, mtime_secs, content_hash)) = match (metadata, indexed) {
         // Nothing on disk and no row: the reindex below confirms the
         // absence (and records it), exactly as the mtime-only guard did.
@@ -1123,6 +1149,19 @@ fn compare_with_disk(relative_path: &str, abs_path: &Path, shared: &SharedIndex)
     {
         return DiskComparison::Same;
     }
+    // Round 3 item 8: the same size limit as the admission gate's stable
+    // read for indexing; a file over it is not confirmed, and is not read.
+    #[cfg(test)]
+    let limit = compare_faults::HASH_LIMIT
+        .with(std::cell::Cell::get)
+        .unwrap_or(crate::domain::index::HARD_SKIP_BYTES);
+    #[cfg(not(test))]
+    let limit = crate::domain::index::HARD_SKIP_BYTES;
+    if byte_len > limit {
+        return DiskComparison::Unconfirmed(crate::discovery::os_response::OsCause::refused(
+            "larger than the indexing size limit",
+        ));
+    }
     // The read goes through the read gate's own reader: regular files only,
     // no link at the leaf, and a FIFO or device never blocks it (H2).
     let bytes = match retry_transient(&budget, Some(abs_path), || {
@@ -1136,6 +1175,9 @@ fn compare_with_disk(relative_path: &str, abs_path: &Path, shared: &SharedIndex)
     if hash::digest_hex(&bytes) != content_hash {
         return DiskComparison::Differs;
     }
+    if shared.current_project_generation() != expected_gen {
+        return DiskComparison::GenerationChanged;
+    }
     shared.record_verified_stamp(
         relative_path,
         crate::live_index::store::VerifiedStamp {
@@ -1146,6 +1188,22 @@ fn compare_with_disk(relative_path: &str, abs_path: &Path, shared: &SharedIndex)
         },
     );
     DiskComparison::Same
+}
+
+/// Test-only fault injection for [`compare_with_disk`] (spec 036 FR-037): a
+/// raw OS code the stat fails with, and a hook that runs between the stat and
+/// the content read.
+#[cfg(test)]
+pub(crate) mod compare_faults {
+    thread_local! {
+        pub(crate) static STAT_ERROR: std::cell::Cell<Option<i32>> =
+            const { std::cell::Cell::new(None) };
+        pub(crate) static AFTER_STAT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+        /// A smaller content-read size limit than the admission gate's.
+        pub(crate) static HASH_LIMIT: std::cell::Cell<Option<u64>> =
+            const { std::cell::Cell::new(None) };
+    }
 }
 
 /// Size, modification-time and racy-content freshness check for one file.
@@ -1187,8 +1245,9 @@ pub(crate) fn freshen_file_if_stale(
             "resolves outside the repository",
         ));
     }
-    match compare_with_disk(relative_path, abs_path, shared) {
+    match compare_with_disk(relative_path, abs_path, shared, expected_gen) {
         DiskComparison::Same => return FreshenResult::Fresh,
+        DiskComparison::GenerationChanged => return FreshenResult::GenerationMismatch,
         DiskComparison::Unconfirmed(cause) => return FreshenResult::Unconfirmed(cause),
         DiskComparison::UnstampedAbsent => return FreshenResult::UnstampedAbsent,
         DiskComparison::Differs => {}
@@ -1250,6 +1309,138 @@ pub(crate) fn freshen_file_if_stale(
 mod tests {
     use super::*;
     use crate::live_index::LiveIndex;
+
+    /// `freshen_file_if_stale` of `path` under `root` at the current generation.
+    fn freshen_at(shared: &SharedIndex, root: &Path, path: &str, generation: u64) -> FreshenResult {
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(root);
+        let observer = authority.active_observer();
+        freshen_file_if_stale(
+            path,
+            &root.join(path),
+            shared,
+            generation,
+            &authority,
+            observer,
+        )
+    }
+
+    fn set_mtime(path: &Path, time: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    /// Review round 3 item 2: a file stamped years ahead must not end the
+    /// racy window for every other file: a same-size edit inside one mtime
+    /// tick is still found by content.
+    #[test]
+    fn a_future_dated_file_does_not_end_the_racy_window() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("future.rs"), "fn f() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let future =
+            std::time::SystemTime::now() + std::time::Duration::from_secs(5 * 365 * 86_400);
+        set_mtime(&dir.path().join("future.rs"), future);
+        let shared = LiveIndex::load(dir.path()).unwrap();
+        let generation = shared.current_project_generation();
+        // The future file is observed, then b.rs is confirmed by content.
+        let _ = freshen_at(&shared, dir.path(), "future.rs", generation);
+        assert!(matches!(
+            freshen_at(&shared, dir.path(), "b.rs", generation),
+            FreshenResult::Fresh
+        ));
+        let stamp = std::fs::metadata(dir.path().join("b.rs"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn c() {}\n").unwrap();
+        set_mtime(&dir.path().join("b.rs"), stamp);
+        assert!(
+            matches!(
+                freshen_at(&shared, dir.path(), "b.rs", generation),
+                FreshenResult::StaleReindexed
+            ),
+            "a same-size edit in the same tick must be found by content"
+        );
+    }
+
+    /// Review round 3 item 3: a retarget between the stat and the hash must
+    /// not confirm one root's row against another root's file, nor stamp it.
+    #[test]
+    fn a_retarget_during_the_comparison_confirms_nothing() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        for dir in [&a, &b] {
+            std::fs::write(dir.path().join("lib.rs"), "pub fn same() {}\n").unwrap();
+        }
+        let shared = LiveIndex::load(a.path()).unwrap();
+        let generation = shared.current_project_generation();
+        let (retarget, root_b) = (shared.clone(), b.path().to_path_buf());
+        compare_faults::AFTER_STAT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || retarget.reload(&root_b).unwrap()));
+        });
+        let result = freshen_at(&shared, a.path(), "lib.rs", generation);
+        assert!(
+            matches!(result, FreshenResult::GenerationMismatch),
+            "the comparison must report the retarget"
+        );
+        assert!(
+            shared.verified_stamp("lib.rs").is_none(),
+            "no stamp is saved under the new generation"
+        );
+    }
+
+    /// Review round 3 item 4: an editor's delete-then-rename save still gets
+    /// its vanish waits after a locked file used up the call's retry budget.
+    #[test]
+    fn a_save_by_rename_survives_a_spent_call_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "pub fn a() {}\n").unwrap();
+        let shared = LiveIndex::load(dir.path()).unwrap();
+        let generation = shared.current_project_generation();
+        std::fs::remove_file(&path).unwrap();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                std::fs::write(path, "pub fn renamed() {}\n").unwrap();
+            })
+        };
+        let result = crate::discovery::os_response::with_spent_call_budget(|| {
+            freshen_at(&shared, dir.path(), "a.rs", generation)
+        });
+        writer.join().unwrap();
+        assert!(
+            matches!(result, FreshenResult::StaleReindexed),
+            "the re-saved file is re-indexed, not evicted"
+        );
+        assert!(shared.read().get_file("a.rs").is_some());
+    }
+
+    /// Review round 3 item 8: the content read obeys the admission gate's
+    /// size limit; a file over it is not confirmed, and is never read.
+    #[test]
+    fn a_file_over_the_size_limit_is_not_read_for_its_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+        let shared = LiveIndex::load(dir.path()).unwrap();
+        let generation = shared.current_project_generation();
+        compare_faults::HASH_LIMIT.with(|limit| limit.set(Some(4)));
+        let result = freshen_at(&shared, dir.path(), "a.rs", generation);
+        compare_faults::HASH_LIMIT.with(|limit| limit.set(None));
+        match result {
+            FreshenResult::Unconfirmed(cause) => assert!(
+                cause.describe().contains("size limit"),
+                "{}",
+                cause.describe()
+            ),
+            _ => panic!("a file over the limit must not be confirmed"),
+        }
+    }
 
     /// Task #24: the facade per-file entry points drive the SAME admission
     /// seam — index a new file, see its symbols, update it, remove it — with

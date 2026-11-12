@@ -1068,6 +1068,25 @@ mod racy_rule_tests {
     }
 }
 
+/// Per-project filesystem clock state behind `observe_filesystem_time`.
+#[derive(Default)]
+struct FilesystemClock {
+    /// Project generation the state below belongs to.
+    generation: u64,
+    /// Newest plausible modification time observed.
+    high_water: Option<SystemTime>,
+    /// When the last probe ran, and the modification time it read.
+    probe: Option<(Instant, SystemTime)>,
+}
+
+/// How often the filesystem clock is re-probed; between probes it advances
+/// with the monotonic clock.
+const PROBE_REFRESH: Duration = Duration::from_secs(10);
+/// Tolerance for a modification time just written past the last probe.
+const PROBE_SLACK: Duration = Duration::from_secs(2);
+/// The probe file in the project's state directory.
+const FILESYSTEM_CLOCK_PROBE: &str = "filesystem-clock.probe";
+
 impl VerifiedStamp {
     /// True when a stat equal to this stamp proves the content unchanged: the
     /// file was last modified well before its content was confirmed.
@@ -2344,9 +2363,10 @@ pub struct SharedIndexHandle {
     /// tagged with the project generation. In memory only, never in a
     /// snapshot, so a restored file has no entry and is hashed on first use.
     verified_by_content: Mutex<(u64, HashMap<String, VerifiedStamp>)>,
-    /// Newest file modification time the filesystem has shown this index, in
-    /// nanoseconds since the epoch (review M11's filesystem clock).
-    filesystem_high_water: AtomicU64,
+    /// The filesystem's own clock for the racy-content rule (review M11,
+    /// round 3 item 2): a probe of the project's state directory and the
+    /// newest plausible modification time seen, both reset with the project.
+    filesystem_clock: Mutex<FilesystemClock>,
     /// Id of the watcher reconcile sweep in progress (0: none). A sweep may
     /// publish its plan once per retry attempt; the unreadable count advances
     /// only on the first publication of each sweep.
@@ -2656,7 +2676,7 @@ impl SharedIndexHandle {
             rejected_stale_mutations: AtomicU64::new(0),
             unreadable_sweeps: Mutex::new((0, HashMap::new())),
             verified_by_content: Mutex::new((0, HashMap::new())),
-            filesystem_high_water: AtomicU64::new(0),
+            filesystem_clock: Mutex::new(FilesystemClock::default()),
             active_reconcile_sweep: AtomicU64::new(0),
             counted_reconcile_sweep: AtomicU64::new(0),
             next_reconcile_sweep: AtomicU64::new(1),
@@ -3457,25 +3477,64 @@ impl SharedIndexHandle {
     }
 
     /// Fold one observed modification time into the filesystem clock and
-    /// return the newest time seen so far.
+    /// return the newest plausible time seen for this project (round 3 item
+    /// 2). A modification time later than the filesystem's "now" (an archive
+    /// stamped in the future) is ignored, so it can never make the racy
+    /// window look passed for other files. "Now" is a probe of the
+    /// filesystem's own clock; without one, the host clock bounds what is
+    /// plausible, and the racy "now" stays the newest plausible time seen,
+    /// so a stamp inside the window is never trusted.
     pub(crate) fn observe_filesystem_time(
         &self,
         modified: Option<SystemTime>,
     ) -> Option<SystemTime> {
-        let nanos = |time: SystemTime| {
-            time.duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |duration| {
-                    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-                })
-        };
-        if let Some(modified) = modified {
-            self.filesystem_high_water
-                .fetch_max(nanos(modified), Ordering::AcqRel);
+        let generation = self.current_project_generation();
+        let now = self
+            .filesystem_now(generation)
+            .unwrap_or_else(SystemTime::now);
+        let mut clock = self.filesystem_clock.lock();
+        if clock.generation != generation {
+            *clock = FilesystemClock {
+                generation,
+                ..FilesystemClock::default()
+            };
         }
-        match self.filesystem_high_water.load(Ordering::Acquire) {
-            0 => None,
-            high => Some(std::time::UNIX_EPOCH + Duration::from_nanos(high)),
+        if let Some(modified) = modified.filter(|modified| *modified <= now + PROBE_SLACK) {
+            clock.high_water = Some(clock.high_water.map_or(modified, |high| high.max(modified)));
         }
+        clock.high_water.map(|high| high.min(now))
+    }
+
+    /// The filesystem's current time, from the modification time of a file
+    /// this process writes in the project's state directory, refreshed at
+    /// most every [`PROBE_REFRESH`]; between probes it advances by the
+    /// monotonic clock. `None` without a state directory or when the write
+    /// fails.
+    fn filesystem_now(&self, generation: u64) -> Option<SystemTime> {
+        {
+            let clock = self.filesystem_clock.lock();
+            if clock.generation == generation
+                && let Some((taken, at)) = clock.probe
+                && taken.elapsed() < PROBE_REFRESH
+            {
+                return Some(at + taken.elapsed());
+            }
+        }
+        // The probe's I/O runs without the lock.
+        let state_dir = self.project_state_dir()?;
+        let probe = state_dir.as_path().join(FILESYSTEM_CLOCK_PROBE);
+        std::fs::write(&probe, b"").ok()?;
+        let at = std::fs::metadata(&probe).ok()?.modified().ok()?;
+        let taken = Instant::now();
+        let mut clock = self.filesystem_clock.lock();
+        if clock.generation != generation {
+            *clock = FilesystemClock {
+                generation,
+                ..FilesystemClock::default()
+            };
+        }
+        clock.probe = Some((taken, at));
+        Some(at)
     }
 
     /// Drop the content stamp of a path that was removed.
@@ -8907,8 +8966,6 @@ mod tests {
     /// `StableReadAccess`, each checked for its classified outcome.
     mod os_fault_injection {
         use super::*;
-        #[cfg(windows)]
-        use crate::discovery::os_response::STATUS_DELETE_PENDING;
         use crate::discovery::os_response::{
             AccessFailure, CALL_RETRY_BUDGET, OsClass, RetryBudget,
         };
@@ -8917,7 +8974,6 @@ mod tests {
 
         /// Sharing violation on Windows, EBUSY on unix: transient on both.
         const IN_USE: i32 = if cfg!(windows) { 32 } else { 16 };
-        const NOT_FOUND: i32 = 2;
 
         fn stamp() -> crate::domain::FileStamp {
             crate::domain::FileStamp {
@@ -9027,57 +9083,166 @@ mod tests {
             assert_eq!(exhausted.first_calls.get(), 1);
         }
 
-        #[cfg(windows)]
-        #[test]
-        fn delete_pending_is_told_apart_from_access_denied() {
-            let pending = Scripted::new(vec![], || Err(failure(5, Some(STATUS_DELETE_PENDING))));
-            let outcome = read(&pending, &RetryBudget::new(CALL_RETRY_BUDGET));
-            assert_eq!(class_of(&outcome), Some(OsClass::DeletePending));
-            assert!(matches!(
-                outcome,
-                StableReadOutcome::Unreadable {
-                    kind: crate::domain::AccessErrorKind::PermissionDenied,
-                    ..
-                }
-            ));
-
-            let denied = Scripted::new(vec![], || Err(failure(5, Some(0xC000_0022))));
-            let outcome = read(&denied, &RetryBudget::new(CALL_RETRY_BUDGET));
-            assert_eq!(class_of(&outcome), Some(OsClass::Denied));
+        /// One indexed file `a.rs` in a fresh index: no content stamp, so a
+        /// comparison reads the file after its stat.
+        fn indexed_file() -> (tempfile::TempDir, SharedIndex) {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+            let shared = LiveIndex::load(dir.path()).unwrap();
+            (dir, shared)
         }
 
+        /// The answer check of an answer citing `a.rs`, through the shared
+        /// comparison, re-index and publication lane.
+        fn check_of_a(
+            dir: &tempfile::TempDir,
+            shared: &SharedIndex,
+        ) -> crate::index_lifecycle::guidance::freshen::AnswerCheck {
+            use crate::index_lifecycle::guidance::freshen::{
+                AnswerDisk, Claim, Rendered, answer_checked,
+            };
+            let authority =
+                crate::live_index::index_lifecycle::activation::project_source_authority(
+                    dir.path(),
+                );
+            let disk = AnswerDisk {
+                shared,
+                expected_gen: shared.current_project_generation(),
+                repo_root: dir.path(),
+                authority: &authority,
+                may_reindex: true,
+                scope: None,
+            };
+            // Like a tool, the answer cites `a.rs` while the publication it
+            // answers from holds it.
+            let (_, _, check) = answer_checked(
+                Ok(disk),
+                || shared.read().get_file("a.rs").is_some(),
+                |holds_a, _| Rendered {
+                    answer: (),
+                    cited: if *holds_a {
+                        vec!["a.rs".to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    claim: Claim::Rows,
+                },
+                || {},
+            );
+            check
+        }
+
+        /// A file that vanishes between the stat and the read is a removal
+        /// the index publishes, never a file left "not confirmed".
         #[test]
-        fn file_vanishing_between_stat_and_read_is_not_found_without_retry() {
-            let access = Scripted::new(vec![], || Err(failure(NOT_FOUND, None)));
-            let outcome = read(&access, &RetryBudget::new(CALL_RETRY_BUDGET));
-            assert_eq!(class_of(&outcome), Some(OsClass::NotFound));
-            assert!(matches!(
-                outcome,
-                StableReadOutcome::Unreadable {
-                    kind: crate::domain::AccessErrorKind::NotFound,
-                    ..
-                }
-            ));
-            assert_eq!(
-                access.first_calls.get(),
-                1,
-                "a vanished file is not transient"
+        fn file_vanishing_between_stat_and_read_is_removed() {
+            let (dir, shared) = indexed_file();
+            let path = dir.path().join("a.rs");
+            crate::live_index::single_file::compare_faults::AFTER_STAT.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || std::fs::remove_file(path).unwrap()));
+            });
+            let check = check_of_a(&dir, &shared);
+            assert!(
+                shared.read().get_file("a.rs").is_none(),
+                "the vanished file is removed from the index"
+            );
+            assert!(
+                check.notes(false).is_empty(),
+                "a confirmed removal is no unconfirmed file: {check:?}"
             );
         }
 
+        /// An unknown raw OS code reaches the answer as the not-confirmed
+        /// line carrying the code, and the index keeps its row.
         #[test]
-        fn unknown_raw_code_is_reported_verbatim() {
-            let access = Scripted::new(vec![], || Err(failure(777_777, None)));
+        fn unknown_raw_code_names_the_file_with_the_code() {
+            let (dir, shared) = indexed_file();
             let before = crate::discovery::os_response::unknown_code_count();
-            let outcome = read(&access, &RetryBudget::new(CALL_RETRY_BUDGET));
-            let StableReadOutcome::Unreadable { cause, .. } = &outcome else {
-                panic!("an unknown code is a failure, never a success: {outcome:?}");
-            };
-            assert_eq!(cause.class, OsClass::Unknown);
-            assert_eq!(cause.raw_code, Some(777_777));
-            assert!(cause.describe().contains("777777"), "{}", cause.describe());
+            crate::live_index::single_file::compare_faults::STAT_ERROR
+                .with(|code| code.set(Some(777_777)));
+            let check = check_of_a(&dir, &shared);
+            crate::live_index::single_file::compare_faults::STAT_ERROR.with(|code| code.set(None));
+            let notes = check.notes(false);
+            assert!(
+                notes.starts_with("Not confirmed against disk: a.rs (unrecognised error:")
+                    && notes.contains("777777"),
+                "{notes}"
+            );
             assert!(crate::discovery::os_response::unknown_code_count() > before);
-            assert_eq!(access.first_calls.get(), 1);
+            assert!(
+                shared.read().get_file("a.rs").is_some(),
+                "an unconfirmed file is not removed"
+            );
+        }
+
+        /// Windows delete-pending, made with the legacy (non-POSIX) delete
+        /// disposition so the name stays visible while a handle is open, is
+        /// classified at the failure site through the real access layer.
+        #[cfg(windows)]
+        #[test]
+        // Test-only FFI: the legacy delete disposition has no std API, and
+        // only it keeps a delete-pending name visible to the access layer.
+        #[allow(unsafe_code)]
+        fn delete_pending_is_captured_at_the_failure_site() {
+            use std::os::windows::fs::OpenOptionsExt;
+            use std::os::windows::io::AsRawHandle;
+            #[repr(C)]
+            struct FileDispositionInfo {
+                delete_file: u8,
+            }
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn SetFileInformationByHandle(
+                    file: *mut std::ffi::c_void,
+                    class: i32,
+                    info: *const std::ffi::c_void,
+                    size: u32,
+                ) -> i32;
+            }
+            const DELETE: u32 = 0x0001_0000;
+            const GENERIC_READ: u32 = 0x8000_0000;
+            const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+            const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
+            let (dir, shared) = indexed_file();
+            let handle = std::fs::OpenOptions::new()
+                .access_mode(DELETE | GENERIC_READ)
+                .share_mode(SHARE_ALL)
+                .open(dir.path().join("a.rs"))
+                .unwrap();
+            let info = FileDispositionInfo { delete_file: 1 };
+            // SAFETY: `handle` is an open file handle with DELETE access for
+            // the whole call, and `info` is a live FILE_DISPOSITION_INFO of the
+            // size passed.
+            let marked = unsafe {
+                SetFileInformationByHandle(
+                    handle.as_raw_handle(),
+                    FILE_DISPOSITION_INFO_CLASS,
+                    std::ptr::from_ref(&info).cast(),
+                    std::mem::size_of::<FileDispositionInfo>() as u32,
+                )
+            };
+            assert_ne!(marked, 0, "control: the file is marked for deletion");
+            let check = check_of_a(&dir, &shared);
+            drop(handle);
+            let notes = check.notes(false);
+            assert!(
+                notes.starts_with("Not confirmed against disk: a.rs (pending deletion"),
+                "{notes}"
+            );
+        }
+
+        /// The unix counterpart: unlinking a file another process holds open
+        /// removes its name at once, so the answer records a removal.
+        #[cfg(not(windows))]
+        #[test]
+        fn unlinked_open_file_is_removed() {
+            let (dir, shared) = indexed_file();
+            let held = std::fs::File::open(dir.path().join("a.rs")).unwrap();
+            std::fs::remove_file(dir.path().join("a.rs")).unwrap();
+            let check = check_of_a(&dir, &shared);
+            drop(held);
+            assert!(shared.read().get_file("a.rs").is_none());
+            assert!(check.notes(false).is_empty(), "{check:?}");
         }
 
         #[test]

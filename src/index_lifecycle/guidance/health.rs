@@ -1262,10 +1262,26 @@ pub(crate) fn render_unreadable_files_line(
     if unreadable.len() > MAX_NAMED {
         line.push_str(&format!(" (+{} more)", unreadable.len() - MAX_NAMED));
     }
-    let unknown = crate::discovery::os_response::unknown_code_count();
-    if unknown > 0 {
+    // Round 3 item 10: counted per project, from this project's own failed
+    // files only (the failure log is keyed by their canonical paths).
+    let unknown: std::collections::BTreeSet<i32> = unreadable
+        .iter()
+        .filter_map(|entry| entry.path.normalized_utf8.as_deref())
+        .filter_map(|relative| {
+            match crate::discovery::os_response::recorded_failure_for(root, relative) {
+                crate::discovery::os_response::RecordedCause::Found(cause)
+                    if cause.class == crate::discovery::os_response::OsClass::Unknown =>
+                {
+                    cause.raw_code
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    if !unknown.is_empty() {
         line.push_str(&format!(
-            "\nUnknown OS error codes seen by this process: {unknown} (each reported verbatim)"
+            "\nUnknown OS error codes among these files: {} (each reported verbatim)",
+            unknown.len()
         ));
     }
     Some(line)

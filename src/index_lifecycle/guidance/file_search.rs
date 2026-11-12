@@ -442,6 +442,7 @@ pub(crate) fn ranking_diagnostics_policy_from_env() -> RankingDiagnosticsPolicy 
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct SearchFilesRankingDiagnosticsDecision {
     pub explain: bool,
     pub evidence: Option<CapabilityEvidence>,
@@ -673,6 +674,7 @@ pub(crate) fn resolve_files(
     (view, hidden_noise_count)
 }
 
+#[derive(Clone)]
 pub(crate) struct RankedFiles {
     pub view: SearchFilesView,
     pub hidden_noise_count: usize,
@@ -993,7 +995,7 @@ pub(crate) fn render_ranked_files(
     include_personal_tooling: bool,
     check: &super::freshen::AnswerCheck,
     untracked_paths: impl FnOnce() -> Vec<String>,
-) -> String {
+) -> (String, super::freshen::Claim) {
     let rank_by_path_cochange = input.rank_by.as_deref() == Some("path+cochange");
     let rank_by_frecency = input.rank_by.as_deref() == Some("frecency");
     let view = ranked.view;
@@ -1098,8 +1100,9 @@ pub(crate) fn render_ranked_files(
     }
     let claims_complete =
         !matches!(view, SearchFilesView::Found { overflow_count, .. } if overflow_count > 0);
+    // No token budget applies here, so the notes close the answer whole.
     check.append_notes(&mut result, claims_complete);
-    result
+    (result, super::freshen::Claim::whole_if(claims_complete))
 }
 
 #[cfg(test)]

@@ -808,13 +808,13 @@ impl EmbeddedBinding {
     fn freshen_exact_path(
         &self,
         relative_path: &str,
-    ) -> Result<(), super::guidance::freshen::TargetedFreshenRefusal> {
+    ) -> Result<Option<String>, super::guidance::freshen::TargetedFreshenRefusal> {
         if self.shutdown_started.load(Ordering::Acquire)
             || self.authority.verify_physical_root_anchor().is_err()
             || self.state.lock().expect("embedded state mutex").phase
                 != super::public_api::SourceRuntimePhase::Current
         {
-            return Ok(());
+            return Ok(None);
         }
         #[cfg(test)]
         if let Some(hook) =
@@ -824,51 +824,59 @@ impl EmbeddedBinding {
         }
         let shared = self.runtime.data_plane();
         let expected_gen = shared.current_project_generation();
-        if super::guidance::freshen::freshen_exact_path(
+        let freshened = super::guidance::freshen::freshen_exact_path(
             shared,
             expected_gen,
             &self.root,
             &self.authority,
             relative_path,
-        )?
-        .changed
-        {
+        )?;
+        if freshened.changed {
             self.publish_freshened();
         }
-        Ok(())
+        // Spec 036 item 5: the caveat MCP's targeted reads print.
+        Ok(freshened.unconfirmed)
     }
 
-    /// Spec 036 FR-015: MCP's `check_answer_files` on a Current source,
-    /// publishing whatever it refreshed as the next Current publication so
-    /// the snapshot captured after it answers from the disk. Any other phase
-    /// compares nothing and says so.
+    /// Spec 036 FR-015: MCP's `answer_checked` over this source, under the
+    /// same rule: whenever a publication is served, the answer's files are
+    /// compared with the disk. Only a Current source re-indexes what differs
+    /// and publishes it as the next Current publication; while the worker
+    /// owns publication (any other phase) a differing file is named instead.
     #[cfg(feature = "embed")]
-    fn check_answer_scope(
+    fn answer_checked<Q, T>(
         &self,
-        path_prefix: Option<&str>,
-    ) -> super::guidance::freshen::AnswerCheck {
-        if self.shutdown_started.load(Ordering::Acquire)
-            || self.authority.verify_physical_root_anchor().is_err()
-            || self.state.lock().expect("embedded state mutex").phase
-                != super::public_api::SourceRuntimePhase::Current
-        {
-            return super::guidance::freshen::AnswerCheck::not_run(
-                super::guidance::freshen::NOT_RUN_INDEX_NOT_READY,
-            );
-        }
+        scope: Option<&str>,
+        capture: impl FnMut() -> Q,
+        render: impl FnMut(
+            &Q,
+            &super::guidance::freshen::AnswerCheck,
+        ) -> super::guidance::freshen::Rendered<T>,
+    ) -> (Q, T, super::guidance::freshen::AnswerCheck) {
         let shared = self.runtime.data_plane();
         let expected_gen = shared.current_project_generation();
-        let (check, changed) = super::guidance::freshen::check_answer_scope(
-            shared,
-            expected_gen,
-            &self.root,
-            &self.authority,
-            path_prefix.filter(|prefix| !prefix.is_empty()),
-        );
-        if changed {
+        // Round 3 item 11: each reason says what happened.
+        let disk = if self.shutdown_started.load(Ordering::Acquire) {
+            Err(super::guidance::freshen::NOT_RUN_SHUTTING_DOWN)
+        } else if self.authority.verify_physical_root_anchor().is_err() {
+            Err(super::guidance::freshen::NOT_RUN_ROOT_REPLACED)
+        } else {
+            Ok(super::guidance::freshen::AnswerDisk {
+                shared,
+                expected_gen,
+                repo_root: &self.root,
+                authority: &self.authority,
+                // A poisoned state lock never grants a re-index: the files
+                // that differ are named instead.
+                may_reindex: self.state.lock().is_ok_and(|state| {
+                    state.phase == super::public_api::SourceRuntimePhase::Current
+                }),
+                scope,
+            })
+        };
+        super::guidance::freshen::answer_checked(disk, capture, render, || {
             self.publish_freshened();
-        }
-        check
+        })
     }
 
     /// MCP `analyze_file_impact`'s re-admission and symbol diff on a Current
@@ -2082,28 +2090,36 @@ impl EmbeddedSourceHandle {
     pub(super) fn freshen_exact_path(
         &self,
         relative_path: &str,
-    ) -> Result<(), super::guidance::freshen::TargetedFreshenRefusal> {
+    ) -> Result<Option<String>, super::guidance::freshen::TargetedFreshenRefusal> {
         match &self.binding {
             Some(binding) if !self.closed.load(Ordering::Acquire) => {
                 binding.freshen_exact_path(relative_path)
             }
-            _ => Ok(()),
+            _ => Ok(None),
         }
     }
 
-    /// Spec 036: compare an answer's scope with the disk; see the binding's
-    /// `check_answer_scope`.
+    /// Spec 036: answer with the answer's files compared with the disk; see
+    /// the binding's `answer_checked`.
     #[cfg(feature = "embed")]
-    pub(super) fn check_answer_scope(
+    pub(super) fn answer_checked<Q, T>(
         &self,
-        path_prefix: Option<&str>,
-    ) -> super::guidance::freshen::AnswerCheck {
+        scope: Option<&str>,
+        capture: impl FnMut() -> Q,
+        render: impl FnMut(
+            &Q,
+            &super::guidance::freshen::AnswerCheck,
+        ) -> super::guidance::freshen::Rendered<T>,
+    ) -> (Q, T, super::guidance::freshen::AnswerCheck) {
         match &self.binding {
             Some(binding) if !self.closed.load(Ordering::Acquire) => {
-                binding.check_answer_scope(path_prefix)
+                binding.answer_checked(scope, capture, render)
             }
-            _ => super::guidance::freshen::AnswerCheck::not_run(
-                super::guidance::freshen::NOT_RUN_INDEX_NOT_READY,
+            _ => super::guidance::freshen::answer_checked(
+                Err(super::guidance::freshen::NOT_RUN_INDEX_NOT_READY),
+                capture,
+                render,
+                || {},
             ),
         }
     }
@@ -3703,7 +3719,7 @@ mod refresh_lifecycle_tests {
         let request = QueryRequest::Syntax {
             path: "lib.rs".into(),
         };
-        assert_eq!(request.freshen_path(), Some("lib.rs"));
+        assert_eq!(request.freshen_paths(), vec!["lib.rs"]);
         let binding = handle.binding.as_ref().unwrap();
         let state = binding.state.lock().unwrap();
         std::fs::write(root.path().join("lib.rs"), "pub fn changed() {}\n").unwrap();

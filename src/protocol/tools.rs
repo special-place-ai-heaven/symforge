@@ -583,86 +583,238 @@ use crate::index_lifecycle::guidance::freshen::classify_targeted_freshen_result;
 pub(crate) use crate::index_lifecycle::guidance::freshen::safe_repo_path_for_freshen;
 use crate::index_lifecycle::guidance::freshen::{TargetedFreshenRefusal, freshen_exact_path};
 
+type TargetedFreshenOutcome =
+    Result<crate::index_lifecycle::guidance::freshen::TargetedFreshen, TargetedFreshenRefusal>;
+
+/// The owned work of a targeted freshen, for a blocking thread.
+struct TargetedFreshenWork {
+    shared: crate::live_index::SharedIndex,
+    expected_gen: u64,
+    repo_root: PathBuf,
+    relative_path: String,
+}
+
+impl TargetedFreshenWork {
+    /// `None` when there is nothing to freshen (not an exact path, no root).
+    fn capture(server: &SymForgeServer, path_scope: &search::PathScope) -> Option<Self> {
+        let search::PathScope::Exact(relative_path) = path_scope else {
+            return None;
+        };
+        // The generation is read BEFORE the root (see `freshen_exact_path`).
+        let expected_gen = server.index.data_plane().current_project_generation();
+        let repo_root = server.capture_repo_root()?;
+        Some(Self {
+            shared: server.index.shared(),
+            expected_gen,
+            repo_root,
+            relative_path: relative_path.clone(),
+        })
+    }
+
+    fn run(self) -> TargetedFreshenOutcome {
+        // V11 observation lane (C4c): a request-path freshen observes under
+        // the incarnation current at call time (the C3b synchronous-facade
+        // ruling).
+        let lane_authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(
+                &self.repo_root,
+            );
+        freshen_exact_path(
+            &self.shared,
+            self.expected_gen,
+            &self.repo_root,
+            &lane_authority,
+            &self.relative_path,
+        )
+    }
+}
+
+#[cfg(test)]
 fn freshen_exact_path_for_targeted_retrieval(
     server: &SymForgeServer,
     path_scope: &search::PathScope,
 ) -> Result<bool, TargetedFreshenRefusal> {
-    freshen_exact_path_with_note(server, path_scope).map(|freshen| freshen.changed)
+    TargetedFreshenWork::capture(server, path_scope)
+        .map_or(Ok(Default::default()), TargetedFreshenWork::run)
+        .map(|freshen| freshen.changed)
 }
 
-/// [`freshen_exact_path_for_targeted_retrieval`] plus the caveat line for a
-/// file it could not compare with the disk (review M14).
-fn freshen_exact_path_with_note(
+/// Freshen one exact path before a targeted read, plus the caveat line for a
+/// file it could not compare with the disk (review M14). Round 3 item 7: the
+/// stat, hash and retry sleeps leave the async worker.
+async fn freshen_exact_path_with_note(
     server: &SymForgeServer,
     path_scope: &search::PathScope,
-) -> Result<crate::index_lifecycle::guidance::freshen::TargetedFreshen, TargetedFreshenRefusal> {
-    let search::PathScope::Exact(relative_path) = path_scope else {
-        return Ok(Default::default());
-    };
-    let expected_gen = server.index.data_plane().current_project_generation();
-    let Some(repo_root) = server.capture_repo_root() else {
-        return Ok(Default::default());
-    };
-    // V11 observation lane (C4c): a request-path freshen observes under the
-    // incarnation current at call time (the C3b synchronous-facade ruling).
-    let lane_authority =
-        crate::live_index::index_lifecycle::activation::project_source_authority(&repo_root);
-    freshen_exact_path(
-        server.index.data_plane(),
-        expected_gen,
-        &repo_root,
-        &lane_authority,
-        relative_path,
-    )
+) -> TargetedFreshenOutcome {
+    match TargetedFreshenWork::capture(server, path_scope) {
+        Some(work) => off_async_worker_owned(move || work.run()).await,
+        None => Ok(Default::default()),
+    }
 }
 
-/// Spec 036 FR-015: compare every indexed file under `path_prefix` with the
-/// disk, re-indexing those that differ. Call it BEFORE
-/// `capture_local_response_generation`, so the publication the answer is
-/// rendered from already holds what the check refreshed.
-async fn check_answer_files(
+/// [`freshen_exact_path_with_note`] without the caveat.
+async fn freshen_exact_path_changed(
     server: &SymForgeServer,
-    path_prefix: Option<&str>,
-) -> crate::index_lifecycle::guidance::freshen::AnswerCheck {
-    use crate::index_lifecycle::guidance::freshen::{
-        AnswerCheck, NOT_RUN_INDEX_NOT_READY, NOT_RUN_NO_ROOT, check_answer_scope,
-    };
-    // A loading index is refused by the caller's guard right after; comparing
-    // it would only fence reindexes against the generation being replaced.
-    if !matches!(
-        server
-            .index
-            .data_plane()
-            .published_generation()
-            .live
-            .index_state(),
-        IndexState::Ready
-    ) {
-        return AnswerCheck::not_run(NOT_RUN_INDEX_NOT_READY);
+    path_scope: &search::PathScope,
+) -> Result<bool, TargetedFreshenRefusal> {
+    freshen_exact_path_with_note(server, path_scope)
+        .await
+        .map(|freshen| freshen.changed)
+}
+
+/// Run blocking work off the async worker: `block_in_place` on a
+/// multi-threaded runtime, `spawn_blocking` on a current-thread one, in place
+/// outside any runtime. A panic in the work resumes on the caller.
+async fn off_async_worker_owned<R: Send + 'static>(work: impl FnOnce() -> R + Send + 'static) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        Ok(_) => match tokio::task::spawn_blocking(work).await {
+            Ok(result) => result,
+            Err(error) => std::panic::resume_unwind(error.into_panic()),
+        },
+        Err(_) => work(),
     }
-    let expected_gen = server.index.data_plane().current_project_generation();
-    let Some(repo_root) = server.capture_repo_root() else {
-        return AnswerCheck::not_run(NOT_RUN_NO_ROOT);
+}
+
+use crate::index_lifecycle::guidance::freshen::{AnswerCheck, Claim, Rendered};
+
+/// Spec 036 FR-015: answer from a publication whose cited files (and, on a
+/// whole claim, its scope under `scope`) were compared with the disk, through
+/// the shared [`freshen::answer_checked`] loop. `render` runs the query over
+/// the captured publication; it is called up to three times, so it must not
+/// record anything the caller would count twice.
+///
+/// [`freshen::answer_checked`]: crate::index_lifecycle::guidance::freshen::answer_checked
+fn answer_checked<T>(
+    server: &SymForgeServer,
+    scope: Option<&str>,
+    mut render: impl FnMut(&Arc<crate::live_index::PublishedGeneration>, &AnswerCheck) -> Rendered<T>,
+) -> (Arc<crate::live_index::PublishedGeneration>, T, AnswerCheck) {
+    let (generation, answer, check) = answer_checked_query(
+        server,
+        scope,
+        |_| (),
+        |generation, (), check| render(generation, check),
+    );
+    (generation, answer, check)
+}
+
+/// [`answer_checked`] whose `query` runs once per captured publication, so
+/// the provisional and final renders of one publication share its result.
+fn answer_checked_query<R, T>(
+    server: &SymForgeServer,
+    scope: Option<&str>,
+    mut query: impl FnMut(&Arc<crate::live_index::PublishedGeneration>) -> R,
+    mut render: impl FnMut(
+        &Arc<crate::live_index::PublishedGeneration>,
+        &R,
+        &AnswerCheck,
+    ) -> Rendered<T>,
+) -> (Arc<crate::live_index::PublishedGeneration>, T, AnswerCheck) {
+    use crate::index_lifecycle::guidance::freshen::{
+        AnswerDisk, NOT_RUN_INDEX_NOT_READY, NOT_RUN_NO_ROOT,
     };
-    let shared = server.index.shared();
-    let prefix = path_prefix
-        .filter(|prefix| !prefix.is_empty())
-        .map(str::to_owned);
-    // Review H3: stats, hashes and retry sleeps stay off the async workers.
-    tokio::task::spawn_blocking(move || {
-        let lane_authority =
-            crate::live_index::index_lifecycle::activation::project_source_authority(&repo_root);
-        check_answer_scope(
-            &shared,
+    let shared = server.index.data_plane();
+    // The generation is read BEFORE the root, so a retarget in between fails
+    // the fence instead of indexing one root's files under another's.
+    let expected_gen = shared.current_project_generation();
+    // A loading index is refused by the render's own guard; comparing it
+    // would only fence re-indexes against the generation being replaced.
+    let ready = matches!(
+        shared.published_generation().live.index_state(),
+        IndexState::Ready
+    );
+    let repo_root = server.capture_repo_root();
+    let authority = repo_root
+        .as_deref()
+        .map(crate::live_index::index_lifecycle::activation::project_source_authority);
+    let disk = match (ready, repo_root.as_deref(), authority.as_deref()) {
+        (false, _, _) => Err(NOT_RUN_INDEX_NOT_READY),
+        (true, Some(repo_root), Some(authority)) => Ok(AnswerDisk {
+            shared,
             expected_gen,
-            &repo_root,
-            &lane_authority,
-            prefix.as_deref(),
+            repo_root,
+            authority,
+            may_reindex: true,
+            scope,
+        }),
+        _ => Err(NOT_RUN_NO_ROOT),
+    };
+    // Review H3: stats, hashes and retry sleeps leave the async worker.
+    let ((generation, _), answer, check) = off_async_worker(|| {
+        crate::index_lifecycle::guidance::freshen::answer_checked(
+            disk,
+            || {
+                let generation = server.capture_local_response_generation();
+                let result = query(&generation);
+                (generation, result)
+            },
+            |(generation, result), check| render(generation, result, check),
+            || {},
         )
-        .0
-    })
-    .await
-    .unwrap_or_else(|_| AnswerCheck::not_run("the disk comparison did not complete"))
+    });
+    (generation, answer, check)
+}
+
+/// The answer of one [`answer_checked`] render of a search tool: the files
+/// answer cites (`cited`, from its structured rows), and on the final render the withheld note, the budget cut
+/// and the check's notes inside that budget (review item 4). A provisional
+/// render stops after the cited files, so nothing is recorded twice.
+#[allow(clippy::too_many_arguments)]
+fn checked_answer(
+    server: &SymForgeServer,
+    tool: &str,
+    generation: &crate::live_index::PublishedGeneration,
+    path_prefix: Option<&str>,
+    output: String,
+    cited: Vec<String>,
+    claim: Claim,
+    max_tokens: Option<u64>,
+    check: &AnswerCheck,
+) -> Rendered<Result<String, String>> {
+    if check.is_provisional() {
+        return Rendered {
+            answer: Ok(String::new()),
+            cited,
+            claim,
+        };
+    }
+    server.session_context.record_summary_output(
+        tool,
+        u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+            output.len() as u64,
+        ))
+        .unwrap_or(u32::MAX),
+    );
+    // Discovery stays neutral: only loaded context and mutations record frecency.
+    let body = with_withheld_note(&generation.live, path_prefix, output);
+    let answer = crate::index_lifecycle::guidance::freshen::budget_with_notes(
+        check,
+        claim,
+        max_tokens,
+        |max_tokens| server.apply_ccr_budget(tool, body, max_tokens),
+    );
+    Rendered {
+        answer: Ok(answer),
+        cited,
+        claim,
+    }
+}
+
+/// Run blocking disk work without stalling a multi-threaded runtime's worker
+/// (`block_in_place`). For borrowed, synchronous work only: a current-thread
+/// runtime (the test runtime; the server runs multi-threaded) runs it in
+/// place, because `spawn_blocking` needs owned work and an `.await`; owned
+/// async callers use `off_async_worker_owned` instead.
+pub(crate) fn off_async_worker<R>(work: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
 }
 
 use crate::index_lifecycle::guidance::reference_read::search_parse_state_for_paths;
@@ -1171,8 +1323,14 @@ fn render_search_text_output(
 ) -> String {
     // The zero-hit untracked sweep reads this server's git root; the rest of
     // the rendering is the shared engine the embedded facade also runs.
+    // A provisional render only learns what the answer cites; untracked
+    // paths are never indexed, so it skips the git sweep.
     let matching_untracked_paths = match &result {
-        Ok(result) if result.files.is_empty() && result.suppressed_by_noise == 0 => {
+        Ok(result)
+            if result.files.is_empty()
+                && result.suppressed_by_noise == 0
+                && !check.is_provisional() =>
+        {
             matching_untracked_paths_for_search_text(
                 server,
                 &generation.live,
@@ -1474,6 +1632,15 @@ macro_rules! loading_guard {
     };
 }
 
+/// [`loading_guard!`] as a value, for code inside an [`answer_checked`] render.
+fn loading_guard_text(live: &LiveIndex) -> Option<String> {
+    let guarded = || -> String {
+        loading_guard!(live);
+        String::new()
+    };
+    Some(guarded()).filter(|text| !text.is_empty())
+}
+
 impl SymForgeServer {
     /// One compact-facade step: the planned tool's answer and the outcome its
     /// own code recorded (or a daemon sent in its outcome header). A step with
@@ -1697,6 +1864,24 @@ impl SymForgeServer {
     }
 
     pub(crate) async fn get_symbol(&self, params: Parameters<GetSymbolInput>) -> String {
+        let max_tokens = params.0.max_tokens;
+        let mut unconfirmed = Vec::new();
+        let output = self.get_symbol_noted(params, &mut unconfirmed).await;
+        // Spec 036 item 3/5: each file the read could not compare with the
+        // disk is named, inside the caller's budget.
+        crate::index_lifecycle::guidance::freshen::close_targeted_read(
+            output,
+            &unconfirmed,
+            max_tokens,
+        )
+    }
+
+    /// `get_symbol`; `unconfirmed` receives the targeted freshens' caveats.
+    async fn get_symbol_noted(
+        &self,
+        params: Parameters<GetSymbolInput>,
+        unconfirmed: &mut Vec<String>,
+    ) -> String {
         if let Some(result) = self.proxy_tool_call("get_symbol", &params.0).await {
             return result;
         }
@@ -1710,6 +1895,20 @@ impl SymForgeServer {
             if targets.is_empty() {
                 record_read_outcome(ReadOutcome::InvalidRequest);
                 return "Error: targets array is empty.".to_string();
+            }
+            // Spec 036 item 3: each target's file is compared with the disk
+            // (and re-indexed when it differs) before the capture.
+            let mut paths: Vec<&str> = targets.iter().map(|target| target.path.as_str()).collect();
+            paths.sort_unstable();
+            paths.dedup();
+            for path in paths {
+                match freshen_exact_path_with_note(self, &search::PathScope::exact(path)).await {
+                    Ok(freshen) => unconfirmed.extend(freshen.unconfirmed),
+                    Err(refusal) => {
+                        record_read_outcome(ReadOutcome::Unavailable { retryable: true });
+                        return refusal.message(path);
+                    }
+                }
             }
             // T038 round-1 (D16): one capture records the evidence receipt
             // from the same immutable bundle that renders the batch below —
@@ -1864,6 +2063,15 @@ impl SymForgeServer {
         }
 
         let force_refresh = params.0.force_refresh == Some(true);
+        // Spec 036 item 3: the symbol's file is compared with the disk (and
+        // re-indexed when it differs) before the capture.
+        match freshen_exact_path_with_note(self, &search::PathScope::exact(&params.0.path)).await {
+            Ok(freshen) => unconfirmed.extend(freshen.unconfirmed),
+            Err(refusal) => {
+                record_read_outcome(ReadOutcome::Unavailable { retryable: true });
+                return refusal.message(&params.0.path);
+            }
+        }
         // Capture freshness and the immutable publication before consulting the
         // repeat-read cache. The same request against a later watcher publication
         // must be a cache miss, and the bytes below must come from this exact
@@ -2102,6 +2310,10 @@ impl SymForgeServer {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
         }
+        // Spec 036 item 3: deliberately no disk check. The map lists indexed
+        // paths and symbol counts and makes no freshness or completeness claim
+        // against the disk; a stale entry shows the indexed count (or a file
+        // since deleted), which the next read of that file freshens.
         let published = self.capture_local_response_generation();
         let detail = if let Some(ref d) = params.0.detail {
             d.as_str()
@@ -2272,9 +2484,11 @@ impl SymForgeServer {
         });
         let mut served = None;
         let mut cache_hit_handle = None;
+        let mut unconfirmed = None;
         let output = self
-            .get_file_context_unnoted(params, &mut served, &mut cache_hit_handle)
+            .get_file_context_unnoted(params, &mut served, &mut cache_hit_handle, &mut unconfirmed)
             .await;
+        let unavailable = is_index_unavailable_output(&output) || is_error_output(&output);
         let (output, withheld_files) = match served {
             Some(live) if project_wide => {
                 let withheld =
@@ -2284,7 +2498,7 @@ impl SymForgeServer {
             }
             _ => (output, false),
         };
-        crate::protocol::knowledge_model::bound_final_code_context_output(
+        let output = crate::protocol::knowledge_model::bound_final_code_context_output(
             output,
             final_max_tokens,
             &final_target,
@@ -2292,15 +2506,27 @@ impl SymForgeServer {
             final_knowledge_requested,
             withheld_files,
             cache_hit_handle.as_deref(),
+        );
+        // Spec 036 item 5: a file the targeted freshen could not compare with
+        // the disk is named, inside the caller's budget.
+        if unavailable {
+            return output;
+        }
+        crate::index_lifecycle::guidance::freshen::close_targeted_read(
+            output,
+            unconfirmed.as_slice(),
+            final_max_tokens,
         )
     }
 
-    /// `served` receives the index the answer is rendered from, once captured.
+    /// `served` receives the index the answer is rendered from, once captured;
+    /// `unconfirmed` the targeted freshen's caveat line.
     async fn get_file_context_unnoted(
         &self,
         params: Parameters<GetFileContextInput>,
         served: &mut Option<Arc<LiveIndex>>,
         cache_hit_handle: &mut Option<String>,
+        unconfirmed: &mut Option<String>,
     ) -> String {
         if let Some(result) = self.proxy_tool_call("get_file_context", &params.0).await {
             return result;
@@ -2309,12 +2535,12 @@ impl SymForgeServer {
             return refusal;
         }
         let force_refresh = params.0.force_refresh == Some(true);
-        if let Err(refusal) = freshen_exact_path_for_targeted_retrieval(
-            self,
-            &search::PathScope::exact(&params.0.path),
-        ) {
-            record_read_outcome(ReadOutcome::Unavailable { retryable: true });
-            return refusal.message(&params.0.path);
+        match freshen_exact_path_with_note(self, &search::PathScope::exact(&params.0.path)).await {
+            Ok(freshen) => *unconfirmed = freshen.unconfirmed,
+            Err(refusal) => {
+                record_read_outcome(ReadOutcome::Unavailable { retryable: true });
+                return refusal.message(&params.0.path);
+            }
         }
         let published = self.capture_local_response_generation();
         *served = Some(Arc::clone(&published.live));
@@ -2712,57 +2938,15 @@ impl SymForgeServer {
         let knowledge_requested = requested_sections.as_ref().is_none_or(|sections| {
             sections.is_empty() || sections.iter().any(|section| section == "knowledge")
         });
-        let mut served = None;
-        let mut checked = None;
-        let output = self
-            .get_symbol_context_unnoted(params, &mut served, &mut checked)
-            .await;
-        let (output, withheld_files) = match served {
-            Some(live) => {
-                let withheld =
-                    format::withheld_not_searched_note(live.withheld_since_restore(), None)
-                        .is_some();
-                (with_withheld_note(&live, None, output), withheld)
-            }
-            None => (output, false),
-        };
-        let mut output = crate::protocol::knowledge_model::bound_final_code_context_output(
-            output,
-            final_max_tokens,
-            &final_target,
-            requested_sections.as_deref(),
-            knowledge_requested,
-            withheld_files,
-            None,
-        );
-        // Spec 036: the files this answer could not confirm, after the bound
-        // so the caveat is never cut. Callers and callees are a complete claim
-        // unless the budget cut them (review M7).
-        if let Some(check) = checked
-            && !is_index_unavailable_output(&output)
-        {
-            let complete = !crate::index_lifecycle::guidance::freshen::answer_was_cut(&output);
-            check.append_notes(&mut output, complete);
-        }
-        output
-    }
-
-    /// `served` receives the index the answer is rendered from, once captured;
-    /// `checked` receives the disk comparison made before that capture.
-    async fn get_symbol_context_unnoted(
-        &self,
-        params: Parameters<GetSymbolContextInput>,
-        served: &mut Option<Arc<LiveIndex>>,
-        checked: &mut Option<crate::index_lifecycle::guidance::freshen::AnswerCheck>,
-    ) -> String {
-        if let Some(result) = self.proxy_tool_call("get_symbol_context", &params.0).await {
+        let input = params.0;
+        if let Some(result) = self.proxy_tool_call("get_symbol_context", &input).await {
             return result;
         }
-        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+        if let Some(refusal) = self.foreign_project_refusal(input.project.as_deref()) {
             return refusal;
         }
-        let refreshed = if let Some(path) = params.0.path.as_deref().or(params.0.file.as_deref()) {
-            match freshen_exact_path_for_targeted_retrieval(self, &search::PathScope::exact(path)) {
+        let refreshed = if let Some(path) = input.path.as_deref().or(input.file.as_deref()) {
+            match freshen_exact_path_changed(self, &search::PathScope::exact(path)).await {
                 Ok(refreshed) => refreshed,
                 Err(refusal) => {
                     record_read_outcome(ReadOutcome::Unavailable { retryable: true });
@@ -2772,36 +2956,103 @@ impl SymForgeServer {
         } else {
             false
         };
-        // Spec 036 FR-015: callers may sit in any file; compare them all
-        // with the disk before the capture.
-        let check = check_answer_files(self, None).await;
-        let published = self.capture_local_response_generation();
-        *served = Some(Arc::clone(&published.live));
-        *checked = Some(check.clone());
+        // Spec 036 FR-015: the answer's files, and on a complete caller list
+        // every file (a caller may sit anywhere), are compared with the disk.
+        answer_checked(self, None, |published, check| {
+            let live = &published.live;
+            let output = self.get_symbol_context_rendered(&input, published, refreshed, check);
+            // The answer's rows come from the symbol's definitions and the
+            // files that reference its name: cite those from the index.
+            let definitions = match input.path.as_deref().or(input.file.as_deref()) {
+                Some(path) => vec![path.to_string()],
+                None => symbol_candidate_paths(live.as_ref(), &input.name),
+            };
+            let cited = crate::index_lifecycle::guidance::freshen::cited_paths(
+                live,
+                definitions.iter().map(String::as_str).chain(
+                    live.reverse_index
+                        .get(&input.name)
+                        .into_iter()
+                        .flatten()
+                        .map(|location| location.file_path.as_str()),
+                ),
+            );
+            let unavailable = is_index_unavailable_output(&output);
+            let withheld_files =
+                format::withheld_not_searched_note(live.withheld_since_restore(), None).is_some();
+            let output = with_withheld_note(live, None, output);
+            let bound = |max_tokens| {
+                crate::protocol::knowledge_model::bound_final_code_context_output(
+                    output,
+                    max_tokens,
+                    &final_target,
+                    requested_sections.as_deref(),
+                    knowledge_requested,
+                    withheld_files,
+                    None,
+                )
+            };
+            // Callers and callees are a complete claim unless the budget cut
+            // them (review M7); a refusal claims nothing and carries no notes.
+            if unavailable || check.is_provisional() {
+                let answer = bound(final_max_tokens);
+                let claim = Claim::whole_if(
+                    !unavailable
+                        && !crate::index_lifecycle::guidance::freshen::answer_was_cut(&answer),
+                );
+                return Rendered {
+                    answer,
+                    cited,
+                    claim,
+                };
+            }
+            // Item 4: the caveat is fitted inside the caller's budget.
+            Rendered {
+                answer: crate::index_lifecycle::guidance::freshen::budget_with_notes(
+                    check,
+                    Claim::Whole,
+                    final_max_tokens,
+                    bound,
+                ),
+                cited,
+                claim: Claim::Whole,
+            }
+        })
+        .1
+    }
+
+    /// One [`answer_checked`] render of `get_symbol_context` over `published`.
+    fn get_symbol_context_rendered(
+        &self,
+        input: &GetSymbolContextInput,
+        published: &Arc<crate::live_index::PublishedGeneration>,
+        refreshed: bool,
+        check: &AnswerCheck,
+    ) -> String {
         if let Some(message) = loading_guard_message_from_published(&published.health) {
             record_read_outcome(unavailable_outcome(&published.health));
             return message;
         }
-        if let Some(path) = params.0.path.as_deref().or(params.0.file.as_deref()) {
+        if let Some(path) = input.path.as_deref().or(input.file.as_deref()) {
             let repo_root = self.capture_repo_root();
             let degraded = admission_tier_degradation_for_path(
                 published.live.as_ref(),
                 repo_root.as_deref(),
                 "get_symbol_context",
                 path,
-                &params.0.name,
+                &input.name,
             );
             if let Some(result) = degraded {
                 return result;
             }
         }
-        if params.0.estimate == Some(true) {
-            let path = params.0.path.as_deref().unwrap_or("");
+        if input.estimate == Some(true) {
+            let path = input.path.as_deref().unwrap_or("");
             if let Some(file) = published.live.capture_shared_file(path) {
                 let sym_tokens = file
                     .symbols
                     .iter()
-                    .find(|s| s.name == params.0.name)
+                    .find(|s| s.name == input.name)
                     .map(|s| {
                         crate::stel::handler::estimate_tokens_from_bytes(u64::from(
                             s.byte_range.1 - s.byte_range.0,
@@ -2811,24 +3062,24 @@ impl SymForgeServer {
                 let ref_count = file
                     .references
                     .iter()
-                    .filter(|r| r.name == params.0.name)
+                    .filter(|r| r.name == input.name)
                     .count();
                 let bundle_est = sym_tokens * 3; // rough: body + deps
                 record_read_outcome(ReadOutcome::Found);
                 return format!(
                     "Estimate for get_symbol_context(name=\"{}\"):\n  Symbol body: ~{} tokens\n  Callers: ~{} tokens\n  Bundle: ~{} tokens",
-                    params.0.name,
+                    input.name,
                     sym_tokens,
                     ref_count * 15 + 50,
                     bundle_est
                 );
             } else {
                 record_read_outcome(ReadOutcome::NotFound);
-                return format!("Symbol '{}' not found in '{}'", params.0.name, path);
+                return format!("Symbol '{}' not found in '{}'", input.name, path);
             }
         }
-        if params.0.bundle.unwrap_or(false) {
-            let path = match params.0.path.as_deref() {
+        if input.bundle.unwrap_or(false) {
+            let path = match input.path.as_deref() {
                 Some(p) => p.to_string(),
                 None => {
                     record_read_outcome(ReadOutcome::InvalidRequest);
@@ -2848,9 +3099,9 @@ impl SymForgeServer {
                     .unwrap_or("parsed");
                 let view = published.live.capture_context_bundle_view(
                     &path,
-                    &params.0.name,
-                    params.0.symbol_kind.as_deref(),
-                    params.0.symbol_line,
+                    &input.name,
+                    input.symbol_kind.as_deref(),
+                    input.symbol_line,
                 );
                 (view, raw, parse_state)
             };
@@ -2864,14 +3115,14 @@ impl SymForgeServer {
                     ReadOutcome::NotFound
                 }
             });
-            let verbosity = params.0.verbosity.as_deref().unwrap_or("full");
+            let verbosity = input.verbosity.as_deref().unwrap_or("full");
             let result = format::context_bundle_result_view_with_max_tokens(
                 &view,
                 verbosity,
-                params.0.max_tokens,
+                input.max_tokens,
             );
             let result = if let crate::live_index::ContextBundleView::Found(found) = &view {
-                let scope = match params.0.max_tokens {
+                let scope = match input.max_tokens {
                     Some(max_tokens) => format!(
                         "path `{}`; bundle mode; max_tokens={max_tokens}",
                         found.file_path
@@ -2879,7 +3130,7 @@ impl SymForgeServer {
                     None => format!("path `{}`; bundle mode", found.file_path),
                 };
                 let envelope = search_format::format_search_envelope(
-                    if params.0.symbol_line.is_some() {
+                    if input.symbol_line.is_some() {
                         "exact"
                     } else {
                         "constrained"
@@ -2891,7 +3142,7 @@ impl SymForgeServer {
                     if refreshed {
                         search_format::SourceAuthority::never_collapse("disk-refreshed")
                     } else {
-                        search_format::SourceAuthority::from_check(&check)
+                        search_format::SourceAuthority::from_check(check)
                     },
                     parse_state,
                     &context_bundle_completeness_label(found.as_ref(), &result),
@@ -2912,23 +3163,27 @@ impl SymForgeServer {
                 raw_chars,
             ));
             let output = format!("{result}{footer}");
-            self.session_context.record_symbol(
-                &path,
-                &params.0.name,
-                u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
-                    output.len() as u64,
-                ))
-                .unwrap_or(u32::MAX),
-            );
+            if !check.is_provisional() {
+                self.session_context.record_symbol(
+                    &path,
+                    &input.name,
+                    u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                        output.len() as u64,
+                    ))
+                    .unwrap_or(u32::MAX),
+                );
+            }
             // Frecency bump — commitment tool, bundle-mode happy path.
             // Collection policy is resolved inside bump_frecency.
-            self.bump_frecency(&[PathBuf::from(&path)]);
+            if !check.is_provisional() {
+                self.bump_frecency(&[PathBuf::from(&path)]);
+            }
             return output;
         }
 
         // Trace mode: comprehensive symbol analysis (absorbed from trace_symbol)
-        if params.0.sections.is_some() {
-            let path = match params.0.path.as_deref() {
+        if input.sections.is_some() {
+            let path = match input.path.as_deref() {
                 Some(p) => p.to_string(),
                 None => {
                     record_read_outcome(ReadOutcome::InvalidRequest);
@@ -2941,8 +3196,8 @@ impl SymForgeServer {
             };
 
             // Convert sections: Some(empty vec) = all sections (like trace_symbol's None)
-            let include_tests = include_tests_from_sections(params.0.sections.as_ref());
-            let requested_sections = visible_sections(&params.0.sections).unwrap_or_default();
+            let include_tests = include_tests_from_sections(input.sections.as_ref());
+            let requested_sections = visible_sections(&input.sections).unwrap_or_default();
             let knowledge_requested = requested_sections.is_empty()
                 || requested_sections
                     .iter()
@@ -2964,15 +3219,15 @@ impl SymForgeServer {
             let sections_param = encode_include_tests_marker(sections_param, include_tests);
 
             let target = crate::protocol::knowledge_model::resolve_symbol_code_anchor(
-                &published,
+                published,
                 &path,
-                &params.0.name,
-                params.0.symbol_kind.as_deref(),
-                params.0.symbol_line,
+                &input.name,
+                input.symbol_kind.as_deref(),
+                input.symbol_line,
             );
             let knowledge = target.as_ref().and_then(|target| {
                 crate::protocol::knowledge_model::render_code_knowledge_context(
-                    &published, target, true,
+                    published, target, true,
                 )
             });
             if knowledge_only {
@@ -2982,9 +3237,9 @@ impl SymForgeServer {
                 } else {
                     ReadOutcome::NotFound
                 });
-                let knowledge_budget = params.0.max_tokens.filter(|limit| *limit > 0);
+                let knowledge_budget = input.max_tokens.filter(|limit| *limit > 0);
                 let output = crate::protocol::knowledge_model::render_budgeted_code_knowledge_only(
-                    &published,
+                    published,
                     knowledge.as_deref(),
                     knowledge_budget,
                 );
@@ -2995,9 +3250,9 @@ impl SymForgeServer {
                         |bytes| {
                             crate::index_lifecycle::guidance::source::symbol_context_continuation(
                                 &path,
-                                &params.0.name,
-                                params.0.symbol_kind.as_deref(),
-                                params.0.symbol_line,
+                                &input.name,
+                                input.symbol_kind.as_deref(),
+                                input.symbol_line,
                                 Some(&requested_sections),
                                 include_tests,
                                 &[],
@@ -3009,31 +3264,35 @@ impl SymForgeServer {
                 } else {
                     output
                 };
-                self.session_context.record_symbol(
-                    &path,
-                    &params.0.name,
-                    u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
-                        output.len() as u64,
-                    ))
-                    .unwrap_or(u32::MAX),
-                );
-                self.bump_frecency(&[PathBuf::from(&path)]);
+                if !check.is_provisional() {
+                    self.session_context.record_symbol(
+                        &path,
+                        &input.name,
+                        u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                            output.len() as u64,
+                        ))
+                        .unwrap_or(u32::MAX),
+                    );
+                }
+                if !check.is_provisional() {
+                    self.bump_frecency(&[PathBuf::from(&path)]);
+                }
                 return output;
             }
 
             let trace_input = TraceSymbolInput {
                 path: path.clone(),
-                name: params.0.name.clone(),
-                kind: params.0.symbol_kind.clone(),
-                symbol_line: params.0.symbol_line,
+                name: input.name.clone(),
+                kind: input.symbol_kind.clone(),
+                symbol_line: input.symbol_line,
                 sections: sections_param,
-                verbosity: params.0.verbosity.clone(),
-                max_tokens: params.0.max_tokens,
+                verbosity: input.verbosity.clone(),
+                max_tokens: input.max_tokens,
                 estimate: None,
             };
             let trace_sections = visible_sections(&trace_input.sections);
             let trace_view = capture_trace_symbol_view_for_generation(
-                &published,
+                published,
                 &trace_input,
                 trace_sections.as_deref(),
             );
@@ -3064,10 +3323,10 @@ impl SymForgeServer {
             // `max_tokens` nothing is derived (the old default of 1,000 tokens halved
             // the code share until the callee names were gone); only the hard cap
             // applies, and it drops the optional knowledge section first.
-            let trace_result = match params.0.max_tokens.filter(|limit| *limit > 0) {
+            let trace_result = match input.max_tokens.filter(|limit| *limit > 0) {
                 Some(limit) => {
                     crate::protocol::knowledge_model::enforce_budgeted_code_context_with_knowledge(
-                        &published,
+                        published,
                         trace_result,
                         knowledge_start,
                         knowledge_start.and(knowledge.as_deref()),
@@ -3088,9 +3347,9 @@ impl SymForgeServer {
                     );
                     crate::index_lifecycle::guidance::source::cap_default_symbol_context(
                         &path,
-                        &params.0.name,
-                        params.0.symbol_kind.as_deref(),
-                        params.0.symbol_line,
+                        &input.name,
+                        input.symbol_kind.as_deref(),
+                        input.symbol_line,
                         Some(&requested_sections),
                         include_tests,
                         &trace_result[..code_end],
@@ -3099,35 +3358,39 @@ impl SymForgeServer {
                     .unwrap_or_else(|| trace_result.clone())
                 }
             };
-            self.session_context.record_symbol(
-                &path,
-                &params.0.name,
-                u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
-                    trace_result.len() as u64,
-                ))
-                .unwrap_or(u32::MAX),
-            );
+            if !check.is_provisional() {
+                self.session_context.record_symbol(
+                    &path,
+                    &input.name,
+                    u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                        trace_result.len() as u64,
+                    ))
+                    .unwrap_or(u32::MAX),
+                );
+            }
             // Frecency bump — commitment tool, trace-mode happy path.
             // Collection policy is resolved inside bump_frecency.
-            self.bump_frecency(&[PathBuf::from(&path)]);
+            if !check.is_provisional() {
+                self.bump_frecency(&[PathBuf::from(&path)]);
+            }
             return trace_result;
         }
 
         // Default: symbol context mode
-        let file_path_hint = params.0.path.as_deref().or(params.0.file.as_deref());
+        let file_path_hint = input.path.as_deref().or(input.file.as_deref());
         // Auto-resolve path from index when not provided
         let resolved_path: Option<String>;
         let file_path_hint = if file_path_hint.is_some() {
             resolved_path = None;
             file_path_hint
         } else {
-            let candidates = symbol_candidate_paths(published.live.as_ref(), &params.0.name);
+            let candidates = symbol_candidate_paths(published.live.as_ref(), &input.name);
             if candidates.len() == 1 {
                 resolved_path = Some(candidates.into_iter().next().unwrap());
                 resolved_path.as_deref()
             } else if candidates.len() > 1 {
                 record_read_outcome(ReadOutcome::Ambiguous);
-                return format_ambiguous_symbol_context(&params.0.name, &candidates);
+                return format_ambiguous_symbol_context(&input.name, &candidates);
             } else {
                 resolved_path = None;
                 None
@@ -3135,23 +3398,23 @@ impl SymForgeServer {
         };
         record_read_outcome(default_symbol_context_outcome(
             published.live.as_ref(),
-            &params.0,
+            input,
         ));
-        let verbosity = params.0.verbosity.as_deref().unwrap_or("full");
-        let max_tokens = params.0.max_tokens;
+        let verbosity = input.verbosity.as_deref().unwrap_or("full");
+        let max_tokens = input.max_tokens;
         let knowledge_section = file_path_hint
             .and_then(|path| {
                 crate::protocol::knowledge_model::resolve_symbol_code_anchor(
-                    &published,
+                    published,
                     path,
-                    &params.0.name,
-                    params.0.symbol_kind.as_deref(),
-                    params.0.symbol_line,
+                    &input.name,
+                    input.symbol_kind.as_deref(),
+                    input.symbol_line,
                 )
             })
             .and_then(|target| {
                 crate::protocol::knowledge_model::render_code_knowledge_context(
-                    &published, &target, false,
+                    published, &target, false,
                 )
             });
 
@@ -3164,9 +3427,9 @@ impl SymForgeServer {
             let header = file.and_then(|f| {
                 render_symbol_context_header(
                     f.as_ref(),
-                    &params.0.name,
-                    params.0.symbol_kind.as_deref(),
-                    params.0.symbol_line,
+                    &input.name,
+                    input.symbol_kind.as_deref(),
+                    input.symbol_line,
                     verbosity,
                     max_tokens,
                 )
@@ -3176,9 +3439,9 @@ impl SymForgeServer {
                 .map(|path| {
                     let view = published.live.capture_context_bundle_view(
                         path,
-                        &params.0.name,
-                        params.0.symbol_kind.as_deref(),
-                        params.0.symbol_line,
+                        &input.name,
+                        input.symbol_kind.as_deref(),
+                        input.symbol_line,
                     );
                     let tip = format::context_bundle_impl_suggestion_tip(&view);
                     let callees = format::context_bundle_callees_text(&view);
@@ -3191,13 +3454,13 @@ impl SymForgeServer {
 
         let state = sidecar_state_for_server(self);
         let symbol_context = SymbolContextParams {
-            name: params.0.name.clone(),
-            file: params.0.file.clone(),
-            path: params.0.path.clone(),
-            symbol_kind: params.0.symbol_kind.clone(),
-            symbol_line: params.0.symbol_line,
+            name: input.name.clone(),
+            file: input.file.clone(),
+            path: input.path.clone(),
+            symbol_kind: input.symbol_kind.clone(),
+            symbol_line: input.symbol_line,
         };
-        match symbol_context_tool_text_for_generation(&state, &published, &symbol_context) {
+        match symbol_context_tool_text_for_generation(&state, published, &symbol_context) {
             Ok(refs_text) => {
                 let mut output = String::new();
                 if let Some(header) = &symbol_header {
@@ -3223,18 +3486,18 @@ impl SymForgeServer {
                 // Resolve the bump path the same way the output did:
                 // explicit params first, auto-resolved path as fallback.
                 // Collection policy is resolved inside bump_frecency.
-                if let Some(bump_path) = params
-                    .0
+                if let Some(bump_path) = input
                     .path
                     .as_deref()
-                    .or(params.0.file.as_deref())
+                    .or(input.file.as_deref())
                     .map(PathBuf::from)
                     .or_else(|| resolved_path.as_deref().map(PathBuf::from))
+                    && !check.is_provisional()
                 {
                     self.bump_frecency(&[bump_path]);
                 }
                 crate::protocol::knowledge_model::enforce_budgeted_code_context_with_knowledge(
-                    &published,
+                    published,
                     format!("{output}{footer}"),
                     knowledge_start,
                     knowledge_section.as_deref(),
@@ -3266,18 +3529,22 @@ impl SymForgeServer {
                     ));
                     let output = format!("{body}{footer}");
                     if let Some(ref p) = resolved_path {
+                        if !check.is_provisional() {
+                            self.session_context.record_symbol(
+                                p,
+                                &input.name,
+                                u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                                    output.len() as u64,
+                                ))
+                                .unwrap_or(u32::MAX),
+                            );
+                        }
+                    } else if let Some(ref p) = input.path
+                        && !check.is_provisional()
+                    {
                         self.session_context.record_symbol(
                             p,
-                            &params.0.name,
-                            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
-                                output.len() as u64,
-                            ))
-                            .unwrap_or(u32::MAX),
-                        );
-                    } else if let Some(ref p) = params.0.path {
-                        self.session_context.record_symbol(
-                            p,
-                            &params.0.name,
+                            &input.name,
                             u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
                                 output.len() as u64,
                             ))
@@ -3288,18 +3555,18 @@ impl SymForgeServer {
                     // branch (sidecar unavailable but we still returned a
                     // useful symbol body to the caller). Collection policy is
                     // resolved inside bump_frecency.
-                    if let Some(bump_path) = params
-                        .0
+                    if let Some(bump_path) = input
                         .path
                         .as_deref()
-                        .or(params.0.file.as_deref())
+                        .or(input.file.as_deref())
                         .map(PathBuf::from)
                         .or_else(|| resolved_path.as_deref().map(PathBuf::from))
+                        && !check.is_provisional()
                     {
                         self.bump_frecency(&[bump_path]);
                     }
                     crate::protocol::knowledge_model::enforce_budgeted_code_context_with_knowledge(
-                        &published,
+                        published,
                         output,
                         knowledge_start,
                         knowledge_section.as_deref(),
@@ -3307,7 +3574,7 @@ impl SymForgeServer {
                     )
                     .0
                 } else {
-                    format!("Symbol \"{}\" not found in index.", params.0.name)
+                    format!("Symbol \"{}\" not found in index.", input.name)
                 }
             }
         }
@@ -3435,73 +3702,89 @@ impl SymForgeServer {
         {
             return refusal;
         }
-        // Spec 036 FR-015: compare the scope with the disk first, so the
-        // publication captured next already holds what the check refreshed.
-        let check = check_answer_files(self, params.0.path_prefix.as_deref()).await;
-        // Capture only after daemon proxy/recovery has either returned or
-        // rebuilt the local index. Rows, trust banner, parse state, and temporal
-        // data then share the same fresh publication advertised by the local
-        // fallback ProjectEvidence.
-        let generation = self.capture_local_response_generation();
-        if let Some(notice) =
-            params.0.path_prefix.as_deref().and_then(|path| {
+        // Spec 036 FR-015: the answer's files are compared with the disk.
+        // Capture happens inside, after daemon proxy/recovery has either
+        // returned or rebuilt the local index, so rows, banner and parse state
+        // share one publication.
+        let input = &params.0;
+        // The query runs once per captured publication; its renders share it.
+        let query = |generation: &Arc<crate::live_index::PublishedGeneration>| {
+            if let Some(notice) = input.path_prefix.as_deref().and_then(|path| {
                 crate::protocol::read_gate::unverified_notice(&generation.live, path)
-            })
-        {
-            // A served notice (the class it always had): withheld content is
-            // named, not failed.
-            record_read_outcome(ReadOutcome::Found);
-            return notice;
-        }
-        let execution = {
-            let guard = Arc::clone(&generation.live);
-            loading_guard!(guard);
-            match crate::index_lifecycle::guidance::search::execute_symbol_search(&guard, &params.0)
-            {
+            }) {
+                record_read_outcome(ReadOutcome::Found);
+                return Err(notice);
+            }
+            if let Some(message) = loading_guard_text(&generation.live) {
+                return Err(message);
+            }
+            crate::index_lifecycle::guidance::search::execute_symbol_search(&generation.live, input)
+                .inspect_err(|_| record_read_outcome(ReadOutcome::InvalidRequest))
+        };
+        let render = |generation: &Arc<crate::live_index::PublishedGeneration>,
+                      execution: &Result<
+            crate::index_lifecycle::guidance::search::SymbolSearchExecution,
+            String,
+        >,
+                      check: &AnswerCheck| {
+            let execution = match execution {
                 Ok(execution) => execution,
-                Err(message) => {
-                    record_read_outcome(ReadOutcome::InvalidRequest);
-                    return message;
+                Err(message) => return Rendered::plain(Err(message.clone())),
+            };
+            record_read_outcome(if execution.result.hits.is_empty() {
+                ReadOutcome::Empty
+            } else {
+                ReadOutcome::Found
+            });
+            let output = crate::index_lifecycle::guidance::search::render_symbol_search(
+                generation, execution, query_str, check,
+            );
+            if !check.is_provisional() {
+                self.record_tool_savings_named(
+                    "search_symbols",
+                    crate::stel::handler::estimate_tokens_from_bytes(
+                        (format::estimate_listing_baseline_chars(output.len())) as u64,
+                    ),
+                    crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
+                );
+                // Session tracking: each hit is list-only until its body is fetched.
+                for hit in &execution.result.hits {
+                    self.session_context
+                        .record_listed_symbol(&hit.path, &hit.name);
                 }
             }
+            // Intentionally NO frecency bump here — search_symbols is a
+            // discovery tool. See wiki `[[SymForge Frecency-Weighted File
+            // Ranking]]` §"Search tools deliberately do NOT bump".
+            let cited = crate::index_lifecycle::guidance::freshen::cited_paths(
+                &generation.live,
+                execution
+                    .result
+                    .hits
+                    .iter()
+                    .map(|hit| hit.path.as_str())
+                    .chain(
+                        execution
+                            .text_fallback
+                            .iter()
+                            .map(|(path, _)| path.as_str()),
+                    ),
+            );
+            checked_answer(
+                self,
+                "search_symbols",
+                generation,
+                input.path_prefix.as_deref(),
+                output,
+                cited,
+                Claim::whole_if(execution.result.overflow_count == 0),
+                input.max_tokens,
+                check,
+            )
         };
-        record_read_outcome(if execution.result.hits.is_empty() {
-            ReadOutcome::Empty
-        } else {
-            ReadOutcome::Found
-        });
-        let output = crate::index_lifecycle::guidance::search::render_symbol_search(
-            &generation,
-            &execution,
-            query_str,
-            &check,
-        );
-        let result = execution.result;
-        self.record_tool_savings_named(
-            "search_symbols",
-            crate::stel::handler::estimate_tokens_from_bytes(
-                (format::estimate_listing_baseline_chars(output.len())) as u64,
-            ),
-            crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
-        );
-        self.session_context.record_summary_output(
-            "search_symbols",
-            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
-                output.len() as u64,
-            ))
-            .unwrap_or(u32::MAX),
-        );
-        // Session tracking: record each symbol hit as list-only until its body is fetched.
-        for hit in &result.hits {
-            self.session_context
-                .record_listed_symbol(&hit.path, &hit.name);
-        }
-        // Intentionally NO frecency bump here — search_symbols is a discovery
-        // tool. See wiki `[[SymForge Frecency-Weighted File Ranking]]`
-        // §"Search tools deliberately do NOT bump" for the positive-feedback-
-        // loop rationale.
-        let output = with_withheld_note(&generation.live, params.0.path_prefix.as_deref(), output);
-        self.apply_ccr_budget("search_symbols", output, params.0.max_tokens)
+        let (_, answer, _) =
+            answer_checked_query(self, input.path_prefix.as_deref(), query, render);
+        answer.unwrap_or_else(|refusal| refusal)
     }
     /// Shows matches with enclosing symbol context. Use group_by='symbol' to deduplicate,
     /// follow_refs=true to inline callers. Set structural=true to match AST patterns using
@@ -3743,80 +4026,92 @@ impl SymForgeServer {
                 est, limit, per_file
             );
         }
-        // Spec 036 FR-015: compare the scope with the disk before the capture.
-        let check = check_answer_files(self, params.0.path_prefix.as_deref()).await;
-        let generation = self.capture_local_response_generation();
-        if let Some(notice) =
-            params.0.path_prefix.as_deref().and_then(|path| {
+        // Spec 036 FR-015: the answer's files are compared with the disk.
+        let input = &params.0;
+        // The query runs once per captured publication; its renders share it.
+        let query = |generation: &Arc<crate::live_index::PublishedGeneration>| {
+            if let Some(notice) = input.path_prefix.as_deref().and_then(|path| {
                 crate::protocol::read_gate::unverified_notice(&generation.live, path)
-            })
-        {
-            // A served notice (the class it always had): withheld content is
-            // named, not failed.
-            record_read_outcome(ReadOutcome::Found);
-            return notice;
-        }
-        let execution = {
-            let guard = Arc::clone(&generation.live);
-            loading_guard!(guard);
-            match crate::index_lifecycle::guidance::search::execute_text_search(
-                &generation,
-                &params.0,
-            ) {
-                Ok(execution) => execution,
-                Err(message) => {
-                    record_read_outcome(ReadOutcome::InvalidRequest);
-                    return message;
-                }
+            }) {
+                // A served notice (the class it always had): withheld content
+                // is named, not failed.
+                record_read_outcome(ReadOutcome::Found);
+                return Err(notice);
             }
+            if let Some(message) = loading_guard_text(&generation.live) {
+                return Err(message);
+            }
+            crate::index_lifecycle::guidance::search::execute_text_search(generation, input)
+                .inspect_err(|_| record_read_outcome(ReadOutcome::InvalidRequest))
         };
-        // The engine's typed result decides: an invalid request, no matching
-        // file, or matches (whatever text the matched lines carry).
-        record_read_outcome(match &execution.result {
-            Err(_) => ReadOutcome::InvalidRequest,
-            Ok(result) if result.files.is_empty() => ReadOutcome::Empty,
-            Ok(_) => ReadOutcome::Found,
-        });
-        let hidden_documentation_note = execution.hidden_documentation_note();
-        let mut output = render_search_text_output(
-            self,
-            &generation,
-            execution.result,
-            execution.effective_query.as_deref(),
-            execution.structural,
-            params.0.group_by.as_deref(),
-            params.0.terms.as_deref(),
-            &execution.options,
-            execution.is_regex,
-            execution.auto_detected_regex,
-            execution.auto_corrected_regex,
-            execution.hidden_test_matches,
-            &check,
-        );
-        if execution.auto_corrected_regex {
-            output.push_str(&format!(
-                "\n(auto-corrected double-escaped regex: `{}` → `{}`)",
-                params.0.query.as_deref().unwrap_or_default(),
-                execution.effective_query.as_deref().unwrap_or_default()
-            ));
-        }
-        if let Some(note) = hidden_documentation_note {
-            output.push('\n');
-            output.push_str(&note);
-        }
-        self.session_context.record_summary_output(
-            "search_text",
-            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
-                output.len() as u64,
-            ))
-            .unwrap_or(u32::MAX),
-        );
-        // Discovery stays neutral: only loaded context and mutations record frecency.
-        self.apply_ccr_budget(
-            "search_text",
-            with_withheld_note(&generation.live, params.0.path_prefix.as_deref(), output),
-            params.0.max_tokens,
-        )
+        let render = |generation: &Arc<crate::live_index::PublishedGeneration>,
+                      execution: &Result<
+            crate::index_lifecycle::guidance::search::TextSearchExecution,
+            String,
+        >,
+                      check: &AnswerCheck| {
+            let execution = match execution {
+                Ok(execution) => execution,
+                Err(message) => return Rendered::plain(Err(message.clone())),
+            };
+            // The engine's typed result decides: an invalid request, no
+            // matching file, or matches (whatever text the lines carry).
+            record_read_outcome(match &execution.result {
+                Err(_) => ReadOutcome::InvalidRequest,
+                Ok(result) if result.files.is_empty() => ReadOutcome::Empty,
+                Ok(_) => ReadOutcome::Found,
+            });
+            let claim =
+                crate::index_lifecycle::guidance::search::text_search_claim(&execution.result);
+            let cited = crate::index_lifecycle::guidance::freshen::cited_paths(
+                &generation.live,
+                execution
+                    .result
+                    .iter()
+                    .flat_map(|found| found.files.iter().map(|file| file.path.as_str())),
+            );
+            let hidden_documentation_note = execution.hidden_documentation_note();
+            let mut output = render_search_text_output(
+                self,
+                generation,
+                execution.result.clone(),
+                execution.effective_query.as_deref(),
+                execution.structural,
+                input.group_by.as_deref(),
+                input.terms.as_deref(),
+                &execution.options,
+                execution.is_regex,
+                execution.auto_detected_regex,
+                execution.auto_corrected_regex,
+                execution.hidden_test_matches,
+                check,
+            );
+            if execution.auto_corrected_regex {
+                output.push_str(&format!(
+                    "\n(auto-corrected double-escaped regex: `{}` → `{}`)",
+                    input.query.as_deref().unwrap_or_default(),
+                    execution.effective_query.as_deref().unwrap_or_default()
+                ));
+            }
+            if let Some(note) = hidden_documentation_note {
+                output.push('\n');
+                output.push_str(&note);
+            }
+            checked_answer(
+                self,
+                "search_text",
+                generation,
+                input.path_prefix.as_deref(),
+                output,
+                cited,
+                claim,
+                input.max_tokens,
+                check,
+            )
+        };
+        let (_, answer, _) =
+            answer_checked_query(self, input.path_prefix.as_deref(), query, render);
+        answer.unwrap_or_else(|refusal| refusal)
     }
 
     /// Internal: trace_symbol logic, called by get_symbol_context when sections are provided.
@@ -3885,6 +4180,15 @@ impl SymForgeServer {
             );
         }
 
+        // Spec 036 item 3: the inspected file is compared with the disk (and
+        // re-indexed when it differs) before the read guard is taken.
+        let unconfirmed =
+            match freshen_exact_path_with_note(self, &search::PathScope::exact(&params.0.path))
+                .await
+            {
+                Ok(freshen) => freshen.unconfirmed,
+                Err(refusal) => return refusal.message(&params.0.path),
+            };
         let view = {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
@@ -3909,7 +4213,11 @@ impl SymForgeServer {
             ))
             .unwrap_or(u32::MAX),
         );
-        format::enforce_token_budget(output, params.0.max_tokens)
+        crate::index_lifecycle::guidance::freshen::close_targeted_read(
+            format::enforce_token_budget(output, params.0.max_tokens),
+            unconfirmed.as_slice(),
+            params.0.max_tokens,
+        )
     }
 
     /// Find files by path, filename, or folder — ranked by relevance. With changed_with=path,
@@ -3939,8 +4247,6 @@ impl SymForgeServer {
         if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
             return refusal;
         }
-        let include_vendor = params.0.include_vendor.unwrap_or(false);
-        let include_personal_tooling = params.0.include_personal_tooling.unwrap_or(false);
         if params.0.estimate == Some(true) {
             let limit = params.0.limit.unwrap_or(20) as usize;
             let est = limit * 10 + 30;
@@ -3950,24 +4256,87 @@ impl SymForgeServer {
                 est, limit
             );
         }
-        // Spec 036 FR-015: compare the scope with the disk before the capture.
-        let check = check_answer_files(self, params.0.path_prefix.as_deref()).await;
-        // Capture only after daemon proxy/recovery has either returned or
-        // rebuilt the local index. The source-free estimate above deliberately
-        // remains before publication selection.
-        let generation = self.capture_local_response_generation();
+        // Spec 036 FR-015: the answer's files are compared with the disk.
+        // Capture happens inside, after daemon proxy/recovery has either
+        // returned or rebuilt the local index; the source-free estimate above
+        // deliberately remains before publication selection.
+        let input = &params.0;
+        // Round 3 item 9: the ranking runs once per captured publication
+        // (and starts derived-state preparation once); its renders share it.
+        let ranked_mode = !input.resolve.unwrap_or(false)
+            && input.changed_with.is_none()
+            && !input.query.is_empty();
+        let query = |generation: &Arc<crate::live_index::PublishedGeneration>| {
+            (ranked_mode && loading_guard_text(&generation.live).is_none()).then(|| {
+                crate::index_lifecycle::guidance::file_search::rank_files(
+                    generation,
+                    self.capture_repo_root().as_deref(),
+                    self.capture_project_state_dir().as_ref(),
+                    input,
+                    true,
+                )
+            })
+        };
+        answer_checked_query(
+            self,
+            input.path_prefix.as_deref(),
+            query,
+            |generation, ranked, check| {
+                let mut claim = Claim::Rows;
+                let mut rows = Vec::new();
+                let answer = self.search_files_rendered(
+                    input,
+                    generation,
+                    ranked.as_ref(),
+                    check,
+                    &mut claim,
+                    &mut rows,
+                );
+                Rendered {
+                    cited: crate::index_lifecycle::guidance::freshen::cited_paths(
+                        &generation.live,
+                        rows.iter().map(String::as_str),
+                    ),
+                    claim,
+                    answer,
+                }
+            },
+        )
+        .1
+    }
 
+    /// One [`answer_checked`] render of `search_files`; `claim` receives what
+    /// the answer claims beyond its rows, `rows` the paths it lists.
+    fn search_files_rendered(
+        &self,
+        input: &SearchFilesInput,
+        generation: &Arc<crate::live_index::PublishedGeneration>,
+        prepared: Option<&crate::index_lifecycle::guidance::file_search::RankedFiles>,
+        check: &AnswerCheck,
+        claim: &mut Claim,
+        rows: &mut Vec<String>,
+    ) -> String {
+        let include_vendor = input.include_vendor.unwrap_or(false);
+        let include_personal_tooling = input.include_personal_tooling.unwrap_or(false);
         // Resolve mode: exact path resolution
-        if params.0.resolve.unwrap_or(false) {
-            if params.0.query.is_empty() {
+        if input.resolve.unwrap_or(false) {
+            if input.query.is_empty() {
                 record_read_outcome(ReadOutcome::InvalidRequest);
                 return "search_files with resolve=true requires a non-empty `query`.".to_string();
             }
             let (view, hidden_noise_count) = {
                 let guard = Arc::clone(&generation.live);
                 loading_guard!(guard);
-                crate::index_lifecycle::guidance::file_search::resolve_files(&guard, &params.0)
+                crate::index_lifecycle::guidance::file_search::resolve_files(&guard, input)
             };
+            match &view {
+                SearchFilesResolveView::Resolved { path }
+                | SearchFilesResolveView::ResolvedMetadataOnly { path, .. } => {
+                    rows.push(path.clone());
+                }
+                SearchFilesResolveView::Ambiguous { matches, .. } => rows.extend(matches.clone()),
+                _ => {}
+            }
             record_read_outcome(match &view {
                 SearchFilesResolveView::EmptyHint => ReadOutcome::InvalidRequest,
                 SearchFilesResolveView::Resolved { .. }
@@ -3980,7 +4349,7 @@ impl SymForgeServer {
                     let guard = Arc::clone(&generation.live);
                     Some(search_format::format_search_envelope(
                         search_files_resolve_match_type_label(&view),
-                        search_format::SourceAuthority::from_check(&check),
+                        search_format::SourceAuthority::from_check(check),
                         search_parse_state_for_paths(&guard, std::iter::once(path.as_str())),
                         &search_completeness_label(0, hidden_noise_count),
                         &search_files_scope_summary(
@@ -3996,7 +4365,7 @@ impl SymForgeServer {
                     // parse state honestly instead of the misleading "parsed".
                     Some(search_format::format_search_envelope(
                         search_files_resolve_match_type_label(&view),
-                        search_format::SourceAuthority::from_check(&check),
+                        search_format::SourceAuthority::from_check(check),
                         "metadata-only (not parsed)",
                         &search_completeness_label(0, hidden_noise_count),
                         &search_files_scope_summary(
@@ -4015,7 +4384,7 @@ impl SymForgeServer {
                     let guard = Arc::clone(&generation.live);
                     Some(search_format::format_search_envelope(
                         search_files_resolve_match_type_label(&view),
-                        search_format::SourceAuthority::from_check(&check),
+                        search_format::SourceAuthority::from_check(check),
                         search_parse_state_for_paths(
                             &guard,
                             matches.iter().map(std::string::String::as_str),
@@ -4057,35 +4426,39 @@ impl SymForgeServer {
                 let matching_untracked_paths = matching_untracked_paths_for_search_files(
                     self,
                     &generation.live,
-                    &params.0.query,
+                    &input.query,
                     include_vendor,
                     include_personal_tooling,
                 );
                 append_untracked_file_diagnostic(&mut result, &matching_untracked_paths);
             }
-            let claims_complete = !matches!(
+            *claim = Claim::whole_if(!matches!(
                 view,
                 SearchFilesResolveView::Ambiguous { overflow_count, .. } if overflow_count > 0
+            ));
+            // Review M7 / item 4: the caveat is fitted inside the budget so it
+            // is never cut, and a cut answer makes no complete claim.
+            let result = crate::index_lifecycle::guidance::freshen::budget_with_notes(
+                check,
+                *claim,
+                input.max_tokens,
+                |max_tokens| format::enforce_token_budget(result, max_tokens),
             );
-            // Review M7: the caveat goes on after the budget so it is never cut,
-            // and a cut answer makes no complete claim.
-            let mut result = format::enforce_token_budget(result, params.0.max_tokens);
-            let claims_complete = claims_complete
-                && !crate::index_lifecycle::guidance::freshen::answer_was_cut(&result);
-            check.append_notes(&mut result, claims_complete);
-            self.session_context.record_summary_output(
-                "search_files",
-                u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
-                    result.len() as u64,
-                ))
-                .unwrap_or(u32::MAX),
-            );
+            if !check.is_provisional() {
+                self.session_context.record_summary_output(
+                    "search_files",
+                    u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                        result.len() as u64,
+                    ))
+                    .unwrap_or(u32::MAX),
+                );
+            }
             return result;
         }
 
         // Deprecated since v7.x: prefer `rank_by="path+cochange"` with `anchor_path`.
         // Keep this compatibility path behavior unchanged for one release cycle.
-        if let Some(ref target_path) = params.0.changed_with {
+        if let Some(ref target_path) = input.changed_with {
             let temporal = Arc::clone(&generation.code_signals.temporal);
             match temporal.state {
                 crate::live_index::git_temporal::GitTemporalState::Ready => {}
@@ -4217,7 +4590,7 @@ impl SymForgeServer {
             ));
         }
 
-        if params.0.query.is_empty() {
+        if input.query.is_empty() {
             record_read_outcome(ReadOutcome::InvalidRequest);
             return "search_files requires a non-empty `query` (or use `changed_with` to find co-changing files).".to_string();
         }
@@ -4225,43 +4598,59 @@ impl SymForgeServer {
         let ranked = {
             let guard = Arc::clone(&generation.live);
             loading_guard!(guard);
-            crate::index_lifecycle::guidance::file_search::rank_files(
-                &generation,
-                self.capture_repo_root().as_deref(),
-                self.capture_project_state_dir().as_ref(),
-                &params.0,
-                true,
-            )
+            match prepared {
+                Some(prepared) => prepared.clone(),
+                // A provisional render never starts derived-state preparation:
+                // that is a side effect the shown answer reports exactly once.
+                None => crate::index_lifecycle::guidance::file_search::rank_files(
+                    generation,
+                    self.capture_repo_root().as_deref(),
+                    self.capture_project_state_dir().as_ref(),
+                    input,
+                    !check.is_provisional(),
+                ),
+            }
         };
+        if let SearchFilesView::Found { hits, .. } = &ranked.view {
+            rows.extend(hits.iter().map(|hit| hit.path.clone()));
+        }
         record_read_outcome(match &ranked.view {
             SearchFilesView::EmptyQuery => ReadOutcome::InvalidRequest,
             SearchFilesView::NotFound { .. } => ReadOutcome::NotFound,
             SearchFilesView::Found { .. } => ReadOutcome::Found,
         });
-        let result = crate::index_lifecycle::guidance::file_search::render_ranked_files(
-            &generation,
-            ranked,
-            &params.0,
-            include_vendor,
-            include_personal_tooling,
-            &check,
-            || {
-                matching_untracked_paths_for_search_files(
-                    self,
-                    &generation.live,
-                    &params.0.query,
-                    include_vendor,
-                    include_personal_tooling,
-                )
-            },
-        );
-        self.session_context.record_summary_output(
-            "search_files",
-            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
-                result.len() as u64,
-            ))
-            .unwrap_or(u32::MAX),
-        );
+        let (result, ranked_claim) =
+            crate::index_lifecycle::guidance::file_search::render_ranked_files(
+                generation,
+                ranked,
+                input,
+                include_vendor,
+                include_personal_tooling,
+                check,
+                || {
+                    // A provisional render never shows the untracked diagnostic.
+                    if check.is_provisional() {
+                        return Vec::new();
+                    }
+                    matching_untracked_paths_for_search_files(
+                        self,
+                        &generation.live,
+                        &input.query,
+                        include_vendor,
+                        include_personal_tooling,
+                    )
+                },
+            );
+        *claim = ranked_claim;
+        if !check.is_provisional() {
+            self.session_context.record_summary_output(
+                "search_files",
+                u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                    result.len() as u64,
+                ))
+                .unwrap_or(u32::MAX),
+            );
+        }
         // Intentionally NO frecency bump here — search_files is a discovery
         // tool, and bumping on discovery creates a positive feedback loop
         // where files that rank high are searched more, which makes them
@@ -5388,6 +5777,102 @@ impl SymForgeServer {
         }
     }
 
+    /// One [`answer_checked`] render of `what_changed`'s timestamp mode;
+    /// `rows` receives the paths it lists.
+    #[allow(clippy::too_many_arguments)]
+    fn what_changed_timestamp_rendered(
+        &self,
+        input: &WhatChangedInput,
+        options: &WhatChangedOptions<'_>,
+        mode: &WhatChangedMode,
+        since_ts: i64,
+        generation: &Arc<crate::live_index::PublishedGeneration>,
+        prepared: &crate::live_index::WhatChangedTimestampView,
+        check: &AnswerCheck,
+        rows: &mut Vec<String>,
+    ) -> String {
+        {
+            let guard = Arc::clone(&generation.live);
+            loading_guard!(guard);
+        }
+        let view = prepared.clone();
+        if since_ts < view.loaded_secs {
+            match filter_paths_by_prefix_and_language(
+                view.paths.clone(),
+                input.path_prefix.as_deref(),
+                input.language.as_deref(),
+                input.code_only.unwrap_or(false),
+            ) {
+                Ok(filtered) => {
+                    rows.extend(filtered.iter().cloned());
+                    if filtered.is_empty() {
+                        return if view.paths.is_empty() {
+                            "Index is empty — no files tracked.".to_string()
+                        } else {
+                            "No indexed files matched the requested filters since the last index load.".to_string()
+                        };
+                    }
+                    let envelope = {
+                        let guard = Arc::clone(&generation.live);
+                        search_format::format_search_envelope(
+                            "exact (timestamp compare)",
+                            what_changed_source_authority(mode, check),
+                            search_parse_state_for_paths(
+                                &guard,
+                                filtered.iter().map(|path| path.as_str()),
+                            ),
+                            &changed_paths_completeness_label(view.paths.len(), filtered.len()),
+                            &what_changed_scope_summary(options, mode),
+                            &search_paths_evidence(filtered.iter().map(|path| path.as_str())),
+                        )
+                    };
+                    let output = format::what_changed_paths_result(
+                        &filtered,
+                        "No indexed files matched the requested filters since the last index load.",
+                    );
+                    let mut result = format!("{envelope}\n\n{output}");
+                    // No token budget applies, so the notes close the answer.
+                    check.append_notes(&mut result, true);
+                    if !check.is_provisional() {
+                        self.session_context.record_summary_output(
+                            "what_changed",
+                            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                                result.len() as u64,
+                            ))
+                            .unwrap_or(u32::MAX),
+                        );
+                    }
+                    result
+                }
+                Err(error) => {
+                    record_read_outcome(ReadOutcome::InvalidRequest);
+                    if !check.is_provisional() {
+                        self.session_context.record_summary_output(
+                            "what_changed",
+                            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                                error.len() as u64,
+                            ))
+                            .unwrap_or(u32::MAX),
+                        );
+                    }
+                    error
+                }
+            }
+        } else {
+            let result = format::what_changed_timestamp_view(&view, since_ts);
+            if !check.is_provisional() {
+                self.session_context.record_summary_output(
+                    "what_changed",
+                    u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                        result.len() as u64,
+                    ))
+                    .unwrap_or(u32::MAX),
+                );
+            }
+            result
+        }
+    }
+
     /// List changed files: uncommitted=true for working tree, git_ref for ref comparison, since for
     /// timestamp filter. Use to see what files changed.
     /// Set code_only=true to exclude non-source files (docs, configs, lock files).
@@ -5458,94 +5943,36 @@ impl SymForgeServer {
             }
         };
 
-        // Spec 036 FR-015: the timestamp mode lists indexed files, so compare
-        // them with the disk first; the git modes answer from git itself.
-        let check = if matches!(mode, WhatChangedMode::Timestamp(_)) {
-            check_answer_files(self, params.0.path_prefix.as_deref()).await
-        } else {
-            crate::index_lifecycle::guidance::freshen::AnswerCheck::not_run(
-                "git modes answer from git",
-            )
-        };
+        // The git modes answer from git itself; only the timestamp mode lists
+        // indexed files and compares them with the disk.
+        let check = AnswerCheck::not_run("git modes answer from git");
         match &mode {
             WhatChangedMode::Timestamp(since_ts) => {
-                let view = {
-                    let guard = self.index.data_plane().read();
-                    loading_guard!(guard);
-                    guard.capture_what_changed_timestamp_view()
-                };
-                if *since_ts < view.loaded_secs {
-                    match filter_paths_by_prefix_and_language(
-                        view.paths.clone(),
-                        params.0.path_prefix.as_deref(),
-                        params.0.language.as_deref(),
-                        params.0.code_only.unwrap_or(false),
-                    ) {
-                        Ok(filtered) => {
-                            if filtered.is_empty() {
-                                return if view.paths.is_empty() {
-                                    "Index is empty — no files tracked.".to_string()
-                                } else {
-                                    "No indexed files matched the requested filters since the last index load.".to_string()
-                                };
-                            }
-                            let envelope = {
-                                let guard = self.index.data_plane().read();
-                                search_format::format_search_envelope(
-                                    "exact (timestamp compare)",
-                                    what_changed_source_authority(&mode, &check),
-                                    search_parse_state_for_paths(
-                                        &guard,
-                                        filtered.iter().map(|path| path.as_str()),
-                                    ),
-                                    &changed_paths_completeness_label(
-                                        view.paths.len(),
-                                        filtered.len(),
-                                    ),
-                                    &what_changed_scope_summary(&options, &mode),
-                                    &search_paths_evidence(
-                                        filtered.iter().map(|path| path.as_str()),
-                                    ),
-                                )
-                            };
-                            let output = format::what_changed_paths_result(
-                                &filtered,
-                                "No indexed files matched the requested filters since the last index load.",
-                            );
-                            let mut result = format!("{envelope}\n\n{output}");
-                            check.append_notes(&mut result, true);
-                            self.session_context.record_summary_output(
-                                "what_changed",
-                                u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
-                                    result.len() as u64,
-                                ))
-                                .unwrap_or(u32::MAX),
-                            );
-                            result
+                // Spec 036 FR-015: the timestamp mode lists indexed files, so
+                // they are compared with the disk; the git modes answer from git.
+                let since_ts = *since_ts;
+                // Round 3 item 9: the view is captured once per publication.
+                answer_checked_query(
+                    self,
+                    params.0.path_prefix.as_deref(),
+                    |generation| generation.live.capture_what_changed_timestamp_view(),
+                    |generation, prepared, check| {
+                        let mut rows = Vec::new();
+                        let answer = self.what_changed_timestamp_rendered(
+                            &params.0, &options, &mode, since_ts, generation, prepared, check,
+                            &mut rows,
+                        );
+                        Rendered {
+                            cited: crate::index_lifecycle::guidance::freshen::cited_paths(
+                                &generation.live,
+                                rows.iter().map(String::as_str),
+                            ),
+                            claim: Claim::Whole,
+                            answer,
                         }
-                        Err(error) => {
-                            record_read_outcome(ReadOutcome::InvalidRequest);
-                            self.session_context.record_summary_output(
-                                "what_changed",
-                                u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
-                                    error.len() as u64,
-                                ))
-                                .unwrap_or(u32::MAX),
-                            );
-                            error
-                        }
-                    }
-                } else {
-                    let result = format::what_changed_timestamp_view(&view, *since_ts);
-                    self.session_context.record_summary_output(
-                        "what_changed",
-                        u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
-                            result.len() as u64,
-                        ))
-                        .unwrap_or(u32::MAX),
-                    );
-                    result
-                }
+                    },
+                )
+                .1
             }
             WhatChangedMode::Uncommitted => {
                 let guard = self.index.data_plane().read();
@@ -6080,21 +6507,16 @@ impl SymForgeServer {
     }
 
     pub(crate) async fn get_file_content(&self, params: Parameters<GetFileContentInput>) -> String {
+        let max_tokens = params.0.max_tokens;
         let mut unconfirmed = None;
-        let mut output = self.get_file_content_noted(params, &mut unconfirmed).await;
-        // Review M14: a file served from the index that could not be compared
-        // with the disk is named, after any budget so the line is never cut.
-        if let Some(line) = unconfirmed
-            && !is_error_output(&output)
-        {
-            output.push_str(
-                "
-
-",
-            );
-            output.push_str(&line);
-        }
-        output
+        let output = self.get_file_content_noted(params, &mut unconfirmed).await;
+        // Review M14 / item 4: a file served from the index that could not be
+        // compared with the disk is named, inside the caller's budget.
+        crate::index_lifecycle::guidance::freshen::close_targeted_read(
+            output,
+            unconfirmed.as_slice(),
+            max_tokens,
+        )
     }
 
     /// `get_file_content`; `unconfirmed` receives the targeted freshen's caveat.
@@ -6208,7 +6630,7 @@ impl SymForgeServer {
                 return message;
             }
         };
-        match freshen_exact_path_with_note(self, &options.path_scope) {
+        match freshen_exact_path_with_note(self, &options.path_scope).await {
             Ok(freshen) => *unconfirmed = freshen.unconfirmed,
             Err(refusal) => {
                 record_read_outcome(ReadOutcome::Unavailable { retryable: true });
@@ -6451,8 +6873,7 @@ impl SymForgeServer {
         }
 
         let path_scope = search::PathScope::exact(&input.path);
-        let force_disk_fallback = match freshen_exact_path_for_targeted_retrieval(self, &path_scope)
-        {
+        let force_disk_fallback = match freshen_exact_path_changed(self, &path_scope).await {
             Ok(_) => false,
             // This tool has an authoritative disk-read lane below. A rejected
             // same-project publication therefore means "do not trust the indexed
@@ -6591,29 +7012,147 @@ impl SymForgeServer {
         {
             return refusal;
         }
-        // Spec 036 FR-015: a reference may sit in any file; compare them all
-        // with the disk before the capture.
-        let check = check_answer_files(self, None).await;
-        let mut output = self.find_references_checked(&params.0, &check);
-        // A reference listing is a complete claim for its scope; a refusal
-        // before any capture claims nothing.
-        if !is_index_unavailable_output(&output) {
-            let complete = !crate::index_lifecycle::guidance::freshen::answer_was_cut(&output);
-            check.append_notes(&mut output, complete);
-        }
-        output
+        // Spec 036 FR-015: the cited files, and on a complete listing every
+        // file (a reference may sit anywhere), are compared with the disk.
+        let input = &params.0;
+        let references_mode = input.mode.as_deref().unwrap_or("references") != "implementations";
+        // Round 3 item 9: the references query runs once per captured
+        // publication; its renders share it.
+        let query = |generation: &Arc<crate::live_index::PublishedGeneration>| {
+            references_mode
+                .then(|| self.find_references_view(input, generation))
+                .and_then(Result::ok)
+        };
+        answer_checked_query(self, None, query, |generation, prepared, check| {
+            let mut rows = Vec::new();
+            let output = self.find_references_checked(
+                input,
+                generation,
+                prepared.as_ref(),
+                check,
+                &mut rows,
+            );
+            let cited = crate::index_lifecycle::guidance::freshen::cited_paths(
+                &generation.live,
+                rows.iter().map(String::as_str),
+            );
+            // A reference listing is a complete claim for its scope unless
+            // the budget cut it; a refusal before any capture claims nothing.
+            let unavailable = is_index_unavailable_output(&output);
+            let claim = Claim::whole_if(
+                !unavailable && !crate::index_lifecycle::guidance::freshen::answer_was_cut(&output),
+            );
+            if unavailable || check.notes(claim == Claim::Whole).is_empty() {
+                return Rendered {
+                    answer: output,
+                    cited,
+                    claim,
+                };
+            }
+            // Item 4: re-render under the budget left after the notes.
+            let answer = crate::index_lifecycle::guidance::freshen::budget_with_notes(
+                check,
+                claim,
+                input.max_tokens,
+                |max_tokens| {
+                    let mut input = input.clone();
+                    input.max_tokens = max_tokens;
+                    self.find_references_checked(
+                        &input,
+                        generation,
+                        prepared.as_ref(),
+                        check,
+                        &mut Vec::new(),
+                    )
+                },
+            );
+            Rendered {
+                answer,
+                cited,
+                claim,
+            }
+        })
+        .1
     }
 
-    /// `find_references` after the disk comparison in `check`.
+    /// The references-mode query of `find_references` over `generation`, run
+    /// once per captured publication (round 3 item 9). The outer `Err` is the
+    /// loading guard's answer; the inner one the selector's refusal.
+    fn find_references_view(
+        &self,
+        input: &FindReferencesInput,
+        generation: &Arc<crate::live_index::PublishedGeneration>,
+    ) -> Result<Result<crate::live_index::FindReferencesView, String>, String> {
+        let limits =
+            format::OutputLimits::new(input.limit.unwrap_or(20), input.max_per_file.unwrap_or(10));
+        let collect_qualified_usages = should_collect_qualified_usages(input);
+        let (result, indexed_ranges, qualified_usages) = {
+            let guard = Arc::clone(&generation.live);
+            if let Some(message) = loading_guard_text(&guard) {
+                return Err(message);
+            }
+            if let Some(path) = input.path.as_deref() {
+                (
+                    guard.capture_find_references_view_for_symbol(
+                        path,
+                        &input.name,
+                        input.symbol_kind.as_deref(),
+                        input.symbol_line,
+                        input.kind.as_deref(),
+                        limits.total_hits,
+                    ),
+                    HashSet::new(),
+                    Vec::new(),
+                )
+            } else {
+                let kind_filter = find_references_kind_filter(input.kind.as_deref());
+                let refs = guard.find_references_for_name(&input.name, kind_filter, false);
+                let indexed_ranges = refs
+                    .iter()
+                    .map(|(file_path, reference)| ((*file_path).to_string(), reference.byte_range))
+                    .collect();
+                let qualified_usages = if collect_qualified_usages {
+                    let files = guard.files.iter().filter_map(|(path, file)| {
+                        (file.language == LanguageId::Rust).then_some(
+                            qualified_usages::QualifiedFileContent {
+                                file_path: path.as_str(),
+                                content: file.content.as_slice(),
+                            },
+                        )
+                    });
+                    qualified_usages::collect_qualified_usages(&input.name, files)
+                } else {
+                    Vec::new()
+                };
+                (
+                    Ok(guard.capture_find_references_view(
+                        &input.name,
+                        input.kind.as_deref(),
+                        limits.total_hits,
+                    )),
+                    indexed_ranges,
+                    qualified_usages,
+                )
+            }
+        };
+        Ok(result.map(|mut view| {
+            if collect_qualified_usages {
+                merge_qualified_usages_into_view(&mut view, qualified_usages, indexed_ranges);
+            }
+            view
+        }))
+    }
+
+    /// One [`answer_checked`] render of `find_references` over `generation`;
+    /// `prepared` is that publication's references query when already run.
     fn find_references_checked(
         &self,
         input: &FindReferencesInput,
+        generation: &Arc<crate::live_index::PublishedGeneration>,
+        prepared: Option<&Result<crate::live_index::FindReferencesView, String>>,
         check: &crate::index_lifecycle::guidance::freshen::AnswerCheck,
+        rows: &mut Vec<String>,
     ) -> String {
-        // Capture only after daemon proxy/recovery has either returned or
-        // rebuilt the local index so the rendered body and local fallback
-        // ProjectEvidence describe one publication.
-        let generation = self.capture_local_response_generation();
         if let Some(path) = input.path.as_deref() {
             let repo_root = self.capture_repo_root();
             let degraded = {
@@ -6639,6 +7178,7 @@ impl SymForgeServer {
                 loading_guard!(guard);
                 guard.capture_implementations_view(&input.name, input.direction.as_deref())
             };
+            rows.extend(view.entries.iter().map(|entry| entry.file_path.clone()));
             let cap = input.limit.unwrap_or(200).min(500);
             let limits = format::OutputLimits::new(cap, cap);
             let envelope = if !view.entries.is_empty() {
@@ -6706,59 +7246,16 @@ impl SymForgeServer {
 
         let limits =
             format::OutputLimits::new(input.limit.unwrap_or(20), input.max_per_file.unwrap_or(10));
-        let collect_qualified_usages = should_collect_qualified_usages(input);
-        let (result, indexed_ranges, qualified_usages) = {
-            let guard = Arc::clone(&generation.live);
-            loading_guard!(guard);
-            if let Some(path) = input.path.as_deref() {
-                (
-                    guard.capture_find_references_view_for_symbol(
-                        path,
-                        &input.name,
-                        input.symbol_kind.as_deref(),
-                        input.symbol_line,
-                        input.kind.as_deref(),
-                        limits.total_hits,
-                    ),
-                    HashSet::new(),
-                    Vec::new(),
-                )
-            } else {
-                let kind_filter = find_references_kind_filter(input.kind.as_deref());
-                let refs = guard.find_references_for_name(&input.name, kind_filter, false);
-                let indexed_ranges = refs
-                    .iter()
-                    .map(|(file_path, reference)| ((*file_path).to_string(), reference.byte_range))
-                    .collect();
-                let qualified_usages = if collect_qualified_usages {
-                    let files = guard.files.iter().filter_map(|(path, file)| {
-                        (file.language == LanguageId::Rust).then_some(
-                            qualified_usages::QualifiedFileContent {
-                                file_path: path.as_str(),
-                                content: file.content.as_slice(),
-                            },
-                        )
-                    });
-                    qualified_usages::collect_qualified_usages(&input.name, files)
-                } else {
-                    Vec::new()
-                };
-                (
-                    Ok(guard.capture_find_references_view(
-                        &input.name,
-                        input.kind.as_deref(),
-                        limits.total_hits,
-                    )),
-                    indexed_ranges,
-                    qualified_usages,
-                )
-            }
+        let result = match prepared {
+            Some(prepared) => prepared.clone(),
+            None => match self.find_references_view(input, generation) {
+                Ok(result) => result,
+                Err(message) => return message,
+            },
         };
         match result {
-            Ok(mut view) => {
-                if collect_qualified_usages {
-                    merge_qualified_usages_into_view(&mut view, qualified_usages, indexed_ranges);
-                }
+            Ok(view) => {
+                rows.extend(view.files.iter().map(|file| file.file_path.clone()));
                 // The references found decide, whatever text their lines carry.
                 record_read_outcome(if view.files.is_empty() {
                     ReadOutcome::Empty
@@ -6880,31 +7377,44 @@ impl SymForgeServer {
                     output.push_str(disclosure);
                 }
 
-                self.record_tool_savings_named(
-                    "find_references",
-                    crate::stel::handler::estimate_tokens_from_bytes(
-                        (format::estimate_listing_baseline_chars(output.len())) as u64,
-                    ),
-                    crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
-                );
-                self.session_context.record_summary_output(
-                    "find_references",
-                    u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
-                        output.len() as u64,
-                    ))
-                    .unwrap_or(u32::MAX),
-                );
-                self.session_context.record_listed_symbol("", &input.name);
+                if !check.is_provisional() {
+                    self.record_tool_savings_named(
+                        "find_references",
+                        crate::stel::handler::estimate_tokens_from_bytes(
+                            (format::estimate_listing_baseline_chars(output.len())) as u64,
+                        ),
+                        crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
+                    );
+                    self.session_context.record_summary_output(
+                        "find_references",
+                        u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                            output.len() as u64,
+                        ))
+                        .unwrap_or(u32::MAX),
+                    );
+                    self.session_context.record_listed_symbol("", &input.name);
+                }
                 let result = match envelope {
                     Some(envelope) => format!("{envelope}\n\n{output}"),
                     None => output,
                 };
                 let result = with_withheld_note(&generation.live, None, result);
-                let (result, truncated) = self.apply_ccr_budget_with_truncation_status(
-                    "find_references",
-                    result,
-                    input.max_tokens,
-                );
+                // A provisional render is never shown: no retrievable handle.
+                let (result, truncated) = if check.is_provisional() {
+                    crate::index_lifecycle::guidance::source::enforce_token_budget_flagged(
+                        result,
+                        crate::index_lifecycle::guidance::compression::resolve_tool_max_tokens(
+                            "find_references",
+                            input.max_tokens,
+                        ),
+                    )
+                } else {
+                    self.apply_ccr_budget_with_truncation_status(
+                        "find_references",
+                        result,
+                        input.max_tokens,
+                    )
+                };
                 if truncated {
                     format::downgrade_full_completeness_after_truncation(&result)
                 } else {
@@ -6972,46 +7482,71 @@ impl SymForgeServer {
             return refusal;
         }
         let input = &params.0;
-        // T038 round-1 (D16): one capture — the evidence receipt and the
-        // rendered view come from the same immutable bundle.
-        let generation = self.capture_local_response_generation();
-        if let Some(message) = loading_guard_message_from_published(&generation.health) {
-            return message;
-        }
-        if let Some(notice) =
-            crate::protocol::read_gate::unverified_notice(&generation.live, &input.path)
-        {
-            return notice;
-        }
-        let view = generation.live.capture_find_dependents_view(&input.path);
-        // Default per-file reference detail is capped at 5 lines (not 10) so the
-        // non-compact view stays bounded on hub files with dozens of dependents;
-        // callers can raise it with max_per_file or switch to compact=true.
-        let limits =
-            format::OutputLimits::new(input.limit.unwrap_or(20), input.max_per_file.unwrap_or(5));
-        let fmt = input.format.as_deref().unwrap_or("text");
-        let output = match fmt {
-            "mermaid" => format::find_dependents_mermaid(&view, &input.path, &limits),
-            "dot" => format::find_dependents_dot(&view, &input.path, &limits),
-            _ if input.compact.unwrap_or(false) => with_withheld_note(
-                &generation.live,
-                None,
-                format::find_dependents_compact_view(&view, &input.path, &limits),
-            ),
-            _ => with_withheld_note(
-                &generation.live,
-                None,
-                format::find_dependents_result_view(&view, &input.path, &limits),
-            ),
+        // T038 round-1 (D16): one capture per render — the evidence receipt
+        // and the rendered view come from the same immutable bundle. Spec 036
+        // item 3: the cited files, and on a complete listing every file (an
+        // importer may sit anywhere), are compared with the disk.
+        // Round 3 item 9: the dependents query runs once per captured publication.
+        let query = |generation: &Arc<crate::live_index::PublishedGeneration>| {
+            generation.live.capture_find_dependents_view(&input.path)
         };
-        self.session_context.record_summary_output(
-            "find_dependents",
-            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
-                output.len() as u64,
-            ))
-            .unwrap_or(u32::MAX),
-        );
-        format::enforce_token_budget(output, params.0.max_tokens)
+        answer_checked_query(self, None, query, |generation, prepared, check| {
+            if let Some(message) = loading_guard_message_from_published(&generation.health) {
+                return Rendered::plain(message);
+            }
+            if let Some(notice) =
+                crate::protocol::read_gate::unverified_notice(&generation.live, &input.path)
+            {
+                return Rendered::plain(notice);
+            }
+            let view = prepared.clone();
+            // Default per-file reference detail is capped at 5 lines (not 10)
+            // so the non-compact view stays bounded on hub files with dozens
+            // of dependents; callers can raise it with max_per_file or switch
+            // to compact=true.
+            let file_limit = input.limit.unwrap_or(20);
+            let limits = format::OutputLimits::new(file_limit, input.max_per_file.unwrap_or(5));
+            let fmt = input.format.as_deref().unwrap_or("text");
+            let output = match fmt {
+                "mermaid" => format::find_dependents_mermaid(&view, &input.path, &limits),
+                "dot" => format::find_dependents_dot(&view, &input.path, &limits),
+                _ if input.compact.unwrap_or(false) => with_withheld_note(
+                    &generation.live,
+                    None,
+                    format::find_dependents_compact_view(&view, &input.path, &limits),
+                ),
+                _ => with_withheld_note(
+                    &generation.live,
+                    None,
+                    format::find_dependents_result_view(&view, &input.path, &limits),
+                ),
+            };
+            let cited = crate::index_lifecycle::guidance::freshen::cited_paths(
+                &generation.live,
+                view.files.iter().map(|file| file.file_path.as_str()),
+            );
+            let claim = Claim::whole_if(view.files.len() <= file_limit as usize);
+            if !check.is_provisional() {
+                self.session_context.record_summary_output(
+                    "find_dependents",
+                    u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                        output.len() as u64,
+                    ))
+                    .unwrap_or(u32::MAX),
+                );
+            }
+            Rendered {
+                answer: crate::index_lifecycle::guidance::freshen::budget_with_notes(
+                    check,
+                    claim,
+                    input.max_tokens,
+                    |max_tokens| format::enforce_token_budget(output, max_tokens),
+                ),
+                cited,
+                claim,
+            }
+        })
+        .1
     }
 
     /// Start here when you don't know where to look. Accepts a natural-language concept
@@ -7064,26 +7599,91 @@ impl SymForgeServer {
             };
             return format!("Estimate for explore: ~{} tokens (depth={})", est, depth);
         }
-        let guard = self.index.data_plane().read();
-        *served = Some(Arc::clone(&guard));
-        loading_guard!(guard);
+        let input = &params.0;
+        // Spec 036 item 3: the files the answer cites are compared with the
+        // disk; a concept search claims nothing about the files it leaves out.
+        // Round 3 item 9: the exploration runs once per captured publication.
+        let query =
+            |generation: &Arc<crate::live_index::PublishedGeneration>| match loading_guard_text(
+                &generation.live,
+            ) {
+                Some(message) => Err(message),
+                None => self.explore_rendered(input, &generation.live, lang_filter),
+            };
+        let render = |generation: &Arc<crate::live_index::PublishedGeneration>,
+                      explored: &Result<(String, Vec<String>), String>,
+                      check: &AnswerCheck| {
+            let guard = &generation.live;
+            let (output, rows) = match explored {
+                Ok((output, rows)) => (output.clone(), rows),
+                Err(message) => return Rendered::plain(message.clone()),
+            };
+            let cited = crate::index_lifecycle::guidance::freshen::cited_paths(
+                guard,
+                rows.iter().map(String::as_str),
+            );
+            if check.is_provisional() {
+                return Rendered {
+                    answer: output,
+                    cited,
+                    claim: Claim::Rows,
+                };
+            }
+            self.record_tool_savings_named(
+                "explore",
+                crate::stel::handler::estimate_tokens_from_bytes(
+                    (format::estimate_listing_baseline_chars(output.len())) as u64,
+                ),
+                crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
+            );
+            self.session_context.record_summary_output(
+                "explore",
+                u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
+                    output.len() as u64,
+                ))
+                .unwrap_or(u32::MAX),
+            );
+            Rendered {
+                answer: crate::index_lifecycle::guidance::freshen::budget_with_notes(
+                    check,
+                    Claim::Rows,
+                    input.max_tokens,
+                    |max_tokens| self.apply_ccr_budget("explore", output, max_tokens),
+                ),
+                cited,
+                claim: Claim::Rows,
+            }
+        };
+        let (generation, answer, _) = answer_checked_query(self, None, query, render);
+        *served = Some(Arc::clone(&generation.live));
+        answer
+    }
+
+    /// `explore`'s rendered answer over `guard`, before its budget, and every
+    /// string of its rows (the paths among them are what it cites).
+    fn explore_rendered(
+        &self,
+        params: &ExploreInput,
+        guard: &LiveIndex,
+        lang_filter: Option<LanguageId>,
+    ) -> Result<(String, Vec<String>), String> {
         let request = crate::index_lifecycle::guidance::exploration::ExploreRequest {
-            query: params.0.query.clone(),
-            limit: params.0.limit.unwrap_or(10) as usize,
-            depth: params.0.depth,
-            include_noise: params.0.include_noise.unwrap_or(false),
-            include_vendor: params.0.include_vendor.unwrap_or(false),
-            include_personal_tooling: params.0.include_personal_tooling.unwrap_or(false),
+            query: params.query.clone(),
+            limit: params.limit.unwrap_or(10) as usize,
+            depth: params.depth,
+            include_noise: params.include_noise.unwrap_or(false),
+            include_vendor: params.include_vendor.unwrap_or(false),
+            include_personal_tooling: params.include_personal_tooling.unwrap_or(false),
             language: lang_filter,
-            path_prefix: params.0.path_prefix.clone(),
+            path_prefix: params.path_prefix.clone(),
         };
         let result = match crate::index_lifecycle::guidance::exploration::explore(
-            &guard,
+            guard,
             &request,
             &mut || true,
         ) {
             Ok(result) => result,
-            Err(_) => return "Explore requires a non-empty query.".to_string(),
+            Err(_) => return Err("Explore requires a non-empty query.".to_string()),
         };
         let crate::index_lifecycle::guidance::exploration::ExploreResult {
             display_label,
@@ -7128,22 +7728,18 @@ impl SymForgeServer {
             },
             noise_hidden,
         );
-
-        self.record_tool_savings_named(
-            "explore",
-            crate::stel::handler::estimate_tokens_from_bytes(
-                (format::estimate_listing_baseline_chars(output.len())) as u64,
-            ),
-            crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
-        );
-        self.session_context.record_summary_output(
-            "explore",
-            u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
-                output.len() as u64,
-            ))
-            .unwrap_or(u32::MAX),
-        );
-        self.apply_ccr_budget("explore", output, params.0.max_tokens)
+        let rows = symbol_hits
+            .iter()
+            .flat_map(|(a, b, c)| [a.clone(), b.clone(), c.clone()])
+            .chain(text_hits.iter().map(|(path, _, _)| path.clone()))
+            .chain(related_files.iter().map(|(path, _)| path.clone()))
+            .chain(
+                enriched_symbols
+                    .iter()
+                    .flat_map(|(a, b, c, _, _)| [a.clone(), b.clone(), c.clone()]),
+            )
+            .collect();
+        Ok((output, rows))
     }
 
     #[tool(

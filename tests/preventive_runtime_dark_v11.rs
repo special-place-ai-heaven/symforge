@@ -1153,10 +1153,17 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // excluded files; no new edge into src/index_lifecycle or server_api.rs.
 // Refreshed for the A3 review round (budget guard around reconcile, the
 // `UnstampedAbsent` freshen arm, one doc reference): same 89 files, no new edge.
+// Refreshed for the A3 row-check rework: the embed facade, reference, dependents
+// and symbol-context lanes take the check from the shared `answer_checked` loop
+// and fit its notes inside their budgets; targeted reads carry their caveat. Same
+// 89 files; no new edge into src/index_lifecycle or server_api.rs.
+// Round 2: cited files from structured rows, facade step caveats, probe reuse
+// for native searches. Same 89 files, no new edge.
+// Round 3: embed search caveats, reason-named not-run states. Same 89 files.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "2ded1cb2692a5dad415b4d27b3e5cd7a47573f97f67486525a2d79852f34a477",
+    "3a18d708e1adbb524b354e4b1f8a2f4503feedc5cfa8551d9a12fd06f61ed3e6",
     89,
-    2349171,
+    2384202,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1346,12 +1353,21 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // per-answer check in `guidance/freshen.rs`, size/racy-content comparison in
 // `single_file.rs`, envelopes from `AnswerCheck`. Calls only, no bridge. 316 files.
 // Refreshed for the A3 review round: errno rows from `libc`, keyed failure log,
-// RAII retry budget, confinement before the disk comparison, spawn_blocking for
+// RAII retry budget, confinement before the disk comparison, block_in_place for
 // the check, the targeted caveat. Calls only, no bridge. 316 files.
+// Refreshed for the A3 row-check rework: `answer_checked` (cited rows, whole-claim
+// scope, one batched publication through `publish_snapshot_verify_with_observation`,
+// one re-run), handlers split into checked renders, notes inside budgets, test
+// fault hooks in `single_file.rs`. Calls only, no bridge. 316 files.
+// Round 2: `cited_paths` over structured rows (no text parsing), facade step
+// caveats, probe reuse for native searches. Calls only, no bridge. 316 files.
+// Round 3: filesystem clock probe, comparison generation fence, hash size limit,
+// vanish-wait minimum, bounded re-index, queries once per publication, targeted
+// freshens off the async worker, per-project unknown codes. No bridge. 316 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "bdb53d256e19450e92dbc7d153c5db37b50308898396ff61e634c7cc71452958",
+    "323e16517decb8b526f6656730ab5810b05d5e3e7a96c2d7ad381d74638c63cd",
     316,
-    12732931,
+    12812827,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

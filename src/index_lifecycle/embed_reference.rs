@@ -252,6 +252,7 @@ fn finish(
     mut result: ReferenceSearchResult,
     request: &ReferenceSearchRequest,
     budget: &mut Budget,
+    check: &super::guidance::freshen::AnswerCheck,
 ) -> Result<QueryOutput, QueryRefusalKind> {
     if request.estimate == Some(true) {
         let tokens = crate::stel::handler::estimate_tokens_from_bytes(result.rendered.len() as u64);
@@ -263,14 +264,26 @@ fn finish(
     } else {
         budget.cache_output = Some(QueryOutput::ReferenceSearch(result.clone()));
         budget.cache_truncated = budget.truncated;
-        let (text, truncated) =
-            source::enforce_token_budget_flagged(result.rendered, request.max_tokens);
-        result.rendered = if truncated || budget.truncated {
-            source::downgrade_full_completeness_after_truncation(&text)
-        } else {
-            text
-        };
-        budget.truncated |= truncated;
+        // Spec 036 item 4: the notes sit inside the budget, as on MCP. A
+        // listing is a complete claim unless the budget cut it.
+        let rows_cut = budget.truncated;
+        let mut cut = false;
+        result.rendered = super::guidance::freshen::budget_with_notes(
+            check,
+            super::guidance::freshen::Claim::Whole,
+            request.max_tokens,
+            |max_tokens| {
+                let (text, truncated) =
+                    source::enforce_token_budget_flagged(result.rendered, max_tokens);
+                cut = truncated;
+                if truncated || rows_cut {
+                    source::downgrade_full_completeness_after_truncation(&text)
+                } else {
+                    text
+                }
+            },
+        );
+        budget.truncated |= cut;
     }
     result.rendered = budget.text(&result.rendered)?;
     Ok(QueryOutput::ReferenceSearch(result))
@@ -352,11 +365,7 @@ pub(super) fn references(
             )
         };
         result.rendered = shared::with_withheld_note(live, None, result.rendered);
-        let complete = !super::guidance::freshen::answer_was_cut(&result.rendered);
-        snapshot
-            .answer_check
-            .append_notes(&mut result.rendered, complete);
-        return finish(result, request, budget);
+        return finish(result, request, budget, &snapshot.answer_check);
     }
     let limits = shared::OutputLimits::new(
         request.limit.unwrap_or(20),
@@ -493,11 +502,7 @@ pub(super) fn references(
         )
     };
     result.rendered = shared::with_withheld_note(live, None, result.rendered);
-    let complete = !super::guidance::freshen::answer_was_cut(&result.rendered);
-    snapshot
-        .answer_check
-        .append_notes(&mut result.rendered, complete);
-    finish(result, request, budget)
+    finish(result, request, budget, &snapshot.answer_check)
 }
 
 pub(super) fn dependents(
@@ -623,10 +628,21 @@ pub(super) fn dependents(
     } else {
         budget.cache_output = Some(QueryOutput::DependentSearch(result.clone()));
         budget.cache_truncated = budget.truncated;
-        let (text, truncated) =
-            source::enforce_token_budget_flagged(result.rendered, request.max_tokens);
-        result.rendered = text;
-        budget.truncated |= truncated;
+        // Spec 036 item 3/4: MCP's find_dependents notes, inside the budget;
+        // a listing within its file limit is a complete claim.
+        let mut cut = false;
+        result.rendered = super::guidance::freshen::budget_with_notes(
+            &snapshot.answer_check,
+            super::guidance::freshen::Claim::whole_if(total_files <= limits.max_files),
+            request.max_tokens,
+            |max_tokens| {
+                let (text, truncated) =
+                    source::enforce_token_budget_flagged(result.rendered, max_tokens);
+                cut = truncated;
+                text
+            },
+        );
+        budget.truncated |= cut;
     }
     result.rendered = budget.text(&result.rendered)?;
     Ok(QueryOutput::DependentSearch(result))

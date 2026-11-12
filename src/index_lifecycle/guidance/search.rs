@@ -940,8 +940,6 @@ pub(crate) fn render_search_text_output(
         )),
         _ => None,
     };
-    // An empty or untruncated answer claims completeness (FR-017).
-    let claims_complete = matches!(&result, Ok(found) if found.overflow_count == 0);
     let confidence = if auto_corrected_regex {
         0.75f32
     } else if is_regex && auto_detected_regex {
@@ -975,8 +973,15 @@ pub(crate) fn render_search_text_output(
         None => output,
     };
     append_untracked_file_diagnostic(&mut rendered, matching_untracked_paths);
-    check.append_notes(&mut rendered, claims_complete);
+    // Spec 036: the caller fits `check`'s notes inside its budget.
     rendered
+}
+
+/// An empty or untruncated text search claims its whole scope (FR-017).
+pub(crate) fn text_search_claim(
+    result: &Result<search::TextSearchResult, search::TextSearchError>,
+) -> super::freshen::Claim {
+    super::freshen::Claim::whole_if(matches!(result, Ok(found) if found.overflow_count == 0))
 }
 
 /// MCP `search_symbols`' rendered answer over one publication: the result
@@ -1033,7 +1038,7 @@ pub(crate) fn render_symbol_search(
         Some(envelope) => format!("{envelope}\n\n{output}"),
         None => output,
     };
-    let mut output = if execution.text_fallback.is_empty() {
+    let output = if execution.text_fallback.is_empty() {
         output
     } else {
         let paths: Vec<_> = execution
@@ -1046,7 +1051,7 @@ pub(crate) fn render_symbol_search(
             paths.join("\n")
         )
     };
-    check.append_notes(&mut output, result.overflow_count == 0);
+    // Spec 036: the caller fits `check`'s notes inside its budget.
     output
 }
 

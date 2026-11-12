@@ -15,6 +15,8 @@ use crate::live_index::search::{
 };
 use crate::live_index::{IndexedFile, LiveIndex, ParseStatus, PublishedGeneration};
 
+use super::guidance::freshen::Rendered;
+
 use super::embedded::EmbeddedSourceHandle;
 use super::public_api::{
     EmbedClaim, EmbedClaimProvenance, OperationKind, RetryAdvice, SourceRefusalKind,
@@ -507,11 +509,17 @@ fn execute_inner(
         .check()
         .map_err(|kind| refuse(kind, RetryAdvice::Never))?;
     // A lease read is bound to its leased snapshot; it never freshens from disk.
-    if !matches!(snapshot_mode, SnapshotMode::GraphLease(_))
-        && let Some(path) = request.freshen_path()
-    {
+    // Spec 036 item 5: a file the freshen could not compare is named, as MCP's
+    // targeted reads name it.
+    let mut targeted_caveats = Vec::new();
+    let freshened = if matches!(snapshot_mode, SnapshotMode::GraphLease(_)) {
+        Vec::new()
+    } else {
+        request.freshen_paths()
+    };
+    for path in freshened {
         match handle.freshen_exact_path(path) {
-            Ok(()) => {}
+            Ok(caveat) => targeted_caveats.extend(caveat),
             Err(refusal)
                 if refusal.permits_authoritative_disk_fallback()
                     && matches!(request, QueryRequest::Syntax { .. }) =>
@@ -531,23 +539,31 @@ fn execute_inner(
         // the facade dispatches them; the facade freshens them all before it
         // captures the one publication every step answers from.
         for path in super::embed_symforge::freshen_paths(input) {
-            if handle.freshen_exact_path(&path).is_err() {
-                return Err(refuse(
-                    QueryRefusalKind::StalePublication,
-                    RetryAdvice::OnEvent,
-                ));
+            match handle.freshen_exact_path(&path) {
+                // Round 2 item 2: each step's read prints its caveat, as the
+                // MCP facade's dispatched read does.
+                Ok(Some(caveat)) => {
+                    budget.targeted_caveats.insert(path, caveat);
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    return Err(refuse(
+                        QueryRefusalKind::StalePublication,
+                        RetryAdvice::OnEvent,
+                    ));
+                }
             }
         }
         budget.stel_store = handle.stel_store(policy);
     }
-    // Spec 036 FR-015: compare the answer's scope with the disk before the
-    // snapshot is captured, as MCP does before its response capture. A lease
-    // read is bound to its leased snapshot and compares nothing.
-    let answer_check = match request.answer_scope() {
-        Some(prefix) if !matches!(snapshot_mode, SnapshotMode::GraphLease(_)) => {
-            Some(handle.check_answer_scope(prefix))
-        }
-        _ => None,
+    // Spec 036 FR-015 / item 6: the request MCP answers through
+    // `answer_checked` is answered the same way here, with the same scope (the
+    // facade takes its planned steps' scope). A lease read is bound to its
+    // leased snapshot and compares nothing.
+    let checked_scope: Option<Option<String>> = match request {
+        _ if matches!(snapshot_mode, SnapshotMode::GraphLease(_)) => None,
+        QueryRequest::Symforge(input) => super::embed_symforge::answer_scope(input),
+        _ => request.answer_scope().map(|scope| scope.map(str::to_owned)),
     };
     if let QueryRequest::FileImpact(input) = request
         && input.estimate != Some(true)
@@ -566,19 +582,17 @@ fn execute_inner(
             })?;
         budget.file_impact = Some(admission);
     }
-    let snapshot = match snapshot_mode {
-        SnapshotMode::Strict => handle
-            .capture_query_snapshot(&normalized)
-            .map_err(|error| {
-                refuse(
-                    if error.kind() == SourceRefusalKind::AdmissionUnavailable {
-                        QueryRefusalKind::AdmissionUnavailable
-                    } else {
-                        QueryRefusalKind::SourceUnavailable
-                    },
-                    error.retry(),
-                )
-            })?,
+    let mut capture = || match &snapshot_mode {
+        SnapshotMode::Strict => handle.capture_query_snapshot(&normalized).map_err(|error| {
+            refuse(
+                if error.kind() == SourceRefusalKind::AdmissionUnavailable {
+                    QueryRefusalKind::AdmissionUnavailable
+                } else {
+                    QueryRefusalKind::SourceUnavailable
+                },
+                error.retry(),
+            )
+        }),
         SnapshotMode::AllowRefreshing => handle
             .capture_query_snapshot_allowing_refresh(&normalized)
             .map_err(|error| {
@@ -590,15 +604,82 @@ fn execute_inner(
                     },
                     error.retry(),
                 )
-            })?,
+            }),
         SnapshotMode::GraphLease(lease) => handle
             .capture_graph_lease_snapshot(lease)
-            .map_err(|kind| refuse(kind, RetryAdvice::Never))?,
+            .map_err(|kind| refuse(kind, RetryAdvice::Never)),
     };
-    let mut snapshot = snapshot;
-    if let Some(check) = answer_check {
-        snapshot.answer_check = check;
-    }
+    // Round 2 item 3: a native search's rows do not depend on the check, so
+    // its provisional projection over the final snapshot IS the answer; only
+    // answers that render the check (envelopes, caveats) are projected again.
+    let reusable_probe = matches!(
+        request,
+        QueryRequest::TextSearch(_) | QueryRequest::SymbolSearch(_)
+    );
+    let mut reused: Option<(Arc<PublishedGeneration>, QueryOutput, Budget)> = None;
+    let snapshot = match &checked_scope {
+        None => capture()?,
+        Some(scope) => {
+            // The provisional renders project the request on a scratch budget
+            // only to learn what the answer cites; the answer itself is the
+            // projection below, over the snapshot the loop captured last.
+            let stel_store = budget.stel_store.clone();
+            let probe_budget = budget.projection_budget();
+            let (snapshot, (), check) =
+                handle.answer_checked(scope.as_deref(), &mut capture, |captured, check| {
+                    let Ok(captured) = captured else {
+                        return Rendered::plain(());
+                    };
+                    if !check.is_provisional() {
+                        return Rendered::plain(());
+                    }
+                    let mut probe_snapshot = captured.clone();
+                    probe_snapshot.answer_check = check.clone();
+                    let mut probe = probe_budget.projection_budget();
+                    probe.stel_store = stel_store.clone();
+                    // Like MCP's provisional render, the probe never starts
+                    // derived-state preparation the answer reports once.
+                    let projected = project(
+                        &probe_snapshot,
+                        request,
+                        &mut probe,
+                        &mut Vec::new(),
+                        None,
+                        QueryPolicy {
+                            allow_derived_state_preparation: false,
+                        },
+                    );
+                    let Ok(value) = projected else {
+                        return Rendered::plain(());
+                    };
+                    let texts = output_texts(&value);
+                    let cut = probe.truncated
+                        || texts
+                            .iter()
+                            .any(|text| super::guidance::freshen::answer_was_cut(text));
+                    let cited = super::guidance::freshen::cited_paths(
+                        &captured.generation.live,
+                        texts.iter().map(String::as_str),
+                    );
+                    if reusable_probe {
+                        reused = Some((Arc::clone(&captured.generation), value, probe));
+                    }
+                    Rendered {
+                        answer: (),
+                        // Round 2 item 1: a string value of the structured
+                        // result that is an indexed path, whole (row paths);
+                        // nothing is parsed out of rendered text.
+                        cited,
+                        claim: super::guidance::freshen::Claim::whole_if(
+                            !cut && !matches!(request, QueryRequest::Explore(_)),
+                        ),
+                    }
+                });
+            let mut snapshot = snapshot?;
+            snapshot.answer_check = check;
+            snapshot
+        }
+    };
     debug_assert!(Arc::ptr_eq(
         &snapshot.generation,
         &snapshot.source_set.current_generation()
@@ -613,20 +694,28 @@ fn execute_inner(
     budget
         .check()
         .map_err(|kind| refuse(kind, RetryAdvice::Never))?;
-    let projected = project(
-        &snapshot,
-        request,
-        &mut budget,
-        &mut observations,
-        session,
-        policy,
-    );
+    let projected = match reused {
+        // The probe answered from this very publication: adopt its result
+        // and its accounting instead of projecting the answer again.
+        Some((generation, value, probe)) if Arc::ptr_eq(&generation, &snapshot.generation) => {
+            budget.adopt_projection(probe);
+            Ok(value)
+        }
+        _ => project(
+            &snapshot,
+            request,
+            &mut budget,
+            &mut observations,
+            session,
+            policy,
+        ),
+    };
     // A cooperative stop must never be reported as a successful partial page or
     // as a budget error raised at the same checkpoint.
     budget
         .check()
         .map_err(|kind| refuse(kind, RetryAdvice::Never))?;
-    let value = projected.map_err(|kind| {
+    let mut value = projected.map_err(|kind| {
         let mut refusal = refuse(
             kind,
             if matches!(
@@ -641,6 +730,8 @@ fn execute_inner(
         refusal.withheld = budget.withheld.clone();
         refusal
     })?;
+    close_targeted_read(&mut value, request, &targeted_caveats);
+    attach_search_notes(&mut value, &snapshot.answer_check);
     let usage = QueryUsage {
         rows: u64::from(limits.max_results) - budget.remaining_rows() as u64,
         decoded_bytes: super::embed_usage::decoded_bytes(&value),
@@ -877,6 +968,71 @@ fn execute_inner(
     Ok(result)
 }
 
+/// Every string value a projected answer carries: its row fields (whole
+/// paths among them, for [`cited_paths`]) and its rendered text (for the cut
+/// markers).
+///
+/// [`cited_paths`]: super::guidance::freshen::cited_paths
+fn output_texts(value: &QueryOutput) -> Vec<String> {
+    fn walk(value: &serde_json::Value, texts: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(text) => texts.push(text.clone()),
+            serde_json::Value::Array(items) => items.iter().for_each(|item| walk(item, texts)),
+            serde_json::Value::Object(map) => map.values().for_each(|item| walk(item, texts)),
+            _ => {}
+        }
+    }
+    let mut texts = Vec::new();
+    if let Ok(value) = serde_json::to_value(value) {
+        walk(&value, &mut texts);
+    }
+    texts
+}
+
+/// Review round 3 item 1: a native text or symbol search carries the caveat
+/// lines MCP's `search_text` / `search_symbols` print for the same check. An
+/// untruncated answer (no overflow) is a complete claim on both lanes.
+fn attach_search_notes(value: &mut QueryOutput, check: &super::guidance::freshen::AnswerCheck) {
+    let (notes, complete) = match value {
+        QueryOutput::TextSearch(found) => (&mut found.freshness_notes, found.overflow_count == 0),
+        QueryOutput::SymbolSearch(found) => (&mut found.freshness_notes, found.overflow_count == 0),
+        _ => return,
+    };
+    *notes = Some(check.notes(complete)).filter(|text| !text.is_empty());
+}
+
+/// Spec 036 item 5: a targeted read's caveat, fitted inside the request's
+/// budget exactly as MCP's targeted reads fit it.
+pub(super) fn close_targeted_read(
+    value: &mut QueryOutput,
+    request: &QueryRequest,
+    caveats: &[String],
+) {
+    if caveats.is_empty() {
+        return;
+    }
+    let (rendered, max_tokens) = match (value, request) {
+        (QueryOutput::FileContent(value), QueryRequest::FileContent(input)) => {
+            (&mut value.rendered, input.max_tokens)
+        }
+        (QueryOutput::FileContext(value), QueryRequest::FileContext(input)) => {
+            (&mut value.rendered, input.max_tokens)
+        }
+        (QueryOutput::SymbolRead(value), QueryRequest::SymbolRead(input)) => {
+            (&mut value.rendered, input.max_tokens)
+        }
+        (QueryOutput::InspectMatch(value), QueryRequest::InspectMatch(input)) => {
+            (&mut value.rendered, input.max_tokens)
+        }
+        _ => return,
+    };
+    *rendered = super::guidance::freshen::close_targeted_read(
+        std::mem::take(rendered),
+        caveats,
+        max_tokens,
+    );
+}
+
 pub(super) struct Budget {
     rows: usize,
     bytes: usize,
@@ -897,6 +1053,8 @@ pub(super) struct Budget {
     pub(super) stel_store: Option<Arc<crate::stel::ledger_store::StelLedgerStore>>,
     /// The facade's ledger event, recorded only once its answer is committed.
     pub(super) stel_event: Option<crate::stel::types::StelLedgerEvent>,
+    /// Facade steps' targeted-read caveats, by path (round 2 item 2).
+    pub(super) targeted_caveats: BTreeMap<String, String>,
 }
 
 impl Budget {
@@ -915,10 +1073,25 @@ impl Budget {
             file_impact: None,
             stel_store: None,
             stel_event: None,
+            targeted_caveats: BTreeMap::new(),
         }
     }
     pub(super) fn limits(&self) -> QueryLimits {
         self.limits
+    }
+
+    /// Take over what a [`Self::projection_budget`] recorded while it
+    /// projected the answer (rows and bytes charged, truncation, withheld
+    /// files, cached output and ledger event), as if this budget had.
+    pub(super) fn adopt_projection(&mut self, projected: Self) {
+        self.rows = projected.rows;
+        self.bytes = projected.bytes;
+        self.truncated = projected.truncated;
+        self.withheld = projected.withheld;
+        self.reused_handle = projected.reused_handle;
+        self.cache_output = projected.cache_output;
+        self.cache_truncated = projected.cache_truncated;
+        self.stel_event = projected.stel_event;
     }
     pub(super) fn remaining_rows(&self) -> usize {
         self.rows
@@ -969,6 +1142,7 @@ impl Budget {
             file_impact: None,
             stel_store: None,
             stel_event: None,
+            targeted_caveats: BTreeMap::new(),
         })
     }
 

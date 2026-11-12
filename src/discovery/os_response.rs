@@ -265,11 +265,16 @@ pub(crate) struct AccessFailure {
 }
 
 impl AccessFailure {
-    /// Capture `error` immediately after the call that produced it.
+    /// Capture `error` immediately after the call that produced it. Round 3
+    /// item 11 (compare, not clear): the thread's NT status is read only when
+    /// the thread's last Win32 error is this error's code, i.e. the failure
+    /// came from the syscall just made; an error built without one (a
+    /// constructed code 5) gets no NT status rather than a stale one.
     pub(crate) fn capture(error: io::Error) -> Self {
-        let nt_status = (error.raw_os_error() == Some(5))
-            .then(ntdll::last_nt_status)
-            .flatten();
+        let nt_status = (error.raw_os_error() == Some(5)
+            && io::Error::last_os_error().raw_os_error() == Some(5))
+        .then(ntdll::last_nt_status)
+        .flatten();
         Self { error, nt_status }
     }
 }
@@ -331,6 +336,16 @@ impl OsCause {
         }
     }
 
+    /// `"; <remedy>"`, or nothing for a cause with no remedy (a refusal by
+    /// SymForge's own rule), so a message never ends in a dangling `"; "`.
+    pub(crate) fn remedy_suffix(&self) -> String {
+        if self.remedy.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", self.remedy)
+        }
+    }
+
     /// The persisted kind, mapped exactly as before this table existed so no
     /// stored disposition changes.
     pub(crate) fn stored_kind(&self) -> AccessErrorKind {
@@ -376,9 +391,12 @@ fn stored_kind(kind: io::ErrorKind) -> AccessErrorKind {
     }
 }
 
-/// The persisted kind for a full error, through the table.
+/// The persisted kind for a full error. The stored kind is the error's own
+/// kind (as before the table existed), so no classification runs and a
+/// non-file error (control-state placement) is never counted as an unknown
+/// OS code (round 3 item 10).
 pub(crate) fn stored_kind_of(error: &io::Error) -> AccessErrorKind {
-    classify(error, None, None).stored_kind()
+    stored_kind(error.kind())
 }
 
 /// Classify `error` for the current platform. `path` enables the parent
@@ -465,7 +483,9 @@ fn unknown_codes() -> &'static Mutex<std::collections::BTreeSet<(Platform, i32)>
     UNKNOWN.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
 }
 
-/// How many distinct raw OS codes the table did not know, seen by this process.
+/// How many distinct raw OS codes the table did not know, seen by this process
+/// (test support; health counts them per project from the failure log).
+#[cfg(test)]
 pub(crate) fn unknown_code_count() -> u64 {
     unknown_codes()
         .lock()
@@ -500,9 +520,10 @@ fn failure_key(path: &Path) -> PathBuf {
     dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+// Round 3 item 5: callers compute the key (a canonicalize, file I/O) before
+// they take the process-wide lock, so the lock never waits on the disk.
 impl FailureLog {
-    fn record(&mut self, path: &Path, cause: &OsCause) {
-        let key = failure_key(path);
+    fn record(&mut self, key: PathBuf, cause: &OsCause) {
         if self.map.len() < self.cap || self.map.contains_key(&key) {
             self.map.insert(key, cause.clone());
         } else {
@@ -510,8 +531,8 @@ impl FailureLog {
         }
     }
 
-    fn get(&self, path: &Path) -> RecordedCause {
-        match self.map.get(&failure_key(path)) {
+    fn get(&self, key: &Path) -> RecordedCause {
+        match self.map.get(key) {
             Some(cause) => RecordedCause::Found(cause.clone()),
             None if self.overflowed => RecordedCause::LimitReached,
             None => RecordedCause::NotRecorded,
@@ -533,17 +554,19 @@ fn recorded() -> &'static Mutex<FailureLog> {
 /// Remember the classified cause of a failed read so health can name it; the
 /// persisted disposition keeps only the coarse kind.
 pub(crate) fn record_failure(path: &Path, cause: &OsCause) {
+    let key = failure_key(path);
     recorded()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .record(path, cause);
+        .record(key, cause);
 }
 
 pub(crate) fn recorded_failure(path: &Path) -> Option<OsCause> {
+    let key = failure_key(path);
     match recorded()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .get(path)
+        .get(&key)
     {
         RecordedCause::Found(cause) => Some(cause),
         RecordedCause::NotRecorded | RecordedCause::LimitReached => None,
@@ -555,10 +578,11 @@ pub(crate) fn recorded_failure_for(root: Option<&Path>, relative: &str) -> Recor
     let Some(root) = root else {
         return RecordedCause::NotRecorded;
     };
+    let key = failure_key(&root.join(relative));
     recorded()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .get(&root.join(relative))
+        .get(&key)
 }
 
 /// The time one tool call may spend retrying transient failures, shared by
@@ -613,6 +637,16 @@ impl Drop for CallBudgetGuard {
             CALL_BUDGET.with(|slot| slot.set(None));
         }
     }
+}
+
+/// Run `f` under a call budget that is already spent, as after a locked file
+/// used it up (test support).
+#[cfg(test)]
+pub(crate) fn with_spent_call_budget<T>(f: impl FnOnce() -> T) -> T {
+    CALL_BUDGET.with(|slot| slot.set(Some(RetryBudget::new(Duration::ZERO))));
+    let result = f();
+    CALL_BUDGET.with(|slot| slot.set(None));
+    result
 }
 
 /// Run `f` under one call budget ([`enter_call_budget`]).
@@ -785,6 +819,18 @@ mod tests {
         assert!(CALL_BUDGET.with(std::cell::Cell::get).is_none());
     }
 
+    /// Review round 3 item 10: storing the kind of a non-file error (control
+    /// state placement) never counts as an unknown OS code.
+    #[test]
+    fn storing_a_kind_counts_no_unknown_code() {
+        let before = unknown_code_count();
+        let _ = stored_kind_of(&raw(777_001));
+        assert_eq!(unknown_code_count(), before);
+        // Control: classifying the same error does count it.
+        let _ = classify(&raw(777_001), None, None);
+        assert_eq!(unknown_code_count(), before + 1);
+    }
+
     /// Review M12: a full log says so instead of "not observed".
     #[test]
     fn a_full_log_reports_the_limit() {
@@ -794,12 +840,12 @@ mod tests {
             overflowed: false,
         };
         let cause = classify_on(Windows, &raw(32), None, None);
-        log.record(Path::new("first_m12.rs"), &cause);
+        log.record(PathBuf::from("first_m12.rs"), &cause);
         assert_eq!(
             log.get(Path::new("never_m12.rs")),
             RecordedCause::NotRecorded
         );
-        log.record(Path::new("second_m12.rs"), &cause);
+        log.record(PathBuf::from("second_m12.rs"), &cause);
         assert_eq!(
             log.get(Path::new("second_m12.rs")),
             RecordedCause::LimitReached

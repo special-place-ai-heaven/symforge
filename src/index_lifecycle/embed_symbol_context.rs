@@ -798,19 +798,27 @@ pub(super) fn project(
             rendered.push_str("\n\n");
             rendered.push_str(withheld);
         }
-        let (rendered, final_truncated) = knowledge_model::bound_final_code_context_output_flagged(
-            rendered,
+        // Spec 036 item 4: as on MCP, the unconfirmed files sit inside the
+        // final bound; callers and callees are a complete claim unless cut.
+        let mut final_truncated = false;
+        let rendered = super::guidance::freshen::budget_with_notes(
+            &snapshot.answer_check,
+            super::guidance::freshen::Claim::Whole,
             max_tokens,
-            &format!("symbol:{path}:{}", request.name),
-            request.sections.as_deref(),
-            knowledge_requested,
-            withheld.is_some(),
-            None,
+            |max_tokens| {
+                let (text, truncated) = knowledge_model::bound_final_code_context_output_flagged(
+                    rendered,
+                    max_tokens,
+                    &format!("symbol:{path}:{}", request.name),
+                    request.sections.as_deref(),
+                    knowledge_requested,
+                    withheld.is_some(),
+                    None,
+                );
+                final_truncated = truncated;
+                text
+            },
         );
-        // Spec 036: MCP appends the unconfirmed files after the final bound.
-        let mut rendered = rendered;
-        let complete = !super::guidance::freshen::answer_was_cut(&rendered);
-        snapshot.answer_check.append_notes(&mut rendered, complete);
         (rendered, render_truncated || final_truncated)
     };
     // The cached answer is the unbudgeted render, which the default hard cap may still cut:

@@ -225,6 +225,8 @@ fn project_symbols(
         file_count: executed.result.file_count as u64,
         suppressed_by_noise: executed.suppressed_by_noise as u64,
         text_fallback,
+        // Set by the query lane from the answer's own check (spec 036).
+        freshness_notes: None,
     }))
 }
 pub(super) fn text(
@@ -506,5 +508,7 @@ fn project_text(
         untracked_paths: untracked_paths.to_vec(),
         untracked_diagnostic,
         hidden_test_matches: executed.hidden_test_matches.map(|n| n as u64),
+        // Set by the query lane from the answer's own check (spec 036).
+        freshness_notes: None,
     }))
 }

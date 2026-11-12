@@ -94,10 +94,19 @@ pub(crate) struct AnswerCheck {
     observations_lost: bool,
     /// Files this call compared with the disk and confirmed.
     compared: usize,
+    /// A render made only to learn what the answer cites; never shown.
+    provisional: bool,
 }
 
 /// Why no comparison ran; the same text on the MCP and embed lanes (M9).
 pub(crate) const NOT_RUN_INDEX_NOT_READY: &str = "the index is not ready";
+/// An embedded source that is shutting down compares nothing.
+#[cfg_attr(not(feature = "embed"), allow(dead_code))] // read by the embed lane
+pub(crate) const NOT_RUN_SHUTTING_DOWN: &str = "the source is shutting down";
+/// An embedded source whose root was replaced or cannot be reached.
+#[cfg_attr(not(feature = "embed"), allow(dead_code))] // read by the embed lane
+pub(crate) const NOT_RUN_ROOT_REPLACED: &str =
+    "the repository root was replaced or cannot be reached";
 /// A server bound to no repository root has no disk to compare with.
 pub(crate) const NOT_RUN_NO_ROOT: &str = "no repository root is bound";
 /// At most this many unconfirmed files are named; the rest are counted (M6).
@@ -124,6 +133,7 @@ impl AnswerCheck {
             not_run: Some(reason),
             observations_lost: false,
             compared: 0,
+            provisional: false,
         }
     }
 
@@ -135,6 +145,7 @@ impl AnswerCheck {
             not_run: None,
             observations_lost: false,
             compared: 1,
+            provisional: false,
         }
     }
 
@@ -146,7 +157,15 @@ impl AnswerCheck {
             not_run: None,
             observations_lost: false,
             compared: 0,
+            provisional: false,
         }
+    }
+
+    /// True for the render [`answer_checked`] makes only to learn what an
+    /// answer cites: a render may skip work whose result is never shown
+    /// (a retrievable budget handle).
+    pub(crate) fn is_provisional(&self) -> bool {
+        self.provisional
     }
 
     /// In-scope files past [`ANSWER_CHECK_FILE_BOUND`], not compared.
@@ -251,82 +270,497 @@ fn observations_lost(shared: &SharedIndex) -> bool {
     }
 }
 
-/// Compare every indexed file under `path_prefix` (all files when `None`)
-/// with the disk, re-indexing those that differ, BEFORE the caller captures
-/// the publication it answers from (spec 036 FR-015, research D5). Each file
-/// takes and releases the index write lock on its own; no read guard is held.
-/// All files share one transient-retry budget (FR-020). Returns what was
-/// observed and whether the publication changed.
-pub(crate) fn check_answer_scope(
-    shared: &SharedIndex,
-    expected_gen: u64,
-    repo_root: &std::path::Path,
-    authority: &crate::live_index::index_lifecycle::activation::ProjectSourceAuthority,
-    path_prefix: Option<&str>,
-) -> (AnswerCheck, bool) {
-    // Indexed paths are forward-slash and relative; spell the prefix the same.
-    let prefix = path_prefix.map(|prefix| {
-        let prefix = prefix.replace('\\', "/");
-        prefix.trim_start_matches("./").to_string()
-    });
-    let mut paths: Vec<String> = shared
-        .published_generation()
-        .live
-        .all_files()
-        .map(|(path, _)| path.clone())
-        .filter(|path| {
-            prefix
-                .as_deref()
-                .is_none_or(|prefix| path.starts_with(prefix))
+/// What an answer claims beyond the rows it cites (spec 036 FR-015).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Claim {
+    /// Only its rows: the answer says nothing about files it does not cite.
+    Rows,
+    /// An empty or complete result over its scope: a file that has just
+    /// gained a match is not among the rows, so the whole scope is compared.
+    Whole,
+}
+
+impl Claim {
+    /// `Whole` when `complete`, else `Rows`.
+    pub(crate) fn whole_if(complete: bool) -> Self {
+        if complete { Self::Whole } else { Self::Rows }
+    }
+}
+
+/// One run of a query: what it rendered, the indexed files the rendered
+/// answer cites, and what it claims.
+pub(crate) struct Rendered<T> {
+    pub(crate) answer: T,
+    pub(crate) cited: Vec<String>,
+    pub(crate) claim: Claim,
+}
+
+/// The disk an answer is compared with, and the scope of its whole claims.
+pub(crate) struct AnswerDisk<'a> {
+    pub(crate) shared: &'a SharedIndex,
+    /// Read BEFORE `repo_root` was captured, so a retarget in between fails
+    /// the generation fence instead of indexing one root's files under
+    /// another's generation.
+    pub(crate) expected_gen: u64,
+    pub(crate) repo_root: &'a std::path::Path,
+    pub(crate) authority:
+        &'a crate::live_index::index_lifecycle::activation::ProjectSourceAuthority,
+    /// False while another writer owns publication (an embedded source that
+    /// is refreshing): files that differ are named, not re-indexed.
+    pub(crate) may_reindex: bool,
+    /// Indexed-path prefix of the query (`None`: every file).
+    pub(crate) scope: Option<&'a str>,
+}
+
+/// Most files one answer re-indexes on the request thread (round 3 item 6).
+/// A parse costs about 1-5 ms per source file (debug build, this repository),
+/// so 32 files keep the re-index under roughly 150 ms of an interactive call;
+/// after a large branch switch the rest are named with
+/// [`NOT_REINDEXED_REFRESHING`] and left to the background reconcile.
+pub(crate) const MAX_REINDEX_PER_ANSWER: usize = 32;
+
+/// Cause for a cited file that still differs after the one re-run (D5).
+const CHANGED_DURING_ANSWER: &str = "changed again while this answer was prepared; retry";
+/// Cause for a file that differs while another writer owns publication.
+pub(crate) const NOT_REINDEXED_REFRESHING: &str = "the index is refreshing; retry";
+const GENERATION_CHANGED: &str = "the project changed during the check; retry";
+
+/// The indexed files among `paths`, the row paths of the structured result
+/// an answer is rendered from (never parsed back out of its text, so a path
+/// with spaces, non-ASCII letters or `\` separators is cited like any other).
+pub(crate) fn cited_paths<'a>(
+    live: &crate::live_index::LiveIndex,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut cited = std::collections::BTreeSet::new();
+    for path in paths {
+        let path = path.trim_start_matches("./");
+        let spelled = path.replace('\\', "/");
+        for candidate in [path, spelled.as_str()] {
+            if live.files.contains_key(candidate) {
+                cited.insert(candidate.to_string());
+                break;
+            }
+        }
+    }
+    cited.into_iter().collect()
+}
+
+/// Answer a query whose files are compared with the disk (spec 036 FR-015,
+/// research D5). `capture` takes the publication to answer from; `render`
+/// runs the query over it with an [`AnswerCheck`] and reports what it cites
+/// and claims. The cited files, and on a [`Claim::Whole`] every file of the
+/// scope up to [`ANSWER_CHECK_FILE_BOUND`], are compared; the files that
+/// differ are re-indexed in one publication and the query runs once more. A
+/// cited file that differs again is named, never looped on. The final render
+/// gets the check of its own files, so its caveats can sit inside its budget.
+/// No read guard is held across the re-index: `capture` runs after it.
+pub(crate) fn answer_checked<Q, T>(
+    disk: Result<AnswerDisk<'_>, &'static str>,
+    mut capture: impl FnMut() -> Q,
+    mut render: impl FnMut(&Q, &AnswerCheck) -> Rendered<T>,
+    mut on_reindexed: impl FnMut(),
+) -> (Q, T, AnswerCheck) {
+    let disk = match disk {
+        Ok(disk) => disk,
+        Err(reason) => {
+            let check = AnswerCheck::not_run(reason);
+            let query = capture();
+            let answer = render(&query, &check).answer;
+            return (query, answer, check);
+        }
+    };
+    crate::discovery::os_response::with_call_budget(|| {
+        let expected_gen = disk.expected_gen;
+        // Renders only to learn what the answer cites: no notes, so the
+        // first run's budget and claim are the answer's own.
+        let provisional = AnswerCheck {
+            unconfirmed: Vec::new(),
+            uncompared: 0,
+            not_run: None,
+            observations_lost: false,
+            compared: 0,
+            provisional: true,
+        };
+        let mut confinement = Confinement::new(disk.repo_root);
+        let mut query = capture();
+        let first = render(&query, &provisional);
+        let (paths, uncompared) = paths_to_compare(&disk, &first);
+        let seen = compare_paths(&disk, &mut confinement, &paths);
+        let differing: Vec<String> = seen
+            .iter()
+            .filter(|(_, seen)| matches!(seen, Seen::Differs))
+            .map(|(path, _)| path.clone())
+            .collect();
+        let mut claim = first.claim;
+        let mut check = if differing.is_empty() || !disk.may_reindex {
+            build_check(seen, uncompared, NOT_REINDEXED_REFRESHING, &[])
+        } else {
+            // Round 3 item 6: a bounded batch; the rest is named and left
+            // to the background reconcile.
+            let mut differing = differing;
+            let deferred = differing.split_off(differing.len().min(MAX_REINDEX_PER_ANSWER));
+            let (changed, mut failed) = reindex_batch(&disk, expected_gen, differing);
+            failed.extend(
+                deferred
+                    .into_iter()
+                    .map(|path| (path, NOT_REINDEXED_REFRESHING.to_string())),
+            );
+            if changed {
+                on_reindexed();
+            }
+            query = capture();
+            let again = render(&query, &provisional);
+            claim = again.claim;
+            let (paths, uncompared) = paths_to_compare(&disk, &again);
+            let seen = compare_paths(&disk, &mut confinement, &paths);
+            build_check(seen, uncompared, CHANGED_DURING_ANSWER, &failed)
+        };
+        // Only an empty or complete claim prints the FR-017 line, and the
+        // measurement walks the scout plan, so a partial answer skips it.
+        check.observations_lost = claim == Claim::Whole && observations_lost(disk.shared);
+        let answer = render(&query, &check).answer;
+        (query, answer, check)
+    })
+}
+
+/// The cited files, plus the rest of the scope on a whole claim, sorted and
+/// bounded; the second value counts the in-scope files past the bound.
+fn paths_to_compare<T>(disk: &AnswerDisk<'_>, rendered: &Rendered<T>) -> (Vec<String>, usize) {
+    paths_to_compare_bounded(disk, rendered, ANSWER_CHECK_FILE_BOUND)
+}
+
+fn paths_to_compare_bounded<T>(
+    disk: &AnswerDisk<'_>,
+    rendered: &Rendered<T>,
+    bound: usize,
+) -> (Vec<String>, usize) {
+    let mut paths: std::collections::BTreeSet<String> = rendered.cited.iter().cloned().collect();
+    let mut uncompared = 0;
+    if rendered.claim == Claim::Whole {
+        // Indexed paths are forward-slash and relative; spell the prefix the same.
+        let prefix = disk
+            .scope
+            .filter(|prefix| !prefix.is_empty())
+            .map(|prefix| {
+                prefix
+                    .replace('\\', "/")
+                    .trim_start_matches("./")
+                    .to_string()
+            });
+        let published = disk.shared.published_generation();
+        let mut scope: Vec<&String> = published
+            .live
+            .all_files()
+            .map(|(path, _)| path)
+            .filter(|path| {
+                prefix
+                    .as_deref()
+                    .is_none_or(|prefix| path.starts_with(prefix))
+                    && !paths.contains(*path)
+            })
+            .collect();
+        scope.sort_unstable();
+        let room = bound.saturating_sub(paths.len());
+        uncompared = scope.len().saturating_sub(room);
+        paths.extend(scope.into_iter().take(room).cloned());
+    }
+    (paths.into_iter().collect(), uncompared)
+}
+
+/// What one comparison of a file with the disk observed.
+enum Seen {
+    Same,
+    Differs,
+    Unconfirmed(String),
+}
+
+/// H2 confinement for many files at once: each distinct parent directory is
+/// resolved once per answer, and a directory that resolves outside the
+/// repository (a junction or a linked folder) refuses every file beneath it.
+/// The leaf itself is refused as a link by the stat in `compare_with_disk`.
+struct Confinement {
+    root: Option<std::path::PathBuf>,
+    inside: std::collections::HashMap<std::path::PathBuf, bool>,
+}
+
+impl Confinement {
+    fn new(repo_root: &std::path::Path) -> Self {
+        Self {
+            root: repo_root.canonicalize().ok(),
+            inside: std::collections::HashMap::new(),
+        }
+    }
+
+    fn admits(&mut self, repo_root: &std::path::Path, relative: &str) -> bool {
+        let Some(root) = &self.root else {
+            // No resolvable root: the per-file resolver decides, as before.
+            return !super::read_gate::resolve_repo_path(repo_root, relative)
+                .is_err_and(|message| message.contains("outside the repository"));
+        };
+        let Some(parent) = std::path::Path::new(relative)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        else {
+            return true;
+        };
+        let parent = parent.to_path_buf();
+        if let Some(&inside) = self.inside.get(&parent) {
+            return inside;
+        }
+        // A directory that is gone holds nothing outside; the stat says so.
+        let inside = repo_root
+            .join(&parent)
+            .canonicalize()
+            .map_or(true, |resolved| resolved.starts_with(root));
+        self.inside.insert(parent, inside);
+        inside
+    }
+}
+
+fn compare_paths(
+    disk: &AnswerDisk<'_>,
+    confinement: &mut Confinement,
+    paths: &[String],
+) -> Vec<(String, Seen)> {
+    use crate::live_index::single_file::{DiskComparison, compare_with_disk};
+    paths
+        .iter()
+        .map(|path| {
+            let seen = if !confinement.admits(disk.repo_root, path) {
+                Seen::Unconfirmed(
+                    crate::discovery::os_response::OsCause::refused(
+                        "resolves outside the repository",
+                    )
+                    .describe(),
+                )
+            } else {
+                match compare_with_disk(
+                    path,
+                    &disk.repo_root.join(path),
+                    disk.shared,
+                    disk.expected_gen,
+                ) {
+                    DiskComparison::Same => Seen::Same,
+                    DiskComparison::GenerationChanged => {
+                        Seen::Unconfirmed(GENERATION_CHANGED.to_string())
+                    }
+                    DiskComparison::Differs => Seen::Differs,
+                    DiskComparison::Unconfirmed(cause) => Seen::Unconfirmed(cause.describe()),
+                    DiskComparison::UnstampedAbsent => Seen::Unconfirmed(
+                        "no modification time was recorded and no file is on disk".to_string(),
+                    ),
+                }
+            };
+            (path.clone(), seen)
         })
-        .collect();
-    paths.sort_unstable();
-    let uncompared = paths.len().saturating_sub(ANSWER_CHECK_FILE_BOUND);
-    paths.truncate(ANSWER_CHECK_FILE_BOUND);
-    let observer = authority.active_observer();
+        .collect()
+}
+
+/// The check of one answer's files: `differs_cause` names a file that still
+/// differs; `failed` carries the re-index failures of the files compared.
+fn build_check(
+    seen: Vec<(String, Seen)>,
+    uncompared: usize,
+    differs_cause: &str,
+    failed: &[(String, String)],
+) -> AnswerCheck {
     let mut check = AnswerCheck {
         unconfirmed: Vec::new(),
         uncompared,
         not_run: None,
         observations_lost: false,
         compared: 0,
+        provisional: false,
     };
+    for (path, seen) in seen {
+        if let Some((_, cause)) = failed.iter().find(|(failed, _)| *failed == path) {
+            check.unconfirmed.push((path, cause.clone()));
+            continue;
+        }
+        match seen {
+            Seen::Same => check.compared += 1,
+            Seen::Differs => check.unconfirmed.push((path, differs_cause.to_string())),
+            Seen::Unconfirmed(cause) => check.unconfirmed.push((path, cause)),
+        }
+    }
+    check
+}
+
+/// Re-index `paths` (all differing from the disk) in ONE publication where
+/// the canonical admission can be prepared off-lock; a path it cannot settle
+/// that way (gone, refused, moved again) takes the single-file seam. Returns
+/// whether the publication changed and the files that could not be confirmed.
+fn reindex_batch(
+    disk: &AnswerDisk<'_>,
+    expected_gen: u64,
+    paths: Vec<String>,
+) -> (bool, Vec<(String, String)>) {
+    use crate::live_index::single_file::prepare_snapshot_verify_admission;
+    let shared = disk.shared;
+    let observer = disk.authority.active_observer();
     let mut changed = false;
-    crate::discovery::os_response::with_call_budget(|| {
+    let mut failed = Vec::new();
+    let mut batch = Vec::new();
+    let mut single = Vec::new();
+    {
+        let live = shared.read();
         for path in paths {
-            let abs_path = repo_root.join(&path);
-            match freshen_file_if_stale(&path, &abs_path, shared, expected_gen, authority, observer)
-            {
-                FreshenResult::Fresh => check.compared += 1,
-                FreshenResult::StaleReindexed | FreshenResult::StaleRemoved => {
-                    changed = true;
-                    check.compared += 1;
-                }
-                // The project changed under the check: every later file
-                // would fail the same fence, so stop and say so once (M6).
-                FreshenResult::GenerationMismatch => {
-                    check.unconfirmed.push((
-                        path,
-                        "the project changed during the check; retry".to_string(),
-                    ));
-                    break;
-                }
-                FreshenResult::PublicationRejected => check
-                    .unconfirmed
-                    .push((path, "refresh did not publish; retry".to_string())),
-                // Nothing was re-indexed, so nothing is published (H5).
-                FreshenResult::Unconfirmed(cause) => {
-                    check.unconfirmed.push((path, cause.describe()));
-                }
-                FreshenResult::UnstampedAbsent => check.unconfirmed.push((
-                    path,
-                    "no modification time was recorded and no file is on disk".to_string(),
-                )),
+            let abs_path = disk.repo_root.join(&path);
+            // A vanished file waits out an atomic save in the single seam.
+            let prepared = abs_path
+                .symlink_metadata()
+                .is_ok()
+                .then(|| {
+                    prepare_snapshot_verify_admission(
+                        &path,
+                        &abs_path,
+                        shared,
+                        live.files.get(&path),
+                    )
+                })
+                .flatten();
+            match prepared {
+                Some(prepared) => batch.push(prepared),
+                None => single.push(path),
             }
         }
-    });
-    check.observations_lost = observations_lost(shared);
-    (check, changed)
+    }
+    if !batch.is_empty() {
+        let batched: Vec<String> = batch.iter().map(|file| file.path.clone()).collect();
+        match shared.publish_snapshot_verify_with_observation(
+            expected_gen,
+            &[],
+            batch,
+            None,
+            |_, _| false,
+            |_, scouted| {
+                scouted.absolute_path.as_deref().is_some_and(|path| {
+                    std::fs::metadata(path).is_ok_and(|meta| {
+                        meta.len() == scouted.stamp.size
+                            && meta.modified().ok() == scouted.stamp.modified_hint
+                    })
+                })
+            },
+            || true,
+        ) {
+            None => failed.extend(
+                batched
+                    .into_iter()
+                    .map(|path| (path, GENERATION_CHANGED.to_string())),
+            ),
+            Some(receipt) => {
+                changed |= !receipt.indexed.is_empty()
+                    || !receipt.terminal.is_empty()
+                    || !receipt.superseded.is_empty();
+                for path in &receipt.indexed {
+                    if disk.authority.observe_admission(observer, path).is_err() {
+                        tracing::debug!("answer check: stale incarnation's admission refused");
+                    }
+                }
+                single.extend(receipt.refused);
+            }
+        }
+    }
+    for path in single {
+        let abs_path = disk.repo_root.join(&path);
+        match freshen_file_if_stale(
+            &path,
+            &abs_path,
+            shared,
+            expected_gen,
+            disk.authority,
+            observer,
+        ) {
+            FreshenResult::Fresh => {}
+            FreshenResult::StaleReindexed | FreshenResult::StaleRemoved => changed = true,
+            FreshenResult::GenerationMismatch => failed.push((path, GENERATION_CHANGED.into())),
+            FreshenResult::PublicationRejected => {
+                failed.push((path, "refresh did not publish; retry".into()));
+            }
+            FreshenResult::Unconfirmed(cause) => failed.push((path, cause.describe())),
+            FreshenResult::UnstampedAbsent => failed.push((
+                path,
+                "no modification time was recorded and no file is on disk".into(),
+            )),
+        }
+    }
+    (changed, failed)
+}
+
+/// Fit `notes` and the answer into `max_tokens` (spec 036 item M7): the notes
+/// are never cut, so the body is assembled under the budget minus the notes.
+/// `assemble` builds the body under the budget it is given.
+pub(crate) fn budget_with_notes(
+    check: &AnswerCheck,
+    claim: Claim,
+    max_tokens: Option<u64>,
+    assemble: impl FnOnce(Option<u64>) -> String,
+) -> String {
+    let notes = check.notes(claim == Claim::Whole);
+    if notes.is_empty() {
+        return assemble(max_tokens);
+    }
+    let reserve = crate::stel::handler::estimate_tokens_from_bytes(notes.len() as u64 + 2);
+    let body = assemble(max_tokens.map(|max| max.saturating_sub(reserve).max(1)));
+    // A body the budget cut claims no completeness (review M7).
+    let notes = if answer_was_cut(&body) {
+        check.notes(false)
+    } else {
+        notes
+    };
+    if notes.is_empty() {
+        body
+    } else {
+        format!("{body}\n\n{notes}")
+    }
+}
+
+/// Close a targeted read with its caveat line, inside `max_tokens` (item 4):
+/// when the answer and the line do not fit, the answer is cut to the budget
+/// the line leaves, never the line.
+pub(crate) fn fit_caveat(body: String, caveat: Option<&str>, max_tokens: Option<u64>) -> String {
+    let Some(caveat) = caveat.filter(|caveat| !caveat.is_empty()) else {
+        return body;
+    };
+    let reserve = caveat.len() + 2;
+    let body = match max_tokens.filter(|max| *max > 0) {
+        Some(max) if body.len() + reserve > (max as usize).saturating_mul(4) => {
+            let left = (max as usize).saturating_mul(4).saturating_sub(reserve) / 4;
+            super::source::enforce_token_budget(body, Some(left.max(1) as u64))
+        }
+        _ => body,
+    };
+    format!("{body}\n\n{caveat}")
+}
+
+/// A targeted read's answer closed with the caveats of the files it could
+/// not compare with the disk (item 5), on both lanes; a refusal or an error
+/// answer is left as it is.
+pub(crate) fn close_targeted_read(
+    body: String,
+    caveats: &[String],
+    max_tokens: Option<u64>,
+) -> String {
+    if caveats.is_empty()
+        || super::outcome::is_error_output(&body)
+        || super::outcome::is_index_unavailable_output(&body)
+    {
+        return body;
+    }
+    fit_caveat(body, Some(&caveats.join("\n")), max_tokens)
+}
+
+impl<T> Rendered<T> {
+    /// An answer that cites no file and claims nothing beyond itself (a
+    /// refusal, a notice, an invalid request).
+    pub(crate) fn plain(answer: T) -> Self {
+        Self {
+            answer,
+            cited: Vec::new(),
+            claim: Claim::Rows,
+        }
+    }
 }
 
 /// Freshen one exact repository path before a targeted read: re-index it when
@@ -402,6 +836,7 @@ mod tests {
             not_run: None,
             observations_lost: false,
             compared: 0,
+            provisional: false,
         };
         let notes = check.notes(false);
         assert_eq!(notes.lines().count(), 6, "{notes}");
@@ -455,13 +890,147 @@ mod tests {
                 return; // root reads through mode 000
             }
         }
-        let generation = shared.current_project_generation();
-        let (check, changed) =
-            check_answer_scope(&shared, generation, dir.path(), &authority, None);
+        let mut changed = false;
+        let (_, _, check) = answer_checked(
+            Ok(disk(&shared, dir.path(), &authority)),
+            || (),
+            |_, _| Rendered {
+                answer: (),
+                cited: vec!["a.rs".to_string(), "b.rs".to_string()],
+                claim: Claim::Rows,
+            },
+            || changed = true,
+        );
         assert!(
             !check.all_confirmed(),
             "control: a.rs was not confirmed: {check:?}"
         );
         assert!(!changed, "an unread file is not a re-index");
+    }
+
+    fn disk<'a>(
+        shared: &'a SharedIndex,
+        root: &'a std::path::Path,
+        authority: &'a crate::live_index::index_lifecycle::activation::ProjectSourceAuthority,
+    ) -> AnswerDisk<'a> {
+        AnswerDisk {
+            shared,
+            expected_gen: shared.current_project_generation(),
+            repo_root: root,
+            authority,
+            may_reindex: true,
+            scope: None,
+        }
+    }
+
+    /// Item 1a / research D5: a cited file that differs is re-indexed and the
+    /// query runs once more; when it differs again the answer names it and
+    /// the loop stops (three renders: first, re-run, final).
+    #[test]
+    fn a_file_that_changes_again_is_named_not_looped_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn a() {}\n").unwrap();
+        let shared = crate::live_index::LiveIndex::load(dir.path()).unwrap();
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(dir.path());
+        std::fs::write(&path, "fn a() { 1 }\n").unwrap();
+        let mut renders = 0;
+        let (_, _, check) = answer_checked(
+            Ok(disk(&shared, dir.path(), &authority)),
+            || (),
+            |_, _| {
+                renders += 1;
+                if renders == 2 {
+                    // The re-run's file changes once more under it.
+                    std::fs::write(&path, "fn a() { 22 }\n").unwrap();
+                }
+                Rendered {
+                    answer: (),
+                    cited: vec!["a.rs".to_string()],
+                    claim: Claim::Rows,
+                }
+            },
+            || {},
+        );
+        assert_eq!(renders, 3, "first run, one re-run, final render");
+        assert_eq!(
+            check.notes(false),
+            format!("Not confirmed against disk: a.rs ({CHANGED_DURING_ANSWER})")
+        );
+        // Control: the first change was re-indexed before the re-run.
+        assert!(
+            shared
+                .read()
+                .get_file("a.rs")
+                .is_some_and(|file| file.content.as_slice() != b"fn a() {}\n")
+        );
+    }
+
+    /// Item 1b/1c: only a whole claim compares the rest of the scope, and only
+    /// a whole claim past the bound says how many files it did not compare.
+    #[test]
+    fn only_a_whole_claim_reaches_past_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(dir.path().join(name), "fn f() {}\n").unwrap();
+        }
+        let shared = crate::live_index::LiveIndex::load(dir.path()).unwrap();
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(dir.path());
+        let disk = disk(&shared, dir.path(), &authority);
+        let rendered = |claim| Rendered {
+            answer: (),
+            cited: vec!["a.rs".to_string()],
+            claim,
+        };
+        assert_eq!(
+            paths_to_compare_bounded(&disk, &rendered(Claim::Rows), 2),
+            (vec!["a.rs".to_string()], 0),
+            "a partial answer compares its rows only"
+        );
+        assert_eq!(
+            paths_to_compare_bounded(&disk, &rendered(Claim::Whole), 2),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 1),
+            "a whole claim fills the bound and counts the rest"
+        );
+    }
+
+    /// Review round 3 item 6: one answer re-indexes at most
+    /// `MAX_REINDEX_PER_ANSWER` files; the rest are named as left to the
+    /// background reconcile, never parsed on the request thread.
+    #[test]
+    fn one_answer_reindexes_a_bounded_batch() {
+        const EXTRA: usize = 3;
+        let dir = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..super::MAX_REINDEX_PER_ANSWER + EXTRA)
+            .map(|n| format!("f{n:03}.rs"))
+            .collect();
+        for name in &names {
+            std::fs::write(dir.path().join(name), "fn f() {}\n").unwrap();
+        }
+        let shared = crate::live_index::LiveIndex::load(dir.path()).unwrap();
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(dir.path());
+        for name in &names {
+            std::fs::write(dir.path().join(name), "fn f() { 1 }\n").unwrap();
+        }
+        let (_, _, check) = answer_checked(
+            Ok(disk(&shared, dir.path(), &authority)),
+            || (),
+            |_, _| Rendered {
+                answer: (),
+                cited: names.clone(),
+                claim: Claim::Rows,
+            },
+            || {},
+        );
+        let deferred = check
+            .unconfirmed
+            .iter()
+            .filter(|(_, cause)| cause == NOT_REINDEXED_REFRESHING)
+            .count();
+        assert_eq!(deferred, EXTRA, "{check:?}");
+        assert_eq!(check.unconfirmed.len(), EXTRA, "{check:?}");
     }
 }

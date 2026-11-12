@@ -512,14 +512,18 @@ pub(crate) fn prepare_exact_path_for_edit(
     let lane_authority =
         crate::live_index::index_lifecycle::activation::project_source_authority(&repo_root);
     let lane_observer = lane_authority.active_observer();
-    let source_authority = match watcher::freshen_file_if_stale(
-        relative_path,
-        &abs_path,
-        server.index.data_plane(),
-        expected_gen,
-        &lane_authority,
-        lane_observer,
-    ) {
+    // Round 3 item 7: the stat, hash and retry sleeps leave the async worker.
+    let freshened = super::tools::off_async_worker(|| {
+        watcher::freshen_file_if_stale(
+            relative_path,
+            &abs_path,
+            server.index.data_plane(),
+            expected_gen,
+            &lane_authority,
+            lane_observer,
+        )
+    });
+    let source_authority = match freshened {
         watcher::FreshenResult::Fresh | watcher::FreshenResult::UnstampedAbsent => {
             edit_format::EditSourceAuthority::CurrentIndex
         }
@@ -544,9 +548,9 @@ pub(crate) fn prepare_exact_path_for_edit(
         }
         watcher::FreshenResult::Unconfirmed(cause) => {
             return Err(format!(
-                "Error: '{relative_path}' could not be compared with the disk ({}); {}",
+                "Error: '{relative_path}' could not be compared with the disk ({}){}",
                 cause.describe(),
-                cause.remedy
+                cause.remedy_suffix()
             ));
         }
     };
@@ -576,14 +580,17 @@ pub(super) fn prepare_batch_paths_for_edit(
     for relative_path in unique_paths {
         let abs_path = safe_repo_path_for_freshen(&repo_root, &relative_path)
             .map_err(|e| format!("Error: {e}"))?;
-        match watcher::freshen_file_if_stale(
-            &relative_path,
-            &abs_path,
-            server.index.data_plane(),
-            expected_gen,
-            &lane_authority,
-            lane_observer,
-        ) {
+        let freshened = super::tools::off_async_worker(|| {
+            watcher::freshen_file_if_stale(
+                &relative_path,
+                &abs_path,
+                server.index.data_plane(),
+                expected_gen,
+                &lane_authority,
+                lane_observer,
+            )
+        });
+        match freshened {
             watcher::FreshenResult::Fresh | watcher::FreshenResult::UnstampedAbsent => {}
             watcher::FreshenResult::StaleReindexed => {
                 refreshed = true;
@@ -611,9 +618,9 @@ pub(super) fn prepare_batch_paths_for_edit(
             }
             watcher::FreshenResult::Unconfirmed(cause) => {
                 return Err(format!(
-                    "Error: '{relative_path}' could not be compared with the disk ({}); {}",
+                    "Error: '{relative_path}' could not be compared with the disk ({}){}",
                     cause.describe(),
-                    cause.remedy
+                    cause.remedy_suffix()
                 ));
             }
         }

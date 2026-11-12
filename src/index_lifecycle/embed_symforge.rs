@@ -85,8 +85,28 @@ pub(super) fn freshen_paths(request: &StelRequest) -> Vec<String> {
         .steps
         .iter()
         .filter_map(|step| step_request(&step.tool, &step.args).ok())
-        .filter_map(|request| request.freshen_path().map(str::to_owned))
+        .flat_map(|request| {
+            request
+                .freshen_paths()
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
         .collect()
+}
+
+/// Spec 036 item 6: the scope MCP's planned steps compare with the disk, as
+/// each dispatched tool does (`answer_scope`). `None` when no step compares;
+/// one shared prefix when every comparing step has it; otherwise every file.
+pub(super) fn answer_scope(request: &StelRequest) -> Option<Option<String>> {
+    let scopes: Vec<Option<String>> = crate::stel::planner::build_plan(request)
+        .steps
+        .iter()
+        .filter_map(|step| step_request(&step.tool, &step.args).ok())
+        .filter_map(|request| request.answer_scope().map(|scope| scope.map(str::to_owned)))
+        .collect();
+    let first = scopes.first()?.clone();
+    Some(first.filter(|first| scopes.iter().all(|scope| scope.as_ref() == Some(first))))
 }
 
 fn answer(outcome: OutcomeClass, rendered: String, steps: Vec<SymforgeStep>) -> QueryOutput {
@@ -257,6 +277,17 @@ pub(super) fn project(
         let nested = step_request(&step.tool, &args)?;
         let projected = super::embed_query::validate_request(&nested).and_then(|()| {
             super::embed_query::project(snapshot, &nested, budget, observations, session, policy)
+        });
+        // Round 2 item 2: the step's targeted read carries the caveat MCP's
+        // dispatched read prints for a file it could not compare.
+        let caveats: Vec<String> = nested
+            .freshen_paths()
+            .into_iter()
+            .filter_map(|path| budget.targeted_caveats.get(path).cloned())
+            .collect();
+        let projected = projected.map(|mut output| {
+            super::embed_query::close_targeted_read(&mut output, &nested, &caveats);
+            output
         });
         // Each step answers once; the outer facade answer is what the
         // session caches, so a child's cache or handle never stands for it.
@@ -439,6 +470,7 @@ pub(super) fn render_search(
                 Err(_) => return Some(Err(QueryRefusalKind::InvalidRequest)),
             };
             let hidden_documentation_note = executed.hidden_documentation_note();
+            let claim = search::text_search_claim(&executed.result);
             let mut rendered = search::render_search_text_output(
                 generation,
                 executed.result,
@@ -465,10 +497,13 @@ pub(super) fn render_search(
                 rendered.push('\n');
                 rendered.push_str(&note);
             }
-            budget(
-                "search_text",
-                with_withheld_note(&generation.live, input.path_prefix.as_deref(), rendered),
+            // MCP's `checked_answer`: the notes sit inside the budget.
+            let body = with_withheld_note(&generation.live, input.path_prefix.as_deref(), rendered);
+            super::guidance::freshen::budget_with_notes(
+                &snapshot.answer_check,
+                claim,
                 input.max_tokens,
+                |max_tokens| budget("search_text", body, max_tokens),
             )
         }
         (QueryRequest::SymbolSearch(input), QueryOutput::SymbolSearch(_)) => {
@@ -483,10 +518,12 @@ pub(super) fn render_search(
                 shared.query.as_deref().unwrap_or("").trim(),
                 &snapshot.answer_check,
             );
-            budget(
-                "search_symbols",
-                with_withheld_note(&generation.live, input.path_prefix.as_deref(), rendered),
+            let body = with_withheld_note(&generation.live, input.path_prefix.as_deref(), rendered);
+            super::guidance::freshen::budget_with_notes(
+                &snapshot.answer_check,
+                super::guidance::freshen::Claim::whole_if(executed.result.overflow_count == 0),
                 input.max_tokens,
+                |max_tokens| budget("search_symbols", body, max_tokens),
             )
         }
         (QueryRequest::FileSearch(input), QueryOutput::FileSearch(value))
@@ -509,6 +546,7 @@ pub(super) fn render_search(
                 &snapshot.answer_check,
                 || value.untracked_paths.clone(),
             )
+            .0
         }
         _ => return None,
     };
