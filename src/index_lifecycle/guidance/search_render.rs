@@ -442,6 +442,16 @@ pub(crate) fn append_withheld_admission_note(
     )
 }
 
+/// The regex error repeats the pattern; the leading echo keeps this many characters.
+const ECHOED_PATTERN_CHARS: usize = 80;
+
+fn capped_pattern(pattern: &str) -> std::borrow::Cow<'_, str> {
+    match pattern.char_indices().nth(ECHOED_PATTERN_CHARS) {
+        Some((end, _)) => format!("{}...", &pattern[..end]).into(),
+        None => pattern.into(),
+    }
+}
+
 /// The text `search_text` prints for a search the engine refused, on both lanes.
 pub fn text_search_error_text(error: &search::TextSearchError) -> String {
     match error {
@@ -452,7 +462,7 @@ pub fn text_search_error_text(error: &search::TextSearchError) -> String {
             "Search requires a non-empty query or terms.".to_string()
         }
         search::TextSearchError::InvalidRegex { pattern, error } => {
-            format!("Invalid regex '{pattern}': {error}")
+            format!("Invalid regex '{}': {error}", capped_pattern(pattern))
         }
         search::TextSearchError::InvalidGlob {
             field,

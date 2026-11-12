@@ -96,6 +96,8 @@ in this slice), **differs** (left, with the reason).
 | 66 | get_file_content, `src/short.rs`, start past EOF, `max_tokens: 5` | the budget-cut text | the uncut error line | fixed | `finish_file_content` |
 | 67 | get_symbol, `lib/shorty.py` with eight `shorty_*.rs` | `Did you mean: <first five sorted>?` | a different five per process (both lanes) | fixed | row 3 |
 | 68 | edit_plan, `Makefile` with `tools/a` and `tools/b` | first sorted file + `⚠ Ambiguous file target 'Makefile' matched 2 paths (...)` | last file in map order, no note (both lanes) | fixed | **MCP bytes change**: a bare target several files end with is picked sorted-first and the ambiguity is named, as the path-shaped branch already did |
+| 68a | edit_plan, `x.rs` with `fox.rs` and `box.rs` | `Target 'x.rs' not found.` | `Found file: src/box.rs` + ambiguity note (both lanes) | fixed | **MCP bytes change**: a file target matches at a path separator only; the ambiguity note lists five paths, then `and N more` |
+| 68b | search_text, invalid regex with a 301-character pattern | `Invalid regex '<first 80 chars>...': <regex error>` | the whole pattern echoed before the regex error (both lanes) | fixed | **MCP bytes change**: `text_search_error_text` caps the leading echo at 80 characters |
 | 69 | get_symbol_context, trace mode, path + absent name | `No symbol NOPE in src/short.rs. Close matches ...` | refusal NotFound, no text | fixed | `trace_symbol_result_view`, `message` |
 | 70 | find_references, `max_tokens: 0` | answers | refusal InvalidRequest | differs: embed refuses a call MCP answers | - |
 | 71 | find_references, `limit: 0` | answers | refusal InvalidRequest | differs: embed refuses a call MCP answers | - |
@@ -104,7 +106,7 @@ in this slice), **differs** (left, with the reason).
 | 74 | find_dependents, `limit: 0` | answers | refusal InvalidRequest | differs: embed refuses a call MCP answers | - |
 | 75 | find_dependents, `max_per_file: 0` | answers | refusal InvalidRequest | differs: embed refuses a call MCP answers | - |
 
-Query totals: 76 rows; 15 equal; 40 fixed; 21 differ (20 embed refuses or decodes a call
+Query totals: 78 rows; 15 equal; 42 fixed; 21 differ (20 embed refuses or decodes a call
 MCP answers: rows 2, 7, 17, 19, 20, 22, 26, 28, 36, 40, 45, 47, 62, 63, 70-75; 1
 admission-tier text: row 1a).
 

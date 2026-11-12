@@ -560,6 +560,16 @@ pub(crate) fn unknown_arguments_refusal(
 
 // ── decode failures that are not unknown keys ──────────────────────────────────────
 
+/// `get_symbol_context(bundle=true)` without `path`, on both lanes.
+pub(crate) const BUNDLE_REQUIRES_PATH: &str = "Error: bundle=true requires the 'path' parameter.";
+/// `search_files` with an empty `query` and no `changed_with`, on both lanes.
+pub(crate) const SEARCH_FILES_REQUIRES_QUERY: &str =
+    "search_files requires a non-empty `query` (or use `changed_with` to find co-changing files).";
+/// `explore` with an empty query, on both lanes and in the facade.
+pub(crate) const EXPLORE_REQUIRES_QUERY: &str = "Explore requires a non-empty query.";
+/// `ask` with an empty question, on both lanes and in the facade.
+pub(crate) const ASK_REQUIRES_QUESTION: &str = "query requires a non-empty question.";
+
 /// rmcp's prefix for a tool-argument decode failure (`missing field`, wrong type); the
 /// embed lane uses the same words.
 pub(crate) const DECODE_FAILURE_PREFIX: &str = "failed to deserialize parameters:";

@@ -3044,7 +3044,8 @@ impl SymForgeServer {
                 Some(p) => p.to_string(),
                 None => {
                     record_read_outcome(ReadOutcome::InvalidRequest);
-                    return "Error: bundle=true requires the 'path' parameter.".to_string();
+                    return crate::index_lifecycle::guidance::request_refusal::BUNDLE_REQUIRES_PATH
+                        .to_string();
                 }
             };
             let (view, raw_chars, parse_state) = {
@@ -4553,7 +4554,8 @@ impl SymForgeServer {
 
         if input.query.is_empty() {
             record_read_outcome(ReadOutcome::InvalidRequest);
-            return "search_files requires a non-empty `query` (or use `changed_with` to find co-changing files).".to_string();
+            return crate::index_lifecycle::guidance::request_refusal::SEARCH_FILES_REQUIRES_QUERY
+                .to_string();
         }
 
         let ranked = {
@@ -7650,7 +7652,12 @@ impl SymForgeServer {
             &mut || true,
         ) {
             Ok(result) => result,
-            Err(_) => return Err("Explore requires a non-empty query.".to_string()),
+            Err(_) => {
+                return Err(
+                    crate::index_lifecycle::guidance::request_refusal::EXPLORE_REQUIRES_QUERY
+                        .to_string(),
+                );
+            }
         };
         let crate::index_lifecycle::guidance::exploration::ExploreResult {
             display_label,
@@ -7988,8 +7995,11 @@ impl SymForgeServer {
 
         let q = smart_query::strip_leading_articles(request.query.trim());
         if q.is_empty() {
-            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
-                .into_call_tool_result("query requires a non-empty question."));
+            return Ok(
+                ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
+                    crate::index_lifecycle::guidance::request_refusal::ASK_REQUIRES_QUESTION,
+                ),
+            );
         }
 
         // Facade contract: a prose `symbol` would be passed verbatim as a tool
@@ -9294,7 +9304,8 @@ impl SymForgeServer {
         let q = smart_query::strip_leading_articles(original_q);
         if q.is_empty() {
             record_read_outcome(ReadOutcome::InvalidRequest);
-            return "query requires a non-empty question.".to_string();
+            return crate::index_lifecycle::guidance::request_refusal::ASK_REQUIRES_QUESTION
+                .to_string();
         }
         // `ask` chooses its route from index state, so daemon-backed calls must
         // run the whole classifier in the selected/ACTIVE project. Keep the

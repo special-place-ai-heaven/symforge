@@ -1328,21 +1328,21 @@ fn invalid_request_text(request: &QueryRequest) -> Option<String> {
                 && input.bundle == Some(true)
                 && input.path.is_none() =>
         {
-            "Error: bundle=true requires the 'path' parameter."
+            super::guidance::request_refusal::BUNDLE_REQUIRES_PATH
         }
         QueryRequest::FileSearch(input)
             if input.query.is_empty() && input.changed_with.is_none() =>
         {
-            "search_files requires a non-empty `query` (or use `changed_with` to find co-changing files)."
+            super::guidance::request_refusal::SEARCH_FILES_REQUIRES_QUERY
         }
         QueryRequest::Explore(input) if input.query.trim().is_empty() => {
-            "Explore requires a non-empty query."
+            super::guidance::request_refusal::EXPLORE_REQUIRES_QUERY
         }
         QueryRequest::Ask(input)
             if super::guidance::smart_query::strip_leading_articles(input.query.trim())
                 .is_empty() =>
         {
-            "query requires a non-empty question."
+            super::guidance::request_refusal::ASK_REQUIRES_QUESTION
         }
         QueryRequest::SearchKnowledge(input) => {
             return crate::knowledge::search::validate_input(input).err();

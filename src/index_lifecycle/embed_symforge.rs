@@ -147,7 +147,7 @@ pub(super) fn project(
         return refusal("query is required: pass a natural-language phrase");
     }
     if smart_query::strip_leading_articles(request.query.trim()).is_empty() {
-        return refusal("query requires a non-empty question.");
+        return refusal(super::guidance::request_refusal::ASK_REQUIRES_QUESTION);
     }
     if let Some(message) = crate::stel::planner::symbol_contract_violation(request) {
         return refusal(message);
@@ -326,7 +326,7 @@ pub(super) fn project(
             // MCP's `explore` answers a stopword-only query with this text
             // as a served body; the shared engine's refusal is the same one.
             Err(QueryRefusalKind::InvalidRequest) if step.tool == "explore" => (
-                "Explore requires a non-empty query.".to_string(),
+                super::guidance::request_refusal::EXPLORE_REQUIRES_QUERY.to_string(),
                 None,
                 super::embed_query::facade_step_class(
                     &nested,

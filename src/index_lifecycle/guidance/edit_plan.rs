@@ -55,7 +55,7 @@ pub fn plan_edit(
                 path_matched = true;
                 collect_selector_hits(&mut symbol_hits, path, file, target_name);
             }
-            if path.ends_with(target) || path == target {
+            if names_file(path, target) {
                 ending_matches.push(path.clone());
             }
         }
@@ -111,7 +111,7 @@ pub fn plan_edit(
                 0 => {
                     for (path, file) in index.all_files() {
                         collect_selector_hits(&mut symbol_hits, path, file, target);
-                        if path.ends_with(target) || path == target {
+                        if names_file(path, target) {
                             ending_matches.push(path.clone());
                         }
                     }
@@ -223,7 +223,7 @@ pub fn plan_edit(
                 "⚠ Ambiguous file target '{}' matched {} paths ({}); selected '{}' (first sorted). Pass a fuller path to disambiguate.",
                 target,
                 ambiguous_file_matches.len(),
-                ambiguous_file_matches.join(", "),
+                listed_paths(&ambiguous_file_matches),
                 path
             ));
         }
@@ -241,6 +241,25 @@ pub fn plan_edit(
     }
 
     lines.join("\n")
+}
+
+/// `target` names `path`: the whole path, or its trailing segments at a separator, so
+/// `x.rs` is not `fox.rs`.
+fn names_file(path: &str, target: &str) -> bool {
+    path == target
+        || path
+            .strip_suffix(target)
+            .is_some_and(|head| head.ends_with('/'))
+}
+
+/// At most five paths, then how many more matched.
+fn listed_paths(paths: &[String]) -> String {
+    const LISTED: usize = 5;
+    let shown = paths[..paths.len().min(LISTED)].join(", ");
+    match paths.len().saturating_sub(LISTED) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
+    }
 }
 
 fn collect_selector_hits(

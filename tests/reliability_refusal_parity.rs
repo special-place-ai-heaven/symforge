@@ -1274,13 +1274,15 @@ fn a_step_refusal_text_does_not_leak_into_a_later_refusal() {
     }
     assert!(later_refusals > 0, "no budget refused the facade answer");
     let ask = json!({ "Ask": { "query": "outline src/missing.rs" } });
-    if let Err(refusal) = wire(&room, &query(ask, 1 << 20)) {
-        assert_ne!(
-            message_of(&refusal).as_deref(),
-            Some(step_text),
-            "{refusal:?}"
-        );
-    }
+    // `ask` routes this to a file search, which answers: no refusal, and no step text.
+    let answer = wire(&room, &query(ask, 1 << 20)).expect("ask answers");
+    let answer: Value = serde_json::from_slice(&answer).expect("ask reply");
+    assert_eq!(
+        find_string(&answer, "route").as_deref(),
+        Some("FindFile"),
+        "{answer}"
+    );
+    assert!(!answer.to_string().contains(step_text), "{answer}");
 }
 
 /// A `symforge` facade step refused for a missing path prints the step tool's own text,
@@ -1380,7 +1382,14 @@ fn multi_file_answers_are_ordered_and_finished_alike() {
         )
         .expect("suggestion source");
     }
-    for side in ["a", "b"] {
+    for name in ["fox", "box"] {
+        std::fs::write(
+            dir.path().join(format!("src/{name}.rs")),
+            format!("pub fn {name}() {{}}\n"),
+        )
+        .expect("suffix source");
+    }
+    for side in ["a", "b", "c", "d", "e", "f", "g"] {
         std::fs::create_dir_all(dir.path().join(format!("tools/{side}"))).expect("tools dir");
         std::fs::write(
             dir.path().join(format!("tools/{side}/Makefile")),
@@ -1420,9 +1429,29 @@ fn multi_file_answers_are_ordered_and_finished_alike() {
     }
     let planned = text_of(&mcp.call("edit_plan", json!({ "target": "Makefile" })));
     if !(planned.contains("Found file: tools/a/Makefile")
-        && planned.contains("matched 2 paths (tools/a/Makefile, tools/b/Makefile)"))
+        && planned.contains(
+            "matched 7 paths (tools/a/Makefile, tools/b/Makefile, tools/c/Makefile, \
+             tools/d/Makefile, tools/e/Makefile and 2 more)",
+        ))
     {
-        failures.push(format!("edit_plan does not name both Makefiles: {planned}"));
+        failures.push(format!(
+            "edit_plan does not list five Makefiles and the rest: {planned}"
+        ));
+    }
+    // A file target matches at a path separator: `x.rs` is not `fox.rs` or `box.rs`.
+    let suffix = text_of(&mcp.call("edit_plan", json!({ "target": "x.rs" })));
+    if !suffix.contains("Target 'x.rs' not found.") {
+        failures.push(format!(
+            "edit_plan matched x.rs inside a file name: {suffix}"
+        ));
+    }
+    // An invalid regex echoes a long pattern once, capped, before the regex error.
+    let pattern = format!("({}", "a".repeat(300));
+    let regex = text_of(&mcp.call("search_text", json!({ "query": pattern, "regex": true })));
+    if regex.starts_with(&format!("Invalid regex '{pattern}'")) {
+        failures.push(format!(
+            "the regex refusal echoes the whole pattern twice: {regex}"
+        ));
     }
     let cases: Vec<(&str, Value, Row)> = vec![
         (
@@ -1431,6 +1460,12 @@ fn multi_file_answers_are_ordered_and_finished_alike() {
             Row::Same,
         ),
         ("edit_plan", json!({ "target": "Makefile" }), Row::Same),
+        ("edit_plan", json!({ "target": "x.rs" }), Row::Same),
+        (
+            "search_text",
+            json!({ "query": format!("({}", "a".repeat(300)), "regex": true }),
+            Row::Same,
+        ),
         (
             "get_file_content",
             json!({ "path": "src/bin.rs", "start_line": 999 }),
