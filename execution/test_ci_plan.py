@@ -20,8 +20,8 @@ def readers(old: dict[str, str], new: dict[str, str]):
 
 
 class RunnerChoice(unittest.TestCase):
-    def choose(self, event="push", head=REPO, labels=(), setting="", online=None):
-        return ci_plan.choose_runners(event, head, REPO, list(labels), setting, online or {})
+    def choose(self, event="push", head=REPO, labels=(), setting="", online=None, actor="", head_ref=""):
+        return ci_plan.choose_runners(event, head, REPO, list(labels), setting, online or {}, actor, head_ref)
 
     def test_trusted_events_default_to_self_hosted(self):
         chosen = self.choose()
@@ -31,6 +31,14 @@ class RunnerChoice(unittest.TestCase):
     def test_fork_pull_requests_never_reach_self_hosted(self):
         for head in ("someone/symforge", ""):
             chosen = self.choose(event="pull_request", head=head, online={"linux": True, "windows": True})
+            self.assertEqual(chosen["linux"][0], "ubuntu-latest")
+            self.assertEqual(chosen["windows"][0], "windows-latest")
+
+    def test_dependabot_never_reaches_self_hosted(self):
+        for chosen in (
+            self.choose(event="pull_request", actor="dependabot[bot]", online={"linux": True, "windows": True}),
+            self.choose(event="pull_request", head_ref="dependabot/cargo/serde-1.0.300"),
+        ):
             self.assertEqual(chosen["linux"][0], "ubuntu-latest")
             self.assertEqual(chosen["windows"][0], "windows-latest")
 
@@ -73,6 +81,17 @@ class CodeChanged(unittest.TestCase):
         self.assertTrue(self.classify(list(old), old, new))
         same = {"Cargo.toml": TOML_OLD.replace('foo = "1"', 'foo = "2"')}
         self.assertTrue(self.classify(["Cargo.toml"], {"Cargo.toml": TOML_OLD}, same))
+
+    def test_dependency_pin_sharing_the_version_prefix_is_code(self):
+        lock = 'name = "symforge"\nversion = "{0}"\nname = "dep"\nversion = "{1}"\n'
+        old = {"Cargo.toml": TOML_OLD.replace("1.2.3", "11.18.1"), "Cargo.lock": lock.format("11.18.1", "11.18.10")}
+        new = {"Cargo.toml": TOML_OLD.replace("1.2.3", "11.18.2"), "Cargo.lock": lock.format("11.18.2", "11.18.20")}
+        self.assertTrue(self.classify(list(old), old, new))
+        bump_only = dict(new, **{"Cargo.lock": new["Cargo.lock"].replace("11.18.20", "11.18.10")})
+        self.assertFalse(self.classify(list(old), old, bump_only))
+
+    def test_vendored_files_are_code(self):
+        self.assertTrue(self.classify(["vendor/rmcp/README.md"]))
 
     def test_documents_tests_read_are_code(self):
         self.assertFalse(self.classify(["docs/guide.md", "specs/030-x/plan.md"]))

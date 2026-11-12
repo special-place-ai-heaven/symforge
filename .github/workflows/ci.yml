@@ -61,6 +61,8 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          ACTOR: ${{ github.actor }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -159,7 +161,7 @@ jobs:
 
   lint:
     needs: plan
-    if: needs.plan.outputs.code_changed == 'true'
+    if: needs.plan.outputs.code_changed != 'false'
     runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
     timeout-minutes: 20
     steps:
@@ -249,7 +251,7 @@ jobs:
   # partition must check out at this job's path; `workspace` lets it check.
   test-build:
     needs: plan
-    if: needs.plan.outputs.code_changed == 'true'
+    if: needs.plan.outputs.code_changed != 'false'
     runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
     timeout-minutes: 30
     outputs:
@@ -355,7 +357,7 @@ jobs:
   test:
     name: test (${{ matrix.partition }}/4)
     needs: [plan, test-build]
-    if: needs.plan.outputs.code_changed == 'true'
+    if: needs.plan.outputs.code_changed != 'false'
     runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
     timeout-minutes: 20
     strategy:
@@ -409,7 +411,7 @@ jobs:
 
   bench:
     needs: plan
-    if: needs.plan.outputs.code_changed == 'true'
+    if: needs.plan.outputs.code_changed != 'false'
     runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
     timeout-minutes: 30
     steps:
@@ -461,7 +463,7 @@ jobs:
 
   release-build:
     needs: plan
-    if: needs.plan.outputs.code_changed == 'true'
+    if: needs.plan.outputs.code_changed != 'false'
     runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
     timeout-minutes: 25
     steps:
@@ -530,7 +532,7 @@ jobs:
 
   embed-build:
     needs: plan
-    if: needs.plan.outputs.code_changed == 'true'
+    if: needs.plan.outputs.code_changed != 'false'
     runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
     timeout-minutes: 20
     steps:
@@ -582,12 +584,12 @@ jobs:
       - name: Run embed parity and replay contracts
         run: |
           set -euo pipefail
-          cargo test --no-default-features --features embed,__test-internals --test embed_parity --test embed_replay_v1 --test embed_aap_refresh_s14_s16 -- --test-threads=1 2>&1 | tee /tmp/embed-parity-replay.log
-          if grep -E 'running 0 tests' /tmp/embed-parity-replay.log; then
+          cargo test --no-default-features --features embed,__test-internals --test embed_parity --test embed_replay_v1 --test embed_aap_refresh_s14_s16 -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/embed-parity-replay.log"
+          if grep -E 'running 0 tests' "$RUNNER_TEMP/embed-parity-replay.log"; then
             echo 'embed_parity, embed_replay_v1, or embed_aap_refresh_s14_s16 executed zero tests' >&2
             exit 1
           fi
-          matches=$(grep -cE 'test result: ok\. [1-9][0-9]* passed' /tmp/embed-parity-replay.log || true)
+          matches=$(grep -cE 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/embed-parity-replay.log" || true)
           test "$matches" -ge 3
 
       - name: zccache stats and stop
@@ -609,7 +611,7 @@ jobs:
 
   server-embed-parity:
     needs: plan
-    if: needs.plan.outputs.code_changed == 'true'
+    if: needs.plan.outputs.code_changed != 'false'
     runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
     timeout-minutes: 30
     steps:
@@ -645,8 +647,8 @@ jobs:
       - name: Run server and embed parity tests
         run: |
           set -euo pipefail
-          cargo test --features embed,__test-internals --lib server_and_embed_ -- --test-threads=1 2>&1 | tee /tmp/server-embed-parity.log
-          grep -q '^test result: ok\. 2 passed; 0 failed;' /tmp/server-embed-parity.log
+          cargo test --features embed,__test-internals --lib server_and_embed_ -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/server-embed-parity.log"
+          grep -q '^test result: ok\. 2 passed; 0 failed;' "$RUNNER_TEMP/server-embed-parity.log"
 
       # The integration tests gated on `embed` compile only with it on, and no
       # other job runs them; the rest already run in the `test` partitions.
@@ -674,7 +676,7 @@ jobs:
 
   embed-musl:
     needs: plan
-    if: needs.plan.outputs.code_changed == 'true'
+    if: needs.plan.outputs.code_changed != 'false'
     runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
     timeout-minutes: 20
     steps:
@@ -862,7 +864,7 @@ jobs:
   # split here.
   windows-native:
     needs: plan
-    if: needs.plan.outputs.code_changed == 'true'
+    if: needs.plan.outputs.code_changed != 'false'
     runs-on: ${{ fromJSON(needs.plan.outputs.windows) }}
     timeout-minutes: 60
     defaults:
@@ -957,12 +959,24 @@ jobs:
         if: ${{ always() && runner.environment == 'self-hosted' }}
         shell: powershell
         working-directory: ${{ runner.temp }}
+        # From the runner's own contexts, not from variables earlier steps (or a
+        # build script writing GITHUB_ENV) could have rewritten.
+        env:
+          CLEAN_TEMP: ${{ runner.temp }}
+          CLEAN_WORKSPACE: ${{ github.workspace }}
         run: |
-          $roots = @($env:CI_ROOT, $env:GITHUB_WORKSPACE) | Where-Object { $_ }
+          foreach ($base in @($env:CLEAN_TEMP, $env:CLEAN_WORKSPACE)) {
+            if (-not $base -or -not [System.IO.Path]::IsPathRooted($base) -or
+                ([System.IO.Path]::GetPathRoot($base).TrimEnd('\') -eq $base.TrimEnd('\'))) {
+              Write-Output "::error::refusing to delete under '$base': empty, relative or a drive root"
+              exit 1
+            }
+          }
+          $roots = @((Join-Path $env:CLEAN_TEMP 'symforge-ci'), $env:CLEAN_WORKSPACE.TrimEnd('\'))
           # Test daemons still running from these trees would hold their files open.
           Get-Process | Where-Object {
             $path = $_.Path
-            $path -and ($roots | Where-Object { $path.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) })
+            $path -and ($roots | Where-Object { $path.StartsWith($_ + '\', [StringComparison]::OrdinalIgnoreCase) })
           } | ForEach-Object {
             Write-Output "stopping $($_.Name) ($($_.Id))"
             Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue

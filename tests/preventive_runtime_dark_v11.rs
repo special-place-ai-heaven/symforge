@@ -1544,7 +1544,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 // and every new cargo-mentioning line is an env assignment, a cache key, a
 // download, or that archive; census 91/53/2.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "556eb4a499b977cf:45078"),
+    ("ci.yml", "f61f13650e1363a4:45888"),
     ("release.yml", "b174946ff2c434bb:115022"),
 ];
 
@@ -1722,11 +1722,11 @@ const CARGO_LINES: &[(&str, usize)] = &[
         1,
     ),
     (
-        "cargo test --no-default-features --features embed,__test-internals --test embed_parity --test embed_replay_v1 --test embed_aap_refresh_s14_s16 -- --test-threads=1 2>&1 | tee /tmp/embed-parity-replay.log",
+        "cargo test --no-default-features --features embed,__test-internals --test embed_parity --test embed_replay_v1 --test embed_aap_refresh_s14_s16 -- --test-threads=1 2>&1 | tee \"$RUNNER_TEMP/embed-parity-replay.log\"",
         1,
     ),
     (
-        "cargo test --features embed,__test-internals --lib server_and_embed_ -- --test-threads=1 2>&1 | tee /tmp/server-embed-parity.log",
+        "cargo test --features embed,__test-internals --lib server_and_embed_ -- --test-threads=1 2>&1 | tee \"$RUNNER_TEMP/server-embed-parity.log\"",
         1,
     ),
     // The embed-gated integration binaries by name (`--test` selects

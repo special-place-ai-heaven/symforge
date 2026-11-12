@@ -43,10 +43,20 @@ CODE_DOCS = {"README.md", "AGENTS.md"}
 CODE_PREFIXES = (
     "src/", "tests/", "benches/", "scripts/", "execution/", "npm/",
     ".github/", ".specify/", ".config/", ".cargo/", "specs/020-",
+    # Vendored crates embed their own files (vendor/rmcp/src/lib.rs does
+    # include_str!("../README.md")).
+    "vendor/",
 )
 # Where a Rust test, the bench, or a harness script could name a document.
 REFERENCE_ROOTS = ["src", "tests", "benches", "scripts", "build.rs"]
 ZERO_SHA = re.compile(r"^0+$")
+DEPENDABOT = "dependabot[bot]"
+
+
+def replace_version(text: str, old: str, new: str) -> str:
+    """Replace `old` only where it is a whole version, so 11.18.10 is not 11.18.1."""
+    whole = re.compile(r"(?<![0-9.])" + re.escape(old) + r"(?![0-9]|\.[0-9])")
+    return whole.sub(lambda _match: new, text)
 
 
 def choose_runners(
@@ -56,6 +66,8 @@ def choose_runners(
     labels: list[str],
     setting: str,
     online: dict[str, Optional[bool]],
+    actor: str = "",
+    head_ref: str = "",
 ) -> dict[str, tuple[object, str]]:
     """Return `{os: (runs_on, reason)}` for linux and windows."""
     setting = setting.strip().lower()
@@ -63,6 +75,8 @@ def choose_runners(
     for os_name in ("linux", "windows"):
         if event.startswith("pull_request") and head_repo != repository:
             reason = "pull request from another repository: untrusted code never runs on self-hosted runners"
+        elif actor == DEPENDABOT or head_ref.startswith("dependabot/"):
+            reason = "Dependabot change: an updated dependency's build script never runs on self-hosted runners"
         elif HOSTED_LABEL in labels:
             reason = f"pull request carries the {HOSTED_LABEL} label"
         elif setting in ("hosted", f"hosted-{os_name}"):
@@ -122,7 +136,7 @@ def classify(
         return True, "version files changed without a package version bump"
     for path in bumped:
         before, after = read_old(path), read_new(path)
-        if before is None or after is None or before.replace(old, new) != after:
+        if before is None or after is None or replace_version(before, old, new) != after:
             return True, f"{path} changed beyond the {old} -> {new} version bump"
     return False, f"only the release version moved ({old} -> {new}), plus documentation"
 
@@ -247,6 +261,8 @@ def main() -> int:
         pull_request_labels(env),
         env.get("CI_RUNNERS", ""),
         online,
+        env.get("ACTOR", ""),
+        env.get("HEAD_REF", ""),
     )
     code_changed, code_reason = changed_code(env)
     outputs = {
