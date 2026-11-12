@@ -168,7 +168,15 @@ fn reference_search_keeps_caller_declarations_scoping_limits_and_implementations
             QueryLimits::default(),
         )
         .unwrap_err();
-    assert_eq!(invalid.kind(), QueryRefusalKind::UnsupportedOption);
+    // Refused by the shared value table, with MCP's text (spec 036 argument values).
+    assert_eq!(invalid.kind(), QueryRefusalKind::InvalidRequest);
+    assert!(
+        invalid
+            .message()
+            .is_some_and(|text| text.contains("\"mode\". Valid values: \"references\"")),
+        "{:?}",
+        invalid.message()
+    );
 }
 
 #[test]

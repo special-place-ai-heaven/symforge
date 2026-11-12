@@ -37,11 +37,8 @@ pub(super) fn validate(request: &FileSearchRequest) -> Result<(), QueryRefusalKi
     {
         return Err(QueryRefusalKind::InvalidRequest);
     }
-    if request
-        .limit
-        .is_some_and(|value| value == 0 || value > 10_000)
-        || request.max_tokens == Some(0)
-    {
+    // Above 50 the limit is clamped, as the published description says.
+    if request.limit == Some(0) || request.max_tokens == Some(0) {
         return Err(QueryRefusalKind::InvalidRequest);
     }
     crate::knowledge::guard_query(&request.query)

@@ -490,6 +490,12 @@ fn execute_inner(
     };
     let mut budget =
         Budget::new(limits, control).map_err(|kind| refuse(kind, RetryAdvice::Never))?;
+    if let Some(text) = typed_value_refusal(request) {
+        return Err(QueryRefusal {
+            message: Some(text),
+            ..refuse(QueryRefusalKind::InvalidRequest, RetryAdvice::Never)
+        });
+    }
     validate_request(request).map_err(|kind| QueryRefusal {
         message: validation_text(request, kind),
         ..refuse(kind, RetryAdvice::Never)
@@ -1245,30 +1251,9 @@ pub(super) fn validate_path(path: &str, prefix: bool) -> Result<(), QueryRefusal
 
 pub(super) fn validate_kind(kind: Option<&str>) -> Result<(), QueryRefusalKind> {
     if let Some(kind) = kind
-        && !matches!(
-            kind.to_ascii_lowercase().as_str(),
-            "all"
-                | "fn"
-                | "function"
-                | "method"
-                | "class"
-                | "struct"
-                | "enum"
-                | "interface"
-                | "mod"
-                | "module"
-                | "const"
-                | "constant"
-                | "let"
-                | "variable"
-                | "type"
-                | "trait"
-                | "impl"
-                | "other"
-                | "key"
-                | "section"
-                | "macro-generated"
-        )
+        && !super::guidance::argument_values::SYMBOL_KINDS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(kind))
     {
         return Err(QueryRefusalKind::UnsupportedOption);
     }
@@ -1297,6 +1282,17 @@ fn validate_selector(selector: &QuerySymbolSelector) -> Result<(), QueryRefusalK
     Ok(())
 }
 
+/// The argument-value refusal (`argument_values`) for a typed request whose variant
+/// answers for an MCP tool: the same table and text the wire lane and the MCP lane apply,
+/// so a host that dispatches typed requests is held to the same values.
+pub(super) fn typed_value_refusal(request: &QueryRequest) -> Option<String> {
+    let serde_json::Value::Object(wire) = serde_json::to_value(request).ok()? else {
+        return None;
+    };
+    let (variant, args) = wire.iter().next()?;
+    let tool = super::guidance::request_refusal::embed_request_tool(&format!("Query.{variant}"))?;
+    super::guidance::argument_values::value_refusal(tool, args.as_object()?)
+}
 /// The MCP lane's text for a request [`validate_request`] refuses, where it has one and
 /// the condition MCP prints it for is the one that refused: an unknown language filter,
 /// and the empty-query and missing-path refusals. `None`: the refusal has no MCP text,

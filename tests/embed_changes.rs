@@ -194,7 +194,7 @@ fn changes_bound_rows_preserve_full_cache_and_reject_unknown_filters() {
     let uncapped = handle
         .query(
             &QueryRequest::WhatChanged(WhatChangedRequest {
-                max_tokens: Some(0),
+                max_tokens: None,
                 ..uncommitted.clone()
             }),
             QueryLimits::default(),

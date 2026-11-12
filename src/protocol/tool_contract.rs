@@ -30,6 +30,7 @@ use rmcp::model::{CallToolResult, JsonObject};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+pub(crate) use crate::index_lifecycle::guidance::argument_values::value_refusal;
 pub(crate) use crate::index_lifecycle::guidance::request_refusal::{
     ABSENT, ModeSelection, StrictError, When, decode_strict, from_value_noting, note_keys_of,
     unknown_arguments_refusal,
@@ -669,6 +670,9 @@ impl SymForgeServer {
                 .map(schema_argument_names)
                 .unwrap_or_default();
             return Err(refuse(unknown_arguments_refusal(tool, &unknown, &valid)));
+        }
+        if let Some(text) = value_refusal(tool, args) {
+            return Err(refuse(text));
         }
         apply_conditions(tool, args).map_err(refuse)
     }

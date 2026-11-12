@@ -519,14 +519,7 @@ fn add_file_context_schema(schema: &mut Schema) {
     add_include_tests_schema(schema);
     add_sections_allowlist(
         schema,
-        &[
-            "outline",
-            "imports",
-            "consumers",
-            "references",
-            "git",
-            "knowledge",
-        ],
+        crate::index_lifecycle::guidance::argument_values::FILE_CONTEXT_SECTIONS,
     );
 }
 
@@ -534,13 +527,7 @@ fn add_symbol_context_schema(schema: &mut Schema) {
     add_include_tests_schema(schema);
     add_sections_allowlist(
         schema,
-        &[
-            "dependents",
-            "siblings",
-            "implementations",
-            "git",
-            "knowledge",
-        ],
+        crate::index_lifecycle::guidance::argument_values::SYMBOL_CONTEXT_SECTIONS,
     );
 }
 

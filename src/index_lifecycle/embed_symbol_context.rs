@@ -28,21 +28,8 @@ pub(super) fn validate(request: &SymbolContextRequest) -> Result<(), QueryRefusa
     if (request.bundle == Some(true) || request.sections.is_some()) && request.path.is_none() {
         return Err(QueryRefusalKind::InvalidRequest);
     }
-    if request
-        .verbosity
-        .as_deref()
-        .is_some_and(|value| !matches!(value, "full" | "summary" | "signature" | "compact"))
-        || request.sections.as_ref().is_some_and(|sections| {
-            sections.iter().any(|section| {
-                !matches!(
-                    section.as_str(),
-                    "dependents" | "siblings" | "implementations" | "git" | "knowledge"
-                )
-            })
-        })
-    {
-        return Err(QueryRefusalKind::UnsupportedOption);
-    }
+    // `verbosity` and `sections` are judged by the shared value table
+    // (`embed_query::typed_value_refusal`), caselessly for sections as on the MCP lane.
     if crate::knowledge::guard_query(&request.name).is_err() {
         return Err(QueryRefusalKind::AdmissionUnavailable);
     }

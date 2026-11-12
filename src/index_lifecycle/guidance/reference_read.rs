@@ -720,16 +720,36 @@ pub(crate) fn find_references_evidence(view: &crate::live_index::FindReferencesV
     anchored_search_evidence(anchors, "reference anchors")
 }
 
+/// `find_references` `kind` values and the filter each selects (`all`: none). The single
+/// source of the accepted names (`argument_values` reads [`REFERENCE_KIND_NAMES`]; a
+/// test pins the two equal).
+pub(crate) const REFERENCE_KIND_FILTERS: &[(&str, Option<ReferenceKind>)] = &[
+    ("call", Some(ReferenceKind::Call)),
+    ("import", Some(ReferenceKind::Import)),
+    ("type_usage", Some(ReferenceKind::TypeUsage)),
+    ("macro_use", Some(ReferenceKind::MacroUse)),
+    ("value_use", Some(ReferenceKind::ValueUse)),
+    ("all", None),
+];
+
+/// The names of [`REFERENCE_KIND_FILTERS`], in its order.
+pub(crate) const REFERENCE_KIND_NAMES: &[&str] = &[
+    "call",
+    "import",
+    "type_usage",
+    "macro_use",
+    "value_use",
+    "all",
+];
+
+/// The filter `kind_filter` selects; an unknown name is refused before any handler runs
+/// (`argument_values`), so it selects none here.
 pub(crate) fn find_references_kind_filter(kind_filter: Option<&str>) -> Option<ReferenceKind> {
-    match kind_filter {
-        Some("call") => Some(ReferenceKind::Call),
-        Some("import") => Some(ReferenceKind::Import),
-        Some("type_usage") => Some(ReferenceKind::TypeUsage),
-        Some("macro_use") => Some(ReferenceKind::MacroUse),
-        Some("value_use") => Some(ReferenceKind::ValueUse),
-        Some("all") | None => None,
-        _ => None,
-    }
+    let name = kind_filter?;
+    REFERENCE_KIND_FILTERS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .and_then(|(_, kind)| *kind)
 }
 
 pub(crate) fn should_collect_qualified_usages(input: &FindReferencesInput) -> bool {

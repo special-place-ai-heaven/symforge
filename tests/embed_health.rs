@@ -167,19 +167,22 @@ fn health_report_pages_quarantine_and_reports_process_sections_as_not_applicable
         assert!(text.contains(&format!("src/broken_{name}.rs [unexpected_partial]")));
     }
 
-    // MCP clamps the limit to 1..=1000.
-    let clamped = report(
-        &room,
-        &HostRequest::HealthReport(HostHealthRequest {
-            quarantine_limit: Some(0),
-            quarantine_offset: None,
-        }),
-    );
-    assert!(
-        clamped
-            .report
-            .unwrap()
-            .contains("showing=1 offset=0 omitted=2")
+    // A limit of 0 is refused with MCP's text (spec 036 argument values); above 1000 it
+    // is capped, as the published description says.
+    let wire = serde_json::to_vec(&HostRequest::HealthReport(HostHealthRequest {
+        quarantine_limit: Some(0),
+        quarantine_offset: None,
+    }))
+    .unwrap();
+    let refusal = room
+        .dispatch_wire(&wire, &room.control().unwrap())
+        .unwrap_err();
+    assert_eq!(
+        refusal.message.as_deref(),
+        Some(
+            "invalid_request: health does not accept \"quarantine_limit\" = 0. Valid range: 1 \
+             or greater."
+        )
     );
 
     let compact = report(&room, &HostRequest::HealthCompact);

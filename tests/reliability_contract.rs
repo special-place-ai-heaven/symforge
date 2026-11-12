@@ -537,7 +537,7 @@ fn calls_the_handlers_read_are_not_refused() {
         ),
         (
             "find_references",
-            json!({ "name": "target_fn", "mode": "refs", "kind": "call" }),
+            json!({ "name": "target_fn", "mode": "references", "kind": "call" }),
         ),
         (
             "find_references",
@@ -545,8 +545,8 @@ fn calls_the_handlers_read_are_not_refused() {
                     "path": "src/parent/leaf.rs", "direction": "auto" }),
         ),
         ("get_repo_map", json!({ "detail": "", "depth": 1 })),
-        ("get_repo_map", json!({ "detail": "Compact", "depth": 3 })),
-        ("get_repo_map", json!({ "detail": "summary", "depth": 3 })),
+        ("get_repo_map", json!({ "detail": "compact", "depth": 3 })),
+        ("get_repo_map", json!({ "detail": "tree", "depth": 3 })),
         ("get_repo_map", json!({ "max_files": 50, "depth": 3 })),
         (
             "get_symbol",
@@ -708,4 +708,132 @@ fn a_mode_refusal_never_echoes_an_argument_value() {
         !text.contains(&"k".repeat(60)) && !text.contains("SENSITIVE_VALUE"),
         "{text}"
     );
+}
+
+/// Spec 036 argument values: a value outside an argument's set or range is refused as an
+/// invalid request that names the argument and lists what it accepts, and the same call
+/// with a valid value is answered.
+#[test]
+fn an_out_of_set_value_is_refused_and_a_valid_one_is_answered() {
+    let (_dir, mut client) = ready_server();
+    let cases: Vec<(&str, Value, &str, Value)> = vec![
+        (
+            "find_references",
+            json!({ "name": "target_fn", "kind": "bogus" }),
+            "Valid values: \"call\", \"import\", \"type_usage\", \"macro_use\", \"value_use\", \"all\".",
+            json!({ "name": "target_fn", "kind": "call" }),
+        ),
+        (
+            "find_references",
+            json!({ "name": "" }),
+            "requires a non-empty \"name\"",
+            json!({ "name": "target_fn" }),
+        ),
+        (
+            "find_references",
+            json!({ "name": "target_fn", "limit": 0 }),
+            "\"limit\" = 0. Valid range: 1 or greater.",
+            json!({ "name": "target_fn", "limit": 1 }),
+        ),
+        (
+            "find_dependents",
+            json!({ "path": "src/parent/leaf.rs", "format": "bogus" }),
+            "Valid values: \"text\", \"mermaid\", \"dot\".",
+            json!({ "path": "src/parent/leaf.rs", "format": "dot" }),
+        ),
+        (
+            "get_symbol_context",
+            json!({ "name": "target_fn", "path": "src/parent/leaf.rs", "verbosity": "bogus" }),
+            "\"verbosity\". Valid values: \"full\", \"summary\", \"signature\", \"compact\".",
+            json!({ "name": "target_fn", "path": "src/parent/leaf.rs", "verbosity": "summary" }),
+        ),
+        (
+            "get_symbol_context",
+            json!({ "name": "target_fn", "path": "src/parent/leaf.rs", "sections": ["bogus"] }),
+            "\"sections.0\"",
+            json!({ "name": "target_fn", "path": "src/parent/leaf.rs", "sections": ["git"] }),
+        ),
+        (
+            "search_symbols",
+            json!({ "query": "target", "kind": "bogus" }),
+            "\"kind\". Valid values: \"all\", \"fn\"",
+            json!({ "query": "target", "kind": "FN" }),
+        ),
+        (
+            "search_text",
+            json!({ "query": "target_fn", "group_by": "bogus" }),
+            "\"group_by\". Valid values: \"file\", \"symbol\", \"usage\", \"purpose\", \"names\", \"count\".",
+            json!({ "query": "target_fn", "group_by": "count" }),
+        ),
+        (
+            "get_file_content",
+            json!({ "path": "src/short.rs", "mode": "bogus" }),
+            "\"mode\". Valid values: \"lines\", \"symbol\", \"match\", \"chunk\".",
+            json!({ "path": "src/short.rs", "mode": "lines", "start_line": 1, "end_line": 2 }),
+        ),
+        (
+            "get_file_context",
+            json!({ "path": "src/short.rs", "max_tokens": 0 }),
+            "\"max_tokens\" = 0. Valid range: 1 or greater.",
+            json!({ "path": "src/short.rs", "max_tokens": 500 }),
+        ),
+        (
+            "get_repo_map",
+            json!({ "detail": "bogus" }),
+            "Valid values: \"compact\", \"full\", \"tree\".",
+            json!({ "detail": "tree" }),
+        ),
+        (
+            "explore",
+            json!({ "query": "target", "depth": 0 }),
+            "\"depth\" = 0. Valid range: 1 to 3.",
+            json!({ "query": "target", "depth": 3 }),
+        ),
+        (
+            "edit_within_symbol",
+            json!({ "path": "src/user.rs", "name": "use_it", "old_text": "target_fn(7)",
+                    "new_text": "target_fn(8)", "near_line": 0, "dry_run": true }),
+            "\"near_line\" = 0",
+            json!({ "path": "src/user.rs", "name": "use_it", "old_text": "target_fn(7)",
+                    "new_text": "target_fn(8)", "near_line": 1, "dry_run": true }),
+        ),
+        (
+            "replace_symbol_body",
+            json!({ "path": "src/short.rs", "name": "SHORT_A", "kind": "bogus",
+                    "new_body": "pub const SHORT_A: u32 = 1;", "dry_run": true }),
+            "\"kind\"",
+            json!({ "path": "src/short.rs", "name": "SHORT_A", "kind": "const",
+                    "new_body": "pub const SHORT_A: u32 = 1;", "dry_run": true }),
+        ),
+        (
+            "batch_edit",
+            json!({ "edits": [{ "path": "src/short.rs", "name": "SHORT_A", "symbol_line": 0,
+                    "operation": { "type": "replace", "new_body": "pub const SHORT_A: u32 = 1;" } }],
+                    "dry_run": true }),
+            "\"edits.0.symbol_line\" = 0",
+            json!({ "edits": [{ "path": "src/short.rs", "name": "SHORT_A",
+                    "operation": { "type": "replace", "new_body": "pub const SHORT_A: u32 = 1;" } }],
+                    "dry_run": true }),
+        ),
+    ];
+    for (tool, bad, names, good) in cases {
+        let refused = client.call(tool, bad.clone());
+        let text = text_of(&refused);
+        assert_eq!(refused["isError"], json!(true), "{tool} {bad}: {text}");
+        assert_eq!(
+            outcome_class(&refused),
+            Some("invalid_request"),
+            "{tool} {bad}: {text}"
+        );
+        assert!(
+            text.starts_with(&format!("invalid_request: {tool} ")) && text.contains(names),
+            "{tool} {bad}: expected `{names}` in {text}"
+        );
+        assert!(
+            !text.contains("bogus"),
+            "{tool}: a string value is never echoed: {text}"
+        );
+        let answered = client.call(tool, good.clone());
+        assert_not_refused(&answered, &format!("{tool} {good}"));
+    }
 }

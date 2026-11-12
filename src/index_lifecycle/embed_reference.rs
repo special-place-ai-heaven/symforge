@@ -24,24 +24,9 @@ pub(super) fn validate(request: &ReferenceSearchRequest) -> Result<(), QueryRefu
     if let Some(path) = &request.path {
         validate_path(path, false)?;
     }
+    // `kind`, `symbol_kind`, `mode` and `direction` are judged by the shared value table
+    // first (`embed_query::typed_value_refusal`).
     validate_kind(request.symbol_kind.as_deref())?;
-    if request
-        .mode
-        .as_deref()
-        .is_some_and(|value| !matches!(value, "references" | "implementations"))
-        || request
-            .direction
-            .as_deref()
-            .is_some_and(|value| !matches!(value, "trait" | "type" | "auto"))
-        || request.kind.as_deref().is_some_and(|value| {
-            !matches!(
-                value,
-                "call" | "import" | "type_usage" | "macro_use" | "value_use" | "all"
-            )
-        })
-    {
-        return Err(QueryRefusalKind::UnsupportedOption);
-    }
     Ok(())
 }
 
@@ -53,13 +38,7 @@ pub(super) fn validate_dependents(
     {
         return Err(QueryRefusalKind::InvalidRequest);
     }
-    if request
-        .format
-        .as_deref()
-        .is_some_and(|format| !matches!(format, "text" | "mermaid" | "dot"))
-    {
-        return Err(QueryRefusalKind::UnsupportedOption);
-    }
+    // `format` is judged by the shared value table (`embed_query::typed_value_refusal`).
     Ok(())
 }
 

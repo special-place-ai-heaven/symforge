@@ -73,7 +73,7 @@ fn validate_filters(
 }
 
 pub(super) fn validate_what_changed(request: &WhatChangedRequest) -> Result<(), QueryRefusalKind> {
-    // MCP reads `max_tokens = 0` as "no cap", so it is not a malformed request here.
+    // `max_tokens = 0` is refused by the shared value table first (`argument_values`).
     validate_filters(
         request.path_prefix.as_deref(),
         request.language.as_deref(),

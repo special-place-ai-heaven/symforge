@@ -5725,8 +5725,14 @@ async fn call_tool_handler(
         "trace_symbol" => "get_symbol_context",
         other => other,
     };
+    // An argument value outside its set or range is refused before the mode rules, as on
+    // the front end (`argument_values`).
     if let serde_json::Value::Object(object) = &mut params
-        && let Err(text) = crate::protocol::tool_contract::apply_conditions(judged_as, object)
+        && let Some(text) = crate::protocol::tool_contract::value_refusal(judged_as, object)
+            .map_or_else(
+                || crate::protocol::tool_contract::apply_conditions(judged_as, object).err(),
+                Some,
+            )
     {
         return Err(bad_request(anyhow::anyhow!(text)));
     }

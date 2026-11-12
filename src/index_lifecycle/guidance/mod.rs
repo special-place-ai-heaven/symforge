@@ -1,5 +1,6 @@
 //! Transport-independent guidance shared by MCP and embedded hosts.
 
+pub(crate) mod argument_values;
 pub(crate) mod changes;
 pub mod conventions;
 pub(crate) mod edit_body;

@@ -260,6 +260,7 @@ fn symbol_context_keeps_ambiguity_estimates_and_full_cache_evidence() {
             )
             .unwrap_err()
             .kind(),
-        QueryRefusalKind::UnsupportedOption
+        // Refused by the shared value table (spec 036 argument values).
+        QueryRefusalKind::InvalidRequest
     );
 }

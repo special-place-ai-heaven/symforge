@@ -22,9 +22,10 @@ use crate::embed::parity::{
     ask, changes, detect_impact, file_impact, guidance, knowledge, read, read_context, reference,
     search, symbol, symbol_context,
 };
+use crate::index_lifecycle::guidance::argument_values::value_refusal;
 use crate::index_lifecycle::guidance::request_refusal::{
     StrictError, UnknownArguments, UnknownKey, decode_strict_wrapped, embed_decode_failure_text,
-    embed_unknown_arguments_refusal, expected_fields_in,
+    embed_request_tool, embed_unknown_arguments_refusal, expected_fields_in,
 };
 
 /// A key no request type declares: decoding `{SENTINEL: null}` makes a
@@ -257,13 +258,23 @@ fn locate(wire: &Value) -> Option<Located> {
 /// mistake).
 pub(super) fn argument_refusal(wire: &Value) -> Option<String> {
     let located = locate(wire)?;
-    match located.verdict() {
-        Verdict::Fine => None,
-        Verdict::Unknown(unknown) => Some(embed_unknown_arguments_refusal(
+    let verdict = located.verdict();
+    if let Verdict::Unknown(unknown) = &verdict {
+        return Some(embed_unknown_arguments_refusal(
             &located.label,
-            &unknown,
+            unknown,
             located.declared_fields().as_deref(),
-        )),
+        ));
+    }
+    // Then the argument values, as on the MCP lane, before a closed embed enum's decode
+    // failure can speak for them.
+    if let (Some(tool), Some(args)) = (embed_request_tool(&located.label), located.args.as_object())
+        && let Some(text) = value_refusal(tool, args)
+    {
+        return Some(text);
+    }
+    match verdict {
+        Verdict::Fine | Verdict::Unknown(_) => None,
         Verdict::Decode(message) => Some(embed_decode_failure_text(
             &located.label,
             &message,
