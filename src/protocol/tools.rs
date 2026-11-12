@@ -536,47 +536,8 @@ use crate::index_lifecycle::guidance::changes::{
     determine_what_changed_mode, filter_paths_by_prefix_and_language, search_paths_evidence,
     what_changed_parse_state_label, what_changed_scope_summary, what_changed_source_authority,
 };
+use crate::index_lifecycle::guidance::file_read::suggest_similar_files;
 use crate::index_lifecycle::guidance::file_search::normalize_exact_path;
-
-/// Find up to 5 similar file paths for "file not found" suggestions.
-/// Extracts the basename from the failed path and searches the index.
-fn suggest_similar_files(index: &crate::live_index::LiveIndex, path: &str) -> Vec<String> {
-    let basename = std::path::Path::new(path)
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or(path);
-    // Try basename match first
-    let mut suggestions: Vec<String> = index
-        .find_files_by_basename(basename)
-        .into_iter()
-        .take(5)
-        .map(|s| s.to_string())
-        .collect();
-    // If no basename match, try the stem (without extension)
-    if suggestions.is_empty() {
-        let stem = std::path::Path::new(path)
-            .file_stem()
-            .and_then(|f| f.to_str())
-            .unwrap_or(basename);
-        if stem.len() >= 3 {
-            let stem_lower = stem.to_ascii_lowercase();
-            suggestions = index
-                .all_files()
-                .map(|(p, _)| p.as_str())
-                .filter(|p| {
-                    let file_stem = std::path::Path::new(p)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("");
-                    file_stem.to_ascii_lowercase().contains(&stem_lower)
-                })
-                .take(5)
-                .map(|s| s.to_string())
-                .collect();
-        }
-    }
-    suggestions
-}
 
 #[cfg(test)]
 use crate::index_lifecycle::guidance::freshen::classify_targeted_freshen_result;
@@ -3083,7 +3044,8 @@ impl SymForgeServer {
                 Some(p) => p.to_string(),
                 None => {
                     record_read_outcome(ReadOutcome::InvalidRequest);
-                    return "Error: bundle=true requires the 'path' parameter.".to_string();
+                    return crate::index_lifecycle::guidance::request_refusal::BUNDLE_REQUIRES_PATH
+                        .to_string();
                 }
             };
             let (view, raw_chars, parse_state) = {
@@ -4592,7 +4554,8 @@ impl SymForgeServer {
 
         if input.query.is_empty() {
             record_read_outcome(ReadOutcome::InvalidRequest);
-            return "search_files requires a non-empty `query` (or use `changed_with` to find co-changing files).".to_string();
+            return crate::index_lifecycle::guidance::request_refusal::SEARCH_FILES_REQUIRES_QUERY
+                .to_string();
         }
 
         let ranked = {
@@ -6711,14 +6674,15 @@ impl SymForgeServer {
                     ),
                     crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
                 );
-                let capped = format::cap_file_content_output_for(
-                    format!("{}{}", mode_annotation, output),
-                    &input.path,
-                    first_line,
-                    numbered,
-                );
-                let with_warning = format::append_nul_byte_warning(capped, &file.as_ref().content);
-                let mut final_output = format::enforce_token_budget(with_warning, max_tokens);
+                let (_, mut final_output, _) =
+                    crate::index_lifecycle::guidance::file_read::finish_file_content(
+                        format!("{}{}", mode_annotation, output),
+                        &input.path,
+                        first_line,
+                        numbered,
+                        &file.as_ref().content,
+                        max_tokens,
+                    );
                 let tokens = u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
                     final_output.len() as u64,
                 ))
@@ -6817,7 +6781,12 @@ impl SymForgeServer {
                         // An unindexed file has no symbols: say so rather than
                         // serving the whole file for an `around_symbol` read.
                         let body = match options.content_context.around_symbol.as_deref() {
-                            Some(name) => format!("Symbol not found in {}: {name}", input.path),
+                            Some(name) => {
+                                crate::index_lifecycle::guidance::file_read::unindexed_symbol_not_found(
+                                    &input.path,
+                                    name,
+                                )
+                            }
                             None => format::render_file_content_bytes(
                                 &input.path,
                                 &content,
@@ -6830,15 +6799,15 @@ impl SymForgeServer {
                         self.bump_frecency(&[PathBuf::from(&input.path)]);
                         // NUL-byte guard (raw-disk fallback branch):
                         // mirror the indexed branch — warn after the cap.
-                        let capped = format::cap_file_content_output_for(
+                        return crate::index_lifecycle::guidance::file_read::finish_file_content(
                             format!("{}{}", mode_annotation, body),
                             &input.path,
                             first_line,
                             numbered,
-                        );
-                        let with_warning = format::append_nul_byte_warning(capped, &content);
-                        let max_tokens = explicit_max_tokens.filter(|limit| *limit > 0);
-                        return format::enforce_token_budget(with_warning, max_tokens);
+                            &content,
+                            explicit_max_tokens,
+                        )
+                        .1;
                     }
                 }
                 // Suggest similar files from the SAME publication that produced
@@ -7683,7 +7652,12 @@ impl SymForgeServer {
             &mut || true,
         ) {
             Ok(result) => result,
-            Err(_) => return Err("Explore requires a non-empty query.".to_string()),
+            Err(_) => {
+                return Err(
+                    crate::index_lifecycle::guidance::request_refusal::EXPLORE_REQUIRES_QUERY
+                        .to_string(),
+                );
+            }
         };
         let crate::index_lifecycle::guidance::exploration::ExploreResult {
             display_label,
@@ -8021,8 +7995,11 @@ impl SymForgeServer {
 
         let q = smart_query::strip_leading_articles(request.query.trim());
         if q.is_empty() {
-            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
-                .into_call_tool_result("query requires a non-empty question."));
+            return Ok(
+                ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
+                    crate::index_lifecycle::guidance::request_refusal::ASK_REQUIRES_QUESTION,
+                ),
+            );
         }
 
         // Facade contract: a prose `symbol` would be passed verbatim as a tool
@@ -9327,7 +9304,8 @@ impl SymForgeServer {
         let q = smart_query::strip_leading_articles(original_q);
         if q.is_empty() {
             record_read_outcome(ReadOutcome::InvalidRequest);
-            return "query requires a non-empty question.".to_string();
+            return crate::index_lifecycle::guidance::request_refusal::ASK_REQUIRES_QUESTION
+                .to_string();
         }
         // `ask` chooses its route from index state, so daemon-backed calls must
         // run the whole classifier in the selected/ACTIVE project. Keep the

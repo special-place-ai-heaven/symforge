@@ -147,7 +147,7 @@ pub(super) fn project(
         return refusal("query is required: pass a natural-language phrase");
     }
     if smart_query::strip_leading_articles(request.query.trim()).is_empty() {
-        return refusal("query requires a non-empty question.");
+        return refusal(super::guidance::request_refusal::ASK_REQUIRES_QUESTION);
     }
     if let Some(message) = crate::stel::planner::symbol_contract_violation(request) {
         return refusal(message);
@@ -278,6 +278,14 @@ pub(super) fn project(
         let projected = super::embed_query::validate_request(&nested).and_then(|()| {
             super::embed_query::project(snapshot, &nested, budget, observations, session, policy)
         });
+        // A step's refusal text belongs to that step, never to the facade's answer:
+        // it is the step body MCP's dispatched tool prints.
+        let step_text = budget.refusal_text.take().or_else(|| {
+            projected
+                .as_ref()
+                .err()
+                .and_then(|kind| super::embed_query::validation_text(&nested, *kind))
+        });
         // Round 2 item 2: the step's targeted read carries the caveat MCP's
         // dispatched read prints for a file it could not compare.
         let caveats: Vec<String> = nested
@@ -318,7 +326,7 @@ pub(super) fn project(
             // MCP's `explore` answers a stopword-only query with this text
             // as a served body; the shared engine's refusal is the same one.
             Err(QueryRefusalKind::InvalidRequest) if step.tool == "explore" => (
-                "Explore requires a non-empty query.".to_string(),
+                super::guidance::request_refusal::EXPLORE_REQUIRES_QUERY.to_string(),
                 None,
                 super::embed_query::facade_step_class(
                     &nested,
@@ -327,7 +335,7 @@ pub(super) fn project(
                 ),
             ),
             Err(kind) => (
-                format!("Error: {} refused: {kind:?}", step.tool),
+                step_text.unwrap_or_else(|| format!("Error: {} refused: {kind:?}", step.tool)),
                 None,
                 super::embed_query::facade_step_class(&nested, Err(kind), None),
             ),

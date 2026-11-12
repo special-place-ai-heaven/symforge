@@ -154,7 +154,10 @@ fn cache_before_token_cap(
 ) -> Result<QueryOutput, QueryRefusalKind> {
     if max_tokens.is_some() {
         let mut full_budget = budget.projection_budget();
-        budget.cache_output = Some(project(&mut full_budget)?);
+        let full = project(&mut full_budget).inspect_err(|_| {
+            budget.refusal_text = full_budget.refusal_text.take();
+        })?;
+        budget.cache_output = Some(full);
         budget.cache_truncated = full_budget.truncated;
         budget.check()?;
         budget.cap_tokens(max_tokens);
@@ -241,9 +244,10 @@ pub(super) fn text(
         }));
     }
     let shared_input = text_input(input);
+    // The shared executor's refusal is the text MCP prints for it.
     let executed =
         super::guidance::search::execute_text_search(&snapshot.generation, &shared_input)
-            .map_err(|_| QueryRefusalKind::InvalidRequest)?;
+            .map_err(|text| budget.refuse_with(QueryRefusalKind::InvalidRequest, text))?;
     budget.check()?;
     let untracked_paths = untracked_sweep(snapshot, &shared_input, &executed);
     budget.check()?;
@@ -299,12 +303,18 @@ fn project_text(
     untracked_paths: &[String],
     budget: &mut Budget,
 ) -> Result<QueryOutput, QueryRefusalKind> {
-    let found = executed.result.as_ref().map_err(|error| match error {
-        engine::TextSearchError::UnsupportedWholeWordRegex
-        | engine::TextSearchError::UnsupportedStructuralLanguage { .. } => {
-            QueryRefusalKind::UnsupportedOption
-        }
-        _ => QueryRefusalKind::InvalidRequest,
+    let found = executed.result.as_ref().map_err(|error| {
+        let kind = match error {
+            engine::TextSearchError::UnsupportedWholeWordRegex
+            | engine::TextSearchError::UnsupportedStructuralLanguage { .. } => {
+                QueryRefusalKind::UnsupportedOption
+            }
+            _ => QueryRefusalKind::InvalidRequest,
+        };
+        budget.refuse_with(
+            kind,
+            super::guidance::search_render::text_search_error_text(error),
+        )
     })?;
     budget.truncated |= found.overflow_count > 0;
     let grouping = input.group_by.unwrap_or_default();

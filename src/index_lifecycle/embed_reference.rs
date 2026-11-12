@@ -371,7 +371,32 @@ pub(super) fn references(
         request.limit.unwrap_or(20),
         request.max_per_file.unwrap_or(10),
     );
-    let mut view = capture(snapshot, request, &limits)?;
+    // A path selector MCP cannot place answers with its exact-reference lookup's text.
+    let mut view = capture(snapshot, request, &limits).map_err(|kind| {
+        let placed = request.path.as_deref().filter(|_| {
+            matches!(
+                kind,
+                QueryRefusalKind::NotFound | QueryRefusalKind::AmbiguousSymbol
+            )
+        });
+        let text = placed.and_then(|path| {
+            snapshot
+                .generation
+                .live
+                .find_exact_references_for_symbol(
+                    path,
+                    &request.name,
+                    request.symbol_kind.as_deref(),
+                    request.symbol_line,
+                    None,
+                )
+                .err()
+        });
+        match text {
+            Some(text) => budget.refuse_with(kind, text),
+            None => kind,
+        }
+    })?;
     result.total_references = view.total_refs as u64;
     result.total_files = view.total_files as u64;
     result.target_candidate_count = view.target_candidate_count as u64;

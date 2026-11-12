@@ -166,8 +166,10 @@ pub(super) fn project(
     budget.required(super::embed_usage::decoded_bytes(&result) as usize)?;
     let rendered = if let Some(nested) = result.routed_request.as_deref() {
         super::embed_query::validate_request(nested)?;
+        // The routed tool's own refusal text is not what MCP `ask` prints for it.
         let output =
-            super::embed_query::project(snapshot, nested, budget, observations, session, policy)?;
+            super::embed_query::project(snapshot, nested, budget, observations, session, policy)
+                .inspect_err(|_| budget.refusal_text = None)?;
         // Search routes carry MCP's result envelope, rendered by the same
         // shared search composition the MCP tools and the facade use.
         let rendered = match super::embed_symforge::render_search(

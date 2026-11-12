@@ -574,6 +574,32 @@ pub fn append_nul_byte_warning(output: String, content: &[u8]) -> String {
     }
 }
 
+/// `get_file_content`'s last steps for a rendered body, served or refused, on both lanes:
+/// the hard byte cap with its continuation, the NUL-byte warning for `content`, then an
+/// explicit `max_tokens`. Returns the text before the token budget, the budgeted text,
+/// and whether the budget cut it.
+pub fn finish_file_content(
+    body: String,
+    path: &str,
+    first_line: u32,
+    numbered: bool,
+    content: &[u8],
+    max_tokens: Option<u64>,
+) -> (String, String, bool) {
+    let capped = cap_file_content_output_for(body, path, first_line, numbered);
+    let warned = append_nul_byte_warning(capped, content);
+    let (budgeted, cut) = super::source::enforce_token_budget_flagged(
+        warned.clone(),
+        max_tokens.filter(|limit| *limit > 0),
+    );
+    (warned, budgeted, cut)
+}
+
+/// An `around_symbol` read of a file the index did not parse: it has no symbols.
+pub fn unindexed_symbol_not_found(path: &str, name: &str) -> String {
+    format!("Symbol not found in {path}: {name}")
+}
+
 pub fn cap_file_content_output(output: String) -> String {
     cap_file_content_output_for(output, "", 1, false)
 }
@@ -668,6 +694,63 @@ pub fn not_found_file(path: &str) -> String {
 
 pub fn not_found_file_match(path: &str, query: &str) -> String {
     format!("No matches for '{query}' in {path}")
+}
+
+/// Richer "file not found" with suggested similar paths.
+/// Call this from tool handlers where the index is available.
+pub fn not_found_file_with_suggestions(path: &str, suggestions: &[String]) -> String {
+    if suggestions.is_empty() {
+        format!("File not found: {path}. Use search_files to find the correct path.")
+    } else {
+        let top: Vec<&str> = suggestions.iter().take(5).map(|s| s.as_str()).collect();
+        format!("File not found: {path}. Did you mean: {}?", top.join(", "))
+    }
+}
+
+/// Find up to 5 similar file paths for "file not found" suggestions.
+/// Extracts the basename from the failed path and searches the index.
+pub(crate) fn suggest_similar_files(
+    index: &crate::live_index::LiveIndex,
+    path: &str,
+) -> Vec<String> {
+    let basename = std::path::Path::new(path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(path);
+    // Try basename match first
+    let mut suggestions: Vec<String> = index
+        .find_files_by_basename(basename)
+        .into_iter()
+        .take(5)
+        .map(|s| s.to_string())
+        .collect();
+    // If no basename match, try the stem (without extension)
+    if suggestions.is_empty() {
+        let stem = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|f| f.to_str())
+            .unwrap_or(basename);
+        if stem.len() >= 3 {
+            let stem_lower = stem.to_ascii_lowercase();
+            // `all_files` iterates a hash map: sort before taking five, so the same
+            // index suggests the same paths in every process and on both lanes.
+            suggestions = index
+                .all_files()
+                .map(|(p, _)| p.as_str())
+                .filter(|p| {
+                    let file_stem = std::path::Path::new(p)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    file_stem.to_ascii_lowercase().contains(&stem_lower)
+                })
+                .map(|s| s.to_string())
+                .collect();
+            suggestions.sort_unstable();
+            suggestions.truncate(5);
+        }
+    }
+    suggestions
 }
 
 fn out_of_range_file_chunk(path: &str, chunk_index: u32, total_chunks: usize) -> String {

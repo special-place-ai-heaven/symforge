@@ -455,10 +455,59 @@ pub(super) fn project(
     result.path = Some(path.clone());
     super::embed_read::admit(snapshot, &path, None, budget)?;
     let published = snapshot.generation.as_ref();
-    let file = published
-        .live
-        .get_file(&path)
-        .ok_or(QueryRefusalKind::NotFound)?;
+    // MCP's answer for a selector it cannot place: the default mode's exact-reference
+    // lookup text or the bundle view's, then the savings footer; the trace view's text.
+    // `None` only when the default lookup places the selector, which no caller passes.
+    let unplaced = |raw_len: usize| {
+        let text = match mode {
+            SymbolContextMode::Default => published
+                .live
+                .find_exact_references_for_symbol(
+                    &path,
+                    &request.name,
+                    request.symbol_kind.as_deref(),
+                    request.symbol_line,
+                    None,
+                )
+                .err()?,
+            SymbolContextMode::Bundle => shared::context_bundle_result_view_with_max_tokens(
+                &published.live.capture_context_bundle_view(
+                    &path,
+                    &request.name,
+                    request.symbol_kind.as_deref(),
+                    request.symbol_line,
+                ),
+                request.verbosity.as_deref().unwrap_or("full"),
+                request.max_tokens,
+            ),
+            // MCP's trace answer carries no savings footer.
+            SymbolContextMode::Trace => {
+                return Some(shared::trace_symbol_result_view(
+                    &shared::capture_trace_symbol_view(
+                        published,
+                        &path,
+                        &request.name,
+                        request.symbol_kind.as_deref(),
+                        request.symbol_line,
+                        None,
+                        request.include_tests,
+                    ),
+                    &request.name,
+                    request.verbosity.as_deref().unwrap_or("full"),
+                    request.max_tokens,
+                ));
+            }
+        };
+        let footer = read_context::compact_savings_footer(text.len(), raw_len);
+        Some(format!("{text}{footer}"))
+    };
+    let miss = |budget: &mut Budget, raw_len: usize| match unplaced(raw_len) {
+        Some(text) => budget.refuse_with(QueryRefusalKind::NotFound, text),
+        None => QueryRefusalKind::NotFound,
+    };
+    let Some(file) = published.live.get_file(&path) else {
+        return Err(miss(budget, 0));
+    };
     let (index, symbol) = match crate::live_index::query::resolve_symbol_selector(
         file,
         &request.name,
@@ -466,10 +515,11 @@ pub(super) fn project(
         request.symbol_line,
     ) {
         crate::live_index::query::SymbolSelectorMatch::Selected(index, symbol) => (index, symbol),
-        crate::live_index::query::SymbolSelectorMatch::Ambiguous(lines) => {
+        crate::live_index::query::SymbolSelectorMatch::Ambiguous(_) => {
             result.refusal = Some(QueryRefusalKind::AmbiguousSymbol);
             result.candidates = candidates(snapshot, request, budget)?;
-            result.rendered=budget.text(&format!("Ambiguous symbol selector for {} in {}; pass symbol_line to disambiguate. Candidates: {:?}",request.name,path,lines))?;
+            let text = unplaced(file.content.len()).unwrap_or_default();
+            result.rendered = budget.text(&text)?;
             return Ok(QueryOutput::SymbolContext(result));
         }
         crate::live_index::query::SymbolSelectorMatch::NotFound => {
@@ -495,7 +545,7 @@ pub(super) fn project(
                     budget,
                 );
             }
-            return Err(QueryRefusalKind::NotFound);
+            return Err(miss(budget, file.content.len()));
         }
     };
     if request.estimate == Some(true) {

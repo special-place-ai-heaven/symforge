@@ -2,7 +2,7 @@
 use super::activation::ProjectSourceAuthority;
 use super::embed_query::{Budget, EmbeddedQuerySnapshot, validate_path};
 use super::embed_session::QuerySession;
-use super::guidance::{file_read, read_contract, read_gate, source};
+use super::guidance::{file_read, read_contract, read_gate};
 use crate::embed::parity::read::*;
 use crate::embed::parity::{QueryObservation, QueryOutput, QueryRefusalKind};
 use crate::lifecycle_identity::PublicationIdentity;
@@ -234,12 +234,12 @@ pub(super) fn observe_syntax_in(
         None => authority.verify_exact_spelling_anchor(relative),
     };
     if !spelled.map_err(authority_refusal)? {
-        return Err(QueryRefusalKind::NotFound);
+        return Err(budget.refuse_with(QueryRefusalKind::NotFound, file_read::not_found_file(path)));
     }
     admit_in(live, authority, expected, path, None, budget)?;
-    let bytes = read_beneath(authority, expected, path)
-        .map_err(authority_refusal)?
-        .ok_or(QueryRefusalKind::NotFound)?;
+    let Some(bytes) = read_beneath(authority, expected, path).map_err(authority_refusal)? else {
+        return Err(budget.refuse_with(QueryRefusalKind::NotFound, file_read::not_found_file(path)));
+    };
     admit_in(live, authority, expected, path, Some(&bytes), budget)?;
     let result = crate::parsing::process_file_with_classification(
         path,
@@ -309,7 +309,10 @@ pub(super) fn content(
             )
             .map_err(authority_refusal)?
     {
-        return Err(QueryRefusalKind::NotFound);
+        return Err(budget.refuse_with(
+            QueryRefusalKind::NotFound,
+            file_read::not_found_file(&input.path),
+        ));
     }
     if input.estimate == Some(true) {
         let (size, lines, authority) = if let Some(file) = indexed {
@@ -338,9 +341,41 @@ pub(super) fn content(
         }));
     }
     admit(snapshot, &input.path, None, budget)?;
-    let (rendered, hash, authority, nul_warning) = if let Some(file) = indexed {
+    let annotation = match (
+        &options.content_context.mode_name,
+        options.content_context.mode_explicit,
+    ) {
+        (Some(mode), true) => format!("── mode: {mode} (explicit) ──\n"),
+        _ => String::new(),
+    };
+    let first_line = options.content_context.start_line.unwrap_or(1);
+    let numbered = options.content_context.show_line_numbers
+        || options.content_context.around_line.is_some()
+        || options.content_context.around_match.is_some()
+        || options.content_context.around_symbol.is_some()
+        || options.content_context.chunk_index.is_some();
+    // FR-024: only an explicit `max_tokens` budgets the output; the byte cap is the
+    // hard limit. MCP finishes a refused selection's text exactly as an answer.
+    let finish = |body: &str, content: &[u8]| {
+        file_read::finish_file_content(
+            format!("{annotation}{body}"),
+            &input.path,
+            first_line,
+            numbered,
+            content,
+            input.max_tokens,
+        )
+    };
+    let (rendered, hash, authority, content) = if let Some(file) = indexed {
         verify_indexed_content(snapshot, &input.path, file)?;
-        selected_range(file, &options.content_context)?;
+        // A selection MCP cannot serve is answered with the shared renderer's text.
+        selected_range(file, &options.content_context).map_err(|kind| {
+            let text = file_read::file_content_from_indexed_file_with_context(
+                file,
+                options.content_context.clone(),
+            );
+            budget.refuse_with(kind, finish(&text, &file.content).1)
+        })?;
         if let Some(session) = session
             && let Some((handle, body)) =
                 session.file_content_cache_hit(snapshot, request, budget.limits())
@@ -370,9 +405,7 @@ pub(super) fn content(
             output,
             crate::hash::digest_hex(&file.content),
             ReadAuthority::PublishedGeneration,
-            crate::domain::index::nul_byte_warning_line(&crate::domain::index::scan_nul_bytes(
-                &file.content,
-            )),
+            std::borrow::Cow::Borrowed(&file.content[..]),
         )
     } else {
         let bytes = snapshot
@@ -385,10 +418,19 @@ pub(super) fn content(
             .map_err(authority_refusal)?
             .ok_or(QueryRefusalKind::NotFound)?;
         admit(snapshot, &input.path, Some(&bytes), budget)?;
-        if options.content_context.around_symbol.is_some() {
-            return Err(QueryRefusalKind::NotFound);
+        if let Some(name) = options.content_context.around_symbol.as_deref() {
+            // An unindexed file has no symbols (MCP's text).
+            let text = file_read::unindexed_symbol_not_found(&input.path, name);
+            return Err(budget.refuse_with(QueryRefusalKind::NotFound, finish(&text, &bytes).1));
         }
-        selected_content_range(&bytes, &options.content_context)?;
+        selected_content_range(&bytes, &options.content_context).map_err(|kind| {
+            let text = file_read::render_file_content_bytes(
+                &input.path,
+                &bytes,
+                options.content_context.clone(),
+            );
+            budget.refuse_with(kind, finish(&text, &bytes).1)
+        })?;
         let body = file_read::render_file_content_bytes(
             &input.path,
             &bytes,
@@ -404,41 +446,11 @@ pub(super) fn content(
             body,
             hash,
             ReadAuthority::DiskObservation,
-            crate::domain::index::nul_byte_warning_line(&crate::domain::index::scan_nul_bytes(
-                &bytes,
-            )),
+            std::borrow::Cow::Owned(bytes),
         )
     };
-    let annotation = match (
-        &options.content_context.mode_name,
-        options.content_context.mode_explicit,
-    ) {
-        (Some(mode), true) => format!("── mode: {mode} (explicit) ──\n"),
-        _ => String::new(),
-    };
-    let combined = format!("{annotation}{rendered}");
-    let file_capped = combined.len() > file_read::GET_FILE_CONTENT_MAX_BYTES;
-    let capped = file_read::cap_file_content_output_for(
-        combined,
-        &input.path,
-        options.content_context.start_line.unwrap_or(1),
-        options.content_context.show_line_numbers
-            || options.content_context.around_line.is_some()
-            || options.content_context.around_match.is_some()
-            || options.content_context.around_symbol.is_some()
-            || options.content_context.chunk_index.is_some(),
-    );
-    let warned = match nul_warning {
-        Some(warning) if capped.is_empty() => warning,
-        Some(warning) => format!("{capped}\n{warning}"),
-        None => capped,
-    };
-    let (mut rendered, token_capped) = source::enforce_token_budget_flagged(
-        warned.clone(),
-        // FR-024: only an explicit `max_tokens` budgets the output; the byte cap above
-        // is the hard limit.
-        input.max_tokens.filter(|limit| *limit > 0),
-    );
+    let file_capped = annotation.len() + rendered.len() > file_read::GET_FILE_CONTENT_MAX_BYTES;
+    let (warned, mut rendered, token_capped) = finish(&rendered, &content);
     if input.force_refresh == Some(true)
         && let Some(prior) = session.and_then(|session| {
             session.prior_file_content_fetch(snapshot, request, budget.limits())

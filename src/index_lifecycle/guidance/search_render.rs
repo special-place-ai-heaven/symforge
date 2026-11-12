@@ -442,6 +442,62 @@ pub(crate) fn append_withheld_admission_note(
     )
 }
 
+/// The regex error repeats the pattern; the leading echo keeps this many characters.
+const ECHOED_PATTERN_CHARS: usize = 80;
+
+fn capped_pattern(pattern: &str) -> std::borrow::Cow<'_, str> {
+    match pattern.char_indices().nth(ECHOED_PATTERN_CHARS) {
+        Some((end, _)) => format!("{}...", &pattern[..end]).into(),
+        None => pattern.into(),
+    }
+}
+
+/// The text `search_text` prints for a search the engine refused, on both lanes.
+pub fn text_search_error_text(error: &search::TextSearchError) -> String {
+    match error {
+        search::TextSearchError::EmptyRegexQuery => {
+            "Regex search requires a non-empty query.".to_string()
+        }
+        search::TextSearchError::EmptyQueryOrTerms => {
+            "Search requires a non-empty query or terms.".to_string()
+        }
+        search::TextSearchError::InvalidRegex { pattern, error } => {
+            format!("Invalid regex '{}': {error}", capped_pattern(pattern))
+        }
+        search::TextSearchError::InvalidGlob {
+            field,
+            pattern,
+            error,
+        } => {
+            format!("Invalid glob for `{field}` ('{pattern}'): {error}")
+        }
+        search::TextSearchError::UnsupportedWholeWordRegex => {
+            "whole_word is not supported when `regex=true`.".to_string()
+        }
+        search::TextSearchError::InvalidStructuralPattern { pattern, error } => {
+            format!(
+                "Error: structural pattern failed to parse.\n\
+                 Pattern: {pattern}\n\
+                 Parse error: {error}\n\
+                 Hint: $VAR = single-node metavariable, $$$ = multi-node wildcard \
+                 (e.g. `fn $NAME($$$) {{ $$$ }}`). Narrow `language` if needed."
+            )
+        }
+        search::TextSearchError::UnsupportedStructuralLanguage {
+            pattern,
+            sample_error,
+        } => {
+            format!(
+                "Error: structural search has no supported grammar for any indexed file.\n\
+                 Pattern: {pattern}\n\
+                 Sample: {sample_error}\n\
+                 Hint: ast-grep covers programming languages only, not TOML/JSON/YAML. \
+                 Widen `path_prefix` / `language` / `include_tests`."
+            )
+        }
+    }
+}
+
 pub fn search_text_result_view(
     result: Result<search::TextSearchResult, search::TextSearchError>,
     group_by: Option<&str>,
@@ -451,46 +507,7 @@ pub fn search_text_result_view(
 ) -> String {
     let result = match result {
         Ok(result) => result,
-        Err(search::TextSearchError::EmptyRegexQuery) => {
-            return "Regex search requires a non-empty query.".to_string();
-        }
-        Err(search::TextSearchError::EmptyQueryOrTerms) => {
-            return "Search requires a non-empty query or terms.".to_string();
-        }
-        Err(search::TextSearchError::InvalidRegex { pattern, error }) => {
-            return format!("Invalid regex '{pattern}': {error}");
-        }
-        Err(search::TextSearchError::InvalidGlob {
-            field,
-            pattern,
-            error,
-        }) => {
-            return format!("Invalid glob for `{field}` ('{pattern}'): {error}");
-        }
-        Err(search::TextSearchError::UnsupportedWholeWordRegex) => {
-            return "whole_word is not supported when `regex=true`.".to_string();
-        }
-        Err(search::TextSearchError::InvalidStructuralPattern { pattern, error }) => {
-            return format!(
-                "Error: structural pattern failed to parse.\n\
-                 Pattern: {pattern}\n\
-                 Parse error: {error}\n\
-                 Hint: $VAR = single-node metavariable, $$$ = multi-node wildcard \
-                 (e.g. `fn $NAME($$$) {{ $$$ }}`). Narrow `language` if needed."
-            );
-        }
-        Err(search::TextSearchError::UnsupportedStructuralLanguage {
-            pattern,
-            sample_error,
-        }) => {
-            return format!(
-                "Error: structural search has no supported grammar for any indexed file.\n\
-                 Pattern: {pattern}\n\
-                 Sample: {sample_error}\n\
-                 Hint: ast-grep covers programming languages only, not TOML/JSON/YAML. \
-                 Widen `path_prefix` / `language` / `include_tests`."
-            );
-        }
+        Err(error) => return text_search_error_text(&error),
     };
 
     let annotate_term = |line: &str| -> String {

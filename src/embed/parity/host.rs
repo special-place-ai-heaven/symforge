@@ -863,7 +863,9 @@ pub struct HostRefusal {
     pub withheld: Option<Box<WithheldMeta>>,
     /// The refusal text the MCP lane prints for the same call, byte for byte, when the
     /// refusal has one (an argument the tool does not define, an enforced project-config
-    /// trust refusal). Names arguments, never their values. Absent on older wires.
+    /// trust refusal, a query's not-found or unsupported-filter answer). Names arguments,
+    /// never their values, except the path, name or text a query's MCP answer itself
+    /// repeats. Absent on older wires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -930,7 +932,7 @@ impl HostRefusal {
             knowledge_kind: None,
             recovery: None,
             withheld: refusal.withheld().cloned().map(Box::new),
-            message: None,
+            message: refusal.message().map(str::to_owned),
         }
     }
 

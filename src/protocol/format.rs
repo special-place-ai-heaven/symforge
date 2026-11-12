@@ -367,7 +367,8 @@ pub use crate::index_lifecycle::guidance::file_read::{
     GET_FILE_CONTENT_MAX_BYTES, append_nul_byte_warning, cap_file_content_output,
     cap_file_content_output_for, file_content, file_content_from_indexed_file,
     file_content_from_indexed_file_with_context, file_content_view, not_found_file,
-    not_found_file_match, not_found_symbol, validate_file_syntax_result,
+    not_found_file_match, not_found_file_with_suggestions, not_found_symbol,
+    validate_file_syntax_result,
 };
 
 /// Explicit "outside the repository root" error for a path that escapes the
@@ -439,17 +440,6 @@ pub fn project_wide_mutation_refused_unverified(
          project-wide change cannot see what they contain: {listed}. A successful re-read \
          releases each one; run index_folder to rebuild the project from source, then retry."
     ))
-}
-
-/// Richer "file not found" with suggested similar paths.
-/// Call this from tool handlers where the index is available.
-pub fn not_found_file_with_suggestions(path: &str, suggestions: &[String]) -> String {
-    if suggestions.is_empty() {
-        format!("File not found: {path}. Use search_files to find the correct path.")
-    } else {
-        let top: Vec<&str> = suggestions.iter().take(5).map(|s| s.as_str()).collect();
-        format!("File not found: {path}. Did you mean: {}?", top.join(", "))
-    }
 }
 
 /// Honest "not indexed" response for a path that EXISTS but was deliberately

@@ -1170,10 +1170,12 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Feature 036 T021 review round: the strict decode finds every unknown key (remove and
 // retry, by path segments, document order, capped), places keys in nested objects, and
 // words decode failures without values for both lanes. Same 90 files, no new edge.
+// Embed refusal text slice: query refusals carry the MCP lane's text (a budget field
+// and shared guidance builders; edit_plan and suggestions sorted; shared file-content finisher and search error text). Same 90 files, calls only, no new edge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "90c0aad455daea2d1c76c1d1b7cccf78bb4f0bf88f7ce2f42a593837eeb2779c",
+    "5d6b3a22f64c42b74544d28088fcc574e760ba1b863a4aefa5440dcd37e5c605",
     90,
-    2443016,
+    2458960,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1381,10 +1383,12 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Calls and `use` re-exports into the shared module only, no bridge. 318 files.
 // T021 review round: shared strict decode and decode-failure wording, the MCP decode
 // hint routed through it, the embed check on the shared decode. Calls only. 318 files.
+// Embed refusal text slice: two not-found builders move from `protocol` into
+// `guidance::file_read`, used by both lanes. Calls and a `use` only. 318 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "d0c4f2e7ca7cc430723b7428d6897d40d51a3c8398a664aa734833bb7aa3b723",
+    "906ed73c0df8674c56c2571e3f1bfd8934bbf8db9e7e3e7db4c425430ae2eb3a",
     318,
-    12875327,
+    12889968,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

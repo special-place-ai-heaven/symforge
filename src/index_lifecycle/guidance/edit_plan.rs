@@ -44,6 +44,9 @@ pub fn plan_edit(
     // AAP-001: populated when a path-shaped bare target matches several files
     // by trailing path segment; drives the deterministic pick + ambiguity note.
     let mut ambiguous_file_matches: Vec<String> = Vec::new();
+    // Files whose path ends with the target, collected over a hash-map walk; sorted
+    // below so the pick, and its ambiguity note, never depend on map order.
+    let mut ending_matches: Vec<String> = Vec::new();
 
     if let Some((target_path, target_name)) = qualified_target {
         let mut path_matched = false;
@@ -52,8 +55,8 @@ pub fn plan_edit(
                 path_matched = true;
                 collect_selector_hits(&mut symbol_hits, path, file, target_name);
             }
-            if path.ends_with(target) || path == target {
-                file_hit = Some(path.clone());
+            if names_file(path, target) {
+                ending_matches.push(path.clone());
             }
         }
         // Type-name fallback: the left segment matched no indexed file path, so
@@ -108,8 +111,8 @@ pub fn plan_edit(
                 0 => {
                     for (path, file) in index.all_files() {
                         collect_selector_hits(&mut symbol_hits, path, file, target);
-                        if path.ends_with(target) || path == target {
-                            file_hit = Some(path.clone());
+                        if names_file(path, target) {
+                            ending_matches.push(path.clone());
                         }
                     }
                 }
@@ -122,6 +125,16 @@ pub fn plan_edit(
         }
     }
 
+    ending_matches.sort();
+    if let Some(first) = ending_matches.first() {
+        file_hit = Some(first.clone());
+        if ending_matches.len() > 1 {
+            ambiguous_file_matches = ending_matches;
+        }
+    }
+    // `all_files` iterates a hash map: without an order the candidates, and the primary
+    // one, differ from process to process and between the two lanes.
+    symbol_hits.sort_by(|a, b| (&a.0, a.3).cmp(&(&b.0, b.3)));
     let symbol_target_name = symbol_hits
         .first()
         .map(|(_, name, _, _)| name.as_str())
@@ -210,7 +223,7 @@ pub fn plan_edit(
                 "⚠ Ambiguous file target '{}' matched {} paths ({}); selected '{}' (first sorted). Pass a fuller path to disambiguate.",
                 target,
                 ambiguous_file_matches.len(),
-                ambiguous_file_matches.join(", "),
+                listed_paths(&ambiguous_file_matches),
                 path
             ));
         }
@@ -228,6 +241,25 @@ pub fn plan_edit(
     }
 
     lines.join("\n")
+}
+
+/// `target` names `path`: the whole path, or its trailing segments at a separator, so
+/// `x.rs` is not `fox.rs`.
+fn names_file(path: &str, target: &str) -> bool {
+    path == target
+        || path
+            .strip_suffix(target)
+            .is_some_and(|head| head.ends_with('/'))
+}
+
+/// At most five paths, then how many more matched.
+fn listed_paths(paths: &[String]) -> String {
+    const LISTED: usize = 5;
+    let shown = paths[..paths.len().min(LISTED)].join(", ");
+    match paths.len().saturating_sub(LISTED) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
+    }
 }
 
 fn collect_selector_hits(
