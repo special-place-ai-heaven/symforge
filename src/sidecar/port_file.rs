@@ -587,7 +587,35 @@ pub(crate) fn process_may_be_alive(pid: u32) -> bool {
     // SAFETY: signal 0 performs existence/permission checking only and does not
     // deliver a signal. ESRCH is the sole definitive "process is gone" result.
     let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    let exists = result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+    // kill(pid, 0) succeeds for a zombie: an exited process its parent has
+    // not reaped. It runs nothing and will never heartbeat again.
+    exists && !process_is_zombie(pid)
+}
+
+/// Linux: `/proc/<pid>/stat` says the process is a zombie or dead. An
+/// unreadable file answers `false`, leaving the `kill` verdict in force.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_is_zombie(pid: libc::pid_t) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| proc_stat_is_dead(&stat))
+}
+
+/// A `/proc/<pid>/stat` line whose state is `Z` (zombie) or `X` (dead). The
+/// state is the first field after the LAST `)`, because the command name in
+/// parentheses may itself contain spaces or parentheses. Unparsable: `false`.
+#[cfg(any(target_os = "linux", test))]
+fn proc_stat_is_dead(stat: &str) -> bool {
+    stat.rfind(')')
+        .and_then(|close| stat[close + 1..].split_whitespace().next())
+        .is_some_and(|state| matches!(state, "Z" | "X"))
+}
+
+/// Other Unix (macOS, BSD): `kill(pid, 0)` reports a zombie as present and
+/// there is no `/proc` to ask, so a zombie stays alive to the pid rule and is
+/// closed by the session TTL instead.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn process_is_zombie(_pid: libc::pid_t) -> bool {
+    false
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -909,6 +937,21 @@ pub fn check_stale(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Issue #876: the `/proc/<pid>/stat` state parser, on fixed strings so it
+    /// runs on every platform. The state follows the LAST `)`.
+    #[test]
+    fn test_proc_stat_is_dead_reads_state_after_last_paren() {
+        assert!(proc_stat_is_dead("42 (symforge) Z 1 42 42 0 -1"));
+        assert!(proc_stat_is_dead("42 (symforge) X 1 42 42 0 -1"));
+        assert!(proc_stat_is_dead("42 (a) b) Z 1 42"), "comm with `) `");
+        assert!(!proc_stat_is_dead("42 (a) Z) S 1 42"), "Z inside comm");
+        assert!(!proc_stat_is_dead("42 (symforge) S 1 42 42 0 -1"));
+        assert!(!proc_stat_is_dead("42 (symforge) R 1 42 42 0 -1"));
+        assert!(!proc_stat_is_dead(""));
+        assert!(!proc_stat_is_dead("42 (symforge)"));
+        assert!(!proc_stat_is_dead("42 symforge Z"), "no paren at all");
+    }
 
     fn with_temp_control(f: impl FnOnce(&ControlStateDir, &Path)) {
         let tmp = TempDir::new().unwrap();

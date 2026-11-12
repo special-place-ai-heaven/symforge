@@ -115,7 +115,69 @@ const SESSION_REAP_TICK_SECS: u64 = 60;
 /// session closed. A session that opens the project within it reuses the live
 /// index instead of restoring or rebuilding it; the reaper unloads the slot
 /// once it passes. The cost is the idle index's memory for that long.
+/// Override with `SYMFORGE_PROJECT_IDLE_GRACE_SECS` (clamped to >= 60).
 const PROJECT_IDLE_GRACE: Duration = Duration::from_secs(15 * 60);
+const PROJECT_IDLE_GRACE_ENV: &str = "SYMFORGE_PROJECT_IDLE_GRACE_SECS";
+const MIN_PROJECT_IDLE_GRACE_SECS: u64 = 60;
+
+/// The idle grace the daemon runs with, plus why an operator value was not
+/// taken as given (refused or raised to the minimum), so health and the log
+/// say so instead of defaulting silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectIdleGrace {
+    grace: Duration,
+    note: Option<String>,
+}
+
+impl ProjectIdleGrace {
+    fn from_env() -> Self {
+        let resolved = Self::parse(std::env::var(PROJECT_IDLE_GRACE_ENV).ok().as_deref());
+        if let Some(note) = &resolved.note {
+            tracing::warn!(
+                env = PROJECT_IDLE_GRACE_ENV,
+                grace_secs = resolved.grace.as_secs(),
+                "{note}"
+            );
+        }
+        resolved
+    }
+
+    fn parse(raw: Option<&str>) -> Self {
+        let Some(raw) = raw else {
+            return Self {
+                grace: PROJECT_IDLE_GRACE,
+                note: None,
+            };
+        };
+        match raw.trim().parse::<u64>() {
+            Ok(secs) if secs >= MIN_PROJECT_IDLE_GRACE_SECS => Self {
+                grace: Duration::from_secs(secs),
+                note: None,
+            },
+            Ok(_) => Self {
+                grace: Duration::from_secs(MIN_PROJECT_IDLE_GRACE_SECS),
+                note: Some(format!(
+                    "{PROJECT_IDLE_GRACE_ENV}={raw:?} raised to the {MIN_PROJECT_IDLE_GRACE_SECS} s minimum"
+                )),
+            },
+            Err(_) => Self {
+                grace: PROJECT_IDLE_GRACE,
+                note: Some(format!(
+                    "{PROJECT_IDLE_GRACE_ENV}={raw:?} rejected: not a whole number of seconds; default in force"
+                )),
+            },
+        }
+    }
+
+    /// One health line: the grace in force and, if any, why.
+    fn render(&self) -> String {
+        let secs = self.grace.as_secs();
+        match &self.note {
+            None => format!("project_idle_grace_secs={secs}"),
+            Some(note) => format!("project_idle_grace_secs={secs} ({note})"),
+        }
+    }
+}
 
 fn session_ttl_from_env() -> std::time::Duration {
     let secs = std::env::var(SESSION_TTL_ENV)
@@ -336,6 +398,9 @@ pub struct DaemonState {
     /// Notified by the reaper once the idle-shutdown window elapses;
     /// `run_daemon_until_shutdown` treats it like a shutdown signal.
     idle_shutdown: tokio::sync::Notify,
+    /// Resolved once from `SYMFORGE_PROJECT_IDLE_GRACE_SECS`; the sweep and
+    /// the idle-projects render read this one value.
+    project_idle_grace: ProjectIdleGrace,
 }
 
 struct AuthenticatedActivityGuard {
@@ -1187,6 +1252,7 @@ impl DaemonState {
             last_activity_at: AtomicU64::new(now_epoch_millis()),
             active_authenticated_requests: AtomicU64::new(0),
             idle_shutdown: tokio::sync::Notify::new(),
+            project_idle_grace: ProjectIdleGrace::from_env(),
         }
     }
 
@@ -1762,7 +1828,9 @@ impl DaemonState {
                 let since = project
                     .idle_since
                     .filter(|_| project.session_ids.is_empty())?;
-                let minutes_left = PROJECT_IDLE_GRACE
+                let minutes_left = self
+                    .project_idle_grace
+                    .grace
                     .saturating_sub(since.elapsed())
                     .as_secs()
                     .div_ceil(60);
@@ -1785,6 +1853,34 @@ impl DaemonState {
         lines.sort();
         lines.insert(0, "── idle projects ──".to_string());
         Some(lines.join("\n"))
+    }
+
+    /// Issue #876: what each loaded project holds, counted at this call from its
+    /// CURRENT published index (idle projects included), plus the idle grace in
+    /// force. The session's own project and process resident memory are in the
+    /// shared `── Memory ──` section every lane renders.
+    fn render_memory(&self) -> String {
+        let slots: Vec<Arc<ProjectSlot>> = self.projects.read().values().cloned().collect();
+        let mut lines: Vec<String> = slots
+            .iter()
+            .map(|slot| {
+                let (project_id, sessions, shared) = {
+                    let meta = slot.metadata.read();
+                    (
+                        meta.project_id.clone(),
+                        meta.session_ids.len(),
+                        meta.index.shared(),
+                    )
+                };
+                let counts =
+                    crate::index_lifecycle::guidance::health::index_memory_counts(&shared.read());
+                format!("{project_id} sessions={sessions} {counts}")
+            })
+            .collect();
+        lines.sort();
+        lines.insert(0, self.project_idle_grace.render());
+        lines.insert(0, "── Daemon memory (every loaded project) ──".to_string());
+        lines.join("\n")
     }
 
     /// Task 9 reaper claim: re-check the SAME last-seen observation under the
@@ -3710,7 +3806,7 @@ async fn stop_running_daemon_for_update_at(
             // removing its discovery files. The daemon's graceful-shutdown drain
             // (up to ~5s on Unix) can outlive terminate_process's wait window, so
             // escalate to SIGKILL and re-poll rather than orphaning a live daemon.
-            if process_is_alive(pid) {
+            if crate::sidecar::port_file::process_may_be_alive(pid) {
                 #[cfg(unix)]
                 #[allow(unsafe_code)]
                 // SAFETY: sending a signal to a pid is always memory-safe; an
@@ -3720,14 +3816,14 @@ async fn stop_running_daemon_for_update_at(
                     libc::kill(pid as i32, libc::SIGKILL);
                 }
                 for _ in 0..20 {
-                    if !process_is_alive(pid) {
+                    if !crate::sidecar::port_file::process_may_be_alive(pid) {
                         break;
                     }
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
             }
 
-            if process_is_alive(pid) {
+            if crate::sidecar::port_file::process_may_be_alive(pid) {
                 // Still alive: LEAVE its runtime files so it stays discoverable and
                 // the next launch reuses it instead of spawning a duplicate.
                 tracing::warn!(
@@ -3752,30 +3848,6 @@ async fn stop_running_daemon_for_update_at(
     }
 }
 
-/// Best-effort liveness check: does a process with this pid still exist?
-#[allow(unsafe_code)] // SAFETY: kill(pid, 0) only probes for existence; it sends no signal and touches no memory.
-fn process_is_alive(pid: u32) -> bool {
-    #[cfg(windows)]
-    {
-        // `tasklist` lists the pid only when it exists; "No tasks" otherwise.
-        // hidden_command: the daemon has no console, so a plain spawn would
-        // flash a new conhost window on every periodic liveness check.
-        crate::process_util::hidden_command("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
-            .unwrap_or(false)
-    }
-    #[cfg(not(windows))]
-    {
-        // kill(pid, 0): Ok(0) => the process exists (or is a zombie),
-        // ESRCH => it is gone.
-        unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
-}
-
 /// One reaper sweep, TTL rule then pid rule, then the idle-project unload, run
 /// on the blocking pool: unloading a project stops its slot, which takes the
 /// mutation lock that a long `index_folder` reload holds, and that must not
@@ -3791,11 +3863,12 @@ async fn sweep_sessions_off_thread(
             state.reap_expired_sessions(ttl),
             state.reap_dead_pid_sessions(STALE_SESSION_HEARTBEAT),
         );
-        let unloaded = state.unload_idle_projects(PROJECT_IDLE_GRACE);
+        let grace = state.project_idle_grace.grace;
+        let unloaded = state.unload_idle_projects(grace);
         if unloaded > 0 {
             tracing::info!(
                 unloaded,
-                grace_secs = PROJECT_IDLE_GRACE.as_secs(),
+                grace_secs = grace.as_secs(),
                 "unloaded projects that had no session for the idle grace"
             );
         }
@@ -5396,6 +5469,11 @@ pub async fn spawn_daemon_at(
     // `Weak` on the state: it exits when the daemon state drops.
     let ttl = session_ttl_from_env();
     let idle_shutdown_after = daemon_idle_shutdown_from_env();
+    tracing::info!(
+        session_ttl_secs = ttl.as_secs(),
+        project_idle_grace = %state.project_idle_grace.render(),
+        "session reaper configuration"
+    );
     let reaper_state = Arc::downgrade(&state);
     let reaper_task = tokio::spawn(async move {
         let mut period_secs = (ttl.as_secs() / 4)
@@ -6168,6 +6246,11 @@ async fn call_tool_handler(
                 if let Some(idle) = state.render_idle_projects() {
                     result.push('\n');
                     result.push_str(&idle);
+                }
+                // Full `health` only: the compact verbs keep their budgets.
+                if tool_name_for_panic == "health" {
+                    result.push('\n');
+                    result.push_str(&state.render_memory());
                 }
             }
             let mut response = result.into_response();
@@ -17319,6 +17402,135 @@ mod tests {
         assert!(
             state.projects.read().contains_key(&dead_fresh.project_id),
             "the project stays open for its surviving sessions"
+        );
+    }
+
+    /// Issue #876: a child that has exited but that its parent has not waited
+    /// for. On Linux that is a zombie, which `kill(pid, 0)` still finds; on
+    /// Windows the held handle keeps the pid from being reused while the exit is
+    /// already observable. Returns once the child has exited (bounded), with the
+    /// `Child` NOT reaped; the caller waits at the end.
+    #[cfg(any(target_os = "linux", windows))]
+    fn exited_unreaped_child() -> std::process::Child {
+        let mut child = spawn_sleeper();
+        child.kill().expect("kill child");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        #[cfg(target_os = "linux")]
+        while !crate::sidecar::port_file::process_is_zombie(child.id() as libc::pid_t) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "killed child never became a zombie"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        #[cfg(windows)]
+        while crate::sidecar::port_file::process_may_be_alive(child.id()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "killed child never exited"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        child
+    }
+
+    /// RED on main for Linux: `kill(pid, 0)` succeeds for a zombie, so the pid
+    /// rule kept a dead client's session (and its project) until the 24 h TTL.
+    /// macOS/BSD have no `/proc` and still see a zombie as alive; the TTL is
+    /// their backstop, so this test does not run there.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn test_exited_unreaped_child_is_not_alive() {
+        let mut child = exited_unreaped_child();
+        // The reaper, the sidecar descriptor checks and the daemon-stop path all
+        // route through this one function.
+        let alive = crate::sidecar::port_file::process_may_be_alive(child.id());
+        child.wait().expect("reap child");
+        assert!(!alive, "an exited, unreaped child must count as dead");
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn test_reaper_closes_session_whose_pid_is_a_zombie_and_unloads_its_project() {
+        let project = project_dir("symforge-zombie-reaper");
+        let state = DaemonState::new();
+        let mut zombie = exited_unreaped_child();
+        let session = open_session_with_pid(&state, &project, zombie.id());
+        set_last_seen(
+            &state,
+            &session.session_id,
+            now_epoch_millis() - 10 * 60_000,
+        );
+
+        let reaped = state.reap_dead_pid_sessions(STALE_SESSION_HEARTBEAT);
+        let unloaded = state.unload_idle_projects(Duration::ZERO);
+        let project_loaded = state.projects.read().contains_key(&session.project_id);
+        zombie.wait().expect("reap child");
+
+        assert_eq!(reaped, 1, "the zombie client's stale session is reaped");
+        assert_eq!(unloaded, 1, "its project is then idle and unloads");
+        assert!(!project_loaded);
+    }
+
+    #[test]
+    fn test_project_idle_grace_env_parses_clamps_and_refuses() {
+        assert_eq!(
+            ProjectIdleGrace::parse(None),
+            ProjectIdleGrace {
+                grace: PROJECT_IDLE_GRACE,
+                note: None
+            }
+        );
+        let taken = ProjectIdleGrace::parse(Some(" 300 "));
+        assert_eq!(taken.grace, Duration::from_secs(300));
+        assert_eq!(taken.render(), "project_idle_grace_secs=300");
+        let raised = ProjectIdleGrace::parse(Some("5"));
+        assert_eq!(
+            raised.grace,
+            Duration::from_secs(MIN_PROJECT_IDLE_GRACE_SECS)
+        );
+        assert_eq!(
+            raised.render(),
+            "project_idle_grace_secs=60 (SYMFORGE_PROJECT_IDLE_GRACE_SECS=\"5\" raised to the 60 s minimum)"
+        );
+        let refused = ProjectIdleGrace::parse(Some("15m"));
+        assert_eq!(refused.grace, PROJECT_IDLE_GRACE);
+        assert_eq!(
+            refused.render(),
+            "project_idle_grace_secs=900 (SYMFORGE_PROJECT_IDLE_GRACE_SECS=\"15m\" rejected: not a whole number of seconds; default in force)"
+        );
+        assert!(ProjectIdleGrace::parse(Some("-1")).note.is_some());
+        assert!(ProjectIdleGrace::parse(Some("")).note.is_some());
+    }
+
+    /// Health's daemon memory section counts what each loaded project's
+    /// published index holds.
+    #[test]
+    fn test_render_memory_reports_measured_project_and_process_numbers() {
+        let project = project_dir("symforge-memory-health");
+        std::fs::write(
+            project.path().join("src").join("lib.rs"),
+            "pub fn memory_probe() { helper(); }\nfn helper() {}\n",
+        )
+        .expect("write source");
+        let state = DaemonState::new();
+        let session = open_session_with_pid(&state, &project, std::process::id());
+        let rendered = state.render_memory();
+        let row = rendered
+            .lines()
+            .find(|line| line.starts_with(&session.project_id))
+            .unwrap_or_else(|| panic!("project row missing: {rendered}"));
+        assert!(row.contains(" sessions=1 "), "{row}");
+        assert!(!row.contains("files=0 "), "{row}");
+        assert!(!row.contains("content_bytes=0 "), "{row}");
+        assert!(!row.contains("trigram_entries=0"), "{row}");
+        assert!(
+            rendered
+                .lines()
+                .nth(1)
+                .expect("grace line")
+                .starts_with("project_idle_grace_secs="),
+            "{rendered}"
         );
     }
 

@@ -1178,10 +1178,13 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Calls only. Same 91 files, no new edge.
 // Review round: the route is chosen once (`embed_ask::choose`), its routed request
 // settles the probe and claim, and `project_chosen` answers over it. Same 91 files.
+// Issue #876 part 1: the shared health renderer gains a memory section (index counts
+// read off the captured generation's `LiveIndex`, and a process resident-memory
+// reader). Calls and field reads only. Same 91 files, no new edge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "1cd844524a0aa6276b24f0f6979d62c84525de1e7203093d591bf8316fb063ee",
+    "c940f88d73715ece33b57963a7b7de32b078fcb0acb294ab426c8828c190612a",
     91,
-    2492609,
+    2496807,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1399,10 +1402,15 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Embed integration tests in CI: embed `ask` checks its routed answer against disk
 // (`embed_ask::routed_for`, called from `embed_query`). Calls only. 319 files.
 // Review round: `routed_for` becomes `choose` plus `project_chosen`. Calls only. 319 files.
+// Issue #876 part 1: zombie-aware pid liveness in `sidecar/port_file.rs` (the daemon-stop
+// path now routes through it), the idle-grace variable and a daemon memory section in
+// `daemon.rs`, and a shared memory section in `index_lifecycle/guidance/health.rs` whose
+// `index_memory_counts` the daemon calls. One index_lifecycle edge, a call reading
+// `LiveIndex` fields only; no bridge. 319 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "f1490e623d0aed5a446b04e24e21ea8bb05e35f79780bd6b1dccbc54e8a26bd8",
+    "ce89dbbc9161ae77831ae77d4a6868316cfcfb11293ec6a4379ead8a6f6995b5",
     319,
-    12939359,
+    12954509,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
