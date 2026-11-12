@@ -179,7 +179,14 @@ pub(super) fn what_changed(
         WhatChangedMode::Uncommitted => request.max_tokens.filter(|tokens| *tokens > 0),
         WhatChangedMode::Timestamp(_) | WhatChangedMode::GitRef(_) => None,
     };
-    let report = what_changed_report(snapshot, &options, &mode, change_mode, repo.as_ref())?;
+    let report = what_changed_report(
+        snapshot,
+        &options,
+        &mode,
+        change_mode,
+        repo.as_ref(),
+        budget,
+    )?;
     budget.check()?;
     cache_before_token_cap(budget, max_tokens, |budget| {
         let rendered = budget.text(&report.rendered)?;
@@ -211,6 +218,7 @@ fn what_changed_report(
     mode: &WhatChangedMode,
     change_mode: ChangeMode,
     repo: Option<&crate::git::GitRepo>,
+    budget: &mut Budget,
 ) -> Result<WhatChangedReport, QueryRefusalKind> {
     let live = snapshot.generation.live.as_ref();
     let filter = |paths: Vec<String>, code_only: bool| {
@@ -328,7 +336,13 @@ fn what_changed_report(
                     "",
                 ),
             };
-            let paths = paths.map_err(|_| QueryRefusalKind::GitUnavailable)?;
+            // MCP's text for a change listing git could not produce.
+            let paths = paths.map_err(|error| {
+                budget.refuse_with(
+                    QueryRefusalKind::GitUnavailable,
+                    format!("Git change detection failed: {error}"),
+                )
+            })?;
             // Counted and listed as git status does: an untracked directory is one
             // entry (FR-031). A ref diff has no untracked directories.
             let untracked_dirs = if matches!(mode, WhatChangedMode::GitRef(_)) {
@@ -495,12 +509,19 @@ pub(super) fn diff_symbols(
     }
     let live = snapshot.generation.live.as_ref();
     let repo = open_repository(&snapshot.root).ok_or(QueryRefusalKind::GitUnavailable)?;
+    // MCP's text for a comparison git could not run.
+    let git_failed = |budget: &mut Budget, error: &dyn std::fmt::Display| {
+        budget.refuse_with(
+            QueryRefusalKind::GitUnavailable,
+            format!("Failed to run git diff: {error}"),
+        )
+    };
     let range = repo
         .comparison_range_between_refs(base, target)
-        .map_err(|_| QueryRefusalKind::GitUnavailable)?;
+        .map_err(|error| git_failed(budget, &error))?;
     let changed = repo
         .changed_paths_for_comparison(&range)
-        .map_err(|_| QueryRefusalKind::GitUnavailable)?;
+        .map_err(|error| git_failed(budget, &error))?;
     let code_only = request.code_only.unwrap_or(false);
     let filtered = shared::filter_diff_symbol_paths(
         &changed,

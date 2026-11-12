@@ -574,6 +574,32 @@ pub fn append_nul_byte_warning(output: String, content: &[u8]) -> String {
     }
 }
 
+/// `get_file_content`'s last steps for a rendered body, served or refused, on both lanes:
+/// the hard byte cap with its continuation, the NUL-byte warning for `content`, then an
+/// explicit `max_tokens`. Returns the text before the token budget, the budgeted text,
+/// and whether the budget cut it.
+pub fn finish_file_content(
+    body: String,
+    path: &str,
+    first_line: u32,
+    numbered: bool,
+    content: &[u8],
+    max_tokens: Option<u64>,
+) -> (String, String, bool) {
+    let capped = cap_file_content_output_for(body, path, first_line, numbered);
+    let warned = append_nul_byte_warning(capped, content);
+    let (budgeted, cut) = super::source::enforce_token_budget_flagged(
+        warned.clone(),
+        max_tokens.filter(|limit| *limit > 0),
+    );
+    (warned, budgeted, cut)
+}
+
+/// An `around_symbol` read of a file the index did not parse: it has no symbols.
+pub fn unindexed_symbol_not_found(path: &str, name: &str) -> String {
+    format!("Symbol not found in {path}: {name}")
+}
+
 pub fn cap_file_content_output(output: String) -> String {
     cap_file_content_output_for(output, "", 1, false)
 }
@@ -706,6 +732,8 @@ pub(crate) fn suggest_similar_files(
             .unwrap_or(basename);
         if stem.len() >= 3 {
             let stem_lower = stem.to_ascii_lowercase();
+            // `all_files` iterates a hash map: sort before taking five, so the same
+            // index suggests the same paths in every process and on both lanes.
             suggestions = index
                 .all_files()
                 .map(|(p, _)| p.as_str())
@@ -716,9 +744,10 @@ pub(crate) fn suggest_similar_files(
                         .unwrap_or("");
                     file_stem.to_ascii_lowercase().contains(&stem_lower)
                 })
-                .take(5)
                 .map(|s| s.to_string())
                 .collect();
+            suggestions.sort_unstable();
+            suggestions.truncate(5);
         }
     }
     suggestions

@@ -456,8 +456,8 @@ pub(super) fn project(
     super::embed_read::admit(snapshot, &path, None, budget)?;
     let published = snapshot.generation.as_ref();
     // MCP's answer for a selector it cannot place: the default mode's exact-reference
-    // lookup text, or the bundle view's, then the savings footer. `None`: a mode
-    // whose MCP text this lane does not render.
+    // lookup text or the bundle view's, then the savings footer; the trace view's text.
+    // `None` only when the default lookup places the selector, which no caller passes.
     let unplaced = |raw_len: usize| {
         let text = match mode {
             SymbolContextMode::Default => published
@@ -480,7 +480,23 @@ pub(super) fn project(
                 request.verbosity.as_deref().unwrap_or("full"),
                 request.max_tokens,
             ),
-            _ => return None,
+            // MCP's trace answer carries no savings footer.
+            SymbolContextMode::Trace => {
+                return Some(shared::trace_symbol_result_view(
+                    &shared::capture_trace_symbol_view(
+                        published,
+                        &path,
+                        &request.name,
+                        request.symbol_kind.as_deref(),
+                        request.symbol_line,
+                        None,
+                        request.include_tests,
+                    ),
+                    &request.name,
+                    request.verbosity.as_deref().unwrap_or("full"),
+                    request.max_tokens,
+                ));
+            }
         };
         let footer = read_context::compact_savings_footer(text.len(), raw_len);
         Some(format!("{text}{footer}"))
@@ -499,16 +515,10 @@ pub(super) fn project(
         request.symbol_line,
     ) {
         crate::live_index::query::SymbolSelectorMatch::Selected(index, symbol) => (index, symbol),
-        crate::live_index::query::SymbolSelectorMatch::Ambiguous(lines) => {
+        crate::live_index::query::SymbolSelectorMatch::Ambiguous(_) => {
             result.refusal = Some(QueryRefusalKind::AmbiguousSymbol);
             result.candidates = candidates(snapshot, request, budget)?;
-            let text = unplaced(file.content.len()).unwrap_or_else(|| {
-                format!(
-                    "Ambiguous symbol selector for {} in {}; pass symbol_line to disambiguate. \
-                     Candidates: {:?}",
-                    request.name, path, lines
-                )
-            });
+            let text = unplaced(file.content.len()).unwrap_or_default();
             result.rendered = budget.text(&text)?;
             return Ok(QueryOutput::SymbolContext(result));
         }

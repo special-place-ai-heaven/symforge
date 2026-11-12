@@ -41,7 +41,9 @@ pub(super) fn validate(request: &SymbolReadRequest) -> Result<(), QueryRefusalKi
 
 pub(super) fn validate_inspect(request: &InspectMatchRequest) -> Result<(), QueryRefusalKind> {
     validate_path(&request.path, false)?;
-    if request.line == 0 || request.max_tokens == Some(0) {
+    // Line 0 is refused by the lane, with MCP's out-of-bounds text (it names the
+    // file's line count).
+    if request.max_tokens == Some(0) {
         return Err(QueryRefusalKind::InvalidRequest);
     }
     Ok(())

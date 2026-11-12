@@ -44,6 +44,9 @@ pub fn plan_edit(
     // AAP-001: populated when a path-shaped bare target matches several files
     // by trailing path segment; drives the deterministic pick + ambiguity note.
     let mut ambiguous_file_matches: Vec<String> = Vec::new();
+    // Files whose path ends with the target, collected over a hash-map walk; sorted
+    // below so the pick, and its ambiguity note, never depend on map order.
+    let mut ending_matches: Vec<String> = Vec::new();
 
     if let Some((target_path, target_name)) = qualified_target {
         let mut path_matched = false;
@@ -53,7 +56,7 @@ pub fn plan_edit(
                 collect_selector_hits(&mut symbol_hits, path, file, target_name);
             }
             if path.ends_with(target) || path == target {
-                file_hit = Some(path.clone());
+                ending_matches.push(path.clone());
             }
         }
         // Type-name fallback: the left segment matched no indexed file path, so
@@ -109,7 +112,7 @@ pub fn plan_edit(
                     for (path, file) in index.all_files() {
                         collect_selector_hits(&mut symbol_hits, path, file, target);
                         if path.ends_with(target) || path == target {
-                            file_hit = Some(path.clone());
+                            ending_matches.push(path.clone());
                         }
                     }
                 }
@@ -122,6 +125,13 @@ pub fn plan_edit(
         }
     }
 
+    ending_matches.sort();
+    if let Some(first) = ending_matches.first() {
+        file_hit = Some(first.clone());
+        if ending_matches.len() > 1 {
+            ambiguous_file_matches = ending_matches;
+        }
+    }
     // `all_files` iterates a hash map: without an order the candidates, and the primary
     // one, differ from process to process and between the two lanes.
     symbol_hits.sort_by(|a, b| (&a.0, a.3).cmp(&(&b.0, b.3)));

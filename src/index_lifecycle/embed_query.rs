@@ -1119,6 +1119,13 @@ impl Budget {
     }
 
     /// Refuse with `kind`, carrying `text`: what the MCP lane prints for the same call.
+    ///
+    /// Not charged to `max_bytes`: the text replaces the answer the budget was for, and
+    /// it is bounded without it. Every caller passes one of MCP's fixed-shape texts: a
+    /// sentence naming at most the request's own path, name or query (bounded by the
+    /// host's request size), five suggestions or close matches, one file's candidate
+    /// lines, a git or regex error, or a `get_file_content` text that has been through
+    /// its hard byte cap.
     pub(super) fn refuse_with(&mut self, kind: QueryRefusalKind, text: String) -> QueryRefusalKind {
         self.refusal_text = Some(text);
         kind
@@ -1290,19 +1297,59 @@ fn validate_selector(selector: &QuerySymbolSelector) -> Result<(), QueryRefusalK
     Ok(())
 }
 
-/// The MCP lane's text for a request [`validate_request`] refuses, where it has one: the
-/// language filter MCP refuses with the same shared text.
-fn validation_text(request: &QueryRequest, kind: QueryRefusalKind) -> Option<String> {
-    if kind != QueryRefusalKind::UnsupportedOption {
-        return None;
+/// The MCP lane's text for a request [`validate_request`] refuses, where it has one and
+/// the condition MCP prints it for is the one that refused: an unknown language filter,
+/// and the empty-query and missing-path refusals. `None`: the refusal has no MCP text,
+/// or another check refused first.
+pub(super) fn validation_text(request: &QueryRequest, kind: QueryRefusalKind) -> Option<String> {
+    match kind {
+        QueryRefusalKind::UnsupportedOption => {
+            let language = match request {
+                QueryRequest::TextSearch(input) => input.language.as_deref(),
+                QueryRequest::SymbolSearch(input) => input.language.as_deref(),
+                QueryRequest::Explore(input) => input.language.as_deref(),
+                _ => return None,
+            };
+            super::guidance::filters::parse_language_filter(language).err()
+        }
+        QueryRefusalKind::InvalidRequest => invalid_request_text(request),
+        _ => None,
     }
-    let language = match request {
-        QueryRequest::TextSearch(input) => input.language.as_deref(),
-        QueryRequest::SymbolSearch(input) => input.language.as_deref(),
-        QueryRequest::Explore(input) => input.language.as_deref(),
+}
+
+/// [`validation_text`] for an `InvalidRequest`: each arm restates the validator's first
+/// check, so a request refused by a later check gets no text.
+fn invalid_request_text(request: &QueryRequest) -> Option<String> {
+    let text = match request {
+        QueryRequest::SymbolContext(input)
+            if !input.name.trim().is_empty()
+                && input.symbol_line != Some(0)
+                && input.max_tokens != Some(0)
+                && input.bundle == Some(true)
+                && input.path.is_none() =>
+        {
+            "Error: bundle=true requires the 'path' parameter."
+        }
+        QueryRequest::FileSearch(input)
+            if input.query.is_empty() && input.changed_with.is_none() =>
+        {
+            "search_files requires a non-empty `query` (or use `changed_with` to find co-changing files)."
+        }
+        QueryRequest::Explore(input) if input.query.trim().is_empty() => {
+            "Explore requires a non-empty query."
+        }
+        QueryRequest::Ask(input)
+            if super::guidance::smart_query::strip_leading_articles(input.query.trim())
+                .is_empty() =>
+        {
+            "query requires a non-empty question."
+        }
+        QueryRequest::SearchKnowledge(input) => {
+            return crate::knowledge::search::validate_input(input).err();
+        }
         _ => return None,
     };
-    super::guidance::filters::parse_language_filter(language).err()
+    Some(text.to_owned())
 }
 
 pub(super) fn validate_request(request: &QueryRequest) -> Result<(), QueryRefusalKind> {

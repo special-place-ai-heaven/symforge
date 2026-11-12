@@ -1171,11 +1171,11 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // retry, by path segments, document order, capped), places keys in nested objects, and
 // words decode failures without values for both lanes. Same 90 files, no new edge.
 // Embed refusal text slice: query refusals carry the MCP lane's text (a budget field
-// and shared guidance builders; edit_plan candidates sorted). Same 90 files, calls only, no new edge.
+// and shared guidance builders; edit_plan and suggestions sorted; shared file-content finisher and search error text). Same 90 files, calls only, no new edge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "cdb9032c8f3f3cd6079db2cdd330d8c7cd90216ac9246f3378ac54ad667b5728",
+    "a206d06a1cacda8ad9f81e80331e04e5a91f3fe4491ce603ad696ec406f45d43",
     90,
-    2451662,
+    2457251,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1386,9 +1386,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Embed refusal text slice: two not-found builders move from `protocol` into
 // `guidance::file_read`, used by both lanes. Calls and a `use` only. 318 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "c1af49cc88cc9c3ecf91a3fe247079c21a8a2c499fbef4ac248b1126b78193d2",
+    "d4f225f4f4eff7edc0c574bd73d7adc697ac7d218d93c668859cf5f8f2bcbea9",
     318,
-    12882304,
+    12887943,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

@@ -6672,14 +6672,15 @@ impl SymForgeServer {
                     ),
                     crate::stel::handler::estimate_tokens_from_bytes(output.len() as u64),
                 );
-                let capped = format::cap_file_content_output_for(
-                    format!("{}{}", mode_annotation, output),
-                    &input.path,
-                    first_line,
-                    numbered,
-                );
-                let with_warning = format::append_nul_byte_warning(capped, &file.as_ref().content);
-                let mut final_output = format::enforce_token_budget(with_warning, max_tokens);
+                let (_, mut final_output, _) =
+                    crate::index_lifecycle::guidance::file_read::finish_file_content(
+                        format!("{}{}", mode_annotation, output),
+                        &input.path,
+                        first_line,
+                        numbered,
+                        &file.as_ref().content,
+                        max_tokens,
+                    );
                 let tokens = u32::try_from(crate::stel::handler::estimate_tokens_from_bytes(
                     final_output.len() as u64,
                 ))
@@ -6778,7 +6779,12 @@ impl SymForgeServer {
                         // An unindexed file has no symbols: say so rather than
                         // serving the whole file for an `around_symbol` read.
                         let body = match options.content_context.around_symbol.as_deref() {
-                            Some(name) => format!("Symbol not found in {}: {name}", input.path),
+                            Some(name) => {
+                                crate::index_lifecycle::guidance::file_read::unindexed_symbol_not_found(
+                                    &input.path,
+                                    name,
+                                )
+                            }
                             None => format::render_file_content_bytes(
                                 &input.path,
                                 &content,
@@ -6791,15 +6797,15 @@ impl SymForgeServer {
                         self.bump_frecency(&[PathBuf::from(&input.path)]);
                         // NUL-byte guard (raw-disk fallback branch):
                         // mirror the indexed branch — warn after the cap.
-                        let capped = format::cap_file_content_output_for(
+                        return crate::index_lifecycle::guidance::file_read::finish_file_content(
                             format!("{}{}", mode_annotation, body),
                             &input.path,
                             first_line,
                             numbered,
-                        );
-                        let with_warning = format::append_nul_byte_warning(capped, &content);
-                        let max_tokens = explicit_max_tokens.filter(|limit| *limit > 0);
-                        return format::enforce_token_budget(with_warning, max_tokens);
+                            &content,
+                            explicit_max_tokens,
+                        )
+                        .1;
                     }
                 }
                 // Suggest similar files from the SAME publication that produced
