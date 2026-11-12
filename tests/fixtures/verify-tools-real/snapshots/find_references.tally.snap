@@ -1,4 +1,4 @@
-Trust: constrained (repo-wide name match) | current index | parsed | full for current scope — usage-trace recall is best-effort; dynamic dispatch, macro-generated, reflective, and cross-language usages may be missed
+Trust: constrained (repo-wide name match) | 6 files confirmed against disk | parsed | full for current scope — usage-trace recall is best-effort; dynamic dispatch, macro-generated, reflective, and cross-language usages may be missed
 Scope: repo-wide symbol token `tally`
 Evidence: reference anchors `src/code_target.rs:11`, `src/code_target.rs:11`, `src/code_target.rs:15`
 
