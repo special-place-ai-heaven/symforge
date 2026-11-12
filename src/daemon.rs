@@ -7372,12 +7372,14 @@ async fn execute_tool_call(
 /// An `UnknownArguments` error from `decode_params`, worded as the front end words it:
 /// the tool, the keys, the valid arguments. Any other error passes through.
 fn name_unknown_arguments(tool_name: &str, error: anyhow::Error) -> anyhow::Error {
-    match error.downcast::<crate::protocol::tool_contract::UnknownArguments>() {
-        Ok(unknown) => anyhow::anyhow!(crate::protocol::tool_contract::unknown_arguments_refusal(
-            tool_name,
-            &unknown.0,
-            &valid_argument_names_for(tool_name)
-        )),
+    match error.downcast::<crate::index_lifecycle::guidance::request_refusal::UnknownArguments>() {
+        Ok(unknown) => anyhow::anyhow!(
+            crate::index_lifecycle::guidance::request_refusal::unknown_arguments_refusal(
+                tool_name,
+                &unknown.0,
+                &valid_argument_names_for(tool_name)
+            )
+        ),
         Err(other) => other,
     }
 }
@@ -7665,7 +7667,7 @@ fn decode_params<T>(params: serde_json::Value) -> anyhow::Result<T>
 where
     T: serde::de::DeserializeOwned,
 {
-    use crate::protocol::tool_contract::{StrictError, decode_strict};
+    use crate::index_lifecycle::guidance::request_refusal::{StrictError, decode_strict};
     match decode_strict(params) {
         Ok(decoded) => Ok(decoded),
         Err(StrictError::Unknown(unknown)) => Err(anyhow::Error::new(unknown)),

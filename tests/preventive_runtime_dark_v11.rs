@@ -489,6 +489,10 @@ const WIRED_PRODUCTION_FILES: &[&str] = &[
     "src/stel/executor.rs",
     "src/stel/planner.rs",
     "src/stel/runtime.rs",
+    // Feature 036 T021: both lanes print the request check's wording from the shared
+    // `guidance::request_refusal` (the MCP request check and the embed wire check).
+    "src/protocol/tool_contract.rs",
+    "src/embed/parity/host/request_check.rs",
 ];
 
 /// The frozen publication_roots census (C4): the state structs that retired
@@ -1077,6 +1081,7 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
     "index_lifecycle/guidance/read_gate.rs",
     "index_lifecycle/guidance/reference_contract.rs",
     "index_lifecycle/guidance/reference_read.rs",
+    "index_lifecycle/guidance/request_refusal.rs",
     "index_lifecycle/guidance/routing.rs",
     "index_lifecycle/guidance/search.rs",
     "index_lifecycle/guidance/search_contract.rs",
@@ -1160,10 +1165,12 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Round 2: cited files from structured rows, facade step caveats, probe reuse
 // for native searches. Same 89 files, no new edge.
 // Round 3: embed search caveats, reason-named not-run states. Same 89 files.
+// Feature 036 T021: new `guidance/request_refusal.rs`, the request check's wording
+// shared by the MCP and embed lanes; its callers are the two new roster rows. 90 files.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "3a18d708e1adbb524b354e4b1f8a2f4503feedc5cfa8551d9a12fd06f61ed3e6",
-    89,
-    2384202,
+    "1b0a8baab2520725d405345de2233703623e235c3cfe80cde2b40f4ce97a6415",
+    90,
+    2420843,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1364,10 +1371,15 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Round 3: filesystem clock probe, comparison generation fence, hash size limit,
 // vanish-wait minimum, bounded re-index, queries once per publication, targeted
 // freshens off the async worker, per-project unknown codes. No bridge. 316 files.
+// Refreshed for feature 036 T021 (embed refusal text parity): new
+// `index_lifecycle/guidance/request_refusal.rs` (the request check's wording, strict
+// decode and tool-argument table, moved out of `protocol/tool_contract.rs`) and
+// `embed/parity/host/request_check.rs` (the wire walk), `HostRefusal::message`.
+// Calls and `use` re-exports into the shared module only, no bridge. 318 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "323e16517decb8b526f6656730ab5810b05d5e3e7a96c2d7ad381d74638c63cd",
-    316,
-    12812827,
+    "a1516b3c8885921232ee16d6db84540fee01e6b2499b8579c53bc21695136350",
+    318,
+    12853145,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

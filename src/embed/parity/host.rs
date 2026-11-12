@@ -5,6 +5,8 @@
 //! before dispatching a deserialized request. Terminal Commander is a separate
 //! provider behind the host's broker; this module has no terminal dependency.
 
+mod request_check;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
@@ -859,6 +861,11 @@ pub struct HostRefusal {
     /// Redacted finding metadata from the shared source admission gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withheld: Option<Box<WithheldMeta>>,
+    /// The refusal text the MCP lane prints for the same call, byte for byte, when the
+    /// refusal has one (an argument the tool does not define, an enforced project-config
+    /// trust refusal). Names arguments, never their values. Absent on older wires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -882,7 +889,13 @@ impl HostRefusal {
             knowledge_kind: None,
             recovery: None,
             withheld: None,
+            message: None,
         }
+    }
+
+    /// The text to show the LLM, when the refusal carries the MCP lane's text.
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
     }
 
     fn from_query(refusal: crate::embed::parity::QueryRefusal) -> Self {
@@ -917,6 +930,7 @@ impl HostRefusal {
             knowledge_kind: None,
             recovery: None,
             withheld: refusal.withheld().cloned().map(Box::new),
+            message: None,
         }
     }
 
@@ -925,6 +939,11 @@ impl HostRefusal {
             EditError::Source(_) => Self::new(HostRefusalKind::SourceUnavailable),
             EditError::Edit(kind) => {
                 use crate::embed::parity::edit::EditErrorKind as Kind;
+                // MCP prints exactly this text for the same refusal.
+                let message = match &kind {
+                    Kind::ProjectConfigTrustEnforced { message } => Some(message.clone()),
+                    _ => None,
+                };
                 let (host_kind, name) = match kind {
                     Kind::WriteUncertain => (HostRefusalKind::EngineFailure, "WriteUncertain"),
                     Kind::ReplayUnavailable => {
@@ -943,6 +962,7 @@ impl HostRefusal {
                 };
                 let mut refusal = Self::new(host_kind);
                 refusal.edit_kind = Some(name.to_owned());
+                refusal.message = message;
                 refusal
             }
         }
@@ -1953,8 +1973,17 @@ impl HostRoom {
         if request_json.len() > self.limits.max_request_bytes as usize {
             return Err(HostRefusal::new(HostRefusalKind::RequestTooLarge));
         }
-        let request: HostRequest = serde_json::from_slice(request_json)
-            .map_err(|_| HostRefusal::new(HostRefusalKind::InvalidRequest))?;
+        let invalid = || HostRefusal::new(HostRefusalKind::InvalidRequest);
+        // The MCP lane's request check: an argument the tool does not define is refused
+        // with the MCP text, including on request types that would otherwise drop it.
+        let value: serde_json::Value =
+            serde_json::from_slice(request_json).map_err(|_| invalid())?;
+        if let Some(text) = request_check::unknown_argument_refusal(&value) {
+            let mut refusal = invalid();
+            refusal.message = Some(text);
+            return Err(refusal);
+        }
+        let request: HostRequest = serde_json::from_slice(request_json).map_err(|_| invalid())?;
         let response = self.dispatch(&request, control)?;
         serde_json::to_vec(&response).map_err(|_| HostRefusal::new(HostRefusalKind::EngineFailure))
     }

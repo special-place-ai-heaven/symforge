@@ -21,6 +21,7 @@ pub(crate) mod read_contract;
 pub(crate) mod read_gate;
 pub(crate) mod reference_contract;
 pub(crate) mod reference_read;
+pub(crate) mod request_refusal;
 pub(crate) mod routing;
 pub(crate) mod search_envelope;
 pub(crate) mod search_render;
