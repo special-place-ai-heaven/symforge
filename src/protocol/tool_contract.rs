@@ -30,6 +30,13 @@ use rmcp::model::{CallToolResult, JsonObject};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+pub(crate) use crate::index_lifecycle::guidance::request_refusal::{
+    ABSENT, ModeSelection, StrictError, When, decode_strict, from_value_noting, note_keys_of,
+    unknown_arguments_refusal,
+};
+use crate::index_lifecycle::guidance::request_refusal::{
+    condition_refusal, conflicting_selection_refusal, current_value, literal, normalized,
+};
 use crate::protocol::SymForgeServer;
 use crate::protocol::edit::{
     BatchEditInput, BatchInsertInput, BatchRenameInput, DeleteSymbolInput, EditWithinSymbolInput,
@@ -48,9 +55,6 @@ use crate::protocol::tools::{
 };
 use crate::stel::{StelEditRequest, StelRequest, StelStatusRequest};
 
-/// Stand-in value in [`When::Equals`] for "the controlling argument is absent".
-pub(crate) const ABSENT: &str = "(absent)";
-
 /// What a condition does when the argument is given outside the mode that uses it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OnMismatch {
@@ -60,24 +64,6 @@ pub(crate) enum OnMismatch {
     SelectMode,
     /// Refuse, naming the mode that accepts the argument.
     Refuse,
-}
-
-/// The mode in which an argument applies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum When {
-    /// The controlling argument is one of `values` (use [`ABSENT`] for "not given").
-    #[allow(dead_code)]
-    // ponytail: no table row after the handler audit; synthetic rows in tests
-    Equals(&'static str, &'static [&'static str]),
-    /// The controlling argument is NOT one of `values`: the argument is ignored only when
-    /// the controller equals one of them, and every other value reaches a branch that
-    /// reads it (a handler's default branch).
-    Unless(&'static str, &'static [&'static str]),
-    /// The controlling argument is given.
-    #[allow(dead_code)] // ponytail: no table row; synthetic rows in tests
-    Present(&'static str),
-    /// The controlling argument is not given.
-    Absent(&'static str),
 }
 
 /// `argument` applies only when `applies_when` holds.
@@ -401,213 +387,6 @@ pub(crate) fn in_drop_order<'a>(tool: &str, sections: &mut [(&'a str, &'a str)])
     });
 }
 
-/// The keys of a call that no argument struct of the tool consumed.
-#[derive(Debug)]
-pub(crate) struct UnknownArguments(pub Vec<String>);
-
-impl std::fmt::Display for UnknownArguments {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown arguments: {}", self.0.join(", "))
-    }
-}
-
-impl std::error::Error for UnknownArguments {}
-
-/// Why [`decode_strict`] did not return a value.
-#[derive(Debug)]
-pub(crate) enum StrictError {
-    /// Keys that serde did not consume (aliases, nested objects and `flatten` are
-    /// honoured by construction), or an `unknown field` error of a
-    /// `deny_unknown_fields` struct, located in the call where it can be.
-    Unknown(UnknownArguments),
-    /// Any other decode failure. The handler reports it in its own words.
-    Decode(serde_json::Error),
-}
-
-/// `element 2: unknown field `x`, expected ...` -> (Some(2), "x"); without the element
-/// prefix -> (None, "x").
-fn unknown_field_in(message: &str) -> Option<(Option<usize>, String)> {
-    let (before, rest) = message.split_once("unknown field `")?;
-    let key = rest.split('`').next()?.to_string();
-    let index = before
-        .rsplit_once("element ")
-        .and_then(|(_, tail)| tail.split(':').next())
-        .and_then(|n| n.trim().parse().ok());
-    Some((index, key))
-}
-
-thread_local! {
-    /// Ignored keys of array elements that a lenient container decoded on its own
-    /// (`lenient_vec_required`), where `serde_ignored` cannot see them. `Some` only while
-    /// `decode_strict` runs on this thread; the decode is synchronous.
-    static NESTED_IGNORED: std::cell::RefCell<Option<Vec<String>>> =
-        const { std::cell::RefCell::new(None) };
-    /// The array element a lenient container is decoding, for `note_value`.
-    static ELEMENT_INDEX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Switches the thread's nested-key sink on for one `decode_strict` call.
-struct NestedSink;
-
-impl NestedSink {
-    fn install() -> Self {
-        NESTED_IGNORED.with(|sink| *sink.borrow_mut() = Some(Vec::new()));
-        Self
-    }
-
-    fn take(&self) -> Vec<String> {
-        NESTED_IGNORED
-            .with(|sink| sink.borrow_mut().take())
-            .unwrap_or_default()
-    }
-}
-
-impl Drop for NestedSink {
-    fn drop(&mut self) {
-        NESTED_IGNORED.with(|sink| *sink.borrow_mut() = None);
-    }
-}
-
-/// `serde_json::from_value::<T>` for element `index` of an array that a lenient container
-/// decodes itself. While a strict decode is running, keys `T` does not consume are
-/// recorded as `[index].key` so the strict decode can refuse them; otherwise it is
-/// exactly `serde_json::from_value`.
-pub(crate) fn from_value_noting<T: DeserializeOwned>(
-    value: Value,
-    index: usize,
-) -> Result<T, serde_json::Error> {
-    let previous = ELEMENT_INDEX.replace(index);
-    let decoded = note_value(value);
-    ELEMENT_INDEX.set(previous);
-    decoded
-}
-
-/// [`from_value_noting`] for a value decoded inside an element (the stringified-object
-/// path of `SingleEdit`): recorded under the element being decoded.
-pub(crate) fn note_value<T: DeserializeOwned>(value: Value) -> Result<T, serde_json::Error> {
-    if NESTED_IGNORED.with(|sink| sink.borrow().is_none()) {
-        return serde_json::from_value(value);
-    }
-    let index = ELEMENT_INDEX.get();
-    let mut ignored = Vec::new();
-    let decoded = serde_ignored::deserialize::<_, _, T>(value, |path| {
-        ignored.push(format!("[{index}].{path}"));
-    });
-    NESTED_IGNORED.with(|sink| {
-        if let Some(sink) = sink.borrow_mut().as_mut() {
-            sink.extend(ignored);
-        }
-    });
-    decoded
-}
-
-/// Record the keys of `value` that `T` does not consume, when a strict decode is running;
-/// otherwise nothing. For lenient extraction paths that read `value` by hand.
-pub(crate) fn note_keys_of<T: DeserializeOwned>(value: &Value) {
-    if NESTED_IGNORED.with(|sink| sink.borrow().is_some()) {
-        let _ = note_value::<T>(value.clone());
-    }
-}
-
-/// The elements of an array argument, whether it arrived as an array or stringified.
-fn array_items(value: &Value) -> Option<Vec<Value>> {
-    match value {
-        Value::Array(items) => Some(items.clone()),
-        Value::String(text) => serde_json::from_str::<Vec<Value>>(text).ok(),
-        _ => None,
-    }
-}
-
-/// An array element that is an object, or a string holding one.
-fn element_object(value: &Value) -> Option<serde_json::Map<String, Value>> {
-    match value {
-        Value::Object(map) => Some(map.clone()),
-        Value::String(text) => match serde_json::from_str::<Value>(text).ok()? {
-            Value::Object(map) => Some(map),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Dotted path of the first object member named `key`, searching nested objects.
-fn find_key_path(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
-    if map.contains_key(key) {
-        return Some(key.to_string());
-    }
-    map.iter().find_map(|(name, value)| match value {
-        Value::Object(inner) => find_key_path(inner, key).map(|rest| format!("{name}.{rest}")),
-        _ => None,
-    })
-}
-
-/// Locate `key` (relative to an array element, at `index` when known) in the call:
-/// `edits.1.operation.zz`. When no top-level array holds it, the key as given, or
-/// `[index].key` for a known element.
-fn qualify(index: Option<usize>, key: &str, root: &Value) -> String {
-    let first = key.split('.').next().unwrap_or(key);
-    let found = root.as_object().and_then(|object| {
-        object.iter().find_map(|(field, value)| {
-            let items = array_items(value)?;
-            let range = match index {
-                Some(i) => i..i.saturating_add(1),
-                None => 0..items.len(),
-            };
-            range.into_iter().find_map(|i| {
-                let element = element_object(items.get(i)?)?;
-                let path = if element.contains_key(first) {
-                    key.to_string()
-                } else {
-                    find_key_path(&element, key)?
-                };
-                Some(format!("{field}.{i}.{path}"))
-            })
-        })
-    });
-    match (found, index) {
-        (Some(path), _) => path,
-        (None, Some(i)) => format!("[{i}].{key}"),
-        (None, None) => key.to_string(),
-    }
-}
-
-/// Decode `value` as `P` and report every key that no field of `P` consumed (FR-001).
-///
-/// Leniency about VALUE types lives in `P`'s own deserializers and is untouched; only
-/// keys are judged. Paths are dotted (`edits.0.zz`); the first segment is a top-level
-/// argument.
-pub(crate) fn decode_strict<P: DeserializeOwned>(value: Value) -> Result<P, StrictError> {
-    let mut ignored = Vec::new();
-    let sink = NestedSink::install();
-    let decoded = serde_ignored::deserialize::<_, _, P>(&value, |path| {
-        ignored.push(path.to_string());
-    });
-    ignored.extend(sink.take().iter().map(|entry| {
-        match entry
-            .strip_prefix('[')
-            .and_then(|rest| rest.split_once("]."))
-            .and_then(|(index, key)| Some((index.parse::<usize>().ok()?, key)))
-        {
-            Some((index, key)) => qualify(Some(index), key, &value),
-            None => entry.clone(),
-        }
-    }));
-    if !ignored.is_empty() {
-        return Err(StrictError::Unknown(UnknownArguments(ignored)));
-    }
-    decoded.map_err(|error| match unknown_field_in(&error.to_string()) {
-        Some((index, key)) => {
-            let located = if index.is_none() && value.get(&key).is_some() {
-                key
-            } else {
-                qualify(index, &key, &value)
-            };
-            StrictError::Unknown(UnknownArguments(vec![located]))
-        }
-        None => StrictError::Decode(error),
-    })
-}
-
 /// Arguments of a tool with none; every key a caller sends is unknown.
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 struct NoArguments {}
@@ -702,64 +481,10 @@ probe_table! {
     ("secret_remediate", SecretRemediateInput),
 }
 
-/// Refusal text for keys no tool argument consumed (contracts/tool-outcome.md).
-pub(crate) fn unknown_arguments_refusal(
-    tool: &str,
-    unknown: &[String],
-    valid: &[String],
-) -> String {
-    let named = unknown
-        .iter()
-        .map(|key| format!("\"{}\"", capped_key(key)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let valid = if valid.is_empty() {
-        "none".to_string()
-    } else {
-        valid.join(", ")
-    };
-    let mut text =
-        format!("invalid_request: {tool} does not accept {named}. Valid arguments: {valid}.");
-    if let Some(parent) = unknown
-        .iter()
-        .find_map(|k| k.split_once('.').map(|(p, _)| p))
-    {
-        text.push_str(&format!(
-            " Check the fields of \"{parent}\" against the tool's input schema."
-        ));
-    }
-    text
-}
-
-/// A raw argument as the handlers' lenient decoders read it: null, `""` and `[]` are
-/// absent (FR-003), `"true"`/`"1"` and `"false"`/`"0"` are booleans. `None` is absent.
-fn normalized(value: Option<&Value>) -> Option<Value> {
-    match value? {
-        Value::Null => None,
-        Value::String(s) => match s.as_str() {
-            "" => None,
-            "true" | "1" => Some(Value::Bool(true)),
-            "false" | "0" => Some(Value::Bool(false)),
-            _ => Some(Value::String(s.clone())),
-        },
-        Value::Array(items) if items.is_empty() => None,
-        other => Some(other.clone()),
-    }
-}
-
 /// An argument counts as given unless it is absent or `false`: `false` is the default of
 /// every flag a condition names.
 fn is_given(value: Option<&Value>) -> bool {
     !matches!(normalized(value), None | Some(Value::Bool(false)))
-}
-
-/// The controlling argument's value as a condition compares it.
-fn current_value(args: &JsonObject, controller: &str) -> String {
-    match normalized(args.get(controller)) {
-        None => ABSENT.to_string(),
-        Some(Value::String(s)) => s,
-        Some(other) => other.to_string(),
-    }
 }
 
 fn controller_of(when: &When) -> &'static str {
@@ -782,34 +507,6 @@ fn holds(when: &When, args: &JsonObject) -> bool {
         When::Present(controller) => is_given(args.get(*controller)),
         When::Absent(controller) => !is_given(args.get(*controller)),
     }
-}
-
-fn literal(value: &str) -> String {
-    if matches!(value, "true" | "false") {
-        value.to_string()
-    } else {
-        format!("\"{value}\"")
-    }
-}
-
-/// An echoed argument NAME is cut to this many characters.
-const KEY_ECHO_LIMIT: usize = 40;
-
-fn capped_key(key: &str) -> String {
-    if key.chars().count() <= KEY_ECHO_LIMIT {
-        return key.to_string();
-    }
-    let cut: String = key.chars().take(KEY_ECHO_LIMIT).collect();
-    format!("{cut}...")
-}
-
-/// A mode the server chose because a lone argument uses only that mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ModeSelection {
-    pub controller: &'static str,
-    pub mode: &'static str,
-    /// The argument whose presence selected the mode.
-    pub argument: &'static str,
 }
 
 /// The line that tells the caller which mode the server chose for it.
@@ -842,80 +539,6 @@ pub(crate) fn append_selection_note(result: &mut CallToolResult, selected: &[Mod
             text.text.push_str(&format!("\n\n{note}"));
             return;
         }
-    }
-}
-
-fn condition_refusal(
-    tool: &str,
-    condition: &Condition,
-    args: &JsonObject,
-    selected: &[ModeSelection],
-) -> String {
-    // No refusal echoes a value the caller sent (a path may be sensitive and a later guard
-    // of the handler refuses it without echo): it names arguments, and the controller's
-    // expected values from the table.
-    let argument = condition.argument;
-    let listed = |values: &[&str]| {
-        let modes: Vec<String> = values
-            .iter()
-            .map(|v| {
-                if *v == ABSENT {
-                    "omitted".to_string()
-                } else {
-                    format!("\"{v}\"")
-                }
-            })
-            .collect();
-        match modes.split_last() {
-            Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
-            _ => modes.join(""),
-        }
-    };
-    match &condition.applies_when {
-        When::Equals(controller, values) => {
-            let modes = listed(values);
-            let mode = values
-                .iter()
-                .find(|v| **v != ABSENT)
-                .map_or_else(String::new, |v| literal(v));
-            if let Some(chosen) = selected.iter().find(|s| s.controller == *controller) {
-                return format!(
-                    "invalid_request: \"{argument}\" applies when {controller} is {modes}; \
-                     `{}` selected {controller}={} for this call. Drop \"{argument}\" or drop \
-                     `{}`.",
-                    chosen.argument,
-                    literal(chosen.mode),
-                    chosen.argument
-                );
-            }
-            let used = if current_value(args, controller) == ABSENT {
-                format!("did not set {controller}")
-            } else {
-                format!("used a different {controller}")
-            };
-            format!(
-                "invalid_request: \"{argument}\" applies when {controller} is {modes}; this call \
-                 {used}. Call {tool}({controller}={mode}, {argument}=...) or drop \"{argument}\"."
-            )
-        }
-        When::Unless(controller, values) => format!(
-            "invalid_request: \"{argument}\" does not apply when {controller} is {}; this call \
-             set {controller} to {}. Drop \"{argument}\" or use another {controller}.",
-            listed(values),
-            if values.len() == 1 {
-                "it"
-            } else {
-                "one of them"
-            }
-        ),
-        When::Absent(controller) => format!(
-            "invalid_request: \"{argument}\" applies only when \"{controller}\" is not given; \
-             this call gave \"{controller}\". Drop \"{argument}\" or drop \"{controller}\"."
-        ),
-        When::Present(controller) => format!(
-            "invalid_request: \"{argument}\" applies only with \"{controller}\"; this call did \
-             not give it. Add \"{controller}\" or drop \"{argument}\"."
-        ),
     }
 }
 
@@ -955,13 +578,11 @@ fn apply_rows(
         };
         if let Some(earlier) = selected.iter().find(|s| s.controller == *controller) {
             if earlier.mode != *mode {
-                return Err(format!(
-                    "invalid_request: \"{}\" selects {controller}={} and \"{}\" selects \
-                     {controller}={}; they cannot be combined. Drop one of them.",
-                    earlier.argument,
-                    literal(earlier.mode),
+                return Err(conflicting_selection_refusal(
+                    controller,
+                    earlier,
                     condition.argument,
-                    literal(mode)
+                    mode,
                 ));
             }
             continue;
@@ -1000,7 +621,13 @@ fn apply_rows(
         {
             continue;
         }
-        return Err(condition_refusal(tool, condition, args, &selected));
+        return Err(condition_refusal(
+            tool,
+            condition.argument,
+            &condition.applies_when,
+            args,
+            &selected,
+        ));
     }
     Ok(selected)
 }
@@ -1034,8 +661,7 @@ impl SymForgeServer {
             ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(text)
         };
         if let Some((_, probe, _)) = PROBES.iter().find(|(name, _, _)| *name == tool)
-            && let Err(StrictError::Unknown(UnknownArguments(unknown))) =
-                probe(Value::Object(args.clone()))
+            && let Err(StrictError::Unknown(unknown)) = probe(Value::Object(args.clone()))
         {
             let valid = self
                 .tool_router
@@ -1154,7 +780,7 @@ mod tests {
                 .unwrap()
                 .insert("zz_unknown".into(), Value::from(1));
             assert!(
-                matches!(probe(bad), Err(StrictError::Unknown(ref u)) if u.0 == ["zz_unknown"]),
+                matches!(probe(bad), Err(StrictError::Unknown(ref u)) if u.paths() == ["zz_unknown"]),
                 "{}: an extra key must be reported",
                 contract.tool
             );
@@ -1217,16 +843,6 @@ mod tests {
         assert_eq!(current_value(&args, "missing"), ABSENT);
     }
 
-    /// Echoed values are cut; the cut keeps the start.
-    #[test]
-    fn echoed_names_are_cut() {
-        let long = "x".repeat(500);
-        assert!(capped_key(&long).chars().count() < KEY_ECHO_LIMIT + 8);
-        assert_eq!(capped_key("zz"), "zz");
-        let text = unknown_arguments_refusal("t", std::slice::from_ref(&long), &["a".to_string()]);
-        assert!(!text.contains(&"x".repeat(60)), "{text}");
-    }
-
     #[test]
     fn decode_strict_reports_nested_keys_and_honours_aliases() {
         let nested = serde_json::json!({
@@ -1234,7 +850,7 @@ mod tests {
                         "operation": { "type": "delete" }, "zz": 1 }]
         });
         match decode_strict::<BatchEditInput>(nested) {
-            Err(StrictError::Unknown(u)) => assert_eq!(u.0, ["edits.0.zz"]),
+            Err(StrictError::Unknown(u)) => assert_eq!(u.paths(), ["edits.0.zz"]),
             other => panic!("nested key not reported: {:?}", other.err()),
         }
         let aliased = serde_json::json!({
@@ -1244,7 +860,7 @@ mod tests {
         // `deny_unknown_fields` structs refuse through serde's own error, normalised.
         let denied = serde_json::json!({ "targets": [{ "path": "a.rs", "zz": 1 }] });
         match decode_strict::<GetSymbolInput>(denied) {
-            Err(StrictError::Unknown(u)) => assert_eq!(u.0, ["targets.0.zz"]),
+            Err(StrictError::Unknown(u)) => assert_eq!(u.paths(), ["targets.0.zz"]),
             other => panic!("deny_unknown_fields not located: {:?}", other.err()),
         }
         // A missing required field is not an unknown key.

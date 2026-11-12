@@ -70,7 +70,6 @@ default = ["server"]
 # reqwest, socket2, notify, tracing-subscriber).
 server = [
     "dep:rmcp",
-    "dep:serde_ignored",
     "dep:axum",
     "dep:clap",
     "dep:reqwest",
@@ -128,7 +127,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Reports the keys a deserializer did not consume, so a call that carries an argument no
 # tool defines is refused instead of answered as if it were absent (feature 036, D1).
-serde_ignored = { version = "0.1.14", optional = true }
+# Not server-only: the embed host refuses the same keys with the same text (T021).
+serde_ignored = "0.1.14"
 # Pure-Rust YAML backend. `serde_yaml_ng` was dropped because it pulls
 # `unsafe-libyaml` (RUSTSEC-2024-0449, unmaintained, no patch). serde-saphyr has no
 # libyaml in its tree and, with its default `strict_indentation: false`, keeps the
