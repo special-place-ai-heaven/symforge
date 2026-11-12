@@ -4,7 +4,7 @@ if [ -x "${HOME}/.cargo/bin/rustup" ]; then
   export PATH="${HOME}/.cargo/bin:${PATH}"
 fi
 if ! command -v rustup >/dev/null 2>&1; then
-  curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+  curl --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-delay 2 --retry-connrefused https://sh.rustup.rs | sh -s -- -y --default-toolchain none
   export PATH="${HOME}/.cargo/bin:${PATH}"
 fi
 if [ -n "${GITHUB_PATH:-}" ]; then

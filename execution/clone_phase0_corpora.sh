@@ -13,8 +13,17 @@ clone_if_missing() {
     echo "phase0 corpus ready: ${dir} (${marker})"
     return 0
   fi
-  echo "cloning ${url} -> ${dir}"
-  git clone --depth 1 "${url}" "${dir}"
+  local attempt
+  for attempt in 1 2 3; do
+    echo "cloning ${url} -> ${dir} (attempt ${attempt})"
+    if git clone --depth 1 "${url}" "${dir}"; then
+      return 0
+    fi
+    rm -rf "${dir}"
+    sleep $((attempt * 3))
+  done
+  echo "could not clone ${url} after 3 attempts" >&2
+  return 1
 }
 
 mkdir -p "${ROOT}"
