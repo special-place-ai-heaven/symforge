@@ -955,9 +955,23 @@ fn probe(mcp: &mut StdioClient, room: &HostRoom, cases: &[(&str, Value, Row)]) -
         let (embed, kinds) = embed_reply(room, tool, args);
         match expected {
             Row::Same if embed == mcp_text => {}
-            Row::Same => failures.push(format!(
-                "{tool} {args}:\n  mcp:   {mcp_text:?}\n  embed: {embed:?}"
-            )),
+            Row::Same => {
+                // Show where the two answers part, not only how they start.
+                let at = mcp_text
+                    .char_indices()
+                    .zip(embed.chars())
+                    .find(|((_, m), e)| m != e)
+                    .map_or(mcp_text.len().min(embed.len()), |((index, _), _)| index);
+                let from = at.saturating_sub(80);
+                let window = |text: &str| -> String {
+                    text.get(from..).unwrap_or("").chars().take(240).collect()
+                };
+                failures.push(format!(
+                    "{tool} {args} (part at byte {at}):\n  mcp:   {:?}\n  embed: {:?}",
+                    window(&mcp_text),
+                    window(&embed)
+                ));
+            }
             Row::Differs {
                 why,
                 embed: refusal,
@@ -980,24 +994,12 @@ fn probe(mcp: &mut StdioClient, room: &HostRoom, cases: &[(&str, Value, Row)]) -
     failures
 }
 
-/// A `Row::Differs` for a call the embed lane refuses although MCP answers it.
-const fn stricter(embed: &'static str, mcp: &'static str) -> Row {
-    Row::Differs {
-        why: "embed refuses a call MCP answers",
-        embed,
-        mcp,
-    }
-}
-
 /// Spec 036 embed refusal inventory: a call that leaves the MCP lane with a refusal,
 /// not-found, ambiguous or invalid answer gives the embed lane the same bytes, in the
 /// refusal `message` or the reply's `rendered` text. Each row is one inventory row.
 #[test]
 fn query_refusals_carry_the_mcp_text_on_the_embed_lane() {
     use Row::Same;
-    const INVALID: &str = "InvalidRequest/Some(InvalidRequest)";
-    const UNSUPPORTED: &str = "InvalidRequest/Some(UnsupportedOption)";
-    const DECODE: &str = "InvalidRequest/None";
     let dir = reliability_support::committed_fixture_copy();
     let root = dunce::canonicalize(dir.path()).expect("canonical fixture");
     let mut mcp = mcp_ready(&root);
@@ -1016,7 +1018,7 @@ fn query_refusals_carry_the_mcp_text_on_the_embed_lane() {
         (
             "get_file_context",
             json!({ "path": "src/short.rs", "max_tokens": 0 }),
-            stricter(INVALID, "Trust: exact"),
+            Same,
         ),
         (
             "get_symbol",
@@ -1033,7 +1035,7 @@ fn query_refusals_carry_the_mcp_text_on_the_embed_lane() {
         (
             "get_symbol",
             json!({ "path": "src/short.rs", "name": "" }),
-            stricter(INVALID, "No symbol  in src/short.rs."),
+            Same,
         ),
         (
             "get_symbol",
@@ -1069,7 +1071,7 @@ fn query_refusals_carry_the_mcp_text_on_the_embed_lane() {
         (
             "get_symbol_context",
             json!({ "name": "target_fn", "verbosity": "bogus" }),
-            stricter(UNSUPPORTED, "Ambiguous symbol selector: 2 symbols"),
+            Same,
         ),
         (
             "get_symbol_context",
@@ -1079,18 +1081,28 @@ fn query_refusals_carry_the_mcp_text_on_the_embed_lane() {
         (
             "get_symbol_context",
             json!({ "name": "target_fn", "symbol_line": 0 }),
-            stricter(INVALID, "Ambiguous symbol selector: 2 symbols"),
+            Same,
         ),
         (
             "get_symbol_context",
             json!({ "name": "target_fn", "path": "src/parent/leaf.rs", "sections": ["bogus"] }),
-            stricter(UNSUPPORTED, "pub fn target_fn"),
+            Same,
         ),
         ("find_references", json!({ "name": "NOPE_ANYWHERE" }), Same),
         (
             "find_references",
+            json!({ "name": "target_fn", "symbol_kind": "all" }),
+            Same,
+        ),
+        (
+            "get_symbol_context",
+            json!({ "name": "target_fn", "path": "src/parent/leaf.rs", "symbol_kind": "all" }),
+            Same,
+        ),
+        (
+            "find_references",
             json!({ "name": "target_fn", "kind": "bogus" }),
-            stricter(UNSUPPORTED, "Trust: constrained"),
+            Same,
         ),
         (
             "find_references",
@@ -1102,46 +1114,42 @@ fn query_refusals_carry_the_mcp_text_on_the_embed_lane() {
             json!({ "name": "NOPE", "path": "src/short.rs" }),
             Same,
         ),
-        (
-            "find_references",
-            json!({ "name": "" }),
-            stricter(INVALID, "No references found for \"\""),
-        ),
+        ("find_references", json!({ "name": "" }), Same),
         (
             "find_references",
             json!({ "name": "target_fn", "max_tokens": 0 }),
-            stricter(INVALID, "Trust: constrained"),
+            Same,
         ),
         (
             "find_references",
             json!({ "name": "target_fn", "limit": 0 }),
-            stricter(INVALID, "Match type: constrained"),
+            Same,
         ),
         (
             "find_references",
             json!({ "name": "target_fn", "max_per_file": 0 }),
-            stricter(INVALID, "Match type: constrained"),
+            Same,
         ),
         ("find_dependents", json!({ "path": "src/missing.rs" }), Same),
         (
             "find_dependents",
             json!({ "path": "src/short.rs", "format": "bogus" }),
-            stricter(UNSUPPORTED, "No file-level dependents found"),
+            Same,
         ),
         (
             "find_dependents",
             json!({ "path": "src/parent/leaf.rs", "max_tokens": 0 }),
-            stricter(INVALID, "File-level dependency graph:"),
+            Same,
         ),
         (
             "find_dependents",
             json!({ "path": "src/parent/leaf.rs", "limit": 0 }),
-            stricter(INVALID, "File-level dependency graph:"),
+            Same,
         ),
         (
             "find_dependents",
             json!({ "path": "src/parent/leaf.rs", "max_per_file": 0 }),
-            stricter(INVALID, "File-level dependency graph:"),
+            Same,
         ),
         (
             "inspect_match",
@@ -1181,7 +1189,7 @@ fn query_refusals_carry_the_mcp_text_on_the_embed_lane() {
         (
             "get_file_content",
             json!({ "path": "src/short.rs", "mode": "bogus" }),
-            stricter(DECODE, "Unknown mode 'bogus'."),
+            Same,
         ),
         (
             "get_file_content",
@@ -1196,7 +1204,7 @@ fn query_refusals_carry_the_mcp_text_on_the_embed_lane() {
         (
             "search_symbols",
             json!({ "query": "x", "kind": "bogus" }),
-            stricter(UNSUPPORTED, "No symbols matching 'x'."),
+            Same,
         ),
         (
             "search_symbols",
@@ -1213,14 +1221,10 @@ fn query_refusals_carry_the_mcp_text_on_the_embed_lane() {
         (
             "search_text",
             json!({ "query": "x", "group_by": "bogus" }),
-            stricter(DECODE, "Match type: constrained"),
+            Same,
         ),
         ("search_files", json!({ "query": "" }), Same),
-        (
-            "get_repo_map",
-            json!({ "max_tokens": 0 }),
-            stricter(INVALID, "Index: "),
-        ),
+        ("get_repo_map", json!({ "max_tokens": 0 }), Same),
         ("get_repo_map", json!({ "path": "nope/dir" }), Same),
         ("get_repo_map", json!({ "detail": "bogus" }), Same),
         (
@@ -1243,6 +1247,198 @@ fn query_refusals_carry_the_mcp_text_on_the_embed_lane() {
         ("ask", json!({ "query": "" }), Same),
     ];
     let failures = probe(&mut mcp, &room, &cases);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Spec 036 argument values (inventory "Argument values"): a value outside an argument's
+/// set or range is refused before any work, with the same bytes on both lanes, and the
+/// text names the argument and its valid values or range. The previously "embed stricter"
+/// rows are in `query_refusals_carry_the_mcp_text_on_the_embed_lane`; these are the
+/// arguments the sweep added.
+#[test]
+fn out_of_set_values_are_refused_alike_on_both_lanes() {
+    let dir = reliability_support::committed_fixture_copy();
+    let root = dunce::canonicalize(dir.path()).expect("canonical fixture");
+    let mut mcp = mcp_ready(&root);
+    let owner = HostRuntimeOwner::new(ProcessIndexRuntime::acquire().expect("runtime"));
+    let room = room_in(&owner, &root, "argument-value-room");
+    let explore = |depth: u32, limit: u32| {
+        json!({ "query": "x", "depth": depth, "limit": limit,
+            "include_noise": false, "include_vendor": false, "include_personal_tooling": false })
+    };
+    let cases: Vec<(&str, Value, &str)> = vec![
+        (
+            "get_file_content",
+            json!({ "path": "src/short.rs", "start_line": 0 }),
+            "\"start_line\" = 0",
+        ),
+        (
+            "get_file_content",
+            json!({ "path": "src/short.rs", "end_line": 0 }),
+            "\"end_line\" = 0",
+        ),
+        (
+            "get_file_content",
+            json!({ "path": "src/short.rs", "mode": "search" }),
+            "\"mode\"",
+        ),
+        (
+            "get_symbol",
+            json!({ "path": "src/short.rs", "name": "SHORT_A", "kind": "bogus" }),
+            "\"kind\"",
+        ),
+        (
+            "get_symbol",
+            json!({ "name": "SHORT_A", "symbol_line": 0 }),
+            "\"symbol_line\" = 0",
+        ),
+        ("get_repo_map", json!({ "detail": "bogus" }), "\"detail\""),
+        (
+            "get_repo_map",
+            json!({ "max_files": 0 }),
+            "\"max_files\" = 0",
+        ),
+        (
+            "get_file_context",
+            json!({ "path": "src/short.rs", "sections": ["bogus"] }),
+            "\"sections.0\"",
+        ),
+        (
+            "get_symbol_context",
+            json!({ "name": "target_fn", "symbol_kind": "bogus" }),
+            "\"symbol_kind\"",
+        ),
+        (
+            "get_symbol_context",
+            json!({ "name": "" }),
+            "non-empty \"name\"",
+        ),
+        (
+            "search_symbols",
+            json!({ "query": "x", "limit": 0 }),
+            "\"limit\" = 0",
+        ),
+        (
+            "search_text",
+            json!({ "query": "x", "limit": 0 }),
+            "\"limit\" = 0",
+        ),
+        (
+            "search_text",
+            json!({ "query": "x", "max_per_file": 20000 }),
+            "1 to 10000",
+        ),
+        (
+            "search_text",
+            json!({ "query": "x", "follow_refs": true, "follow_refs_limit": 0 }),
+            "\"follow_refs_limit\" = 0",
+        ),
+        (
+            "search_files",
+            json!({ "query": "x", "limit": 0 }),
+            "\"limit\" = 0",
+        ),
+        (
+            "search_knowledge",
+            json!({ "query": "x", "limit": 0 }),
+            "\"limit\" = 0",
+        ),
+        (
+            "find_references",
+            json!({ "name": "target_fn", "mode": "bogus" }),
+            "\"mode\"",
+        ),
+        (
+            "find_references",
+            json!({ "name": "target_fn", "direction": "bogus" }),
+            "\"direction\"",
+        ),
+        (
+            "find_references",
+            json!({ "name": "target_fn", "symbol_kind": "bogus" }),
+            "\"symbol_kind\"",
+        ),
+        (
+            "inspect_match",
+            json!({ "path": "src/short.rs", "line": 1, "max_tokens": 0 }),
+            "\"max_tokens\" = 0",
+        ),
+        (
+            "analyze_file_impact",
+            json!({ "path": "src/short.rs", "co_changes_limit": 0 }),
+            "\"co_changes_limit\" = 0",
+        ),
+        (
+            "what_changed",
+            json!({ "max_tokens": 0 }),
+            "\"max_tokens\" = 0",
+        ),
+        (
+            "diff_symbols",
+            json!({ "base": "HEAD", "max_tokens": 0 }),
+            "\"max_tokens\" = 0",
+        ),
+        ("explore", explore(4, 10), "\"depth\" = 4"),
+        ("explore", explore(1, 0), "\"limit\" = 0"),
+        (
+            "ask",
+            json!({ "query": "who calls target_fn", "max_tokens": 0 }),
+            "\"max_tokens\" = 0",
+        ),
+        (
+            "symforge",
+            json!({ "query": "who calls target_fn", "max_tokens": 10 }),
+            "64 or greater",
+        ),
+        (
+            "health",
+            json!({ "quarantine_limit": 0 }),
+            "\"quarantine_limit\" = 0",
+        ),
+    ];
+    // A described cap clamps and the answer says so, in the same bytes on both lanes.
+    for (tool, args) in [
+        (
+            "find_references",
+            json!({ "name": "target_fn", "limit": 500 }),
+        ),
+        (
+            "find_dependents",
+            json!({ "path": "src/parent/leaf.rs", "limit": 500 }),
+        ),
+        ("get_repo_map", json!({ "depth": 8 })),
+    ] {
+        let mcp_text = text_of(&mcp.call(tool, args.clone()));
+        let (embed, _) = embed_reply(&room, tool, &args);
+        assert!(
+            mcp_text.contains("is above its maximum of"),
+            "{tool} {args}: no cap note on MCP: {mcp_text}"
+        );
+        let note = mcp_text
+            .rsplit(
+                "
+
+",
+            )
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            embed.ends_with(&note) && embed == mcp_text,
+            "{tool} {args}: embed lacks `{note}`: {embed}"
+        );
+    }
+    let mut failures = Vec::new();
+    for (tool, args, names) in &cases {
+        let mcp_text = text_of(&mcp.call(tool, args.clone()));
+        let (embed, _) = embed_reply(&room, tool, args);
+        let prefix = format!("invalid_request: {tool} ");
+        if !mcp_text.starts_with(&prefix) || !mcp_text.contains(names) || embed != mcp_text {
+            failures.push(format!(
+                "{tool} {args} (expects {names}):\n  mcp:   {mcp_text:?}\n  embed: {embed:?}"
+            ));
+        }
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 

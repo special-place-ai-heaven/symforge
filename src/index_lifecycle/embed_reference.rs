@@ -24,24 +24,9 @@ pub(super) fn validate(request: &ReferenceSearchRequest) -> Result<(), QueryRefu
     if let Some(path) = &request.path {
         validate_path(path, false)?;
     }
+    // `kind`, `symbol_kind`, `mode` and `direction` are judged by the shared value table
+    // first (`embed_query::typed_value_refusal`).
     validate_kind(request.symbol_kind.as_deref())?;
-    if request
-        .mode
-        .as_deref()
-        .is_some_and(|value| !matches!(value, "references" | "implementations"))
-        || request
-            .direction
-            .as_deref()
-            .is_some_and(|value| !matches!(value, "trait" | "type" | "auto"))
-        || request.kind.as_deref().is_some_and(|value| {
-            !matches!(
-                value,
-                "call" | "import" | "type_usage" | "macro_use" | "value_use" | "all"
-            )
-        })
-    {
-        return Err(QueryRefusalKind::UnsupportedOption);
-    }
     Ok(())
 }
 
@@ -53,13 +38,7 @@ pub(super) fn validate_dependents(
     {
         return Err(QueryRefusalKind::InvalidRequest);
     }
-    if request
-        .format
-        .as_deref()
-        .is_some_and(|format| !matches!(format, "text" | "mermaid" | "dot"))
-    {
-        return Err(QueryRefusalKind::UnsupportedOption);
-    }
+    // `format` is judged by the shared value table (`embed_query::typed_value_refusal`).
     Ok(())
 }
 
@@ -201,7 +180,7 @@ fn capture(
                         .symbol_line
                         .is_some_and(|line| symbol.line_range.0 + 1 != line)
                     || request.symbol_kind.as_deref().is_some_and(|kind| {
-                        !crate::live_index::search::kind_filter_matches(kind, &symbol.kind)
+                        !crate::live_index::search::symbol_kind_filter_matches(kind, &symbol.kind)
                     })
                 {
                     continue;
@@ -224,10 +203,9 @@ fn capture(
     refs.sort_by_key(|(path, reference)| (*path, reference.byte_range));
     refs.dedup_by_key(|(path, reference)| (*path, reference.byte_range));
     let mut view = live.build_find_references_view(&refs, limits.total_hits, &request.name);
-    if shared::should_collect_qualified_usages(request)
-        && request.symbol_kind.is_none()
-        && request.symbol_line.is_none()
-    {
+    // The same condition as the MCP lane (`tools.rs` find_references), which collects
+    // qualified usages whatever `symbol_kind` / `symbol_line` select.
+    if shared::should_collect_qualified_usages(request) {
         let seen = refs
             .iter()
             .map(|(path, reference)| ((*path).to_owned(), reference.byte_range))

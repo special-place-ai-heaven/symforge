@@ -76,7 +76,9 @@ fn common_validation(
     if let Some(query) = query {
         crate::knowledge::guard_query(query).map_err(|_| QueryRefusalKind::AdmissionUnavailable)?;
     }
-    if limit.is_some_and(|limit| limit == 0 || limit > 10_000) || max_tokens == Some(0) {
+    // A limit above `search_symbols`' cap is clamped (its published description); the
+    // text search ceiling is the shared value table's.
+    if limit == Some(0) || max_tokens == Some(0) {
         return Err(QueryRefusalKind::InvalidRequest);
     }
     Ok(())

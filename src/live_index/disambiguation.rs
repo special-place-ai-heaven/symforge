@@ -486,7 +486,7 @@ where
         .filter(|(_, s)| {
             name_pred(s)
                 && symbol_kind
-                    .map(|k| super::search::kind_filter_matches(k, &s.kind))
+                    .map(|k| super::search::symbol_kind_filter_matches(k, &s.kind))
                     .unwrap_or(true)
         })
         .collect();

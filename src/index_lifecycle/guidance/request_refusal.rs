@@ -218,7 +218,7 @@ pub(crate) fn note_keys_of<T: DeserializeOwned>(value: &Value) {
 }
 
 /// The elements of an array argument, whether it arrived as an array or stringified.
-fn array_items(value: &Value) -> Option<Vec<Value>> {
+pub(crate) fn array_items(value: &Value) -> Option<Vec<Value>> {
     match value {
         Value::Array(items) => Some(items.clone()),
         Value::String(text) => serde_json::from_str::<Vec<Value>>(text).ok(),
@@ -227,7 +227,7 @@ fn array_items(value: &Value) -> Option<Vec<Value>> {
 }
 
 /// An array element that is an object, or a string holding one.
-fn element_object(value: &Value) -> Option<Map<String, Value>> {
+pub(crate) fn element_object(value: &Value) -> Option<Map<String, Value>> {
     match value {
         Value::Object(map) => Some(map.clone()),
         Value::String(text) => match serde_json::from_str::<Value>(text).ok()? {
@@ -511,7 +511,7 @@ const KEY_ECHO_LIMIT: usize = 40;
 /// A refusal names at most this many keys, then `(+N more)`.
 const KEY_LIST_LIMIT: usize = 8;
 
-fn capped_key(key: &str) -> String {
+pub(crate) fn capped_key(key: &str) -> String {
     if key.chars().count() <= KEY_ECHO_LIMIT {
         return key.to_string();
     }
@@ -1346,6 +1346,15 @@ pub(crate) static EMBED_REQUEST_TOOLS: &[(&str, Option<&str>)] = &[
     ("Knowledge.curate_preview", Some("curate_knowledge")),
     ("Knowledge.curate_apply", Some("curate_knowledge")),
 ];
+
+/// The MCP tool the embed request labelled `label` answers for ([`EMBED_REQUEST_TOOLS`]).
+#[cfg(feature = "embed")]
+pub(crate) fn embed_request_tool(label: &str) -> Option<&'static str> {
+    EMBED_REQUEST_TOOLS
+        .iter()
+        .find(|(name, _)| *name == label)
+        .and_then(|(_, tool)| *tool)
+}
 
 /// The MCP tool `label` answers for, and whether its request declares exactly that tool's
 /// arguments (`embed_fields` `None`: the request type is the MCP tool's own, which accepts

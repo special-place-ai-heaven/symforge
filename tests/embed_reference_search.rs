@@ -168,7 +168,15 @@ fn reference_search_keeps_caller_declarations_scoping_limits_and_implementations
             QueryLimits::default(),
         )
         .unwrap_err();
+    // Refused by the shared value table, with MCP's text and the kind hosts match on.
     assert_eq!(invalid.kind(), QueryRefusalKind::UnsupportedOption);
+    assert!(
+        invalid
+            .message()
+            .is_some_and(|text| text.contains("\"mode\". Valid values: \"references\"")),
+        "{:?}",
+        invalid.message()
+    );
 }
 
 #[test]

@@ -885,7 +885,7 @@ pub(crate) fn outline_text_for_generation_with(
 
     // Surface section validation warnings in the output.
     if let Some(ref section_list) = params.sections {
-        let valid = ["outline", "imports", "consumers", "references", "git"];
+        let valid = super::argument_values::FILE_CONTEXT_SECTIONS;
         let unknown: Vec<&str> = section_list
             .iter()
             .filter(|s| !valid.iter().any(|v| s.eq_ignore_ascii_case(v)))

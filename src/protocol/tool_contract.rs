@@ -30,6 +30,7 @@ use rmcp::model::{CallToolResult, JsonObject};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+pub(crate) use crate::index_lifecycle::guidance::argument_values::value_refusal;
 pub(crate) use crate::index_lifecycle::guidance::request_refusal::{
     ABSENT, ModeSelection, StrictError, When, decode_strict, from_value_noting, note_keys_of,
     unknown_arguments_refusal,
@@ -525,6 +526,21 @@ pub(crate) fn selection_note(selected: &[ModeSelection]) -> String {
         .join("\n")
 }
 
+/// Append the capped-value notes (`argument_values::notes_suffix`, already in the
+/// answer's grammar) to the last text block of `result`, so the caller learns which value
+/// was used. Never to an error: a call that failed used no value.
+pub(crate) fn append_value_notes(result: &mut CallToolResult, notes: &str) {
+    if notes.is_empty() || result.is_error == Some(true) {
+        return;
+    }
+    for block in result.content.iter_mut().rev() {
+        if let rmcp::model::ContentBlock::Text(text) = block {
+            text.text.push_str(notes);
+            return;
+        }
+    }
+}
+
 /// Append [`selection_note`] to the last text block of `result`.
 /// Only a tool whose output is prose may have a selecting row: a tool with a fixed
 /// grammar (`review_knowledge` prints key=value lines) would be corrupted by the line, so
@@ -653,9 +669,9 @@ impl SymForgeServer {
         &self,
         tool: &str,
         arguments: &mut Option<JsonObject>,
-    ) -> Result<Vec<ModeSelection>, CallToolResult> {
+    ) -> Result<(Vec<ModeSelection>, String), CallToolResult> {
         let Some(args) = arguments.as_mut() else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), String::new()));
         };
         let refuse = |text: String| {
             ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(text)
@@ -670,7 +686,20 @@ impl SymForgeServer {
                 .unwrap_or_default();
             return Err(refuse(unknown_arguments_refusal(tool, &unknown, &valid)));
         }
-        apply_conditions(tool, args).map_err(refuse)
+        use crate::index_lifecycle::guidance::argument_values as values;
+        let notes = values::check_values(tool, args).map_err(|refusal| refuse(refusal.text))?;
+        let notes = values::notes_suffix(tool, args, &notes);
+        // The note is paid for inside the caller's budget: the handler builds its answer
+        // for the budget less the note.
+        if !notes.is_empty()
+            && let Some(budget) = args.get("max_tokens").and_then(Value::as_u64)
+        {
+            let reduced = budget.saturating_sub(values::notes_tokens(&notes)).max(1);
+            args.insert("max_tokens".to_string(), Value::from(reduced));
+        }
+        apply_conditions(tool, args)
+            .map(|selected| (selected, notes))
+            .map_err(refuse)
     }
 }
 

@@ -654,21 +654,10 @@ pub struct ViewSymbolHit {
     pub tier: SymbolMatchTier,
 }
 
-/// Match `filter` (display string or common semantic alias) against a symbol
-/// kind. A local mirror of the engine search's `kind_filter_matches` (which is
-/// private to `search.rs`); kept minimal and overlay-internal.
+/// Match `filter` against a symbol kind with the one matcher every symbol argument uses
+/// (`search::symbol_kind_filter_matches`: display names, aliases and `all`).
 fn symbol_kind_matches(filter: &str, kind: &crate::domain::SymbolKind) -> bool {
-    if kind.to_string().eq_ignore_ascii_case(filter) {
-        return true;
-    }
-    matches!(
-        (filter.to_ascii_lowercase().as_str(), kind),
-        ("variable", crate::domain::SymbolKind::Variable)
-            | ("function", crate::domain::SymbolKind::Function)
-            | ("method", crate::domain::SymbolKind::Method)
-            | ("module", crate::domain::SymbolKind::Module)
-            | ("constant", crate::domain::SymbolKind::Constant)
-    )
+    super::search::symbol_kind_filter_matches(filter, kind)
 }
 
 /// A compiled line matcher used to scan overlay `Upsert` files directly. Mirrors

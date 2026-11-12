@@ -2706,7 +2706,7 @@ impl LiveIndex {
                         .find(|s| {
                             s.name == name
                                 && kind_filter
-                                    .map(|k| s.kind.to_string().eq_ignore_ascii_case(k))
+                                    .map(|k| super::search::symbol_kind_filter_matches(k, &s.kind))
                                     .unwrap_or(true)
                                 && symbol_line.map(|l| s.line_range.0 + 1 == l).unwrap_or(true)
                         })

@@ -22,9 +22,12 @@ use crate::embed::parity::{
     ask, changes, detect_impact, file_impact, guidance, knowledge, read, read_context, reference,
     search, symbol, symbol_context,
 };
+use crate::index_lifecycle::guidance::argument_values::{
+    check_values, notes_suffix, notes_tokens, value_refusal,
+};
 use crate::index_lifecycle::guidance::request_refusal::{
     StrictError, UnknownArguments, UnknownKey, decode_strict_wrapped, embed_decode_failure_text,
-    embed_unknown_arguments_refusal, expected_fields_in,
+    embed_request_tool, embed_unknown_arguments_refusal, expected_fields_in,
 };
 
 /// A key no request type declares: decoding `{SENTINEL: null}` makes a
@@ -257,18 +260,117 @@ fn locate(wire: &Value) -> Option<Located> {
 /// mistake).
 pub(super) fn argument_refusal(wire: &Value) -> Option<String> {
     let located = locate(wire)?;
-    match located.verdict() {
-        Verdict::Fine => None,
-        Verdict::Unknown(unknown) => Some(embed_unknown_arguments_refusal(
+    let verdict = located.verdict();
+    if let Verdict::Unknown(unknown) = &verdict {
+        return Some(embed_unknown_arguments_refusal(
             &located.label,
-            &unknown,
+            unknown,
             located.declared_fields().as_deref(),
-        )),
+        ));
+    }
+    // Then the argument values, as on the MCP lane, before a closed embed enum's decode
+    // failure can speak for them. A query that decodes is judged on the typed lane
+    // instead (`embed_query::typed_value_refusal`), which keeps the refusal kind hosts
+    // already match on (`UnsupportedOption` for a name outside its set).
+    let typed_lane_judges = located.label.starts_with("Query.") && matches!(verdict, Verdict::Fine);
+    if !typed_lane_judges
+        && let (Some(tool), Some(args)) =
+            (embed_request_tool(&located.label), located.args.as_object())
+        && let Some(text) = value_refusal(tool, args)
+    {
+        return Some(text);
+    }
+    match verdict {
+        Verdict::Fine | Verdict::Unknown(_) => None,
         Verdict::Decode(message) => Some(embed_decode_failure_text(
             &located.label,
             &message,
             located.declared_fields().as_deref(),
         )),
+    }
+}
+
+/// The capped-value notes the answer to `wire` must carry, already in the answer's
+/// grammar (`argument_values::notes_suffix`); empty when nothing was capped or the
+/// request answers for no MCP tool.
+pub(super) fn argument_notes(wire: &Value) -> String {
+    let Some(located) = locate(wire) else {
+        return String::new();
+    };
+    match (embed_request_tool(&located.label), located.args.as_object()) {
+        (Some(tool), Some(args)) => check_values(tool, args)
+            .map(|notes| notes_suffix(tool, args, &notes))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Reduce the caller's `max_tokens` in `wire` by the note's share, as the MCP lane does,
+/// so the answer plus its note fits the budget the caller set.
+pub(super) fn reserve_for_notes(wire: &mut Value, notes: &str) {
+    let tokens = notes_tokens(notes);
+    let args = match wire {
+        Value::Object(map) if map.len() == 1 => map.values_mut().next(),
+        _ => None,
+    };
+    let args = match args {
+        Some(Value::Object(query)) if query.contains_key("request") => {
+            query.get_mut("request").and_then(|request| match request {
+                Value::Object(variant) if variant.len() == 1 => variant.values_mut().next(),
+                _ => None,
+            })
+        }
+        other => other,
+    };
+    if let Some(Value::Object(args)) = args
+        && let Some(budget) = args.get("max_tokens").and_then(Value::as_u64)
+    {
+        args.insert(
+            "max_tokens".to_string(),
+            Value::from(budget.saturating_sub(tokens).max(1)),
+        );
+    }
+}
+
+/// Append `notes` (already in the answer's grammar) to the answer text of a serialized
+/// reply, as the MCP lane appends them to its last text block: the shallowest `rendered`
+/// or `report` string. A reply with no answer text (symbol and file search) carries them
+/// in `freshness_notes`, the field for lines MCP prints after its answer.
+// ponytail: walks the serialized reply; a typed `notes` field on every output if more
+// kinds of note appear.
+pub(super) fn append_notes(reply: &mut Value, notes: &str) {
+    if notes.is_empty() {
+        return;
+    }
+    for keys in [&["rendered", "report"][..], &["freshness_notes"][..]] {
+        let mut level: Vec<&mut Value> = vec![&mut *reply];
+        while !level.is_empty() {
+            let mut next = Vec::new();
+            for value in level {
+                let Value::Object(map) = value else {
+                    if let Value::Array(items) = value {
+                        next.extend(items.iter_mut());
+                    }
+                    continue;
+                };
+                if let Some(key) = keys.iter().find(|key| {
+                    map.get(**key).is_some_and(|v| {
+                        v.is_string() || (v.is_null() && **key == "freshness_notes")
+                    })
+                }) {
+                    let current = map.get(*key).and_then(Value::as_str).unwrap_or_default();
+                    let text = if current.is_empty() {
+                        notes.trim_start_matches('\n').to_string()
+                    } else {
+                        format!("{current}{notes}")
+                    };
+                    map.insert((*key).to_string(), Value::String(text));
+                    return;
+                }
+                next.extend(map.values_mut());
+            }
+            level = next;
+        }
     }
 }
 
