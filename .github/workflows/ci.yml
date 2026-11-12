@@ -383,6 +383,22 @@ jobs:
           fi
           echo "SYMFORGE_HOME=$RUNNER_TEMP/symforge-test-home" >> "$GITHUB_ENV"
 
+      # One test spawns `rustc` to compile a probe file
+      # (src/edit_safety/structural.rs, rust_insert_before_keeps_disabled_code_disabled),
+      # so the slices need the pinned compiler, minimal profile, no build.
+      - name: Install rustc only (rust-toolchain.toml channel)
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$channel"
+          bin="$HOME/.cargo/bin"
+          if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-delay 2 --retry-connrefused https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+          fi
+          export PATH="$bin:$PATH"
+          echo "$bin" >> "$GITHUB_PATH"
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          rustc --version
+
       - name: Set up Node for tests that spawn node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -985,7 +1001,9 @@ jobs:
               exit 1
             }
           }
-          $roots = @((Join-Path $env:CLEAN_TEMP 'symforge-ci'), $env:CLEAN_WORKSPACE.TrimEnd('\'))
+          $ciRoot = Join-Path $env:CLEAN_TEMP 'symforge-ci'
+          $workspace = $env:CLEAN_WORKSPACE.TrimEnd('\')
+          $roots = @($ciRoot, $workspace)
           # Test daemons still running from these trees would hold their files open.
           Get-Process | Where-Object {
             $path = $_.Path
@@ -994,19 +1012,23 @@ jobs:
             Write-Output "stopping $($_.Name) ($($_.Id))"
             Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
           }
-          $left = @()
-          foreach ($root in $roots) {
-            for ($i = 0; $i -lt 5 -and (Test-Path -LiteralPath $root); $i++) {
-              Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
-              if (Test-Path -LiteralPath $root) { Start-Sleep -Seconds 3 }
-            }
-            if (Test-Path -LiteralPath $root) { $left += $root }
+          # The job directory goes entirely; the checkout directory itself stays,
+          # emptied, because the runner starts the post-job steps inside it.
+          for ($i = 0; $i -lt 5; $i++) {
+            Remove-Item -LiteralPath $ciRoot -Recurse -Force -ErrorAction SilentlyContinue
+            Get-ChildItem -LiteralPath $workspace -Force -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            $left = @()
+            if (Test-Path -LiteralPath $ciRoot) { $left += $ciRoot }
+            if (Get-ChildItem -LiteralPath $workspace -Force -ErrorAction SilentlyContinue) { $left += "contents of $workspace" }
+            if (-not $left) { break }
+            Start-Sleep -Seconds 3
           }
           if ($left) {
             Write-Output "::error::could not delete: $($left -join ', ')"
             exit 1
           }
-          Write-Output "deleted: $($roots -join ', ')"
+          Write-Output "deleted $ciRoot and the contents of $workspace"
 
   # The one stable check for branch protection: fails unless every job passed
   # or was skipped by design.
