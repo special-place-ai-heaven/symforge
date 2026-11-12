@@ -1168,9 +1168,9 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Feature 036 T021: new `guidance/request_refusal.rs`, the request check's wording
 // shared by the MCP and embed lanes; its callers are the two new roster rows. 90 files.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "1b0a8baab2520725d405345de2233703623e235c3cfe80cde2b40f4ce97a6415",
+    "19dca959aff65ffced6289b57dc73deb23190401b029daf182c34c3ea6e09b70",
     90,
-    2420843,
+    2420890,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1377,9 +1377,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // `embed/parity/host/request_check.rs` (the wire walk), `HostRefusal::message`.
 // Calls and `use` re-exports into the shared module only, no bridge. 318 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "a1516b3c8885921232ee16d6db84540fee01e6b2499b8579c53bc21695136350",
+    "00bb5559596868c82a60f35924273ec7af26a64d4a9f5445fdffe8e9d0b2f35c",
     318,
-    12853145,
+    12853340,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

@@ -9159,13 +9159,13 @@ mod tests {
             let (dir, shared) = indexed_file();
             let before = crate::discovery::os_response::unknown_code_count();
             crate::live_index::single_file::compare_faults::STAT_ERROR
-                .with(|code| code.set(Some(777_777)));
+                .with(|code| code.set(Some(777_123)));
             let check = check_of_a(&dir, &shared);
             crate::live_index::single_file::compare_faults::STAT_ERROR.with(|code| code.set(None));
             let notes = check.notes(false);
             assert!(
                 notes.starts_with("Not confirmed against disk: a.rs (unrecognised error:")
-                    && notes.contains("777777"),
+                    && notes.contains("777123"),
                 "{notes}"
             );
             assert!(crate::discovery::os_response::unknown_code_count() > before);
