@@ -46,6 +46,20 @@ Embedders keep their own response bytes and check them with `ReplayOutcome::resp
 
 AAP S14-S16 add opt-in refresh-safe snapshot reads for Graph, File, SymbolSearch, and References via `EmbeddedSourceHandle::query_allowing_refresh`; the claim keeps the prior publication identity and reports `Refreshing`. Strict `query` remains Current-only, and mutating/mixed-disk variants are refused before freshening. `change_version` plus blocking `wait_for_change` provide lossless phase/publication event waits. `begin_graph_publication_lease` pins one Graph snapshot across pages for at most 30 seconds; no more than eight leases are live per source, and expired leases return `GraphPublicationLeaseExpired`.
 
+## [11.17.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.16.0...v11.17.0) (2026-11-12)
+
+
+### Features
+
+* **embed:** carry MCP refusal text for query refusals ([#871](https://github.com/special-place-ai-heaven/symforge/issues/871)) ([cd822ad](https://github.com/special-place-ai-heaven/symforge/commit/cd822adc887ae79dc6cca129990d58191e07d6e3))
+
+## [11.16.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.15.0...v11.16.0) (2026-11-12)
+
+
+### Features
+
+* **embed:** carry the same refusal text as the MCP lane ([#869](https://github.com/special-place-ai-heaven/symforge/issues/869)) ([4538577](https://github.com/special-place-ai-heaven/symforge/commit/4538577ea0d69d096cc098a6f9fe8473e287e942))
+
 ## [11.15.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.14.0...v11.15.0) (2026-11-12)
 
 
