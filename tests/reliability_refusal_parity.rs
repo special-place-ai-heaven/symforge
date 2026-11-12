@@ -1401,7 +1401,7 @@ fn multi_file_answers_are_ordered_and_finished_alike() {
     let mut nul = b"pub const NUL_A: u32 = 1;\n".to_vec();
     nul.extend(b"// padding past the binary sniff window\n".repeat(250));
     nul.extend(b"// a \0 byte\npub const NUL_B: u32 = 2;\n");
-    std::fs::write(dir.path().join("src/nul.rs"), nul).expect("nul source");
+    std::fs::write(dir.path().join("src/nulbyte.rs"), nul).expect("nul source");
     // A NUL byte inside the sniff window: a metadata-only binary file.
     std::fs::write(
         dir.path().join("src/bin.rs"),
@@ -1500,21 +1500,16 @@ fn multi_file_answers_are_ordered_and_finished_alike() {
             json!({ "path": "src/bin.rs" }),
             Row::Same,
         ),
+        // The stem must not be `nul`: on Windows that is the reserved NUL device name.
         (
             "get_file_content",
-            json!({ "path": "src/nul.rs" }),
-            stricter(
-                "SourceUnavailable/Some(StalePublication)",
-                "pub const NUL_A",
-            ),
+            json!({ "path": "src/nulbyte.rs" }),
+            Row::Same,
         ),
         (
             "get_file_content",
-            json!({ "path": "src/nul.rs", "start_line": 999 }),
-            stricter(
-                "SourceUnavailable/Some(StalePublication)",
-                "src/nul.rs [error:",
-            ),
+            json!({ "path": "src/nulbyte.rs", "start_line": 999 }),
+            Row::Same,
         ),
     ];
     failures.extend(probe(&mut mcp, &room, &binary));

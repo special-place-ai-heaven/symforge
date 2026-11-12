@@ -89,8 +89,8 @@ in this slice), **differs** (left, with the reason).
 | 59 | ask, empty query | `query requires a non-empty question.` | refusal InvalidRequest, no text | fixed | `validation_text` |
 | 60 | symforge facade (compact surface), `outline src/missing.rs` | step body `File not found: src/missing.rs` inside the facade answer | step body `Error: get_file_context refused: NotFound`, other token estimate | fixed | the step's refusal text is the step body; the old line only when a step has none |
 | 61 | get_file_content, metadata-only binary (`src/bin.rs`) | file bytes + NUL warning (disk read) | same | equal | disk branch |
-| 62 | get_file_content, indexed file whose NUL byte lies past the 8 KiB binary sniff (`src/nul.rs`) | file text + NUL warning | refusal StalePublication | differs: embed refuses a call MCP answers (cause not investigated: the exact-path freshen or `verify_indexed_content`) | - |
-| 63 | get_file_content, `src/nul.rs`, start past EOF | `<path> [error: ...]` + NUL warning | refusal StalePublication | differs: as 62 | - |
+| 62 | get_file_content, indexed file whose NUL byte lies past the 8 KiB binary sniff (`src/nulbyte.rs`) | file text + NUL warning | same | equal | an earlier `src/nul.rs` fixture was refused (StalePublication) on Windows only: the stem `nul` is the reserved NUL device name there, see below |
+| 63 | get_file_content, `src/nulbyte.rs`, start past EOF | `<path> [error: ...]` + NUL warning | same | equal | `finish_file_content` |
 | 64 | get_file_content, `src/bin.rs`, start past EOF | `<path> [error: ...]` + NUL warning | error line without the warning | fixed | `finish_file_content` |
 | 65 | get_file_content, `src/bin.rs`, start past EOF, `max_tokens: 5` | the budget-cut text | the uncut error line | fixed | `finish_file_content` |
 | 66 | get_file_content, `src/short.rs`, start past EOF, `max_tokens: 5` | the budget-cut text | the uncut error line | fixed | `finish_file_content` |
@@ -106,8 +106,8 @@ in this slice), **differs** (left, with the reason).
 | 74 | find_dependents, `limit: 0` | answers | refusal InvalidRequest | differs: embed refuses a call MCP answers | - |
 | 75 | find_dependents, `max_per_file: 0` | answers | refusal InvalidRequest | differs: embed refuses a call MCP answers | - |
 
-Query totals: 78 rows; 15 equal; 42 fixed; 21 differ (20 embed refuses or decodes a call
-MCP answers: rows 2, 7, 17, 19, 20, 22, 26, 28, 36, 40, 45, 47, 62, 63, 70-75; 1
+Query totals: 78 rows; 17 equal; 42 fixed; 19 differ (18 embed refuses or decodes a call
+MCP answers: rows 2, 7, 17, 19, 20, 22, 26, 28, 36, 40, 45, 47, 70-75; 1
 admission-tier text: row 1a).
 
 The dup.rs rows (9, 15, 16, 25, 39) were added after the RED run; their "before" column
@@ -127,8 +127,8 @@ is read from the code they ran through, not from a recorded run.
 The query rows alone exceeded the slice cap, so these were inventoried by refusal kind,
 not probed:
 
-1. **Embed stricter than MCP** (rows 2, 7, 17, 19, 20, 22, 26, 28, 36, 40, 45, 47, 62,
-   63, 70-75): a behaviour change (accept what MCP accepts), not a text change; with the
+1. **Embed stricter than MCP** (rows 2, 7, 17, 19, 20, 22, 26, 28, 36, 40, 45, 47,
+   70-75): a behaviour change (accept what MCP accepts), not a text change; with the
    owner.
 2. **Admission-tier text** (row 1a): MCP builds it from a disk probe in `protocol`.
 3. **`ask` routes**: a routed read's refusal carries no text (it is the routed tool's
@@ -155,3 +155,13 @@ and `get_repo_map` listed the key types `A`, `B`, `Thing` in a different order o
 lanes (observed in one run each, causes not investigated). Neither is a refusal text; both
 are outside this slice, and the dup.rs fixture lives in its own test so they do not mask
 the refusal rows.
+
+## Windows reserved device names (open)
+
+On Windows a file whose stem is a reserved device name (`NUL`, `CON`, `PRN`, `AUX`,
+`COM1`-`COM9`, `LPT1`-`LPT9`, e.g. `src/nul.rs`) is indexed and served by MCP (std paths),
+but the embed lane's confined read (`physical_root::open_regular_beneath`, cap-std) finds
+no regular file there, so `verify_indexed_content` (`embed_read.rs`) reports
+`StalePublication`. Observed with `src/nul.rs`; Linux serves it. Left open: the read goes
+through the cap-std confinement boundary, which needs a security review before it may
+accept device-named paths. No parity row pins it.
