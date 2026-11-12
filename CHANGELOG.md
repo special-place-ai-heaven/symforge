@@ -46,6 +46,13 @@ Embedders keep their own response bytes and check them with `ReplayOutcome::resp
 
 AAP S14-S16 add opt-in refresh-safe snapshot reads for Graph, File, SymbolSearch, and References via `EmbeddedSourceHandle::query_allowing_refresh`; the claim keeps the prior publication identity and reports `Refreshing`. Strict `query` remains Current-only, and mutating/mixed-disk variants are refused before freshening. `change_version` plus blocking `wait_for_change` provide lossless phase/publication event waits. `begin_graph_publication_lease` pins one Graph snapshot across pages for at most 30 seconds; no more than eight leases are live per source, and expired leases return `GraphPublicationLeaseExpired`.
 
+## [11.15.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.14.0...v11.15.0) (2026-11-12)
+
+
+### Features
+
+* **tools:** check the files an answer cites against disk ([#867](https://github.com/special-place-ai-heaven/symforge/issues/867)) ([de14294](https://github.com/special-place-ai-heaven/symforge/commit/de142941ec2f218b59f3f7ab66cf73d71f160833))
+
 ## [11.14.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.13.0...v11.14.0) (2026-11-11)
 
 
