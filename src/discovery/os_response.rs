@@ -714,6 +714,9 @@ mod tests {
         assert_eq!(denied.class, OsClass::Denied);
         let pending = classify_on(Windows, &raw(5), Some(STATUS_DELETE_PENDING), None);
         assert_eq!(pending.class, OsClass::DeletePending);
+        // The stored kind follows the host's own reading of raw code 5, which is
+        // access denied only on Windows.
+        #[cfg(windows)]
         assert_eq!(pending.stored_kind(), AccessErrorKind::PermissionDenied);
         assert!(pending.describe().starts_with("pending deletion"));
     }

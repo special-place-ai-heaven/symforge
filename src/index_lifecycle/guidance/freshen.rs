@@ -884,8 +884,11 @@ mod tests {
         #[cfg(not(windows))]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir.path().join("a.rs"), std::fs::Permissions::from_mode(0))
-                .unwrap();
+            std::fs::set_permissions(
+                dir.path().join("a.rs"),
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
             if std::fs::read(dir.path().join("a.rs")).is_ok() {
                 return; // root reads through mode 000
             }

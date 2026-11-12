@@ -1161,9 +1161,9 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // for native searches. Same 89 files, no new edge.
 // Round 3: embed search caveats, reason-named not-run states. Same 89 files.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "3a18d708e1adbb524b354e4b1f8a2f4503feedc5cfa8551d9a12fd06f61ed3e6",
+    "82c40efc7bff9e7f47a71368850e8e825314bb2a4c8985d43fd9a4b2b4d15f09",
     89,
-    2384202,
+    2384249,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1365,9 +1365,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // vanish-wait minimum, bounded re-index, queries once per publication, targeted
 // freshens off the async worker, per-project unknown codes. No bridge. 316 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "323e16517decb8b526f6656730ab5810b05d5e3e7a96c2d7ad381d74638c63cd",
+    "565d9e6da25ce9735619b12a9a6445d238dec3ab875bcb76d763400b7c4f233b",
     316,
-    12812827,
+    12813022,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
