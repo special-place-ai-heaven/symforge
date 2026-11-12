@@ -16,14 +16,27 @@ pub(super) fn validate(request: &AskRequest) -> Result<(), QueryRefusalKind> {
         .map_err(|_| QueryRefusalKind::AdmissionUnavailable)
 }
 
-/// The request `ask` routes to over this snapshot, as `project` chooses it.
-pub(super) fn routed_for(
-    snapshot: &EmbeddedQuerySnapshot,
-    request: &AskRequest,
-) -> Option<QueryRequest> {
+/// The route `ask` takes, chosen once from the index as MCP chooses it before
+/// the routed tool runs.
+pub(super) struct ChosenRoute {
+    intent: smart_query::QueryIntent,
+    matched: bool,
+    route: AskRoute,
+    /// The request the route dispatches; it settles the disk-check scope and
+    /// claim, as MCP's routed tool does before `ask` applies its token cap.
+    pub(super) routed: Option<QueryRequest>,
+}
+
+pub(super) fn choose(snapshot: &EmbeddedQuerySnapshot, request: &AskRequest) -> ChosenRoute {
     let normalized = smart_query::strip_leading_articles(request.query.trim());
-    let (intent, _) = routing::resolve(&snapshot.generation.live, normalized);
-    routed_request(&intent, request.max_tokens).1
+    let (intent, matched) = routing::resolve(&snapshot.generation.live, normalized);
+    let (route, routed) = routed_request(&intent, request.max_tokens);
+    ChosenRoute {
+        intent,
+        matched,
+        route,
+        routed,
+    }
 }
 
 fn routed_request(
@@ -157,16 +170,39 @@ pub(super) fn project(
     session: Option<&super::embed_session::QuerySession>,
     policy: QueryPolicy,
 ) -> Result<QueryOutput, QueryRefusalKind> {
+    let chosen = choose(snapshot, request);
+    project_chosen(
+        snapshot,
+        request,
+        &chosen,
+        budget,
+        observations,
+        session,
+        policy,
+    )
+}
+
+/// `ask` over a route already chosen, so the disk check and the answer use one.
+pub(super) fn project_chosen(
+    snapshot: &EmbeddedQuerySnapshot,
+    request: &AskRequest,
+    chosen: &ChosenRoute,
+    budget: &mut Budget,
+    observations: &mut Vec<QueryObservation>,
+    session: Option<&super::embed_session::QuerySession>,
+    policy: QueryPolicy,
+) -> Result<QueryOutput, QueryRefusalKind> {
     super::embed_changes::check_project(snapshot, request.project.as_deref())?;
     let original = request.query.trim();
     let normalized = smart_query::strip_leading_articles(original);
-    let (intent, matched) = routing::resolve(&snapshot.generation.live, normalized);
-    let assessment = smart_query::assess_route(&intent, matched);
-    let (route, routed_request) = routed_request(&intent, request.max_tokens);
+    let intent = &chosen.intent;
+    let assessment = smart_query::assess_route(intent, chosen.matched);
+    let route = chosen.route;
+    let routed_request = chosen.routed.clone();
     let mut result = AskResult {
         route,
         confidence: smart_query::route_confidence_label(assessment.confidence).into(),
-        invocation: smart_query::route_invocation(&intent),
+        invocation: smart_query::route_invocation(intent),
         rationale: assessment.rationale.into(),
         suggested_next_step: assessment.suggested_next_step.map(str::to_owned),
         routed_request: routed_request.map(Box::new),
@@ -190,7 +226,7 @@ pub(super) fn project(
         };
         result.output = Some(Box::new(output));
         rendered
-    } else if let smart_query::QueryIntent::ToolHelp { topic } = &intent {
+    } else if let smart_query::QueryIntent::ToolHelp { topic } = intent {
         smart_query::render_tool_catalog_for_topic(topic.as_deref())
     } else {
         return Err(QueryRefusalKind::InvalidRequest);
@@ -199,7 +235,7 @@ pub(super) fn project(
     // must always refer to the outer operation that the caller actually made.
     let full_child = budget.cache_output.take();
     let full_rendered =
-        smart_query::render_answer(&intent, assessment, original, normalized, &rendered);
+        smart_query::render_answer(intent, assessment, original, normalized, &rendered);
     let bounded = budget.text(&full_rendered)?;
     result.rendered = bounded;
     let mut cached = result.clone();

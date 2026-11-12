@@ -1176,10 +1176,12 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Embed integration tests in CI: embed `ask` takes its disk-check scope and claim
 // from the routed request (`embed_ask::routed_for`), as MCP's routed tool does.
 // Calls only. Same 91 files, no new edge.
+// Review round: the route is chosen once (`embed_ask::choose`), its routed request
+// settles the probe and claim, and `project_chosen` answers over it. Same 91 files.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "ace28fa2c37d4ec81ba3e00c66cd9ee98c0d6d6eb41cc7cd83c9860fbdc72d74",
+    "1cd844524a0aa6276b24f0f6979d62c84525de1e7203093d591bf8316fb063ee",
     91,
-    2490948,
+    2492609,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1396,10 +1398,11 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // lowercasing, the include_tests marker skipped on the daemon lane. Calls only. 319 files.
 // Embed integration tests in CI: embed `ask` checks its routed answer against disk
 // (`embed_ask::routed_for`, called from `embed_query`). Calls only. 319 files.
+// Review round: `routed_for` becomes `choose` plus `project_chosen`. Calls only. 319 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "d1ff3ea37a7114af6d3e2d11398140f2c674f8991db7145a73a05d02fff741c8",
+    "ade8c8295436b75f4ba59128399da3f20ba6eb22e1da4f149748ea065dccbb69",
     319,
-    12936669,
+    12938330,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
@@ -1533,10 +1536,10 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 /// boundary: FNV-1a is not collision-resistant, and whoever edits a
 /// workflow can edit this too. What it buys is that the edit is never
 /// silent.
-// ci.yml's server-embed reliability step widens to every integration binary
-// (`--test '*'`, pinned in CARGO_LINES); no doctest lane.
+// ci.yml's server-embed integration step runs the embed-gated binaries by name
+// (`--test` selectors only, pinned in CARGO_LINES); no doctest lane.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "8e4a9b47e069cb14:29941"),
+    ("ci.yml", "937360af9738245a:30158"),
     ("release.yml", "b174946ff2c434bb:115022"),
 ];
 
@@ -1724,10 +1727,11 @@ const CARGO_LINES: &[(&str, usize)] = &[
         "cargo test --features embed,__test-internals --lib server_and_embed_ -- --test-threads=1 2>&1 | tee /tmp/server-embed-parity.log",
         1,
     ),
-    // Every integration binary with both features; `--test '*'` selects
-    // integration-test targets only, never the lib's doctests.
+    // The embed-gated integration binaries by name (`--test` selects
+    // integration-test targets only, never the lib's doctests); the selection
+    // is checked by tests/ci_embed_selection.rs.
     (
-        "run: cargo test --features embed --test '*' -- --test-threads=1",
+        "run: cargo test --features embed,__test-internals --test 'embed_*' --test reliability_freshness --test reliability_refusal_parity --test reliability_review -- --test-threads=1",
         1,
     ),
     (

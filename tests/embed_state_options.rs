@@ -71,7 +71,14 @@ fn memory_only_creates_no_state_and_source_can_reopen_with_automatic_placement()
 fn selected_user_local_base_is_partitioned_by_source_root() {
     let first = repository();
     let second = repository();
+    // A user-local base must be host-protected: on Unix, no group or other
+    // access (a fresh tempdir follows the umask).
     let base = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let owner = HostRuntimeOwner::new_with_options(
         ProcessIndexRuntime::acquire().unwrap(),
         EmbeddedOpenOptions {

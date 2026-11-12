@@ -14,6 +14,18 @@ use symforge::embed::parity::source_options::GitPreparationOptions;
 use symforge::embed::parity::{QueryLimits, QueryOutput, QueryRefusalKind, QueryRequest};
 use symforge::embed::{EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase};
 
+/// The host-protected scratch directory `GitPreparationOptions` requires: on
+/// Unix, no group or other access (a fresh tempdir follows the umask).
+fn private_scratch() -> tempfile::TempDir {
+    let scratch = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    scratch
+}
+
 fn commit(repo: &git2::Repository, paths: &[&str]) {
     let mut index = repo.index().unwrap();
     for path in paths {
@@ -39,7 +51,7 @@ fn commit(repo: &git2::Repository, paths: &[&str]) {
 #[test]
 fn bound_detect_impact_preserves_body_delta_blast_and_full_risk_counts() {
     let root = tempfile::tempdir().unwrap();
-    let scratch = tempfile::tempdir().unwrap();
+    let scratch = private_scratch();
     fs::create_dir(root.path().join("src")).unwrap();
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cbm_impact");
     let paths = [
@@ -209,7 +221,7 @@ fn explicit_paths_impact_equals_union_of_per_file_results_and_refuses_outside_pa
     use std::collections::BTreeSet;
 
     let root = tempfile::tempdir().unwrap();
-    let scratch = tempfile::tempdir().unwrap();
+    let scratch = private_scratch();
     fs::create_dir(root.path().join("src")).unwrap();
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cbm_impact");
     let paths = [

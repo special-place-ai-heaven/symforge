@@ -628,19 +628,28 @@ fn execute_inner(
             .capture_graph_lease_snapshot(lease)
             .map_err(|kind| refuse(kind, RetryAdvice::Never)),
     };
-    // MCP `ask` answers through the tool it routes to, which checks its own
-    // answer: the route, chosen from the index, supplies the scope and claim.
+    // MCP `ask` chooses its route once from the index and answers through the
+    // routed tool, which checks its own answer before `ask` applies its token
+    // cap: the routed request supplies the scope, the probe and the claim, and
+    // the answer is projected over the same route.
     let ask_route = match request {
         QueryRequest::Ask(input) if !matches!(snapshot_mode, SnapshotMode::GraphLease(_)) => {
-            super::embed_ask::routed_for(&capture()?, input)
+            Some(super::embed_ask::choose(&capture()?, input))
         }
         _ => None,
     };
     let checked_scope = match &ask_route {
-        Some(routed) => routed.answer_scope().map(|scope| scope.map(str::to_owned)),
+        Some(chosen) => chosen
+            .routed
+            .as_ref()
+            .and_then(|routed| routed.answer_scope())
+            .map(|scope| scope.map(str::to_owned)),
         None => checked_scope,
     };
-    let claim_request = ask_route.as_ref().unwrap_or(request);
+    let claim_request = ask_route
+        .as_ref()
+        .and_then(|chosen| chosen.routed.as_ref())
+        .unwrap_or(request);
     // Round 2 item 3: a native search's rows do not depend on the check, so
     // its provisional projection over the final snapshot IS the answer; only
     // answers that render the check (envelopes, caveats) are projected again.
@@ -673,7 +682,7 @@ fn execute_inner(
                     // derived-state preparation the answer reports once.
                     let projected = project(
                         &probe_snapshot,
-                        request,
+                        claim_request,
                         &mut probe,
                         &mut Vec::new(),
                         None,
@@ -733,14 +742,25 @@ fn execute_inner(
             budget.adopt_projection(probe);
             Ok(value)
         }
-        _ => project(
-            &snapshot,
-            request,
-            &mut budget,
-            &mut observations,
-            session,
-            policy,
-        ),
+        _ => match (request, &ask_route) {
+            (QueryRequest::Ask(input), Some(chosen)) => super::embed_ask::project_chosen(
+                &snapshot,
+                input,
+                chosen,
+                &mut budget,
+                &mut observations,
+                session,
+                policy,
+            ),
+            _ => project(
+                &snapshot,
+                request,
+                &mut budget,
+                &mut observations,
+                session,
+                policy,
+            ),
+        },
     };
     // A cooperative stop must never be reported as a successful partial page or
     // as a budget error raised at the same checkpoint.

@@ -24,6 +24,18 @@ use symforge::embed::{
     EmbeddedSourceHandle, EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase,
 };
 
+/// The host-protected scratch directory `GitPreparationOptions` requires: on
+/// Unix, no group or other access (a fresh tempdir follows the umask).
+fn private_scratch() -> tempfile::TempDir {
+    let scratch = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    scratch
+}
+
 /// The fixture repository: commits with a fixed signature and time, then
 /// uncommitted working files. Returns the commit ids in order.
 fn query_parity_repo(spec: &serde_json::Value, root: &Path) -> Vec<String> {
@@ -204,6 +216,7 @@ fn tool_text(
         }
         "ask" => QueryRequest::Ask(AskRequest {
             query: input["query"].as_str().unwrap().to_owned(),
+            max_tokens: input["max_tokens"].as_u64(),
             ..Default::default()
         }),
         other => panic!("unsupported fixture tool {other}"),
@@ -234,7 +247,7 @@ fn change_and_query_lanes_render_the_mcp_answer() {
     for case in fixture["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let repo = tempfile::tempdir().unwrap();
-        let scratch = tempfile::tempdir().unwrap();
+        let scratch = private_scratch();
         let commits = query_parity_repo(
             &fixture["repos"][case["repo"].as_str().unwrap()],
             repo.path(),
