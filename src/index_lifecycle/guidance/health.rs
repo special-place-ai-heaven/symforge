@@ -2176,33 +2176,32 @@ fn health_binding_view<'a>(
     }
 }
 
-/// Issue #876: what one published index holds, counted at call time: file
+/// Issue #876: one published index's memory figures as a health line: file
 /// count, file content bytes, stored references and trigram posting entries.
-pub(crate) fn index_memory_counts(index: &crate::live_index::store::LiveIndex) -> String {
-    let (content_bytes, references) = index
-        .files
-        .values()
-        .fold((0usize, 0usize), |(bytes, refs), file| {
-            (bytes + file.content.len(), refs + file.references.len())
-        });
+pub(crate) fn index_memory_counts(counts: crate::live_index::store::IndexMemoryCounts) -> String {
+    let crate::live_index::store::IndexMemoryCounts {
+        files,
+        content_bytes,
+        references,
+        trigram_entries,
+    } = counts;
     format!(
-        "files={} content_bytes={content_bytes} references={references} trigram_entries={}",
-        index.files.len(),
-        index.trigram_index.posting_count(),
+        "files={files} content_bytes={content_bytes} references={references} trigram_entries={trigram_entries}"
     )
 }
 
 /// The `── Memory ──` section: process resident memory read from the OS now,
-/// and the counts of the index this report was captured from. A platform or
+/// and the counts of the generation this report was captured from (counted
+/// once per generation, see `PublishedGeneration::memory_counts`). A platform or
 /// read failure says so; it never prints a number it did not read.
-fn format_memory_health(index: &crate::live_index::store::LiveIndex) -> String {
+fn format_memory_health(generation: &crate::live_index::store::PublishedGeneration) -> String {
     let resident = match process_resident_bytes() {
         Ok(bytes) => format!("process_resident_bytes={bytes}"),
         Err(reason) => format!("process_resident_bytes: not measured ({reason})"),
     };
     format!(
         "── Memory ──\n{resident}\nproject {}",
-        index_memory_counts(index)
+        index_memory_counts(generation.memory_counts())
     )
 }
 
@@ -2282,7 +2281,7 @@ pub(crate) fn render_health_report(
     // Issue #876: from the same entry capture, so the counts are this report's
     // generation; every lane (local, daemon session, embed) renders it.
     result.push('\n');
-    result.push_str(&format_memory_health(&generation.live));
+    result.push_str(&format_memory_health(&generation));
     result.push('\n');
     result.push_str(&format!(
         "── Worktree-awareness misuse ──\nedit tool calls without working_directory (last hour): {}",
@@ -2377,8 +2376,8 @@ mod memory_section_tests {
     /// it read nothing, says so instead of a zero.
     #[test]
     fn test_memory_section_reports_counts_and_measured_resident_memory() {
-        let index = crate::live_index::store::LiveIndex::empty_live_index();
-        let section = format_memory_health(&index);
+        let shared = crate::live_index::store::LiveIndex::empty();
+        let section = format_memory_health(&shared.published_generation());
         let lines: Vec<&str> = section.lines().collect();
         assert_eq!(lines[0], "── Memory ──");
         #[cfg(any(target_os = "linux", windows))]

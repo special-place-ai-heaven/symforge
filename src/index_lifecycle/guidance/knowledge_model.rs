@@ -1128,6 +1128,7 @@ mod tests {
             live: current.live.clone(),
             health: current.health.clone(),
             outline: current.outline.clone(),
+            memory_counts: std::sync::OnceLock::new(),
         }
     }
 
@@ -1702,6 +1703,7 @@ mod tests {
             live: current.live.clone(),
             health: current.health.clone(),
             outline: current.outline.clone(),
+            memory_counts: std::sync::OnceLock::new(),
         };
         let long_details = "  backlink details omitted by a bounded summary.\n".repeat(100);
 

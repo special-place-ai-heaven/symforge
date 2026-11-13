@@ -1181,10 +1181,13 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Issue #876 part 1: the shared health renderer gains a memory section (index counts
 // read off the captured generation's `LiveIndex`, and a process resident-memory
 // reader). Calls and field reads only. Same 91 files, no new edge.
+// Review round: the section reads `PublishedGeneration::memory_counts` (an inherent
+// method, counted once per generation) and literal sites add the `OnceLock` field.
+// Same 91 files, no bridge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "c940f88d73715ece33b57963a7b7de32b078fcb0acb294ab426c8828c190612a",
+    "10b244ca137eea9e5c868629731f1ed38b3ffa2f22fdc08c8e96ed2d3107ec54",
     91,
-    2496807,
+    2496936,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1407,10 +1410,15 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // `daemon.rs`, and a shared memory section in `index_lifecycle/guidance/health.rs` whose
 // `index_memory_counts` the daemon calls. One index_lifecycle edge, a call reading
 // `LiveIndex` fields only; no bridge. 319 files.
+// Review round: memory figures are a once-per-generation `OnceLock` on
+// `PublishedGeneration` (`live_index/store.rs`, plus the field at each literal site,
+// one of them in `index_lifecycle/guidance/knowledge_model.rs`); the zombie rule also
+// requires a single thread in `/proc/<pid>/status`; `terminate_process` polls through
+// the shared liveness check. Inherent method and calls only; no bridge. 319 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "ce89dbbc9161ae77831ae77d4a6868316cfcfb11293ec6a4379ead8a6f6995b5",
+    "8edca4c09860536788f255cd076aea6e2168fec3fc6b2c12a4692ecf4162e69b",
     319,
-    12954509,
+    12962703,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
