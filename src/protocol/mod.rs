@@ -2188,12 +2188,29 @@ impl ServerHandler for SymForgeServer {
         // overwrite the seeded local evidence with its receipt).
         async move {
             // #875: a multi-repository serve routes the read by its `project` query.
+            // The reply keeps the URI the client asked for, `?project=` included, so
+            // two repositories' contents never share one URI.
+            let requested = uri.clone();
             let (server, uri) = match self.serve_projects.as_ref() {
                 Some(projects) => projects.route_resource(self, &uri)?,
                 None => (self, uri),
             };
             result_status::with_project_evidence_scope(server.local_project_evidence(), async {
                 server.read_resource_uri(&uri).await.map(|mut result| {
+                    if uri != requested {
+                        for contents in &mut result.contents {
+                            match contents {
+                                rmcp::model::ResourceContents::TextResourceContents {
+                                    uri, ..
+                                }
+                                | rmcp::model::ResourceContents::BlobResourceContents {
+                                    uri, ..
+                                } => *uri = requested.clone(),
+                                // ponytail: a future content kind keeps its own URI.
+                                _ => {}
+                            }
+                        }
+                    }
                     result_status::attach_project_evidence_meta(&mut result.meta);
                     rmcp::model::ReadResourceResponse::Complete(result)
                 })
@@ -2263,6 +2280,14 @@ impl ServerHandler for SymForgeServer {
         request: rmcp::model::GetPromptRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::GetPromptResponse, rmcp::ErrorData> {
+        if let Some(projects) = self.serve_projects.as_ref()
+            && projects.serves_several()
+        {
+            return Err(rmcp::ErrorData::invalid_request(
+                projects.prompts_refusal(),
+                None,
+            ));
+        }
         let prompt_context = rmcp::handler::server::prompt::PromptContext::new(
             self,
             request.name,
@@ -2279,11 +2304,15 @@ impl ServerHandler for SymForgeServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::ListPromptsResult, rmcp::ErrorData> {
-        Ok(
-            rmcp::model::ListPromptsResult::with_all_items(self.prompt_router.list_all())
-                .with_ttl_ms(3_600_000)
-                .with_cache_scope(rmcp::model::CacheScope::Public),
-        )
+        // #875: a multi-repository serve lists none (it refuses them); the
+        // list stays constant per process, so the Public cache still holds.
+        let prompts = match self.serve_projects.as_ref() {
+            Some(projects) if projects.serves_several() => Vec::new(),
+            _ => self.prompt_router.list_all(),
+        };
+        Ok(rmcp::model::ListPromptsResult::with_all_items(prompts)
+            .with_ttl_ms(3_600_000)
+            .with_cache_scope(rmcp::model::CacheScope::Public))
     }
 
     /// React to the client's `notifications/initialized`.

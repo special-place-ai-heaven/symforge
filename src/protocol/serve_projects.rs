@@ -8,7 +8,6 @@
 //! operator passed `--allow-index-folder`, which startup admits for one repository
 //! only.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock};
@@ -18,6 +17,7 @@ use serde_json::{Map, Value};
 
 use super::SymForgeServer;
 use super::result_status::{OutcomeClass, RESULT_STATUS_META_KEY, ResultStatus};
+use super::tool_contract;
 use crate::live_index::view::{BaseKey, CommitId, IndexBase, WorkingSet};
 
 /// One served repository: its operator alias and its own server (own index,
@@ -55,11 +55,32 @@ impl ServeProjects {
         self.aliases().join(", ")
     }
 
-    fn lookup(&self, alias: &str) -> Option<&SymForgeServer> {
+    /// Whether more than one repository is served (the routing-required case).
+    pub(crate) fn serves_several(&self) -> bool {
+        self.repos.len() > 1
+    }
+
+    /// Prompts name one repository and link its resources; on a multi-repository
+    /// server they cannot say which, so they are refused rather than emitted.
+    pub(crate) fn prompts_refusal(&self) -> String {
+        format!(
+            "prompts are not served when this server serves several repositories ({}); use \
+             the tools with project instead.",
+            self.alias_list()
+        )
+    }
+
+    /// Aliases match case-insensitively, the same folding the startup duplicate
+    /// check uses, so no two aliases can match one value.
+    fn find(&self, alias: &str) -> Option<&ServedRepo> {
+        let folded = alias.to_lowercase();
         self.repos
             .iter()
-            .find(|repo| repo.alias == alias)
-            .map(|repo| &repo.server)
+            .find(|repo| repo.alias.to_lowercase() == folded)
+    }
+
+    fn lookup(&self, alias: &str) -> Option<&SymForgeServer> {
+        self.find(alias).map(|repo| &repo.server)
     }
 
     fn missing_project(&self) -> String {
@@ -117,12 +138,11 @@ impl ServeProjects {
                 .await);
         }
         if project.is_none()
-            && self.repos.len() > 1
-            && tool == "status"
-            && arguments.get("detail").and_then(Value::as_str) == Some("projects")
+            && self.serves_several()
+            && matches!(tool.as_str(), "status" | "health" | "health_compact")
         {
             return Ok(CallToolResponse::Complete(CallToolResult::success(vec![
-                ContentBlock::text(self.inventory()),
+                ContentBlock::text(self.server_view()),
             ])));
         }
         let target = match self.select(project.as_deref()) {
@@ -138,6 +158,8 @@ impl ServeProjects {
 
     /// `projects` fan-out over the fixed repositories, rebuilt per call from each
     /// one's current published index (so it is never staler than the entries).
+    /// Only the code-read verbs: their answers are budgeted inline (no CCR
+    /// handle) and typed from the search itself.
     async fn fan_out(
         &self,
         front: &SymForgeServer,
@@ -146,27 +168,38 @@ impl ServeProjects {
         projects: Vec<String>,
         params: Map<String, Value>,
     ) -> CallToolResponse {
-        if !crate::daemon::is_cross_project_read_verb(tool) {
+        if !FAN_OUT_TOOLS.contains(&tool) {
             return refusal(format!(
-                "Error: project_routing: projects is supported here only on search_symbols, \
-                 search_text, find_references, search_files, search_knowledge and \
-                 review_knowledge; for '{tool}' pass project with one of: {}.",
+                "Error: project_routing: projects is supported here only on {}; for '{tool}' \
+                 pass project with one of: {}.",
+                FAN_OUT_TOOLS.join(", "),
                 self.alias_list()
             ));
         }
-        if let Some(unknown) = projects
-            .iter()
-            .find(|alias| alias.as_str() != "*" && self.lookup(alias).is_none())
-        {
-            return refusal(self.unknown_project(unknown));
+        let mut targeted = Vec::with_capacity(projects.len());
+        for alias in &projects {
+            if alias == "*" {
+                targeted.push(alias.clone());
+                continue;
+            }
+            match self.find(alias) {
+                Some(repo) => targeted.push(repo.alias.clone()),
+                None => return refusal(self.unknown_project(alias)),
+            }
         }
-        let targets = match crate::daemon::resolve_targets(project.as_deref(), Some(&projects), "")
+        let targets = match crate::daemon::resolve_targets(project.as_deref(), Some(&targeted), "")
         {
             Ok(targets) => targets,
             Err(message) => return refusal(format!("Error: project_routing: {message}")),
         };
+        // The same argument checks a routed call gets.
+        let mut arguments = Some(params);
+        let (selected_modes, value_notes) =
+            match front.refuse_invalid_arguments(tool, &mut arguments) {
+                Ok(selected) => selected,
+                Err(refused) => return CallToolResponse::Complete(refused),
+            };
         let mut working_set = WorkingSet::new();
-        let mut indexes = HashMap::new();
         for repo in &self.repos {
             let root = repo.server.capture_repo_root().unwrap_or_default();
             let base = IndexBase::new(
@@ -175,33 +208,35 @@ impl ServeProjects {
                 1,
             );
             working_set.add(repo.alias.clone(), Arc::new(base));
-            indexes.insert(repo.alias.clone(), repo.server.index.clone());
         }
         let tool = tool.to_string();
-        let ccr_server = front.clone();
+        let params = Value::Object(arguments.unwrap_or_default());
         let outcome = tokio::task::spawn_blocking(move || {
-            crate::daemon::serve_cross_project_read(
-                &tool,
-                Value::Object(params),
-                targets,
-                &working_set,
-                &indexes,
-                &ccr_server,
-            )
+            crate::daemon::execute_cross_project_read(&tool, params, targets, &working_set)
         })
         .await;
         match outcome {
-            Ok(Ok(text)) => {
-                CallToolResponse::Complete(CallToolResult::success(vec![ContentBlock::text(text)]))
+            Ok(Ok((text, found))) => {
+                let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+                let class = if found {
+                    OutcomeClass::Found
+                } else {
+                    OutcomeClass::EmptyResult
+                };
+                attach_status(&mut result, class);
+                tool_contract::append_selection_note(&mut result, &selected_modes);
+                tool_contract::append_value_notes(&mut result, &value_notes);
+                CallToolResponse::Complete(result)
             }
             Ok(Err(error)) => refusal(format!("Error: {error:#}")),
             Err(join) => refusal(format!("Error: cross-project read failed: {join}")),
         }
     }
 
-    /// `status {detail: projects}` without `project`: one row per repository.
-    fn inventory(&self) -> String {
-        let mut lines = vec!["── projects ──".to_string()];
+    /// `status`, `health` and `health_compact` without `project` on a
+    /// multi-repository server: one observed row per repository.
+    fn server_view(&self) -> String {
+        let mut lines = vec!["── served repositories ──".to_string()];
         for repo in &self.repos {
             let published = repo.server.index.data_plane().published_state();
             let root = repo
@@ -209,12 +244,14 @@ impl ServeProjects {
                 .capture_repo_root()
                 .map(|root| root.display().to_string())
                 .unwrap_or_else(|| "(unbound)".to_string());
+            let index = format!("{:?}", published.status).to_lowercase();
             let watcher = format!("{:?}", repo.server.watcher_info.lock().state).to_lowercase();
             lines.push(format!(
-                "name={} root={root} files={} symbols={} watcher={watcher}",
+                "name={} root={root} index={index} files={} symbols={} watcher={watcher}",
                 repo.alias, published.file_count, published.symbol_count
             ));
         }
+        lines.push("Pass project=ALIAS for the full report of one repository.".to_string());
         lines.join("\n")
     }
 
@@ -289,14 +326,26 @@ fn take_selectors(
     Ok((project, projects))
 }
 
+/// The code-read verbs `projects` fans out over on `serve`.
+const FAN_OUT_TOOLS: [&str; 4] = [
+    "search_symbols",
+    "search_text",
+    "find_references",
+    "search_files",
+];
+
+fn attach_status(result: &mut CallToolResult, class: OutcomeClass) {
+    result.meta.get_or_insert_with(Default::default).0.insert(
+        RESULT_STATUS_META_KEY.to_string(),
+        serde_json::to_value(ResultStatus::new(class))
+            .expect("ResultStatus must serialize to JSON"),
+    );
+}
+
 /// A typed `isError: true` refusal that names no repository (it judged none).
 fn refusal(text: String) -> CallToolResponse {
     let mut result = CallToolResult::error(vec![ContentBlock::text(text)]);
-    result.meta.get_or_insert_with(Default::default).0.insert(
-        RESULT_STATUS_META_KEY.to_string(),
-        serde_json::to_value(ResultStatus::new(OutcomeClass::InvalidRequest))
-            .expect("ResultStatus must serialize to JSON"),
-    );
+    attach_status(&mut result, OutcomeClass::InvalidRequest);
     CallToolResponse::Complete(result)
 }
 

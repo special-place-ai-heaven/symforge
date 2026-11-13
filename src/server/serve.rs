@@ -495,10 +495,12 @@ pub fn parse_project_spec(raw: &str) -> Result<ProjectSpec, String> {
     let Some((alias, path)) = raw.split_once('=') else {
         return Err(format!("--project {raw:?}: expected ALIAS=PATH"));
     };
-    let alias_problem = if alias.trim().is_empty() {
+    let alias_problem = if alias.is_empty() {
         Some("must not be empty")
-    } else if alias.trim() != alias {
-        Some("must not start or end with whitespace")
+    } else if alias.chars().any(char::is_whitespace) {
+        Some("must not contain whitespace")
+    } else if alias.contains(',') {
+        Some("must not contain a comma (aliases are listed comma-separated)")
     } else if alias.contains('/') || alias.contains('\\') {
         Some("must not contain / or \\ (an alias is a name, not a path)")
     } else if alias == "*" {
@@ -550,6 +552,42 @@ pub fn parse_project_specs(
         );
     }
     Ok(specs)
+}
+
+/// Refuse two `--project` roots that are equal (one state directory written
+/// twice) or nested (one repository reachable through another's alias).
+fn refuse_overlapping_roots(
+    bindings: &[(String, crate::domain::RootBinding)],
+) -> Result<(), ServeError> {
+    for (index, (alias, binding)) in bindings.iter().enumerate() {
+        for (other_alias, other) in &bindings[index + 1..] {
+            let (root, other_root) = (&binding.canonical_root, &other.canonical_root);
+            let problem = if root == other_root {
+                format!(
+                    "--project {alias} and {other_alias} name the same repository ({})",
+                    root.display()
+                )
+            } else if other_root.starts_with(root) {
+                format!(
+                    "--project {other_alias} ({}) is inside --project {alias} ({})",
+                    other_root.display(),
+                    root.display()
+                )
+            } else if root.starts_with(other_root) {
+                format!(
+                    "--project {alias} ({}) is inside --project {other_alias} ({})",
+                    root.display(),
+                    other_root.display()
+                )
+            } else {
+                continue;
+            };
+            return Err(ServeError::Projects(format!(
+                "{problem}; list repositories that neither equal nor contain each other"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Bind one `--project` path through the same authority `index_folder` uses
@@ -782,6 +820,16 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
         .iter()
         .map(|spec| bind_project_spec(spec).map(|binding| (spec.alias.clone(), binding)))
         .collect::<Result<Vec<_>, _>>()?;
+    refuse_overlapping_roots(&bindings)?;
+    if !bindings.is_empty() {
+        // Worktree rerouting on edit tools may not leave the listed roots.
+        crate::worktree::restrict_rerouting_to_serve_roots(
+            bindings
+                .iter()
+                .map(|(alias, binding)| (alias.clone(), binding.canonical_root.clone()))
+                .collect(),
+        );
+    }
 
     let phase = std::time::Instant::now();
     let loaded = if bindings.is_empty() {
@@ -1208,15 +1256,22 @@ mod tests {
         let spec = parse_project_spec(r"a=C:\work\x=y").expect("drive colon and = in the path");
         assert_eq!(spec.alias, "a");
         assert_eq!(spec.path, std::path::PathBuf::from(r"C:\work\x=y"));
-        let spec = parse_project_spec("my repo=/srv/x").expect("inner space is a name");
-        assert_eq!(spec.alias, "my repo");
         assert!(
             parse_project_spec(r"C:\work")
                 .expect_err("no =")
                 .contains("ALIAS=PATH")
         );
         for bad in [
-            "=p", " a=p", "a =p", "a/b=p", r"a\b=p", "*=p", "a=", "a\tb=p",
+            "=p",
+            " a=p",
+            "a =p",
+            "my repo=p",
+            "a,b=p",
+            "a/b=p",
+            r"a\b=p",
+            "*=p",
+            "a=",
+            "a\tb=p",
         ] {
             assert!(parse_project_spec(bad).is_err(), "{bad:?} must be refused");
         }

@@ -1436,10 +1436,14 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // `pub(crate)`; wording in `protocol/surface_probe.rs` and `protocol/tools.rs`. Calls
 // only into existing accessors (`data_plane().read()`, `published_state()`); no
 // index_lifecycle file touched, no bridge. 320 files.
+// #875 review round: worktree reroute limited to the serve roots (`worktree.rs`), the
+// facade relay allow-list check (`protocol/tools.rs`), root overlap refusal, typed and
+// argument-checked fan-out, server-level status view, prompt refusal and admin labels.
+// No index_lifecycle file touched; calls only, no bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "56e889ee2876bc010b301a1068e8657efe628b44549675a085f4b1d3b9ca8378",
+    "7cf95fa5411a9307b0169000797e9f2a51088532911b932f267704f99cff733b",
     320,
-    13034117,
+    13045042,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

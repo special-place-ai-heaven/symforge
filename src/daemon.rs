@@ -6959,37 +6959,6 @@ fn reject_unsupported_cross_project_scoping(
     Ok(())
 }
 
-/// #875: the `symforge serve` fan-out — the same dispatch the daemon read route
-/// performs for a cross-project read, over a working set and project indexes the
-/// caller built from its fixed repositories (every target already validated).
-pub(crate) fn serve_cross_project_read(
-    tool_name: &str,
-    params: serde_json::Value,
-    targets: Targets,
-    working_set: &WorkingSet,
-    project_indexes: &HashMap<
-        String,
-        crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle,
-    >,
-    ccr_server: &SymForgeServer,
-) -> anyhow::Result<String> {
-    match tool_name {
-        "search_knowledge" => execute_cross_project_knowledge(
-            decode_params::<SearchKnowledgeInput>(params)?,
-            targets,
-            project_indexes,
-            ccr_server,
-        ),
-        "review_knowledge" => execute_cross_project_review(
-            decode_params::<ReviewKnowledgeInput>(params)?,
-            targets,
-            project_indexes,
-            ccr_server,
-        ),
-        _ => execute_cross_project_read(tool_name, params, targets, working_set),
-    }
-}
-
 /// Feature 012 (Phase 3): execute one of the three cross-project READ verbs
 /// against the session's working set and format the attributed [`crate::live_index::view::ProjectHit`]
 /// results with `── project: <id> ──` section headers (flat, no header, when a
@@ -7011,12 +6980,15 @@ pub(crate) fn serve_cross_project_read(
 /// BOUNDED: a total-hit cap (caller `limit`, else
 /// [`CROSS_PROJECT_DEFAULT_RESULT_CAP`]) and the caller's optional `max_tokens`
 /// budget are applied by the formatters, which disclose any truncation.
-fn execute_cross_project_read(
+///
+/// The flag is whether any targeted project produced a hit, so a caller that
+/// types the answer (#875 `serve`) reads it from the search, not the text.
+pub(crate) fn execute_cross_project_read(
     tool_name: &str,
     params: serde_json::Value,
     targets: Targets,
     working_set: &WorkingSet,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, bool)> {
     ensure_targets_open(&targets, working_set).map_err(|message| anyhow::anyhow!("{message}"))?;
 
     // Honest refusal of the DEFERRED per-project derived-index scoping when
@@ -7050,7 +7022,10 @@ fn execute_cross_project_read(
             let cap = cross_project_result_cap(input.limit);
             let hits = working_set.search_symbols(&targets, query, input.kind.as_deref(), &options);
             let body = format_cross_project_symbols(&hits, query, multi, cap);
-            Ok(apply_cross_project_token_budget(body, input.max_tokens))
+            Ok((
+                apply_cross_project_token_budget(body, input.max_tokens),
+                !hits.is_empty(),
+            ))
         }
         "search_text" => {
             let input: SearchTextInput = decode_params(params)?;
@@ -7077,7 +7052,11 @@ fn execute_cross_project_read(
                 )
                 .map_err(|error| anyhow::anyhow!("text search failed: {error:?}"))?;
             let body = format_cross_project_text(&results, multi, cap);
-            Ok(apply_cross_project_token_budget(body, input.max_tokens))
+            let found = results.iter().any(|project| project.hit.total_matches > 0);
+            Ok((
+                apply_cross_project_token_budget(body, input.max_tokens),
+                found,
+            ))
         }
         "find_references" => {
             let input: FindReferencesInput = decode_params(params)?;
@@ -7096,7 +7075,10 @@ fn execute_cross_project_read(
             let cap = cross_project_result_cap(input.limit);
             let hits = working_set.find_references(&targets, name, kind_filter, false);
             let body = format_cross_project_references(&hits, name, multi, cap);
-            Ok(apply_cross_project_token_budget(body, input.max_tokens))
+            Ok((
+                apply_cross_project_token_budget(body, input.max_tokens),
+                !hits.is_empty(),
+            ))
         }
         "search_files" => {
             let input: SearchFilesInput = decode_params(params)?;
@@ -7124,7 +7106,10 @@ fn execute_cross_project_read(
                 &path_scope,
             );
             let body = format_cross_project_files(&hits, query, multi, cap);
-            Ok(apply_cross_project_token_budget(body, input.max_tokens))
+            Ok((
+                apply_cross_project_token_budget(body, input.max_tokens),
+                !hits.is_empty(),
+            ))
         }
         other => anyhow::bail!("'{other}' is not a cross-project read verb"),
     }
@@ -7652,7 +7637,8 @@ async fn execute_tool_call_decoded(
                 );
             }
             let working_set = runtime.working_set.read();
-            return execute_cross_project_read(tool_name, params, targets, &working_set);
+            return execute_cross_project_read(tool_name, params, targets, &working_set)
+                .map(|(text, _found)| text);
         }
         // else: single active project -> fall through to the unchanged path. The
         // worker is intentionally local-only and refuses any `project`/`projects`

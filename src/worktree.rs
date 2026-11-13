@@ -413,6 +413,41 @@ impl Default for WorktreeAwareEditHook {
     }
 }
 
+/// #875: the repositories a `symforge serve --project` process was started
+/// with, as `(alias, canonical root)`. Unset on every other surface.
+static FIXED_SERVE_ROOTS: OnceLock<Vec<(String, PathBuf)>> = OnceLock::new();
+
+/// Restrict worktree rerouting to the operator's `--project` roots. Called once
+/// by `serve` when it has `--project` entries; later calls are ignored.
+pub fn restrict_rerouting_to_serve_roots(roots: Vec<(String, PathBuf)>) {
+    let _ = FIXED_SERVE_ROOTS.set(roots);
+}
+
+/// A rerouted write must land in one of the fixed roots; the refusal names them.
+fn check_fixed_serve_root(
+    working_directory: &Path,
+    fixed: &[(String, PathBuf)],
+) -> Result<(), WorktreeError> {
+    let target_root = canonicalize_or_identity(working_directory);
+    if fixed
+        .iter()
+        .any(|(_, root)| canonicalize_or_identity(root) == target_root)
+    {
+        return Ok(());
+    }
+    let aliases = fixed
+        .iter()
+        .map(|(alias, _)| alias.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(WorktreeError::TargetPathRefused {
+        path: target_root,
+        reason: format!(
+            "this server writes only to the repositories the operator listed ({aliases});              omit working_directory or pass one of those roots"
+        ),
+    })
+}
+
 impl EditHook for WorktreeAwareEditHook {
     fn resolve_target_path(&self, ctx: &EditContext) -> Result<ResolvedTarget, String> {
         if let Some(cwd) = ctx.working_directory
@@ -427,13 +462,19 @@ impl EditHook for WorktreeAwareEditHook {
             .to_string());
         }
         let mut cache = self.cache.lock();
-        resolve_target_path(
+        let resolved = resolve_target_path(
             ctx.indexed_absolute_path,
             ctx.repo_root,
             ctx.working_directory,
             &mut cache,
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        if resolved.rerouted
+            && let (Some(fixed), Some(cwd)) = (FIXED_SERVE_ROOTS.get(), ctx.working_directory)
+        {
+            check_fixed_serve_root(cwd, fixed).map_err(|e| e.to_string())?;
+        }
+        Ok(resolved)
     }
 }
 
@@ -523,6 +564,21 @@ impl Default for WorktreeMisuseCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_serve_roots_admit_only_listed_roots() {
+        let listed = tempfile::TempDir::new().expect("listed root");
+        let other = tempfile::TempDir::new().expect("other root");
+        let fixed = vec![("a".to_string(), listed.path().to_path_buf())];
+        assert!(check_fixed_serve_root(listed.path(), &fixed).is_ok());
+        let refused = check_fixed_serve_root(other.path(), &fixed)
+            .expect_err("an unlisted worktree is refused")
+            .to_string();
+        assert!(
+            refused.starts_with("TargetPathRefused") && refused.contains("(a)"),
+            "{refused}"
+        );
+    }
     use std::fs;
 
     fn run_git(args: &[&str], cwd: &Path) {

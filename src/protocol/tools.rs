@@ -7938,6 +7938,14 @@ impl SymForgeServer {
                         "Phase 0 facade relay is restricted to the A-019 source-mutation-safe measurement allowlist; batch_rename additionally requires dry_run=true",
                     ));
             }
+            // #874: the relay runs another tool's handler, so that tool must be on this
+            // connection's allow-list too, as for `ask` routes and edit steps.
+            if let Some(refusal) =
+                super::surface_probe::allow_list_refusal(legacy_tool, Some("This relay"))
+            {
+                return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                    .into_call_tool_result(format!("Error: {refusal}")));
+            }
             // Feature 036: the relayed arguments pass the same request check as a direct
             // `tools/call` (unknown keys and mode rules), so an ignored argument cannot hide
             // behind the relay. A mode a lone argument selects is applied; the relay adds no
@@ -32376,6 +32384,47 @@ mod tests {
         assert!(
             serialized["_meta"][RESULT_STATUS_META_KEY].is_null(),
             "rendered legacy text is not a typed semantic status: {serialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn symforge_facade_probe_relay_obeys_the_tool_allow_list() {
+        use crate::protocol::surface_probe::SurfaceEnvVarGuard;
+        use crate::stel::{StelRequest, SymforgeCallInput};
+
+        let _tools = SurfaceEnvVarGuard::set("SYMFORGE_TOOLS", Some("symforge,get_file_content"));
+        let _surface = SurfaceEnvVarGuard::set("SYMFORGE_SURFACE", None);
+        let server = make_server(make_live_index_ready(Vec::new()));
+        let relay = |tool: &str, args: serde_json::Value| SymforgeCallInput {
+            request: StelRequest::default(),
+            probe_legacy_tool: Some(tool.to_string()),
+            probe_legacy_args: Some(args),
+        };
+
+        let withheld = server
+            .symforge_facade_tool(Parameters(relay(
+                "search_text",
+                serde_json::json!({"query": "x"}),
+            )))
+            .await
+            .expect("facade dispatch");
+        let withheld = serde_json::to_value(&withheld).expect("serialize");
+        let text = tool_result_text(&withheld);
+        assert!(
+            text.contains("not in this server's tool allow-list"),
+            "a withheld tool must be refused through the relay: {text}"
+        );
+        assert_eq!(withheld["isError"], serde_json::json!(true), "{withheld}");
+
+        let allowed = server
+            .symforge_facade_tool(Parameters(relay("get_file_content", serde_json::json!({}))))
+            .await
+            .expect("facade dispatch");
+        let allowed = serde_json::to_value(&allowed).expect("serialize");
+        let text = tool_result_text(&allowed);
+        assert!(
+            !text.contains("allow-list"),
+            "an allowed tool still reaches its handler: {text}"
         );
     }
 

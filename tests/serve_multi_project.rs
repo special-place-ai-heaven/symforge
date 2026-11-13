@@ -270,6 +270,8 @@ async fn startup_refuses_bad_project_lists() {
     let a = fixture_repo("alpha.rs", "alpha_only_fn");
     let b = fixture_repo("beta.rs", "beta_only_fn");
     let missing = a.path().join("does-not-exist");
+    let nested = a.path().join("inner");
+    std::fs::create_dir(&nested).expect("nested root");
     let cases: Vec<(Vec<String>, bool, &str)> = vec![
         (
             vec![spec("a", a.path()), spec("A", b.path())],
@@ -281,6 +283,18 @@ async fn startup_refuses_bad_project_lists() {
         (vec![spec("*", a.path())], false, "alias"),
         (vec![spec("", a.path())], false, "alias"),
         (vec![spec(" a", a.path())], false, "alias"),
+        (vec![spec("my repo", a.path())], false, "whitespace"),
+        (vec![spec("a,b", a.path())], false, "comma"),
+        (
+            vec![spec("a", a.path()), spec("b", a.path())],
+            false,
+            "same repository",
+        ),
+        (
+            vec![spec("a", a.path()), spec("inner", &nested)],
+            false,
+            "is inside",
+        ),
         (vec![a.path().display().to_string()], false, "ALIAS=PATH"),
         (vec![spec("a", &missing)], false, "does not exist"),
         (
@@ -314,6 +328,13 @@ async fn resource_reads_route_by_project_or_list_the_aliases() {
         .as_str()
         .unwrap_or_else(|| panic!("routed read: {routed}"));
     assert!(text.contains("beta_only_fn"), "{text}");
+    let echoed = routed["result"]["contents"][0]["uri"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        echoed.contains("project=b"),
+        "the reply keeps ?project=: {echoed}"
+    );
 
     // The same file does not exist in repository a.
     let elsewhere = rpc(
@@ -387,16 +408,142 @@ async fn projects_fan_out_answers_from_every_listed_repository() {
         "{unknown}"
     );
 
-    let (unsupported, is_error) = call(
+    for (tool, arguments) in [
+        ("get_repo_map", serde_json::json!({"projects": ["a", "b"]})),
+        (
+            "search_knowledge",
+            serde_json::json!({"query": "x", "projects": ["a", "b"]}),
+        ),
+    ] {
+        let (unsupported, is_error) = call(url, tool, arguments).await;
+        assert!(
+            is_error && unsupported.contains("pass project"),
+            "{tool}: {unsupported}"
+        );
+    }
+
+    // Fan-out answers are typed and checked like any other call.
+    let response = rpc(
         url,
-        "get_repo_map",
-        serde_json::json!({"projects": ["a", "b"]}),
+        "tools/call",
+        serde_json::json!({"name": "search_symbols",
+            "arguments": {"query": "only_fn", "projects": ["*"]}}),
+    )
+    .await;
+    assert_eq!(
+        response["result"]["_meta"]["symforge/result_status"]["outcome_class"],
+        serde_json::json!("found"),
+        "{response}"
+    );
+    let (bad_argument, is_error) = call(
+        url,
+        "search_symbols",
+        serde_json::json!({"query": "only_fn", "projects": ["*"], "no_such_argument": 1}),
     )
     .await;
     assert!(
-        is_error && unsupported.contains("pass project"),
-        "{unsupported}"
+        is_error,
+        "an unknown argument is refused on fan-out too: {bad_argument}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aliases_match_case_insensitively() {
+    let repos = two_repos().await;
+    let (text, is_error) = call(
+        &repos.served.url,
+        "search_symbols",
+        serde_json::json!({"query": "beta_only_fn", "project": "B"}),
+    )
+    .await;
+    assert!(!is_error && text.contains("beta_only_fn"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prompts_are_refused_on_several_repositories() {
+    let repos = two_repos().await;
+    let url = &repos.served.url;
+    let listed = rpc(url, "prompts/list", serde_json::json!({})).await;
+    assert_eq!(
+        listed["result"]["prompts"],
+        serde_json::json!([]),
+        "{listed}"
+    );
+    let got = rpc(
+        url,
+        "prompts/get",
+        serde_json::json!({"name": "symforge-review", "arguments": {}}),
+    )
+    .await;
+    let message = got["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("prompts/get must be refused: {got}"));
+    assert!(message.contains("a, b"), "{message}");
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let status = symforge::process_util::hidden_command("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .status()
+        .expect("git runs");
+    assert!(status.success(), "git {args:?} failed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn edits_cannot_reroute_into_an_unlisted_worktree() {
+    let base = tempfile::TempDir::new().expect("base");
+    let a = base.path().join("a");
+    let b = fixture_repo("beta.rs", "beta_only_fn");
+    std::fs::create_dir(&a).expect("repo a");
+    std::fs::write(a.join("alpha.rs"), "pub fn alpha_only_fn() {}\n").expect("seed");
+    git(&a, &["init", "-q"]);
+    git(&a, &["add", "."]);
+    git(&a, &["commit", "-q", "-m", "seed"]);
+    let worktree = base.path().join("unlisted");
+    git(
+        &a,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "side",
+            &worktree.display().to_string(),
+        ],
+    );
+    let before = std::fs::read(worktree.join("alpha.rs")).expect("worktree file");
+    let served = start(args(vec![spec("a", &a), spec("b", b.path())], false)).await;
+
+    let (text, is_error) = call(
+        &served.url,
+        "edit_within_symbol",
+        serde_json::json!({
+            "project": "a",
+            "path": "alpha.rs",
+            "name": "alpha_only_fn",
+            "old_text": "{}",
+            "new_text": "{ }",
+            "working_directory": worktree.display().to_string(),
+        }),
+    )
+    .await;
+    assert!(is_error, "an unlisted worktree must be refused: {text}");
+    assert!(
+        text.contains("TargetPathRefused") && text.contains("(a, b)"),
+        "{text}"
+    );
+    let after = std::fs::read(worktree.join("alpha.rs")).expect("worktree file");
+    assert_eq!(after, before, "the unlisted worktree is unchanged");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -404,14 +551,19 @@ async fn status_and_health_name_the_served_repositories() {
     let repos = two_repos().await;
     let url = &repos.served.url;
 
-    let (inventory, is_error) =
-        call(url, "status", serde_json::json!({"detail": "projects"})).await;
-    assert!(!is_error, "{inventory}");
-    assert!(
-        inventory.contains("name=a ") && inventory.contains("name=b "),
-        "{inventory}"
-    );
-    assert!(inventory.contains("watcher="), "{inventory}");
+    for tool in ["status", "health", "health_compact"] {
+        let (view, is_error) = call(url, tool, serde_json::json!({})).await;
+        assert!(!is_error, "{tool}: {view}");
+        assert!(
+            view.contains("name=a ") && view.contains("name=b "),
+            "{tool}: {view}"
+        );
+        assert!(
+            view.contains("index=ready") && view.contains("watcher="),
+            "{tool}: {view}"
+        );
+        assert!(view.contains("Pass project=ALIAS"), "{tool}: {view}");
+    }
 
     let (health, is_error) = call(url, "health", serde_json::json!({"project": "b"})).await;
     assert!(!is_error, "{health}");
