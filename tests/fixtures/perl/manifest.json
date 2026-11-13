@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "grammar": "ts-parser-perl 1.1.3",
+  "grammar": "ts-parser-perl 2.0.6",
   "fixtures": [
     {
       "file": "sub_greet.pl",
@@ -193,6 +193,22 @@
       ],
       "refs": [
         { "kind": "Call", "name": "compute", "qualified_name": "SUPER::compute" }
+      ]
+    },
+    {
+      "file": "parenthesized_expr.pl",
+      "construct_classes": ["package", "sub", "parenthesized_expression"],
+      "parse_expect": "clean",
+      "symbols": [
+        { "kind": "Module", "name": "Calc" },
+        { "kind": "Function", "name": "total" }
+      ],
+      "refs": [
+        { "kind": "Call", "name": "helper" },
+        { "kind": "Call", "name": "scale" },
+        { "kind": "Call", "name": "valid" },
+        { "kind": "Call", "name": "cb" },
+        { "kind": "Call", "name": "round", "qualified_name": "Calc::Util::round" }
       ]
     }
   ]

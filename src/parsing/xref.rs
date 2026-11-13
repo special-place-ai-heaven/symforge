@@ -3465,6 +3465,39 @@ public class PacketsController
         );
     }
 
+    /// ts-parser-perl 2.0 wraps `( ... )` in `parenthesized_expression`; calls
+    /// nested inside it must still surface, and the source must parse clean.
+    #[test]
+    fn test_perl_calls_inside_parenthesized_expressions() {
+        let source = "my $sum = (helper(1) + $self->scale());\n\
+                      my $ok = (valid($sum) && ($cb->()));\n\
+                      return (Calc::Util::round($sum));";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_perl::LANGUAGE.into())
+            .expect("set perl language");
+        let tree = parser.parse(source, None).expect("parse");
+        let sexp = tree.root_node().to_sexp();
+        assert!(
+            !tree.root_node().has_error(),
+            "parenthesized expressions should parse clean: {sexp}"
+        );
+        assert!(
+            sexp.contains("parenthesized_expression"),
+            "fixture must exercise the 2.0 parenthesized_expression node: {sexp}"
+        );
+
+        let (refs, _) = parse_and_extract(source, LanguageId::Perl);
+        for name in ["helper", "scale", "valid", "cb", "round"] {
+            assert!(
+                has_ref(&refs, name, ReferenceKind::Call),
+                "should capture {name} inside parentheses, refs: {refs:?}"
+            );
+        }
+        let round = find_ref(&refs, "round").expect("round ref");
+        assert_eq!(round.qualified_name.as_deref(), Some("Calc::Util::round"));
+    }
+
     /// A deliberately-malformed query must degrade to `None` (logged + cached),
     /// never panic. This is the panic-hardening contract of `compile_xref_query`.
     #[test]

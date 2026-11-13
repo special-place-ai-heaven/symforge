@@ -1028,11 +1028,7 @@ fn is_non_source_path(path: &str) -> bool {
         "/node_modules/",
         "/.git/",
     ];
-    if non_source_dirs.iter().any(|dir| p.contains(dir)) {
-        return true;
-    }
-
-    false
+    non_source_dirs.iter().any(|dir| p.contains(dir))
 }
 
 /// True when a Grep pattern is a bare code identifier worth a symbol lookup.

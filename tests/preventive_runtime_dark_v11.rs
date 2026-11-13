@@ -1465,10 +1465,14 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Embed close phase: `index_lifecycle/embedded.rs` gains a private inherent method that
 // maps a pre-close phase to Stopping once the handle's `closed` flag is set, called from
 // `wait_for_change` and the bound `runtime_view`. No new edge, no bridge. 320 files.
+// Rust 1.100 toolchain: two `needless_bool` tails in `cli/hook.rs` and `discovery/mod.rs`
+// become plain expressions, two Perl comments are reworded, and `xref.rs` gains a
+// test for calls inside parenthesized expressions. No index_lifecycle file touched,
+// no bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "25f5a10c55a20af424fb4972406dc49833bdc699980bc5a3903ef7cee925e9b8",
+    "d52bb9961294db834b741ca5acc17e611bace88cea05c168e3bf88fdbda76a14",
     320,
-    13077777,
+    13079145,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

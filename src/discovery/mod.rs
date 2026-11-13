@@ -2808,11 +2808,7 @@ fn is_binary_content_sample(content: &[u8], file_size: u64) -> bool {
         .filter(|&&b| matches!(b, 0x01..=0x08 | 0x0E..=0x1F | 0x7F))
         .count();
     let ratio = suspicious_controls as f64 / window.len() as f64;
-    if ratio > 0.30 {
-        return true;
-    }
-
-    false
+    ratio > 0.30
 }
 
 use crate::domain::index::{

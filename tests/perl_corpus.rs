@@ -225,7 +225,7 @@ fn bench_corpus_parse_metrics() {
             "error_count": error,
             "measured_at": chrono::Utc::now().to_rfc3339(),
             "symforge_version": env!("CARGO_PKG_VERSION"),
-            "grammar_version": "ts-parser-perl 1.1.3"
+            "grammar_version": "ts-parser-perl 2.0.6"
         });
         let out = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("docs/research/perl/corpus-metrics.json");
