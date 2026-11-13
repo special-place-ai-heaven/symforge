@@ -128,6 +128,7 @@ async fn non_loopback_without_key_refuses_to_start() {
         api_key_env: None,
         bound_addr_tx: None,
         workspace_root: None,
+        ..ServeArgs::default()
     };
     let err = run(args)
         .await

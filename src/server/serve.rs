@@ -73,6 +73,12 @@ pub struct ServeArgs {
     /// which on a large repository or a slow runner exceeds the start deadline
     /// even though nothing under test involves the index's contents.
     pub workspace_root: Option<std::path::PathBuf>,
+    /// `--project ALIAS=PATH` entries (#875), as given; `run` validates them
+    /// before binding. Empty keeps the one-repository behaviour above.
+    pub projects: Vec<String>,
+    /// `--allow-index-folder` (#875): let clients call `index_folder`. Startup
+    /// refuses it beside several `--project` entries.
+    pub allow_index_folder: bool,
 }
 
 impl Default for ServeArgs {
@@ -84,6 +90,8 @@ impl Default for ServeArgs {
             api_key_env: None,
             bound_addr_tx: None,
             workspace_root: None,
+            projects: Vec::new(),
+            allow_index_folder: false,
         }
     }
 }
@@ -316,6 +324,10 @@ pub enum ServeError {
     /// is not available, or conflicts with `SYMFORGE_SURFACE` (#874).
     #[error("{0}")]
     ToolAllowList(String),
+    /// A `--project` entry (or `--allow-index-folder` beside several) is invalid
+    /// (#875). Refused before binding, never served as an empty index.
+    #[error("{0}")]
+    Projects(String),
     /// The socket could not be bound (e.g. address already in use).
     #[error("failed to bind {addr}: {source}")]
     Bind {
@@ -346,8 +358,9 @@ pub enum ServeError {
 /// and a background verification pass reconciling against current disk state.
 /// Only when no usable snapshot exists does serve pay the synchronous cold
 /// `LiveIndex::load` it always paid. When no safe root is found, serves over
-/// an empty index — `tools/list` still responds, and the operator can
-/// `index_folder` after attaching.
+/// an empty index — `tools/list` still responds; a client may `index_folder`
+/// after attaching only when the operator passed `--allow-index-folder` (#875).
+/// An explicit `--project` root never takes this path: it refuses instead.
 ///
 /// The fourth tuple element carries the snapshot's mtime map when the fast
 /// path was taken; the caller spawns `persist::background_verify` with it
@@ -370,139 +383,342 @@ fn load_serve_index(
         Some(root) => Some(root.to_path_buf()),
         None => crate::discovery::find_project_root(),
     };
-    match discovered {
-        Some(root) => {
-            let RootResolution::Bound(binding) = crate::discovery::resolve_root_candidate(
-                &root,
-                RootCandidateSource::LaunchCwd,
-                RootRequestMode::Automatic,
-            ) else {
-                return Ok((LiveIndex::empty(), None, None, None, None));
-            };
-            let state_placement = crate::discovery::resolve_state_placement(&binding);
-            let root = binding.canonical_root;
-            let admission = crate::live_index::index_lifecycle::activation::admit_project(
-                crate::live_index::index_lifecycle::process_runtime::SurfaceKind::Serve,
-                &root,
-                &binding.root_id.0,
-                binding.access_mode,
-                &state_placement,
-            )
-            .map_err(|refusal| ServeError::IndexLoad {
-                source: anyhow::anyhow!("project admission refused: {refusal:?}"),
-            })?;
-            let source_authority =
-                crate::live_index::index_lifecycle::activation::project_source_authority(&root);
-            let admitted_physical_root = admission
-                .binding()
-                .map_err(|refusal| ServeError::IndexLoad {
-                    source: anyhow::anyhow!("project admission retired: {refusal:?}"),
-                })?
-                .physical_root();
-            if source_authority.admission_binding().physical_root() != admitted_physical_root {
-                return Err(ServeError::IndexLoad {
-                    source: anyhow::anyhow!(
-                        "admitted serve source changed before snapshot restore"
-                    ),
-                });
-            }
+    let Some(root) = discovered else {
+        return Ok((LiveIndex::empty(), None, None, None, None));
+    };
+    let RootResolution::Bound(binding) = crate::discovery::resolve_root_candidate(
+        &root,
+        RootCandidateSource::LaunchCwd,
+        RootRequestMode::Automatic,
+    ) else {
+        return Ok((LiveIndex::empty(), None, None, None, None));
+    };
+    load_bound_serve_index(binding)
+}
 
-            // Fast path: rehydrate the persisted snapshot (staleness-gated
-            // inside `load_snapshot`) instead of re-parsing the tree.
-            if let Some(snapshot) = crate::live_index::persist::load_snapshot_bound(
+/// Load one already-bound root for serving (snapshot first, else cold).
+fn load_bound_serve_index(
+    binding: crate::domain::RootBinding,
+) -> Result<LoadedServeIndex, ServeError> {
+    let state_placement = crate::discovery::resolve_state_placement(&binding);
+    let root = binding.canonical_root;
+    let admission = crate::live_index::index_lifecycle::activation::admit_project(
+        crate::live_index::index_lifecycle::process_runtime::SurfaceKind::Serve,
+        &root,
+        &binding.root_id.0,
+        binding.access_mode,
+        &state_placement,
+    )
+    .map_err(|refusal| ServeError::IndexLoad {
+        source: anyhow::anyhow!("project admission refused: {refusal:?}"),
+    })?;
+    let source_authority =
+        crate::live_index::index_lifecycle::activation::project_source_authority(&root);
+    let admitted_physical_root = admission
+        .binding()
+        .map_err(|refusal| ServeError::IndexLoad {
+            source: anyhow::anyhow!("project admission retired: {refusal:?}"),
+        })?
+        .physical_root();
+    if source_authority.admission_binding().physical_root() != admitted_physical_root {
+        return Err(ServeError::IndexLoad {
+            source: anyhow::anyhow!("admitted serve source changed before snapshot restore"),
+        });
+    }
+
+    // Fast path: rehydrate the persisted snapshot (staleness-gated
+    // inside `load_snapshot`) instead of re-parsing the tree.
+    if let Some(snapshot) =
+        crate::live_index::persist::load_snapshot_bound(&root, &state_placement, &source_authority)
+            .map_err(|refusal| ServeError::IndexLoad {
+                source: anyhow::anyhow!("admitted snapshot load refused: {refusal:?}"),
+            })?
+    {
+        let file_count = snapshot.files.len();
+        let snapshot_mtimes: std::collections::HashMap<String, u64> = snapshot
+            .files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.mtime_secs))
+            .collect();
+        let (live, code_signals) =
+            crate::live_index::persist::snapshot_to_live_index_with_code_signals_bound(
+                snapshot,
                 &root,
-                &state_placement,
                 &source_authority,
             )
             .map_err(|refusal| ServeError::IndexLoad {
-                source: anyhow::anyhow!("admitted snapshot load refused: {refusal:?}"),
-            })? {
-                let file_count = snapshot.files.len();
-                let snapshot_mtimes: std::collections::HashMap<String, u64> = snapshot
-                    .files
-                    .iter()
-                    .map(|(path, file)| (path.clone(), file.mtime_secs))
-                    .collect();
-                let (live, code_signals) =
-                    crate::live_index::persist::snapshot_to_live_index_with_code_signals_bound(
-                        snapshot,
-                        &root,
-                        &source_authority,
-                    )
-                    .map_err(|refusal| ServeError::IndexLoad {
-                        source: anyhow::anyhow!("admitted snapshot source refused: {refusal:?}"),
-                    })?;
-                tracing::info!(
-                    files = file_count,
-                    load_source = ?live.load_source(),
-                    snapshot_verify_state = ?live.snapshot_verify_state(),
-                    "serve: loaded serialized index from .symforge/index.bin"
-                );
-                let shared = crate::live_index::SharedIndexHandle::shared_restored_for_state_placement_with_code_signals(
-                    live,
-                    &root,
-                    &state_placement,
-                    code_signals,
-                );
-                return Ok((
-                    shared,
-                    Some(root),
-                    Some(state_placement),
-                    Some(snapshot_mtimes),
-                    Some(source_authority),
-                ));
-            }
+                source: anyhow::anyhow!("admitted snapshot source refused: {refusal:?}"),
+            })?;
+        tracing::info!(
+            files = file_count,
+            load_source = ?live.load_source(),
+            snapshot_verify_state = ?live.snapshot_verify_state(),
+            "serve: loaded serialized index from .symforge/index.bin"
+        );
+        let shared = crate::live_index::SharedIndexHandle::shared_restored_for_state_placement_with_code_signals(
+            live,
+            &root,
+            &state_placement,
+            code_signals,
+        );
+        return Ok((
+            shared,
+            Some(root),
+            Some(state_placement),
+            Some(snapshot_mtimes),
+            Some(source_authority),
+        ));
+    }
 
-            let index = LiveIndex::load_for_state_placement(&root, &state_placement)
-                .map_err(|source| ServeError::IndexLoad { source })?;
-            Ok((
-                index,
-                Some(root),
-                Some(state_placement),
-                None,
-                Some(source_authority),
-            ))
+    let index = LiveIndex::load_for_state_placement(&root, &state_placement)
+        .map_err(|source| ServeError::IndexLoad { source })?;
+    Ok((
+        index,
+        Some(root),
+        Some(state_placement),
+        None,
+        Some(source_authority),
+    ))
+}
+
+/// One validated `--project ALIAS=PATH` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSpec {
+    pub alias: String,
+    pub path: std::path::PathBuf,
+}
+
+/// Parse one `--project` value. The alias ends at the FIRST `=`, so a path may
+/// itself contain `=` (and a Windows drive colon). The alias follows the
+/// daemon's selector rules: a name, never a path and never the `*` wildcard.
+pub fn parse_project_spec(raw: &str) -> Result<ProjectSpec, String> {
+    let Some((alias, path)) = raw.split_once('=') else {
+        return Err(format!("--project {raw:?}: expected ALIAS=PATH"));
+    };
+    let alias_problem = if alias.is_empty() {
+        Some("must not be empty")
+    } else if alias.chars().any(char::is_whitespace) {
+        Some("must not contain whitespace")
+    } else if alias.contains(',') {
+        Some("must not contain a comma (aliases are listed comma-separated)")
+    } else if alias.contains('/') || alias.contains('\\') {
+        Some("must not contain / or \\ (an alias is a name, not a path)")
+    } else if alias == "*" {
+        Some("must not be * (it selects every project)")
+    } else if alias.chars().any(char::is_control) {
+        Some("must not contain control characters")
+    } else {
+        None
+    };
+    if let Some(problem) = alias_problem {
+        return Err(format!("--project {raw:?}: the alias {problem}"));
+    }
+    if path.is_empty() {
+        return Err(format!(
+            "--project {raw:?}: expected ALIAS=PATH, PATH is empty"
+        ));
+    }
+    Ok(ProjectSpec {
+        alias: alias.to_string(),
+        path: std::path::PathBuf::from(path),
+    })
+}
+
+/// Validate the whole `--project` list: every entry parses, aliases are unique
+/// case-insensitively, and `--allow-index-folder` stays single-repository.
+pub fn parse_project_specs(
+    raw: &[String],
+    allow_index_folder: bool,
+) -> Result<Vec<ProjectSpec>, String> {
+    let specs = raw
+        .iter()
+        .map(|entry| parse_project_spec(entry))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut seen = std::collections::HashSet::new();
+    if let Some(duplicate) = specs
+        .iter()
+        .find(|spec| !seen.insert(spec.alias.to_lowercase()))
+    {
+        return Err(format!(
+            "--project: duplicate alias {:?} (aliases are compared case-insensitively)",
+            duplicate.alias
+        ));
+    }
+    if allow_index_folder && specs.len() > 1 {
+        return Err(
+            "--allow-index-folder lets a client replace the served repository, so it is only \
+             accepted with at most one --project entry"
+                .to_string(),
+        );
+    }
+    Ok(specs)
+}
+
+/// Refuse two `--project` roots that are equal (one state directory written
+/// twice) or nested (one repository reachable through another's alias).
+fn refuse_overlapping_roots(
+    bindings: &[(String, crate::domain::RootBinding)],
+) -> Result<(), ServeError> {
+    for (index, (alias, binding)) in bindings.iter().enumerate() {
+        for (other_alias, other) in &bindings[index + 1..] {
+            let (root, other_root) = (&binding.canonical_root, &other.canonical_root);
+            let problem = if root == other_root {
+                format!(
+                    "--project {alias} and {other_alias} name the same repository ({})",
+                    root.display()
+                )
+            } else if other_root.starts_with(root) {
+                format!(
+                    "--project {other_alias} ({}) is inside --project {alias} ({})",
+                    other_root.display(),
+                    root.display()
+                )
+            } else if root.starts_with(other_root) {
+                format!(
+                    "--project {alias} ({}) is inside --project {other_alias} ({})",
+                    root.display(),
+                    other_root.display()
+                )
+            } else {
+                continue;
+            };
+            return Err(ServeError::Projects(format!(
+                "{problem}; list repositories that neither equal nor contain each other"
+            )));
         }
-        None => Ok((LiveIndex::empty(), None, None, None, None)),
+    }
+    Ok(())
+}
+
+/// Bind one `--project` path through the same authority `index_folder` uses
+/// (protected roots need operator configuration). Refuses, never empties.
+fn bind_project_spec(spec: &ProjectSpec) -> Result<crate::domain::RootBinding, ServeError> {
+    let refuse = |why: String| {
+        ServeError::Projects(format!(
+            "--project {}={}: {why}",
+            spec.alias,
+            spec.path.display()
+        ))
+    };
+    match crate::protocol::tools::resolve_explicit_index_folder_root(&spec.path) {
+        RootResolution::Bound(binding) => Ok(binding),
+        RootResolution::Unbound { reason, .. } => Err(refuse(match reason {
+            crate::domain::UnboundReason::Refused(_) if !spec.path.exists() => {
+                "the path does not exist".to_string()
+            }
+            crate::domain::UnboundReason::Refused(reason) => {
+                format!("the path cannot be served ({})", reason.code())
+            }
+            other => format!("the path cannot be served ({other:?})"),
+        })),
     }
 }
 
-/// Construct the [`ServerRuntime`] from a resolved index + auth config.
+/// Construct the [`ServerRuntime`] over every loaded repository (#875).
 ///
-/// Builds the **same** [`SymForgeServer`] the stdio path constructs (one shared
-/// dispatcher, no logic fork), a default [`RequestGovernor`], and opens the
-/// durable STEL [`StelLedgerStore`] under the project's symforge data dir. If the
-/// store cannot open it degrades to [`StelLedgerStore::Disabled`] (serving
-/// continues — FR-011). When there is no project root the ledger store is left
-/// `None` (no data dir to anchor it).
+/// Builds one [`SymForgeServer`] per repository through [`build_repo_server`]
+/// (the same dispatcher stdio constructs, no logic fork), puts them in the
+/// `/mcp` routing registry, and adds a default [`RequestGovernor`]. The runtime
+/// ledger summary and the API-key store belong to the first listed repository.
+fn build_serve_runtime(
+    repos: Vec<LoadedRepo>,
+    allow_index_folder: bool,
+    fixed_roots: Option<crate::worktree::ServeRoots>,
+    auth: AuthConfig,
+) -> ServerRuntime {
+    // #875: the first listed repository also owns the process-level stores: the
+    // runtime's ledger summary and the hashed API-key store open under ITS
+    // state dir. Every repository keeps its own index, watcher, ledger and
+    // knowledge state; nothing below is shared between entries.
+    let first_index = Arc::clone(&repos[0].index);
+    let first_state_dir = repos[0]
+        .state_placement
+        .as_ref()
+        .and_then(|placement| placement.directory())
+        .cloned();
+    let mut served = Vec::with_capacity(repos.len());
+    let mut first_ledger = None;
+    for repo in repos {
+        let (server, ledger) = build_repo_server(repo);
+        if first_ledger.is_none() {
+            first_ledger = Some(ledger);
+        }
+        served.push(server);
+    }
+
+    // 006 G-039: the hashed product API-key store shares the exact same typed
+    // project state owner. It cannot reconstruct placement from the source root.
+    let phase = std::time::Instant::now();
+    let key_store: Option<Arc<ApiKeyStore>> = first_state_dir
+        .as_ref()
+        .map(|state_dir| Arc::new(ApiKeyStore::open(state_dir)));
+    tracing::info!("serve: runtime/key store in {:?}", phase.elapsed());
+
+    // `/mcp` dispatches through a clone of the first repository's server that
+    // carries the registry; clones share every `Arc`, so a one-repository serve
+    // answers exactly as it did before routing existed.
+    let mut front = served[0].server.clone();
+    front.serve_projects = Some(Arc::new(
+        crate::protocol::serve_projects::ServeProjects::new(
+            served,
+            allow_index_folder,
+            fixed_roots,
+        ),
+    ));
+    let protocol = Arc::new(front);
+    // P2-F (resolved): the governor is now consulted on the `/mcp` HTTP path.
+    // `mcp_http::build_mcp_router` wraps the route with `apply_governor`, which
+    // acquires one concurrency permit per request from this shared governor and
+    // releases it on completion — bounding concurrent operator clients to
+    // `max_concurrency` (queued/shed with 503 beyond that). No longer dead.
+    let governor = Arc::new(RequestGovernor::new());
+
+    // The runtime holds a clone of the same underlying store (the `Sqlite`
+    // variant shares its `Arc<Mutex<Connection>>`), so `status`'s `summary()`
+    // observes exactly the rows the dispatcher wrote — surviving restart.
+    let runtime_store = first_ledger.flatten().map(|store| (*store).clone());
+
+    let phase = std::time::Instant::now();
+    let mut runtime =
+        ServerRuntime::build_runtime(first_index, protocol, governor, auth, runtime_store);
+    if let Some(store) = key_store {
+        runtime = runtime.with_key_store(store);
+    }
+    tracing::info!("serve: runtime/server runtime in {:?}", phase.elapsed());
+    runtime
+}
+
+/// One loaded repository, before its server is built.
+struct LoadedRepo {
+    alias: String,
+    index: SharedIndex,
+    repo_root: Option<std::path::PathBuf>,
+    state_placement: Option<StatePlacement>,
+}
+
+/// Build one repository's [`SymForgeServer`] — the same dispatcher stdio uses —
+/// with its own durable ledger, and start its file watcher.
 ///
 /// US3/T028+T029: the durable store is opened **before** the protocol
 /// dispatcher so the same `Arc<StelLedgerStore>` is shared into both the
 /// dispatcher (write-through on each `symforge`/`symforge_edit` invocation via
 /// `finalize_symforge_with_ledger`) and the [`ServerRuntime`] (read path for
 /// the `status` summary). One physical store = one durable ledger path, so no
-/// economics row is counted twice across the in-memory and durable sinks.
-fn build_serve_runtime(
-    index: SharedIndex,
-    repo_root: Option<std::path::PathBuf>,
-    state_placement: Option<StatePlacement>,
-    auth: AuthConfig,
-) -> ServerRuntime {
-    let project_name = repo_root
-        .as_ref()
-        .and_then(|root| root.file_name())
-        .and_then(|name| name.to_str())
-        .unwrap_or("project")
-        .to_string();
-
-    // US3: open the durable economics ledger under the resolved project state
-    // owner FIRST,
-    // so the opened handle can be shared with both the dispatcher and the
-    // runtime. A failure here degrades to Disabled inside `StelLedgerStore::open`,
-    // so the server still starts (FR-011).
-    // A dir/open failure degrades to `Disabled` inside `open` (logged, never
-    // panics), so the server still starts (FR-011).
-    let project_state_dir = state_placement
+/// economics row is counted twice across the in-memory and durable sinks. A
+/// store that cannot open degrades to `Disabled` inside `open` (FR-011).
+///
+/// #875: a client can no longer start a watcher through `index_folder`, so
+/// serve starts one per bound repository here. A watch that cannot register is
+/// latched `Degraded` by the watcher task and `health` for that repository
+/// reports it; a repository with no root has none and reports `off`.
+fn build_repo_server(
+    repo: LoadedRepo,
+) -> (
+    crate::protocol::serve_projects::ServedRepo,
+    Option<Arc<StelLedgerStore>>,
+) {
+    let project_state_dir = repo
+        .state_placement
         .as_ref()
         .and_then(|placement| placement.directory());
     // Sub-phase timings. `serve: runtime built in` measures 2.8s on a
@@ -523,49 +739,34 @@ fn build_serve_runtime(
     });
     tracing::info!("serve: runtime/ledger store in {:?}", phase.elapsed());
 
-    // 006 G-039: the hashed product API-key store shares the exact same typed
-    // project state owner. It cannot reconstruct placement from the source root.
-    let phase = std::time::Instant::now();
-    let key_store: Option<Arc<ApiKeyStore>> =
-        project_state_dir.map(|state_dir| Arc::new(ApiKeyStore::open(state_dir)));
-    tracing::info!("serve: runtime/key store in {:?}", phase.elapsed());
-
     let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
     let phase = std::time::Instant::now();
-    let mut protocol = SymForgeServer::new_with_state_placement(
-        Arc::clone(&index),
-        project_name,
-        watcher_info,
-        repo_root.clone(),
-        state_placement,
+    let mut server = SymForgeServer::new_with_state_placement(
+        Arc::clone(&repo.index),
+        repo.alias.clone(),
+        Arc::clone(&watcher_info),
+        repo.repo_root.clone(),
+        repo.state_placement,
         None,
     );
     tracing::info!("serve: runtime/protocol server in {:?}", phase.elapsed());
     // Share the SAME store allocation with the dispatcher so durable
     // write-through (T028) and the runtime summary read (T029) use one path.
     if let Some(store) = ledger_store.as_ref() {
-        protocol = protocol.with_stel_ledger_store(Arc::clone(store));
+        server = server.with_stel_ledger_store(Arc::clone(store));
     }
-    let protocol = Arc::new(protocol);
-    // P2-F (resolved): the governor is now consulted on the `/mcp` HTTP path.
-    // `mcp_http::build_mcp_router` wraps the route with `apply_governor`, which
-    // acquires one concurrency permit per request from this shared governor and
-    // releases it on completion — bounding concurrent operator clients to
-    // `max_concurrency` (queued/shed with 503 beyond that). No longer dead.
-    let governor = Arc::new(RequestGovernor::new());
-
-    // The runtime holds a clone of the same underlying store (the `Sqlite`
-    // variant shares its `Arc<Mutex<Connection>>`), so `status`'s `summary()`
-    // observes exactly the rows the dispatcher wrote — surviving restart.
-    let runtime_store = ledger_store.map(|store| (*store).clone());
-
-    let phase = std::time::Instant::now();
-    let mut runtime = ServerRuntime::build_runtime(index, protocol, governor, auth, runtime_store);
-    if let Some(store) = key_store {
-        runtime = runtime.with_key_store(store);
+    if let Some(root) = repo.repo_root {
+        let handle = crate::watcher::restart_watcher(root, repo.index, watcher_info, None);
+        // Held where `index_folder` looks for it, so an allowed replace stops it.
+        server.watcher_handle.lock().replace(handle);
     }
-    tracing::info!("serve: runtime/server runtime in {:?}", phase.elapsed());
-    runtime
+    (
+        crate::protocol::serve_projects::ServedRepo {
+            alias: repo.alias,
+            server,
+        },
+        ledger_store,
+    )
 }
 
 /// `symforge serve` entrypoint (US1 — `/mcp` over Streamable HTTP).
@@ -616,27 +817,70 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     // gap between "LiveIndex loaded" and "listening" was measured at more than
     // the load itself on this repo, and an unattributed slow phase is exactly
     // what let the load-duration under-report go unnoticed.
+    // #875: every `--project` entry is validated and bound before anything
+    // loads; a bad entry refuses the start instead of serving an empty index.
+    let specs = parse_project_specs(&args.projects, args.allow_index_folder)
+        .map_err(ServeError::Projects)?;
+    let bindings = specs
+        .iter()
+        .map(|spec| bind_project_spec(spec).map(|binding| (spec.alias.clone(), binding)))
+        .collect::<Result<Vec<_>, _>>()?;
+    refuse_overlapping_roots(&bindings)?;
+    // Worktree rerouting on edit tools may not leave the listed roots; the
+    // registry carries them, so each serve enforces its own set.
+    let fixed_roots = (!bindings.is_empty()).then(|| {
+        Arc::new(
+            bindings
+                .iter()
+                .map(|(alias, binding)| (alias.clone(), binding.canonical_root.clone()))
+                .collect::<Vec<_>>(),
+        )
+    });
+
     let phase = std::time::Instant::now();
-    let (index, repo_root, state_placement, snapshot_mtimes, source_authority) =
-        load_serve_index(args.workspace_root.as_deref())?;
+    let loaded = if bindings.is_empty() {
+        let loaded = load_serve_index(args.workspace_root.as_deref())?;
+        let alias = loaded
+            .1
+            .as_ref()
+            .and_then(|root| root.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("project")
+            .to_string();
+        vec![(alias, loaded)]
+    } else {
+        bindings
+            .into_iter()
+            .map(|(alias, binding)| load_bound_serve_index(binding).map(|loaded| (alias, loaded)))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     tracing::info!("serve: index ready in {:?}", phase.elapsed());
-    // `load_serve_index` admitted the resolved binding before any source proof.
-    // Spec 026: a snapshot-restored index reconciles against current disk
-    // state in the background (same verify pass the stdio path spawns); tools
-    // serve immediately with the honest SnapshotRestore/Pending trust labels.
-    if let (Some(mtimes), Some(root), Some(authority)) =
-        (snapshot_mtimes, repo_root.clone(), source_authority)
-    {
-        let bg_index = index.clone();
-        tokio::spawn(async move {
-            crate::live_index::persist::background_verify_cancellable_bound(
-                bg_index,
-                root,
-                mtimes,
-                authority,
-                || false,
-            )
-            .await;
+    let mut repos = Vec::with_capacity(loaded.len());
+    for (alias, (index, repo_root, state_placement, snapshot_mtimes, source_authority)) in loaded {
+        // `load_serve_index` admitted the resolved binding before any source proof.
+        // Spec 026: a snapshot-restored index reconciles against current disk
+        // state in the background (same verify pass the stdio path spawns); tools
+        // serve immediately with the honest SnapshotRestore/Pending trust labels.
+        if let (Some(mtimes), Some(root), Some(authority)) =
+            (snapshot_mtimes, repo_root.clone(), source_authority)
+        {
+            let bg_index = index.clone();
+            tokio::spawn(async move {
+                crate::live_index::persist::background_verify_cancellable_bound(
+                    bg_index,
+                    root,
+                    mtimes,
+                    authority,
+                    || false,
+                )
+                .await;
+            });
+        }
+        repos.push(LoadedRepo {
+            alias,
+            index,
+            repo_root,
+            state_placement,
         });
     }
     let control_state_dir: Option<ControlStateDir> =
@@ -644,7 +888,7 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
             .directory()
             .cloned();
     let phase = std::time::Instant::now();
-    let runtime = build_serve_runtime(index, repo_root, state_placement, auth.clone());
+    let runtime = build_serve_runtime(repos, args.allow_index_folder, fixed_roots, auth.clone());
     tracing::info!("serve: runtime built in {:?}", phase.elapsed());
 
     // US1 (FR-001/002/003): an explicit operator-chosen `--listen` is honored
@@ -779,11 +1023,14 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     // writes scheduled via `spawn_blocking` just before shutdown to finish, so
     // the economics ledger does not lose events accepted at the very end. A
     // stuck DB cannot hang shutdown — the drain times out and logs the residual.
-    runtime
-        .protocol()
-        .ledger_write_tracker()
-        .drain(std::time::Duration::from_secs(5))
-        .await;
+    if let Some(projects) = runtime.protocol().serve_projects.as_ref() {
+        for repo in projects.repos() {
+            repo.server
+                .ledger_write_tracker()
+                .drain(std::time::Duration::from_secs(5))
+                .await;
+        }
+    }
 
     tracing::info!("operator server shut down cleanly");
     Ok(())
@@ -918,6 +1165,7 @@ mod tests {
             api_key_env: None,
             bound_addr_tx: None,
             workspace_root: None,
+            ..ServeArgs::default()
         };
         let err = run(args)
             .await
@@ -963,6 +1211,7 @@ mod tests {
             api_key_env: None,
             bound_addr_tx: None,
             workspace_root: None,
+            ..ServeArgs::default()
         };
         let err = run(args)
             .await
@@ -984,6 +1233,7 @@ mod tests {
             api_key_env: None,
             bound_addr_tx: None,
             workspace_root: None,
+            ..ServeArgs::default()
         };
         let err = run(args).await.expect_err("unknown name must refuse");
         assert!(
@@ -1001,9 +1251,57 @@ mod tests {
             api_key_env: None,
             bound_addr_tx: None,
             workspace_root: None,
+            ..ServeArgs::default()
         };
         let err = run(args).await.expect_err("bad --listen must error");
         assert!(matches!(err, ServeError::InvalidListen { .. }));
+    }
+
+    #[test]
+    fn parse_project_spec_splits_at_the_first_equals() {
+        let spec = parse_project_spec(r"a=C:\work\x=y").expect("drive colon and = in the path");
+        assert_eq!(spec.alias, "a");
+        assert_eq!(spec.path, std::path::PathBuf::from(r"C:\work\x=y"));
+        assert!(
+            parse_project_spec(r"C:\work")
+                .expect_err("no =")
+                .contains("ALIAS=PATH")
+        );
+        for bad in [
+            "=p",
+            " a=p",
+            "a =p",
+            "my repo=p",
+            "a,b=p",
+            "a/b=p",
+            r"a\b=p",
+            "*=p",
+            "a=",
+            "a\tb=p",
+        ] {
+            assert!(parse_project_spec(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn parse_project_specs_refuses_duplicates_and_allow_with_several() {
+        let list = |entries: &[&str]| entries.iter().map(|e| e.to_string()).collect::<Vec<_>>();
+        let duplicate = parse_project_specs(&list(&["Repo=/a", "repo=/b"]), false)
+            .expect_err("case-insensitive duplicate");
+        assert!(duplicate.contains("duplicate"), "{duplicate}");
+        let allow = parse_project_specs(&list(&["a=/a", "b=/b"]), true).expect_err("allow + two");
+        assert!(allow.contains("--allow-index-folder"), "{allow}");
+        assert_eq!(
+            parse_project_specs(&list(&["a=/a"]), true)
+                .expect("allow + one")
+                .len(),
+            1
+        );
+        assert!(
+            parse_project_specs(&[], true)
+                .expect("allow + none")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -480,7 +480,11 @@ async fn bypass_at_dispatch_returns_structured_envelope() {
 /// The complementary stdio+daemon HONOR path is proven by
 /// `daemon::tests::test_cross_project_query_returns_attributed_hits_from_both_projects`
 /// (attributed cross-project hits; a no-params call stays single-project). This
-/// test locks the `/mcp` refusal end-to-end over the real HTTP transport.
+/// test locks the refusal over the real HTTP transport for a runtime built
+/// WITHOUT serve's repository registry. Since #875, `serve::run` always installs
+/// that registry, so production `/mcp` routes `project`/`projects` instead; its
+/// routing, alias-list refusals and fan-out are pinned by
+/// `tests/serve_multi_project.rs`.
 #[tokio::test]
 async fn cross_project_targeting_is_refused_over_http() {
     // The individual cross-project-capable tools are only advertised + dispatched
@@ -535,8 +539,8 @@ async fn cross_project_targeting_is_refused_over_http() {
         );
         // The refusal must name the /mcp transport so it is honest for the caller.
         assert!(
-            text.contains("/mcp HTTP transport"),
-            "{name} refusal should name the /mcp transport, got:\n{text}"
+            text.contains("single-repository /mcp HTTP transport"),
+            "{name} refusal should name the single-repository /mcp transport, got:\n{text}"
         );
         // Semantic refusals are typed MCP errors, never isError:false (the
         // incident's "refusal returned as success" defect).

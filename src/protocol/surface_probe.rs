@@ -306,7 +306,7 @@ pub fn enforce_compact_surface(tool_name: &str) -> Result<(), rmcp::ErrorData> {
 pub const SERVER_INSTRUCTIONS_MAX_BYTES: usize = 600;
 
 /// Full-surface routing hint. Names only tools the full surface lists.
-pub const FULL_SURFACE_INSTRUCTIONS: &str = "SymForge indexes this repository. Start with search_symbols to find a function or type, get_symbol to read its body (pass targets[] to fetch several in one call), and find_references for callers and usages. Use search_text for code text. For exact literal match counts your own grep is fine. Read raw files with get_file_content only for docs, configs or exact bytes. On a daemon with several open projects, the project/projects parameters select one by ID or alias (never a path); omit both for the active project.";
+pub const FULL_SURFACE_INSTRUCTIONS: &str = "SymForge indexes this repository. Start with search_symbols to find a function or type, get_symbol to read its body (pass targets[] to fetch several in one call), and find_references for callers and usages. Use search_text for code text. For exact literal match counts your own grep is fine. Read raw files with get_file_content only for docs, configs or exact bytes. With several projects (daemon, or serve with --project), project/projects select by ID or alias (never a path); omit both for the active project.";
 
 /// Compact-surface routing hint. Names only the three compact tools.
 pub const COMPACT_SURFACE_INSTRUCTIONS: &str = "SymForge indexes this repository. Ask code questions (find, read, trace, impact) with symforge, edit a symbol with symforge_edit, and check index state with status. For exact literal match counts your own grep is fine.";
@@ -479,10 +479,10 @@ fn slimmed_router_tools(keep: impl Fn(&str) -> bool) -> Vec<Tool> {
 /// One-line text for the `project` selector; the full explanation lives in the
 /// server instructions (`get_info`) instead of being repeated on ~30 tools.
 const PROJECT_SELECTOR_TEXT: &str =
-    "Open-project ID or alias (not a path); omit for the active project.";
+    "Project ID/alias (not a path); omit for the active or only project.";
 /// One-line text for the `projects` multi-project selector.
 const PROJECTS_SELECTOR_TEXT: &str =
-    "Open-project IDs/aliases, or [\"*\"] for all; daemon only; exclusive with `project`.";
+    "Project IDs/aliases, or [\"*\"] for all; daemon or serve; exclusive with `project`.";
 
 /// SF-TE-05: replace the per-tool `project` / `projects` descriptions with one
 /// line each. Only the top-level `properties` are touched, and only the
@@ -910,7 +910,7 @@ mod tests {
         assert_eq!(
             server_instructions(SurfaceProfile::Full),
             Some(
-                "SymForge indexes this repository. Start with search_symbols to find a function or type, get_symbol to read its body (pass targets[] to fetch several in one call), and find_references for callers and usages. Use search_text for code text. For exact literal match counts your own grep is fine. Read raw files with get_file_content only for docs, configs or exact bytes. On a daemon with several open projects, the project/projects parameters select one by ID or alias (never a path); omit both for the active project."
+                "SymForge indexes this repository. Start with search_symbols to find a function or type, get_symbol to read its body (pass targets[] to fetch several in one call), and find_references for callers and usages. Use search_text for code text. For exact literal match counts your own grep is fine. Read raw files with get_file_content only for docs, configs or exact bytes. With several projects (daemon, or serve with --project), project/projects select by ID or alias (never a path); omit both for the active project."
             )
         );
         assert_eq!(

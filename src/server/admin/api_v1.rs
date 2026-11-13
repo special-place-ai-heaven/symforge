@@ -71,6 +71,9 @@ impl CompressionHeuristicView {
 /// (FR-003 / GATE-3 / SC-004).
 #[derive(Debug, Clone, Serialize)]
 pub struct LedgerSummaryView {
+    /// The served repository whose ledger these figures are (#875: on a serve
+    /// with several repositories, the first listed one).
+    pub project: String,
     /// Whether a durable ledger summary could be read.
     pub available: bool,
     /// Total recorded economics events. `None` when unavailable.
@@ -157,6 +160,7 @@ impl LedgerSummaryView {
         {
             let (recent_runs, recent_runs_window) = Self::recent_runs(store);
             Self {
+                project: runtime.project_name().to_string(),
                 available: true,
                 total_events: Some(summary.total_events),
                 total_net_vs_manual: Some(summary.total_net_vs_manual),
@@ -168,6 +172,7 @@ impl LedgerSummaryView {
             }
         } else {
             Self {
+                project: runtime.project_name().to_string(),
                 available: false,
                 total_events: None,
                 total_net_vs_manual: None,
@@ -425,6 +430,19 @@ pub struct SystemSnapshot {
     pub indexed_symbol_count: usize,
     /// Live index generation counter.
     pub index_generation: u64,
+    /// The repository the three counts above describe (#875).
+    pub counts_project: String,
+    /// One row per served repository, each counted from its own index.
+    pub projects: Vec<ProjectIndexView>,
+}
+
+/// One served repository's index counts (#875).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectIndexView {
+    pub name: String,
+    pub indexed_file_count: usize,
+    pub indexed_symbol_count: usize,
+    pub index_generation: u64,
 }
 
 impl SystemSnapshot {
@@ -434,7 +452,29 @@ impl SystemSnapshot {
         let project = runtime.project_name().to_string();
         // An empty index over no project root still names the configured project;
         // report it only when there are indexed files OR a non-default name.
-        let indexed_projects = if published.file_count > 0 || project != "project" {
+        let served = runtime.protocol().serve_projects.as_ref();
+        // #875: a serve with several repositories lists every alias it serves;
+        // the top-level counts are labelled with the one they describe.
+        let projects = served
+            .map(|projects| {
+                projects
+                    .repos()
+                    .iter()
+                    .map(|repo| {
+                        let state = repo.server.index.data_plane().published_state();
+                        ProjectIndexView {
+                            name: repo.alias.clone(),
+                            indexed_file_count: state.file_count,
+                            indexed_symbol_count: state.symbol_count,
+                            index_generation: state.generation,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let indexed_projects = if let Some(projects) = served.filter(|p| p.serves_several()) {
+            projects.aliases()
+        } else if published.file_count > 0 || project != "project" {
             vec![project]
         } else {
             vec![]
@@ -447,6 +487,8 @@ impl SystemSnapshot {
             indexed_file_count: published.file_count,
             indexed_symbol_count: published.symbol_count,
             index_generation: published.generation,
+            counts_project: runtime.project_name().to_string(),
+            projects,
         }
     }
 }

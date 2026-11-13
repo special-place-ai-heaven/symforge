@@ -25,6 +25,7 @@ pub(crate) mod search_format;
 pub(crate) mod search_tools;
 pub use crate::knowledge::secret_dismissals;
 pub(crate) mod secret_remediate;
+pub(crate) mod serve_projects;
 pub mod session;
 pub mod smart_query;
 pub mod surface_probe;
@@ -299,6 +300,10 @@ pub struct SymForgeServer {
     /// just before SIGINT/SIGTERM are not lost.
     #[cfg(feature = "server")]
     pub(crate) ledger_writes: Arc<LedgerWriteTracker>,
+    /// #875: the operator-fixed repositories of a `symforge serve`. `Some` only
+    /// on the one server `/mcp` dispatches through, which routes each call to a
+    /// registry entry; the entries themselves carry `None`.
+    pub(crate) serve_projects: Option<Arc<serve_projects::ServeProjects>>,
 }
 
 fn default_analytics_db_path(project_state_dir: Option<&ProjectStateDir>) -> PathBuf {
@@ -444,6 +449,7 @@ impl SymForgeServer {
             stel_ledger_store: None,
             #[cfg(feature = "server")]
             ledger_writes: Arc::new(LedgerWriteTracker::default()),
+            serve_projects: None,
         }
     }
 
@@ -522,6 +528,7 @@ impl SymForgeServer {
             stel_ledger_store: None,
             #[cfg(feature = "server")]
             ledger_writes: Arc::new(LedgerWriteTracker::default()),
+            serve_projects: None,
         }
     }
 
@@ -2139,11 +2146,17 @@ impl ServerHandler for SymForgeServer {
         // `result_type: Some(COMPLETE)` (FR-305 pinned shape); 1h TTL, Public
         // (`resource_definitions()` embeds no workspace data). The #874 tool
         // allow-list filter is per process, so Public still holds.
-        std::future::ready(Ok(ListResourcesResult::with_all_items(
-            self.advertised_resource_definitions(),
-        )
-        .with_ttl_ms(3_600_000)
-        .with_cache_scope(rmcp::model::CacheScope::Public)))
+        // #875: a multi-repository serve lists repository resources per alias.
+        // The list is a function of the process's fixed set, so Public still holds.
+        let resources = match self.serve_projects.as_ref() {
+            Some(projects) if projects.serves_several() => {
+                projects.per_alias_resources(self.advertised_resource_definitions())
+            }
+            _ => self.advertised_resource_definitions(),
+        };
+        std::future::ready(Ok(ListResourcesResult::with_all_items(resources)
+            .with_ttl_ms(3_600_000)
+            .with_cache_scope(rmcp::model::CacheScope::Public)))
     }
 
     fn list_resource_templates(
@@ -2155,11 +2168,15 @@ impl ServerHandler for SymForgeServer {
     + '_ {
         // FR-310/FR-311: static list surface — same cache policy as
         // `list_resources`.
-        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(
-            self.advertised_resource_template_definitions(),
-        )
-        .with_ttl_ms(3_600_000)
-        .with_cache_scope(rmcp::model::CacheScope::Public)))
+        let templates = match self.serve_projects.as_ref() {
+            Some(projects) if projects.serves_several() => {
+                projects.project_templates(self.advertised_resource_template_definitions())
+            }
+            _ => self.advertised_resource_template_definitions(),
+        };
+        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(templates)
+            .with_ttl_ms(3_600_000)
+            .with_cache_scope(rmcp::model::CacheScope::Public)))
     }
 
     fn read_resource(
@@ -2180,8 +2197,30 @@ impl ServerHandler for SymForgeServer {
         // scope `tools/call` uses (an inner daemon-proxied handler may
         // overwrite the seeded local evidence with its receipt).
         async move {
-            result_status::with_project_evidence_scope(self.local_project_evidence(), async {
-                self.read_resource_uri(&uri).await.map(|mut result| {
+            // #875: a multi-repository serve routes the read by its `project` query.
+            // The reply keeps the URI the client asked for, `?project=` included, so
+            // two repositories' contents never share one URI.
+            let requested = uri.clone();
+            let (server, uri) = match self.serve_projects.as_ref() {
+                Some(projects) => projects.route_resource(self, &uri)?,
+                None => (self, uri),
+            };
+            result_status::with_project_evidence_scope(server.local_project_evidence(), async {
+                server.read_resource_uri(&uri).await.map(|mut result| {
+                    if uri != requested {
+                        for contents in &mut result.contents {
+                            match contents {
+                                rmcp::model::ResourceContents::TextResourceContents {
+                                    uri, ..
+                                }
+                                | rmcp::model::ResourceContents::BlobResourceContents {
+                                    uri, ..
+                                } => *uri = requested.clone(),
+                                // ponytail: a future content kind keeps its own URI.
+                                _ => {}
+                            }
+                        }
+                    }
                     result_status::attach_project_evidence_meta(&mut result.meta);
                     rmcp::model::ReadResourceResponse::Complete(result)
                 })
@@ -2206,10 +2245,119 @@ impl ServerHandler for SymForgeServer {
     /// serve path dispatch through the same `ServerHandler::call_tool`.
     async fn call_tool(
         &self,
-        mut request: rmcp::model::CallToolRequestParams,
+        request: rmcp::model::CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         surface_probe::enforce_compact_surface(request.name.as_ref())?;
+        // #875: a `symforge serve` with operator-fixed repositories routes the
+        // call to one of them here, after the gate above and before any evidence,
+        // so each answer names its own repository. The gate runs exactly once.
+        if let Some(projects) = self.serve_projects.as_ref() {
+            return projects.route_tool_call(self, request, context).await;
+        }
+        self.dispatch_gated_tool_call(request, context).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        let tools = surface_probe::advertised_tools();
+        // FR-305 pinned struct shape: the constructor seeds
+        // `result_type: Some(COMPLETE)`. FR-310/FR-311: 1h TTL, Public — the
+        // surface is fixed per-process (`SYMFORGE_SURFACE` is env-driven), and a
+        // Public cache assumes ONE profile per HTTP origin (FR-311c). If core,
+        // full and compact servers share an origin, a cached list from one is
+        // served to the others: core<->full only hides or shows callable tools
+        // (core refuses nothing); a core or full list reaching a compact client
+        // discloses schemas the compact dispatch gate will refuse; a compact
+        // list reaching core or full hides callable tools. Ordering is
+        // deterministic (router insertion order), verified by test (SC-313).
+        // The #874 tool allow-list (`SYMFORGE_TOOLS` / `serve --tools`) keeps
+        // Public correct for the same reason: it is per process, never per
+        // request or per API key, so one origin still serves one list.
+        Ok(ListToolsResult::with_all_items(tools)
+            .with_ttl_ms(3_600_000)
+            .with_cache_scope(rmcp::model::CacheScope::Public))
+    }
+
+    /// Hand-written prompt dispatch — identical to what `#[prompt_handler]`
+    /// would generate (see the impl-block doc comment for why the macro is not
+    /// used).
+    async fn get_prompt(
+        &self,
+        request: rmcp::model::GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::GetPromptResponse, rmcp::ErrorData> {
+        if let Some(projects) = self.serve_projects.as_ref()
+            && projects.serves_several()
+        {
+            return Err(rmcp::ErrorData::invalid_request(
+                projects.prompts_refusal(),
+                None,
+            ));
+        }
+        let prompt_context = rmcp::handler::server::prompt::PromptContext::new(
+            self,
+            request.name,
+            request.arguments,
+            context,
+        );
+        self.prompt_router.get_prompt(prompt_context).await
+    }
+
+    /// Manual `list_prompts` override (FR-310): the macro body plus the
+    /// FR-311 static-list cache hints.
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListPromptsResult, rmcp::ErrorData> {
+        // #875: a multi-repository serve lists none (it refuses them); the
+        // list stays constant per process, so the Public cache still holds.
+        let prompts = match self.serve_projects.as_ref() {
+            Some(projects) if projects.serves_several() => Vec::new(),
+            _ => self.prompt_router.list_all(),
+        };
+        Ok(rmcp::model::ListPromptsResult::with_all_items(prompts)
+            .with_ttl_ms(3_600_000)
+            .with_cache_scope(rmcp::model::CacheScope::Public))
+    }
+
+    /// React to the client's `notifications/initialized`.
+    ///
+    /// After the handshake completes, the client's MCP `roots` capability (the
+    /// open workspace folder it declared) becomes queryable via `roots/list`.
+    /// We use it to bind the workspace when the launch CWD and
+    /// `SYMFORGE_WORKSPACE_ROOT` resolved nothing at startup — the keystone
+    /// "index won't load" case for home-CWD launchers (Cursor). Precedence
+    /// (`SYMFORGE_WORKSPACE_ROOT` > client roots > launch-CWD walk) is enforced
+    /// inside [`Self::bind_workspace_from_client_roots`], which is a deliberate
+    /// no-op whenever startup already bound a root.
+    ///
+    /// Scope (FR-316, spec 025): this hook fires only for stdio /
+    /// legacy-lifecycle clients that send `notifications/initialized`. The
+    /// stateless HTTP `/mcp` path serves requests directly with no handshake
+    /// enforcement, so this hook never runs there; modern discover-lifecycle
+    /// clients are bound by the fallback chain (`SYMFORGE_WORKSPACE_ROOT` >
+    /// `index_folder` > CWD walk), with the residual wrong-binding case
+    /// disclosed via `_meta` project evidence (FR-319).
+    async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
+        tracing::info!("client initialized");
+        self.bind_workspace_from_client_roots(&context.peer).await;
+    }
+}
+
+impl SymForgeServer {
+    /// The `tools/call` body behind the surface gate: argument checks, evidence,
+    /// dispatch, result typing and the repeat notice. Reached from `call_tool`
+    /// after `enforce_compact_surface`, directly or through serve routing.
+    pub(crate) async fn dispatch_gated_tool_call(
+        &self,
+        mut request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         // Feature 036 (FR-001/FR-002): an argument the tool does not define, or one
         // outside its mode, refuses the call here, BEFORE the repeat tracker observes it,
         // so a refused call can never count toward the repeat notice. A mode that a lone
@@ -2392,84 +2540,6 @@ impl ServerHandler for SymForgeServer {
             .await
         })
         .await
-    }
-
-    async fn list_tools(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, rmcp::ErrorData> {
-        let tools = surface_probe::advertised_tools();
-        // FR-305 pinned struct shape: the constructor seeds
-        // `result_type: Some(COMPLETE)`. FR-310/FR-311: 1h TTL, Public — the
-        // surface is fixed per-process (`SYMFORGE_SURFACE` is env-driven), and a
-        // Public cache assumes ONE profile per HTTP origin (FR-311c). If core,
-        // full and compact servers share an origin, a cached list from one is
-        // served to the others: core<->full only hides or shows callable tools
-        // (core refuses nothing); a core or full list reaching a compact client
-        // discloses schemas the compact dispatch gate will refuse; a compact
-        // list reaching core or full hides callable tools. Ordering is
-        // deterministic (router insertion order), verified by test (SC-313).
-        // The #874 tool allow-list (`SYMFORGE_TOOLS` / `serve --tools`) keeps
-        // Public correct for the same reason: it is per process, never per
-        // request or per API key, so one origin still serves one list.
-        Ok(ListToolsResult::with_all_items(tools)
-            .with_ttl_ms(3_600_000)
-            .with_cache_scope(rmcp::model::CacheScope::Public))
-    }
-
-    /// Hand-written prompt dispatch — identical to what `#[prompt_handler]`
-    /// would generate (see the impl-block doc comment for why the macro is not
-    /// used).
-    async fn get_prompt(
-        &self,
-        request: rmcp::model::GetPromptRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<rmcp::model::GetPromptResponse, rmcp::ErrorData> {
-        let prompt_context = rmcp::handler::server::prompt::PromptContext::new(
-            self,
-            request.name,
-            request.arguments,
-            context,
-        );
-        self.prompt_router.get_prompt(prompt_context).await
-    }
-
-    /// Manual `list_prompts` override (FR-310): the macro body plus the
-    /// FR-311 static-list cache hints.
-    async fn list_prompts(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<rmcp::model::ListPromptsResult, rmcp::ErrorData> {
-        Ok(
-            rmcp::model::ListPromptsResult::with_all_items(self.prompt_router.list_all())
-                .with_ttl_ms(3_600_000)
-                .with_cache_scope(rmcp::model::CacheScope::Public),
-        )
-    }
-
-    /// React to the client's `notifications/initialized`.
-    ///
-    /// After the handshake completes, the client's MCP `roots` capability (the
-    /// open workspace folder it declared) becomes queryable via `roots/list`.
-    /// We use it to bind the workspace when the launch CWD and
-    /// `SYMFORGE_WORKSPACE_ROOT` resolved nothing at startup — the keystone
-    /// "index won't load" case for home-CWD launchers (Cursor). Precedence
-    /// (`SYMFORGE_WORKSPACE_ROOT` > client roots > launch-CWD walk) is enforced
-    /// inside [`Self::bind_workspace_from_client_roots`], which is a deliberate
-    /// no-op whenever startup already bound a root.
-    ///
-    /// Scope (FR-316, spec 025): this hook fires only for stdio /
-    /// legacy-lifecycle clients that send `notifications/initialized`. The
-    /// stateless HTTP `/mcp` path serves requests directly with no handshake
-    /// enforcement, so this hook never runs there; modern discover-lifecycle
-    /// clients are bound by the fallback chain (`SYMFORGE_WORKSPACE_ROOT` >
-    /// `index_folder` > CWD walk), with the residual wrong-binding case
-    /// disclosed via `_meta` project evidence (FR-319).
-    async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
-        tracing::info!("client initialized");
-        self.bind_workspace_from_client_roots(&context.peer).await;
     }
 }
 

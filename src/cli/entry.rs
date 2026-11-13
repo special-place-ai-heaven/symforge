@@ -224,7 +224,10 @@ fn run_serve(args: cli::serve::ServeCliArgs) -> anyhow::Result<MainExit> {
             eprintln!("error: {err}");
             Ok(MainExit::ServeRefusedToStart)
         }
-        Err(server::serve::ServeError::ToolAllowList(problem)) => {
+        Err(
+            server::serve::ServeError::ToolAllowList(problem)
+            | server::serve::ServeError::Projects(problem),
+        ) => {
             eprintln!("error: {problem}");
             Ok(MainExit::ServeRefusedToStart)
         }
