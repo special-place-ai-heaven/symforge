@@ -207,11 +207,26 @@ fn serve_refusal(args: &[&str], tools_env: Option<std::ffi::OsString>) -> (Optio
     if let Some(value) = tools_env {
         command.env("SYMFORGE_TOOLS", value);
     }
-    let output = command.output().expect("spawn symforge serve");
-    (
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    )
+    // Bounded: a refusal is immediate, so a child still running past the
+    // deadline means startup did NOT refuse; kill it and fail loudly.
+    const REFUSAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+    let mut child = command.spawn().expect("spawn symforge serve");
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll symforge serve") {
+            break status;
+        }
+        if started.elapsed() > REFUSAL_DEADLINE {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("symforge serve {args:?} did not refuse within {REFUSAL_DEADLINE:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().expect("piped stderr"), &mut stderr)
+        .expect("read stderr");
+    (status.code(), stderr)
 }
 
 #[test]
