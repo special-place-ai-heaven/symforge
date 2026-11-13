@@ -77,3 +77,14 @@ threads-required = "num-cpus"
 [[profile.default.overrides]]
 filter = "binary(live_index_integration) and test(=test_arcswap_concurrent_reads_under_writer_pressure)"
 threads-required = "num-test-threads"
+
+# src/cli/hook.rs fixture tests give an in-process loopback server 50 ms to
+# accept, read the request and answer. With eight test processes on a
+# four-core runner the server thread is not scheduled inside that window:
+# the hook times out, closes, and the fixture reads zero bytes ("complete
+# hook request"). Both attempts failed in slice 1 of CI run 43326210473 on
+# main; the same tests pass serially. Class TIMING, same remedy as the
+# ArcSwap test above: the machine to themselves.
+[[profile.default.overrides]]
+filter = "test(/cli::hook::tests::.*http_response/)"
+threads-required = "num-test-threads"
