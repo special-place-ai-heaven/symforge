@@ -1452,10 +1452,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // `pub(crate)` except two build counters behind `__test-internals`; one inherent impl
 // on a private type, no trait impl, macro, registration or re-export. No index_lifecycle
 // file touched; its existing calls into publication are unchanged. 320 files.
+// #876 part 2, trim: `daemon.rs` calls a private, glibc-only `malloc_trim(0)` wrapper
+// after the idle reaper unloads projects. Server-only, no index_lifecycle file, no
+// bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "3320a4a15c9b52222b2bc3df2a01767a97f574192ff4ac1812f5fdf3843dffcf",
+    "735e7215d7289510e80aba606b5d4ee2a303f64a0fdae3cd2c5ec773a44f06e5",
     320,
-    13073407,
+    13074300,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
