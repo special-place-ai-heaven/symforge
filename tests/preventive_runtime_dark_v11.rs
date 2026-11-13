@@ -1460,9 +1460,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // compares against the replaced generation once per publication. No index_lifecycle
 // file touched, no bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "d6d23694bfd74dd505280397885ac1d830b937a6b5f699eab870628e35eaffe7",
+    "4caf5d8fbfff993c65cc12d73b900d1fb61a93e2ea0daee88ef0facbd7d2555c",
     320,
-    13076110,
+    13076087,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

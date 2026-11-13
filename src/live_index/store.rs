@@ -2219,7 +2219,6 @@ fn build_published_authority(
 /// the same.
 fn carried_authority(
     previous: &PublishedGeneration,
-    live: &LiveIndex,
     code_only: bool,
     bridge: &KnowledgeBridge,
     source_version: Option<&SourceVersion>,
@@ -2243,9 +2242,9 @@ fn carried_authority(
         && previous.source_version.as_deref() == source_version
         && Arc::ptr_eq(&previous.code_signals, code_signals)
         && secret_policy(previous.manifest.as_deref()) == secret_policy(manifest)
-        && !previous.live.files.contains_key(POLICY_PATH)
-        && !live.files.contains_key(POLICY_PATH)
-        && code_only;
+        // `code_only` admits no added path, so no policy file can appear.
+        && code_only
+        && !previous.live.files.contains_key(POLICY_PATH);
     if !reusable {
         return None;
     }
@@ -5644,7 +5643,6 @@ impl SharedIndexHandle {
             .then(|| {
                 carried_authority(
                     &previous,
-                    &live,
                     code_only.is_some(),
                     &bridge,
                     source_version.as_deref(),
