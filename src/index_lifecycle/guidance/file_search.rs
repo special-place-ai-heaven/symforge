@@ -1041,6 +1041,7 @@ pub(crate) fn render_ranked_files(
                 &super::search_envelope::search_completeness_label(
                     *overflow_count,
                     hidden_noise_count,
+                    0,
                 ),
                 &super::search_envelope::search_files_scope_summary(
                     scope,

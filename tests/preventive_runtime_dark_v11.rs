@@ -1191,9 +1191,9 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // the shared search renderer names files whose parse was cancelled. Field copies and
 // a pure render helper. Same 91 files, no bridge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "7929ee50e60a1d3c136ca407be74689148abce929165cc9459136ae951487437",
+    "02226b2999ab85ff43e1039e08a696a8a470a949e59d37aab8303eb64766331b",
     91,
-    2499576,
+    2501633,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1476,9 +1476,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // `live_index/search.rs` counts cancelled files; index_lifecycle files only copy the
 // new count and render it. No new edge, no bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "eaca9b096a00334af7b096689fc33a9b647852ad10ba56c94963ab55d72cb9c6",
+    "474126899f2801f070bce51df7e72670c1e546ea3d40e1dd90ce61006af36c83",
     320,
-    13084766,
+    13086832,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

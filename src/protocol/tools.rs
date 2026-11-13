@@ -4344,7 +4344,7 @@ impl SymForgeServer {
                         search_files_resolve_match_type_label(&view),
                         search_format::SourceAuthority::from_check(check),
                         search_parse_state_for_paths(&guard, std::iter::once(path.as_str())),
-                        &search_completeness_label(0, hidden_noise_count),
+                        &search_completeness_label(0, hidden_noise_count, 0),
                         &search_files_scope_summary(
                             "resolve=true against indexed file paths",
                             include_vendor,
@@ -4360,7 +4360,7 @@ impl SymForgeServer {
                         search_files_resolve_match_type_label(&view),
                         search_format::SourceAuthority::from_check(check),
                         "metadata-only (not parsed)",
-                        &search_completeness_label(0, hidden_noise_count),
+                        &search_completeness_label(0, hidden_noise_count, 0),
                         &search_files_scope_summary(
                             "resolve=true against indexed file paths",
                             include_vendor,
@@ -4382,7 +4382,7 @@ impl SymForgeServer {
                             &guard,
                             matches.iter().map(std::string::String::as_str),
                         ),
-                        &search_completeness_label(*overflow_count, hidden_noise_count),
+                        &search_completeness_label(*overflow_count, hidden_noise_count, 0),
                         &search_files_scope_summary(
                             "resolve=true against indexed file paths",
                             include_vendor,

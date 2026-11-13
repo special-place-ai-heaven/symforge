@@ -926,7 +926,11 @@ pub(crate) fn render_search_text_output(
                 &generation.live,
                 result.files.iter().map(|file| file.path.as_str()),
             ),
-            &search_completeness_label(result.overflow_count, result.suppressed_by_noise),
+            &search_completeness_label(
+                result.overflow_count,
+                result.suppressed_by_noise,
+                result.unparsed_files,
+            ),
             &search_scope_summary(
                 &options.path_scope,
                 options.language_filter.as_ref(),
@@ -977,11 +981,14 @@ pub(crate) fn render_search_text_output(
     rendered
 }
 
-/// An empty or untruncated text search claims its whole scope (FR-017).
+/// An empty or untruncated text search claims its whole scope (FR-017),
+/// unless it skipped files whose parse was cancelled or failed.
 pub(crate) fn text_search_claim(
     result: &Result<search::TextSearchResult, search::TextSearchError>,
 ) -> super::freshen::Claim {
-    super::freshen::Claim::whole_if(matches!(result, Ok(found) if found.overflow_count == 0))
+    super::freshen::Claim::whole_if(
+        matches!(result, Ok(found) if found.overflow_count == 0 && found.unparsed_files == 0),
+    )
 }
 
 /// MCP `search_symbols`' rendered answer over one publication: the result
@@ -1013,7 +1020,7 @@ pub(crate) fn render_symbol_search(
                 &generation.live,
                 result.hits.iter().map(|hit| hit.path.as_str()),
             ),
-            &search_completeness_label(result.overflow_count, execution.suppressed_by_noise),
+            &search_completeness_label(result.overflow_count, execution.suppressed_by_noise, 0),
             &search_scope_summary(
                 &options.path_scope,
                 options.language_filter.as_ref(),

@@ -192,6 +192,9 @@ pub(crate) fn search_scope_summary(
 pub(crate) fn search_completeness_label(
     overflow_count: usize,
     suppressed_by_noise: usize,
+    // Files a structural search skipped because their parse was cancelled or
+    // failed: never searched, so the scope is not claimed as full.
+    unparsed_files: usize,
 ) -> String {
     // Honesty (trust): the index is built by a discovery walk with the `ignore`
     // crate default `.hidden(true)`, so hidden / dotdir paths (`.github/`,
@@ -202,9 +205,16 @@ pub(crate) fn search_completeness_label(
     // claim so the agent knows to use a raw grep for hidden paths.
     let mut parts = vec![if overflow_count > 0 {
         format!("truncated by result cap ({overflow_count} more omitted)")
+    } else if unparsed_files > 0 {
+        "incomplete for indexed scope".to_string()
     } else {
         "full for indexed scope (hidden/dotdir paths not indexed — grep those)".to_string()
     }];
+    if unparsed_files > 0 {
+        parts.push(format!(
+            "{unparsed_files} file(s) not searched (parse cancelled or failed)"
+        ));
+    }
     if suppressed_by_noise > 0 {
         if suppressed_by_noise > search::SUPPRESSED_TEXT_MATCH_DISPLAY_CAP {
             parts.push(format!(
@@ -444,7 +454,7 @@ mod tests {
             false,
         );
         assert_eq!(default_scope, super::DEFAULT_SEARCH_SCOPE);
-        let completeness = super::search_completeness_label(0, 0);
+        let completeness = super::search_completeness_label(0, 0, 0);
         let current = || SourceAuthority::from_check(&AnswerCheck::confirmed_for_tests());
 
         let one = format_search_envelope(
@@ -475,7 +485,7 @@ mod tests {
             "constrained (literal)",
             current(),
             "parsed",
-            &super::search_completeness_label(3, 0),
+            &super::search_completeness_label(3, 0, 0),
             &default_scope,
             "line anchors `src/lib.rs:7`",
         );
@@ -486,7 +496,7 @@ mod tests {
             "exact",
             current(),
             "parsed",
-            &super::search_completeness_label(0, 2),
+            &super::search_completeness_label(0, 2, 0),
             &default_scope,
             "symbol anchors `src/lib.rs:7`",
         );
@@ -567,5 +577,42 @@ mod tests {
         );
         // Control: a confirmed check has no notes at all.
         assert!(AnswerCheck::confirmed_for_tests().notes(true).is_empty());
+    }
+
+    #[test]
+    fn structural_search_with_unparsed_files_claims_neither_full_nor_whole() {
+        use super::super::freshen::Claim;
+        use super::super::search::text_search_claim;
+        let completeness = super::search_completeness_label(0, 0, 1);
+        assert!(!completeness.starts_with("full"), "{completeness}");
+        let envelope = format_search_envelope(
+            "structural",
+            SourceAuthority::from_check(&AnswerCheck::confirmed_for_tests()),
+            "parsed",
+            &completeness,
+            "repo-wide",
+            "line anchors `src/lib.rs:7`",
+        );
+        assert!(
+            envelope.contains(
+                "\nCompleteness: incomplete for indexed scope; 1 file(s) not searched (parse cancelled or failed)"
+            ),
+            "{envelope}"
+        );
+
+        let mut result = crate::live_index::search::TextSearchResult {
+            label: "structural 'fn $NAME() {}'".to_string(),
+            total_matches: 1,
+            files: vec![],
+            suppressed_by_noise: 0,
+            overflow_count: 0,
+            excluded_knowledge_files: 0,
+            withheld_policy_files: 0,
+            withheld_size_files: 0,
+            unparsed_files: 0,
+        };
+        assert_eq!(text_search_claim(&Ok(result.clone())), Claim::Whole);
+        result.unparsed_files = 1;
+        assert_eq!(text_search_claim(&Ok(result)), Claim::Rows);
     }
 }
