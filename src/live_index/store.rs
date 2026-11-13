@@ -15,10 +15,11 @@ use tracing::{debug, error, info, warn};
 
 use super::knowledge_authority::{
     AuthorityLimits, AuthorityTemporalIndex, KnowledgeAuthorityView, build_knowledge_authority,
+    restamped_authority,
 };
 use super::knowledge_bridge::{
     BridgeLimits, DerivedCoverage, DerivedLimitKind, KnowledgeBridge, LimitBreach,
-    build_knowledge_bridge,
+    build_knowledge_bridge, carry_knowledge_bridge, code_only_changes,
 };
 use super::query::RepoOutlineView;
 use crate::domain::ParseDiagnostic;
@@ -2202,6 +2203,58 @@ fn build_published_authority(
         }),
         &AuthorityLimits::default(),
     ))
+}
+
+/// The previous generation's authority, shared or restamped, when a full
+/// build over this publication would equal it; `None` means build.
+///
+/// A build reads the live index (the knowledge files' targets, content,
+/// hashes, symbols and mtimes, and the `.symforge-knowledge.toml` policy, which
+/// may name any file), the bridge, the source and source version, the code
+/// signals, the secret policy version and the content generation. `bridge`
+/// must already be the previous bridge or carried from it, and `code_only`
+/// is whether [`code_only_changes`] held between the two indices. Then, with the
+/// source, source version, code signals and secret policy unchanged, no policy
+/// file, and every changed file code-only, every input but the generation is
+/// the same.
+fn carried_authority(
+    previous: &PublishedGeneration,
+    code_only: bool,
+    bridge: &KnowledgeBridge,
+    source_version: Option<&SourceVersion>,
+    code_signals: &Arc<CodeSignalsSnapshot>,
+    manifest: Option<&RepositoryManifest>,
+    content_generation: u64,
+) -> Option<Arc<KnowledgeAuthorityView>> {
+    const POLICY_PATH: &str = ".symforge-knowledge.toml";
+    let secret_policy = |manifest: Option<&RepositoryManifest>| {
+        manifest.map_or(crate::knowledge::SECRET_POLICY_VERSION, |manifest| {
+            manifest.secret_policy_version
+        })
+    };
+    let reusable = bridge.referenced_symbols.is_some()
+        && previous.bridge.referenced_symbols.is_some()
+        && !matches!(previous.authority.coverage, DerivedCoverage::Loading)
+        && previous.authority.content_generation == previous.content_generation
+        && previous.authority.source.is_some()
+        && previous.authority.source.as_ref() == previous.source.as_deref()
+        && previous.source_version.is_some()
+        && previous.source_version.as_deref() == source_version
+        && Arc::ptr_eq(&previous.code_signals, code_signals)
+        && secret_policy(previous.manifest.as_deref()) == secret_policy(manifest)
+        // `code_only` admits no added path, so no policy file can appear.
+        && code_only
+        && !previous.live.files.contains_key(POLICY_PATH);
+    if !reusable {
+        return None;
+    }
+    if previous.authority.content_generation == content_generation {
+        return Some(Arc::clone(&previous.authority));
+    }
+    Some(Arc::new(restamped_authority(
+        &previous.authority,
+        content_generation,
+    )))
 }
 
 /// The in-memory index: file contents and parsed symbols for all discovered files.
@@ -5541,24 +5594,66 @@ impl SharedIndexHandle {
         // snapshot when its input is unchanged; the source-identity equality is
         // belt-and-braces, since a content-preserving publish should not move
         // the source either.
+        //
+        // A content publish whose change cannot reach knowledge (an edit to a
+        // code file no document points at, or a hash-skip that only moved an
+        // mtime) carries the previous bridge with its anchors restamped to
+        // the new content generation: `carry_knowledge_bridge` proves the
+        // result equals a full build, which costs ~1.2 GB of allocation and
+        // ~1.8 s on this repository (issue #876).
+        // One comparison against the replaced generation serves both carries.
+        let code_only = code_only_changes(&previous.live, &live);
+        let mut bridge_carried = false;
         let bridge = if deferred_owner.is_some() {
             Arc::new(KnowledgeBridge::loading())
         } else {
             match source.as_deref() {
                 Some(source) if !content_changed && previous.source.as_deref() == Some(source) => {
+                    bridge_carried = true;
                     Arc::clone(&previous.bridge)
                 }
-                Some(source) => Arc::new(build_knowledge_bridge(
-                    &live,
-                    source,
-                    content_generation,
-                    &BridgeLimits::default(),
-                )),
+                Some(source) => {
+                    let carried = (previous.source.as_deref() == Some(source))
+                        .then(|| {
+                            carry_knowledge_bridge(
+                                &previous.live,
+                                &previous.bridge,
+                                &live,
+                                code_only.as_deref(),
+                                content_generation,
+                            )
+                        })
+                        .flatten();
+                    bridge_carried = carried.is_some();
+                    Arc::new(carried.unwrap_or_else(|| {
+                        build_knowledge_bridge(
+                            &live,
+                            source,
+                            content_generation,
+                            &BridgeLimits::default(),
+                        )
+                    }))
+                }
                 None => Arc::new(KnowledgeBridge::default()),
             }
         };
         let authority = if deferred_owner.is_some() {
             Arc::new(KnowledgeAuthorityView::loading(content_generation))
+        } else if let Some(carried) = bridge_carried
+            .then(|| {
+                carried_authority(
+                    &previous,
+                    code_only.is_some(),
+                    &bridge,
+                    source_version.as_deref(),
+                    &code_signals,
+                    manifest.as_deref(),
+                    content_generation,
+                )
+            })
+            .flatten()
+        {
+            carried
         } else {
             build_published_authority(
                 &live,

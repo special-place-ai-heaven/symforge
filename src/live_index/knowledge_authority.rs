@@ -9,6 +9,7 @@ use crate::domain::{
 use super::knowledge_bridge::{
     BridgeEvidenceKind, BridgeResolution, CodeAnchor, CodeAnchorId, DerivedCoverage,
     DerivedLimitKind, KnowledgeAnchor, KnowledgeAnchorId, KnowledgeBridge, LimitBreach,
+    restamp_code_anchor, restamp_knowledge_anchor,
 };
 use super::store::{CodeSignalsSnapshot, LiveIndex, PublishedGeneration};
 
@@ -810,6 +811,8 @@ pub fn build_knowledge_authority(
     if matches!(bridge.coverage, DerivedCoverage::Loading) {
         return KnowledgeAuthorityView::loading(content_generation);
     }
+    #[cfg(any(test, feature = "__test-internals"))]
+    FULL_AUTHORITY_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let mut units = collect_authority_units(live, source, content_generation);
     let policy = evaluate_policy(live, &units);
     apply_policy(&mut units, &policy);
@@ -947,6 +950,118 @@ pub fn build_knowledge_authority(
             secret_policy_version,
         },
     }
+}
+
+#[cfg(any(test, feature = "__test-internals"))]
+thread_local! {
+    static FULL_AUTHORITY_BUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Full [`build_knowledge_authority`] runs past the loading short-cut, on this
+/// thread (a publication builds on the thread that publishes). Tests read it
+/// to prove a publication carried its authority.
+#[cfg(any(test, feature = "__test-internals"))]
+pub fn full_authority_builds() -> u64 {
+    FULL_AUTHORITY_BUILDS.with(std::cell::Cell::get)
+}
+
+/// `previous` with every anchor restamped to `content_generation`: what a
+/// fresh build produces when none of its other inputs changed. The caller
+/// owns that proof (store.rs `carried_authority`). Every struct is
+/// destructured and every enum matched in full, so a new anchor-bearing field
+/// cannot skip the restamp.
+pub(crate) fn restamped_authority(
+    previous: &KnowledgeAuthorityView,
+    content_generation: u64,
+) -> KnowledgeAuthorityView {
+    let mut view = previous.clone();
+    let KnowledgeAuthorityView {
+        source: _,
+        source_version: _,
+        content_generation: stamp,
+        records,
+        finding_index: _,
+        policy_digest: _,
+        policy_status: _,
+        curation_eligible: _,
+        skipped_suppression_ids: _,
+        coverage: _,
+        usage: _,
+        versions: _,
+    } = &mut view;
+    *stamp = content_generation;
+    for KnowledgeAuthorityRecord {
+        unit,
+        lifecycle: _,
+        lifecycle_evidence,
+        authority_domain: _,
+        authority_domain_evidence,
+        code_evidence: _,
+        voice: _,
+        successor,
+        timeline,
+        proposal,
+    } in records
+    {
+        restamp_knowledge_anchor(unit, content_generation);
+        match lifecycle_evidence {
+            LifecycleEvidence::DeclaredSpan(anchor) => {
+                restamp_knowledge_anchor(anchor, content_generation);
+            }
+            LifecycleEvidence::PolicyEntry { entry_id: _ }
+            | LifecycleEvidence::ArchivePathRule { rule_id: _ }
+            | LifecycleEvidence::None => {}
+        }
+        match authority_domain_evidence {
+            AuthorityDomainEvidence::DeclaredSpan(anchor)
+            | AuthorityDomainEvidence::RoleRule { rule_id: _, anchor } => {
+                restamp_knowledge_anchor(anchor, content_generation);
+            }
+            AuthorityDomainEvidence::PolicyEntry { entry_id: _ }
+            | AuthorityDomainEvidence::Unknown => {}
+        }
+        if let Some(anchor) = successor {
+            restamp_knowledge_anchor(anchor, content_generation);
+        }
+        let DocumentTimeline {
+            filesystem_created: _,
+            filesystem_modified: _,
+            git_first_seen: _,
+            git_last_touch: _,
+            working_tree_changed: _,
+            relevant_code_changes,
+            coverage: _,
+        } = timeline;
+        for CodeChangeEvidence {
+            anchor,
+            commit_id: _,
+            unix_seconds: _,
+            topologically_after_document: _,
+            rule_id: _,
+        } in relevant_code_changes
+        {
+            restamp_code_anchor(anchor, content_generation);
+        }
+        let RemediationProposal {
+            action,
+            confidence: _,
+            evidence_ids: _,
+            unmet_preconditions: _,
+        } = proposal;
+        match action {
+            RemediationAction::MergeInto { target: anchor }
+            | RemediationAction::MarkSuperseded { successor: anchor }
+            | RemediationAction::DeletionCandidate { retained: anchor } => {
+                restamp_knowledge_anchor(anchor, content_generation);
+            }
+            RemediationAction::Keep
+            | RemediationAction::Update
+            | RemediationAction::RelabelIntent
+            | RemediationAction::Archive
+            | RemediationAction::NeedsReview => {}
+        }
+    }
+    view
 }
 
 fn collect_authority_units(

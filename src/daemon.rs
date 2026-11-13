@@ -553,6 +553,27 @@ impl SessionRecord {
     }
 }
 
+/// Issue #876: give freed heap back to the OS after projects unload.
+///
+/// glibc keeps freed pages in its arenas. Measured on this repository under
+/// WSL (`tests/publication_memory_876.rs`): after the index was dropped,
+/// resident memory stayed far above the live heap, and `malloc_trim(0)`
+/// returned most of the difference in about a tenth of a second. Unloads are
+/// rare, so that cost is paid rarely. Other allocators (musl, Windows, macOS)
+/// get nothing here.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[allow(unsafe_code)]
+fn release_freed_heap() {
+    // SAFETY: malloc_trim takes a pad size and touches only allocator state;
+    // its return value is only a hint that memory was released.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn release_freed_heap() {}
+
 /// Current time as milliseconds since the Unix epoch.
 fn now_epoch_millis() -> u64 {
     SystemTime::now()
@@ -1818,6 +1839,7 @@ impl DaemonState {
         }
         if count > 0 {
             self.gc_orphaned_bases();
+            release_freed_heap();
         }
         count
     }
