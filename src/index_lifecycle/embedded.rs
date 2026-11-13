@@ -2681,13 +2681,36 @@ impl EmbeddedSourceHandle {
                 .expect("embedded state mutex");
             state = next;
         }
-        Ok(super::public_api::SourceRuntimeView {
-            binding_identity: format!("source-{}", self.identity.raw()),
-            current_publication_identity: state.current_publication_identity.clone(),
-            observer_epoch: state.observer_epoch,
-            phase: state.phase,
-            source_version: state.source_version,
-        })
+        Ok(
+            self.phase_after_close(super::public_api::SourceRuntimeView {
+                binding_identity: format!("source-{}", self.identity.raw()),
+                current_publication_identity: state.current_publication_identity.clone(),
+                observer_epoch: state.observer_epoch,
+                phase: state.phase,
+                source_version: state.source_version,
+            }),
+        )
+    }
+
+    /// `close`, `begin_close` and `Drop` set `closed` before the shutdown
+    /// moves the stored phase to Stopping, and that shutdown can only flip
+    /// `shutdown_started` first (otherwise a worker could regress the phase).
+    /// A view this handle builds after observing its own close therefore
+    /// reports Stopping instead of the pre-close phase still stored.
+    fn phase_after_close(
+        &self,
+        mut view: super::public_api::SourceRuntimeView,
+    ) -> super::public_api::SourceRuntimeView {
+        use super::public_api::SourceRuntimePhase;
+        if self.closed.load(Ordering::Acquire)
+            && !matches!(
+                view.phase,
+                SourceRuntimePhase::Stopping | SourceRuntimePhase::Stopped
+            )
+        {
+            view.phase = SourceRuntimePhase::Stopping;
+        }
+        view
     }
 
     /// Capture the source's lifecycle state atomically.
@@ -2704,7 +2727,7 @@ impl EmbeddedSourceHandle {
                 },
                 source_version: 0,
             },
-            |binding| binding.runtime_view(),
+            |binding| self.phase_after_close(binding.runtime_view()),
         )
     }
 
@@ -3425,6 +3448,21 @@ mod refresh_lifecycle_tests {
         );
         wait_current(&handle, 0);
         (root, runtime, handle)
+    }
+
+    #[test]
+    fn views_after_the_handle_observes_its_close_never_report_a_pre_close_phase() {
+        let (_root, _runtime, handle) = open_current();
+        let since = handle.change_version();
+        // Reproduce the gap in `begin_close`: `closed` is set, but the
+        // shutdown has not yet moved the stored phase to Stopping.
+        handle.closed.store(true, Ordering::Release);
+        let waited = handle.wait_for_change(since, Duration::ZERO).unwrap();
+        let viewed = handle.runtime_view();
+        handle.closed.store(false, Ordering::Release);
+        let _ = handle.begin_close();
+        assert_eq!(waited.phase, SourceRuntimePhase::Stopping);
+        assert_eq!(viewed.phase, SourceRuntimePhase::Stopping);
     }
 
     #[test]
