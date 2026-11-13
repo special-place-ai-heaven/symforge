@@ -21,7 +21,7 @@ fn walk_node(
     symbols: &mut Vec<SymbolRecord>,
 ) {
     let kind = match node.kind() {
-        // ts-parser-perl 1.1.x: subs and class methods are *_declaration_statement.
+        // ts-parser-perl 1.1+: subs and class methods are *_declaration_statement.
         // Keep the legacy ganezdragon kinds harmless for forward-compat.
         "subroutine_declaration_statement"
         | "method_declaration_statement"
@@ -40,7 +40,7 @@ fn walk_node(
 }
 
 fn find_name(node: &Node, source: &str, kind: SymbolKind) -> Option<String> {
-    // ts-parser-perl 1.1.x exposes the defined name via the `name:` field on
+    // ts-parser-perl 1.1+ exposes the defined name via the `name:` field on
     // subroutine/method/package/class statements:
     //   (subroutine_declaration_statement name: (bareword) ...)   -> "greet"
     //   (package_statement name: (package))                       -> "MyApp::Module"
