@@ -82,14 +82,37 @@ fn symforge_launcher() -> &'static str {
     }
 }
 
-/// Build the `npm install` package specs. Always installs the `symforge`
-/// wrapper at `@latest`; when the OS/arch is known, also names the platform
-/// package explicitly so npm materializes the new nested binary instead of
-/// silently reusing a stale one.
-fn install_specs(os: &str, arch: &str) -> Vec<String> {
-    let mut specs = vec!["symforge@latest".to_string()];
+/// True for `MAJOR.MINOR.PATCH` with an optional `-prerelease` / `+build`
+/// suffix drawn from `[0-9A-Za-z.+-]`. The version comes from a network response
+/// and is placed into an npm argument, so anything else is refused. (npm is
+/// spawned with argv, never through a shell; this also keeps a value such as
+/// `--foo` or a range from being read by npm as something else.)
+fn is_strict_semver(version: &str) -> bool {
+    let (core, suffix) = match version.find(['-', '+']) {
+        Some(i) => (&version[..i], &version[i + 1..]),
+        None => (version, "x"),
+    };
+    let numeric = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|p| numeric(p))
+        && !suffix.is_empty()
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+}
+
+/// Build the `npm install` package specs. With a known `version`, the
+/// `symforge` wrapper and (when the OS/arch is known) the platform package are
+/// both pinned to exactly that version, so npm cannot resolve `latest` from a
+/// stale cached registry answer; without one they stay at `@latest`. Naming the
+/// platform package explicitly makes npm materialize the new nested binary
+/// instead of silently reusing a stale one.
+fn install_specs(os: &str, arch: &str, version: Option<&str>) -> Vec<String> {
+    let tag = version.unwrap_or("latest");
+    let mut specs = vec![format!("symforge@{tag}")];
     if let Some(pkg) = platform_package_for(os, arch) {
-        specs.push(format!("{pkg}@latest"));
+        specs.push(format!("{pkg}@{tag}"));
     }
     specs
 }
@@ -103,6 +126,8 @@ fn staging_install_args(staging: &Path, specs: &[String]) -> Vec<String> {
         "--prefix".to_string(),
         staging.display().to_string(),
         "--no-save".to_string(),
+        // Revalidate the registry answer npm holds instead of trusting a recent one.
+        "--prefer-online".to_string(),
     ];
     args.extend(specs.iter().cloned());
     args
@@ -1425,8 +1450,13 @@ fn update_steps(
         eprintln!("symforge update: note: {}", mismatch.message);
     }
 
-    let latest = ops.latest_version();
-    if latest.is_none() {
+    let mut latest = ops.latest_version();
+    if let Some(version) = latest.take_if(|v| !is_strict_semver(v)) {
+        summary.notes.push(format!(
+            "skipped: pinning the latest published version (the registry answered {version:?}, \
+             which is not a plain version); staging @latest"
+        ));
+    } else if latest.is_none() {
         summary.notes.push(
             "skipped: confirming the latest published version (the npm registry was unreachable)"
                 .to_string(),
@@ -1456,7 +1486,7 @@ fn update_steps(
         );
     } else {
         let program = npm_executable_for_os(os);
-        let specs = install_specs(os, arch);
+        let specs = install_specs(os, arch, latest.as_deref());
         let plain_cmd = match &mismatch {
             Some(m) => format!(
                 "npm install -g --prefix {} {}",
@@ -1486,7 +1516,10 @@ fn update_steps(
                 {
                     bail!(
                         "symforge update failed: the staged binary reports {staged}, not the latest \
-                         published {latest}. {untouched}"
+                         published {latest}. npm was asked to stage exactly {latest} and delivered \
+                         {staged}; the registry may still be publishing it, so try again in a \
+                         few minutes. \
+                         {untouched}"
                     );
                 }
                 if let InstalledProbe::Version(live) = &before
@@ -1941,23 +1974,102 @@ mod tests {
     #[test]
     fn install_specs_force_the_os_native_platform_package() {
         assert_eq!(
-            install_specs("windows", "x86_64"),
+            install_specs("windows", "x86_64", None),
             vec!["symforge@latest", "symforge-windows-x64@latest"]
         );
         assert_eq!(
-            install_specs("linux", "x86_64"),
+            install_specs("linux", "x86_64", None),
             vec!["symforge@latest", "symforge-linux-x64@latest"]
         );
         assert_eq!(
-            install_specs("macos", "aarch64"),
+            install_specs("macos", "aarch64", None),
             vec!["symforge@latest", "symforge-macos-arm64@latest"]
         );
     }
 
     #[test]
+    fn install_specs_pin_both_packages_to_a_known_latest() {
+        assert_eq!(
+            install_specs("windows", "x86_64", Some("11.18.2")),
+            vec!["symforge@11.18.2", "symforge-windows-x64@11.18.2"]
+        );
+    }
+
+    #[test]
+    fn strict_semver_accepts_versions_and_refuses_anything_npm_could_misread() {
+        for ok in [
+            "11.18.2",
+            "0.0.1",
+            "1.2.3-rc.1",
+            "1.2.3+build.5",
+            "1.2.3-beta-1+x",
+        ] {
+            assert!(is_strict_semver(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "latest",
+            "1.2",
+            "1.2.3.4",
+            "--foo",
+            "^1.2.3",
+            "1.2.3 ",
+            "1.2.3-",
+            "1.2.3;rm",
+            "1.2.x",
+            "v1.2.3",
+            "1.2.3-a b",
+            "1.2.3\n",
+        ] {
+            assert!(!is_strict_semver(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_registry_version_is_not_passed_to_npm() {
+        let mut ops = FakeOps {
+            latest: Some("--registry=http://evil".to_string()),
+            ..Default::default()
+        };
+        let _ = orchestrate_update("linux", "x86_64", &mut ops);
+        assert!(ops.happened("stage npm symforge@latest symforge-linux-x64@latest"));
+        assert!(
+            !ops.events.iter().any(|e| e.contains("evil")),
+            "{:?}",
+            ops.events
+        );
+    }
+
+    #[test]
+    fn a_stale_npm_resolution_names_both_versions() {
+        let mut ops = FakeOps {
+            latest: Some("11.18.2".to_string()),
+            staged: InstalledProbe::Version("11.18.1".to_string()),
+            ..Default::default()
+        };
+        let msg = orchestrate_update("linux", "x86_64", &mut ops)
+            .expect_err("a stale staged binary is refused")
+            .to_string();
+        assert!(
+            msg.contains(
+                "npm was asked to stage exactly 11.18.2 and delivered 11.18.1; the registry may \
+                 still be publishing it, so try again in a few minutes."
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains("The live install was NOT touched."), "{msg}");
+    }
+
+    #[test]
     fn install_specs_falls_back_to_wrapper_only_for_unknown_target() {
-        assert_eq!(install_specs("linux", "riscv64"), vec!["symforge@latest"]);
-        assert_eq!(install_specs("plan9", "x86_64"), vec!["symforge@latest"]);
+        assert_eq!(
+            install_specs("linux", "riscv64", None),
+            vec!["symforge@latest"]
+        );
+        assert_eq!(
+            install_specs("plan9", "x86_64", None),
+            vec!["symforge@latest"]
+        );
     }
 
     #[test]
@@ -1980,7 +2092,7 @@ mod tests {
         let mut ops = FakeOps::default();
         orchestrate_update("linux", "x86_64", &mut ops).expect("update should succeed");
 
-        let stage = ops.position("stage npm symforge@latest symforge-linux-x64@latest");
+        let stage = ops.position("stage npm symforge@7.15.4 symforge-linux-x64@7.15.4");
         let stop = ops.position("stop-daemon");
         let swap = ops.position("swap");
         let daemon = ops.position("daemon 7.15.4");
@@ -2162,7 +2274,7 @@ mod tests {
             .expect_err("staging failed")
             .to_string();
         assert!(
-            msg.contains("npm install -g --prefix /home/box/.npm-global symforge@latest"),
+            msg.contains("npm install -g --prefix /home/box/.npm-global symforge@7.15.4"),
             "{msg}"
         );
     }
@@ -2172,7 +2284,7 @@ mod tests {
         let mut ops = FakeOps::default();
         orchestrate_update("windows", "x86_64", &mut ops).expect("update should succeed");
 
-        assert!(ops.happened("stage npm.cmd symforge@latest symforge-windows-x64@latest"));
+        assert!(ops.happened("stage npm.cmd symforge@7.15.4 symforge-windows-x64@7.15.4"));
     }
 
     #[test]
@@ -2186,7 +2298,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("NOT touched"), "{msg}");
         assert!(
-            msg.contains("npm install -g symforge@latest symforge-windows-x64@latest"),
+            msg.contains("npm install -g symforge@7.15.4 symforge-windows-x64@7.15.4"),
             "{msg}"
         );
         assert!(ops.happened("prune"), "prune runs even when staging fails");
@@ -2206,7 +2318,7 @@ mod tests {
         assert_eq!(prunes, 1, "prune runs exactly once");
         assert!(
             ops.position("prune")
-                < ops.position("stage npm symforge@latest symforge-linux-x64@latest"),
+                < ops.position("stage npm symforge@7.15.4 symforge-linux-x64@7.15.4"),
             "prune precedes the npm swap"
         );
     }
@@ -2293,7 +2405,7 @@ mod tests {
     fn install_invocation_uses_no_shell_wrappers() {
         let args = staging_install_args(
             Path::new("C:/npm/.symforge-update-staging"),
-            &install_specs("windows", "x86_64"),
+            &install_specs("windows", "x86_64", None),
         );
         let text = invocation_text(
             npm_executable_for_os("windows"),
@@ -2734,7 +2846,7 @@ mod tests {
     #[test]
     fn staging_install_is_local_to_the_staging_prefix_and_never_global() {
         let staging = Path::new("/npm/.symforge-update-staging");
-        let args = staging_install_args(staging, &install_specs("linux", "x86_64"));
+        let args = staging_install_args(staging, &install_specs("linux", "x86_64", None));
         assert_eq!(
             args,
             vec![
@@ -2742,6 +2854,7 @@ mod tests {
                 "--prefix",
                 &staging.display().to_string(),
                 "--no-save",
+                "--prefer-online",
                 "symforge@latest",
                 "symforge-linux-x64@latest",
             ]
