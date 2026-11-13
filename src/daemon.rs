@@ -3123,6 +3123,16 @@ impl DaemonSessionClient {
                 crate::protocol::surface_probe::surface_profile_from_env(),
             ),
         );
+        // #874: this adapter's tool allow-list, so a tool that dispatches to
+        // other handlers daemon-side (`ask`) honors it. Only same-version
+        // daemons are used (`daemon_health_matches`), so the header is read.
+        let request = match crate::protocol::surface_probe::connection_tools_header_value() {
+            Some(tools) => request.header(
+                crate::protocol::surface_probe::CONNECTION_TOOLS_HEADER,
+                tools,
+            ),
+            None => request,
+        };
         let response = request
             .send()
             .await
@@ -6187,6 +6197,13 @@ async fn call_tool_handler(
     // not this daemon process's env. `None` (older adapter / direct attach) leaves
     // it unbound -> env fallback (unchanged behavior).
     let connection_surface = connection_surface_from_headers(&headers);
+    // #874: the connection's tool allow-list, authoritative over this daemon's
+    // own env (shared by clients with different lists). Absent means none.
+    let connection_tools = crate::protocol::surface_probe::connection_tools_from_header(
+        headers
+            .get(crate::protocol::surface_probe::CONNECTION_TOOLS_HEADER)
+            .map(|value| value.as_bytes()),
+    );
     match state
         .governor
         .execute_non_abortable(&tool_name, async move {
@@ -6215,9 +6232,12 @@ async fn call_tool_handler(
                         // beside the evidence receipt (`READ_OUTCOME_HEADER`).
                         let (result, outcome) =
                             crate::protocol::result_status::with_read_outcome_scope(
-                                crate::protocol::surface_probe::with_connection_surface(
-                                    connection_surface,
-                                    execute_tool_call(runtime, &tool_name_owned, params),
+                                crate::protocol::surface_probe::with_connection_tools(
+                                    connection_tools,
+                                    crate::protocol::surface_probe::with_connection_surface(
+                                        connection_surface,
+                                        execute_tool_call(runtime, &tool_name_owned, params),
+                                    ),
                                 ),
                             )
                             .await;
@@ -19519,6 +19539,98 @@ mod tests {
             LEGACY_DAEMON_PORT_FILE,
         ))
         .await;
+    }
+
+    /// #874: in the stdio-plus-daemon topology the front end forwards `ask`
+    /// before its own gate, so the daemon-side check bound from
+    /// `CONNECTION_TOOLS_HEADER` is the only gate for `ask` routes. Raw requests
+    /// prove the daemon binds the header (with this process's env unset, an unbound
+    /// header would serve the route); the real adapter client proves it sends one.
+    #[tokio::test]
+    async fn test_daemon_ask_obeys_the_forwarded_tool_allow_list_header() {
+        use crate::protocol::surface_probe::CONNECTION_TOOLS_HEADER;
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _home = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let _surface = EnvVarGuard::unset("SYMFORGE_SURFACE");
+        let _tools = EnvVarGuard::unset("SYMFORGE_TOOLS");
+        let project = project_dir("symforge-ask-allow-list");
+        std::fs::write(
+            project.path().join("src").join("lib.rs"),
+            "pub fn helper() {}\npub fn caller() { helper(); }\n",
+        )
+        .expect("write source");
+
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let http = authed_client(&handle);
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "ask-allow-list".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let ask_url = format!("{base_url}/v1/sessions/{}/tools/ask", opened.session_id);
+        let question = serde_json::json!({ "query": "who calls helper" });
+        let raw_ask = |tools: &'static str| {
+            let request = http
+                .post(&ask_url)
+                .header(CONNECTION_TOOLS_HEADER, tools)
+                .json(&question);
+            async move {
+                request
+                    .send()
+                    .await
+                    .expect("ask request")
+                    .text()
+                    .await
+                    .expect("ask body")
+            }
+        };
+
+        let refused = raw_ask("ask,search_text").await;
+        assert!(
+            refused.contains("needs the tool 'find_references'")
+                && refused.contains("SYMFORGE_TOOLS"),
+            "the daemon must enforce the forwarded list: {refused}"
+        );
+        let served = raw_ask("ask,find_references").await;
+        assert!(
+            served.contains("Chosen tool: find_references") && !served.contains("needs the tool"),
+            "{served}"
+        );
+
+        // The adapter side: its own allow-list rides on every proxied call.
+        let client = DaemonSessionClient::new_for_test_at(
+            base_url.clone(),
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+            test_control_state(daemon_home.path()),
+        )
+        .with_project_root(project.path().to_path_buf());
+        let _tools = EnvVarGuard::set_str("SYMFORGE_TOOLS", "ask,search_text");
+        let via_adapter = client
+            .call_tool_value("ask", question.clone())
+            .await
+            .expect("adapter ask");
+        assert!(
+            via_adapter.contains("needs the tool 'find_references'"),
+            "the adapter must forward its list: {via_adapter}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
     }
 
     #[tokio::test]

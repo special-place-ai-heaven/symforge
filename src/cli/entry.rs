@@ -193,6 +193,11 @@ fn run_daemon() -> anyhow::Result<()> {
 }
 
 fn run_serve(args: cli::serve::ServeCliArgs) -> anyhow::Result<MainExit> {
+    // `--tools` sets this process's allow-list, ahead of `SYMFORGE_TOOLS`;
+    // `server::serve::run` validates it before binding.
+    if let Some(tools) = args.tools.clone() {
+        protocol::surface_probe::set_tools_override(tools);
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -219,6 +224,10 @@ fn run_serve(args: cli::serve::ServeCliArgs) -> anyhow::Result<MainExit> {
             eprintln!("error: {err}");
             Ok(MainExit::ServeRefusedToStart)
         }
+        Err(server::serve::ServeError::ToolAllowList(problem)) => {
+            eprintln!("error: {problem}");
+            Ok(MainExit::ServeRefusedToStart)
+        }
         Err(other) => Err(anyhow::Error::from(other)),
     }
 }
@@ -232,6 +241,14 @@ fn run_mcp_server() -> anyhow::Result<()> {
 
 async fn run_mcp_server_async() -> anyhow::Result<()> {
     observability::init_tracing()?;
+
+    // #874: an allow-list with no available tool would serve nothing, so stdio
+    // refuses to start. Other problems are warned once here and, because stderr
+    // is usually hidden from the agent, also shown in `status` and in the
+    // instructions.
+    for problem in protocol::surface_probe::check_tool_allow_list().map_err(anyhow::Error::msg)? {
+        tracing::warn!("{problem}");
+    }
 
     // V11 bootstrap (Feature 020 Slice 4, T030, C4b): the stdio surface runs
     // the process activation ceremony before the transport comes up — both

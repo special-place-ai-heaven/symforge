@@ -1418,10 +1418,21 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Test-only: the sidecar's live `0.0.0.0` listen test is split from its resolve test and
 // ignored on Windows only (Firewall prompt); `sidecar/server.rs` test module only, no bridge.
 // 319 files.
+// Issue #874: the `SYMFORGE_TOOLS` / `serve --tools` allow-list. A group table and
+// parser in `stel/surface.rs`; the gate, list filter, instructions and status lines in
+// `protocol/surface_probe.rs`, called from `protocol/mod.rs`, `protocol/tools.rs`,
+// `server/admin/api_v1.rs`, `server/serve.rs` and `cli/entry.rs`. No index_lifecycle
+// file touched; calls only, no bridge. 319 files.
+// Review round: the allow-list also gates resource reads and lists
+// (`protocol/resources.rs`), `ask` routes and `symforge_edit` steps (`protocol/tools.rs`),
+// and rides to the daemon as a header bound around `execute_tool_call` (`daemon.rs`).
+// No index_lifecycle file touched; calls only, no bridge. 319 files.
+// Test-only: a `daemon.rs` test module case proving the daemon binds and the
+// adapter sends the allow-list header. No bridge. 319 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "50545f8ebcc566182917a2efb06f6562a9a25919295409aeed6847fd423c691b",
+    "0047ac986c0274908ec17bb4b1bc269d60c013d0ab8cfe6ae7b477462abdc979",
     319,
-    12963608,
+    13007851,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

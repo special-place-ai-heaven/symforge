@@ -295,3 +295,158 @@ async fn core_still_dispatches_unlisted_tools() {
         );
     }
 }
+
+// ---- #874: operator tool allow-list (`SYMFORGE_TOOLS`) ----
+
+use stel_surface_env::EnvVarGuard;
+use symforge::protocol::surface_probe::{
+    TOOL_GROUPS, advertised_tools, check_tool_allow_list, connection_instructions,
+    server_instructions,
+};
+
+fn allow_list(value: &str) -> (EnvVarGuard, EnvVarGuard) {
+    (
+        EnvVarGuard::set("SYMFORGE_TOOLS", value),
+        EnvVarGuard::unset("SYMFORGE_SURFACE"),
+    )
+}
+
+fn advertised_now() -> Vec<String> {
+    advertised_tools()
+        .into_iter()
+        .map(|tool| tool.name.to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn allow_list_of_three_lists_exactly_those_byte_identical() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _env = allow_list("get_symbol, SEARCH_TEXT,what_changed");
+
+    let full: Vec<serde_json::Value> = list_tools_for_profile(SurfaceProfile::Full)
+        .into_iter()
+        .map(|tool| serde_json::to_value(tool).unwrap())
+        .collect();
+    let listed = advertised_tools();
+    let names: BTreeSet<String> = listed.iter().map(|t| t.name.to_string()).collect();
+    let expected: BTreeSet<String> = ["get_symbol", "search_text", "what_changed"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(names, expected);
+    for tool in listed {
+        let value = serde_json::to_value(&tool).unwrap();
+        assert!(
+            full.contains(&value),
+            "`{}` must be byte-identical to its full-surface entry",
+            tool.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn allow_list_refuses_any_other_tool_with_a_recoverable_message() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _env = allow_list("get_symbol,search_text,what_changed");
+
+    for name in ["get_symbol", "search_text", "what_changed"] {
+        assert!(enforce_compact_surface(name).is_ok(), "`{name}` is listed");
+    }
+    let err = enforce_compact_surface("status").expect_err("unlisted tool must be refused");
+    assert!(err.message.contains("'status'"), "{}", err.message);
+    assert!(err.message.contains("SYMFORGE_TOOLS"), "{}", err.message);
+    assert!(
+        err.message
+            .contains("get_symbol, search_text, what_changed"),
+        "the refusal lists what is callable: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn unset_or_blank_allow_list_changes_nothing() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    for value in [None, Some(" ")] {
+        let _tools = match value {
+            Some(v) => EnvVarGuard::set("SYMFORGE_TOOLS", v),
+            None => EnvVarGuard::unset("SYMFORGE_TOOLS"),
+        };
+        let _surface = EnvVarGuard::unset("SYMFORGE_SURFACE");
+        let names: BTreeSet<String> = advertised_now().into_iter().collect();
+        assert_eq!(names, advertised_names(SurfaceProfile::Full));
+        assert_eq!(names.len(), 40);
+        assert_eq!(
+            connection_instructions().as_deref(),
+            server_instructions(SurfaceProfile::Full)
+        );
+        assert!(check_tool_allow_list().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn allow_list_groups_expand_and_mixed_lists_deduplicate() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _env = allow_list("impact, what_changed ,IMPACT,status");
+    let names = advertised_now();
+    let mut expected: Vec<&str> = TOOL_GROUPS
+        .iter()
+        .find(|(group, _)| *group == "impact")
+        .unwrap()
+        .1
+        .to_vec();
+    expected.push("status");
+    let got: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+    assert_eq!(got, expected.iter().copied().collect::<BTreeSet<_>>());
+    assert_eq!(names.len(), expected.len(), "no duplicates: {names:?}");
+}
+
+#[tokio::test]
+async fn every_full_surface_tool_is_in_exactly_one_group() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let grouped: Vec<&str> = TOOL_GROUPS
+        .iter()
+        .flat_map(|(_, members)| members.iter().copied())
+        .collect();
+    let full = advertised_names(SurfaceProfile::Full);
+    let grouped_set: BTreeSet<String> = grouped.iter().map(|n| n.to_string()).collect();
+    assert_eq!(grouped.len(), grouped_set.len(), "a tool is in two groups");
+    assert_eq!(grouped_set, full, "groups must partition the full surface");
+    for (group, _) in TOOL_GROUPS {
+        assert!(!full.contains(group), "group `{group}` equals a tool name");
+    }
+}
+
+#[tokio::test]
+async fn unknown_names_and_surface_conflicts_are_reported_not_dropped() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _tools = EnvVarGuard::set("SYMFORGE_TOOLS", "get_symbol,bogus,symforge");
+    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+    // The allow-list wins and filters the full surface...
+    assert_eq!(surface_profile_from_env(), SurfaceProfile::Full);
+    assert_eq!(advertised_now(), vec!["get_symbol".to_string()]);
+    // ...and every problem is reported.
+    let problems = check_tool_allow_list()
+        .expect("a valid name remains")
+        .join("\n");
+    assert!(problems.contains("bogus"), "{problems}");
+    assert!(problems.contains("symforge (compact-only"), "{problems}");
+    assert!(
+        problems.contains("SYMFORGE_SURFACE=compact is ignored"),
+        "{problems}"
+    );
+    let instructions = connection_instructions().unwrap();
+    assert!(instructions.contains("get_symbol"), "{instructions}");
+    assert!(instructions.contains("bogus"), "{instructions}");
+    assert!(
+        instructions.contains("SYMFORGE_SURFACE=compact"),
+        "{instructions}"
+    );
+
+    let _tools = EnvVarGuard::set("SYMFORGE_TOOLS", "bogus");
+    let fatal = check_tool_allow_list().expect_err("no valid name remains");
+    assert!(
+        fatal.contains("names no available tool") && fatal.contains("read"),
+        "{fatal}"
+    );
+}

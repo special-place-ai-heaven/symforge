@@ -1434,6 +1434,37 @@ fn append_daemon_staleness_warning(mut proxied_health: String, frontend_version:
     proxied_health
 }
 
+/// Append this front end's tool allow-list lines (#874) to a `status` body.
+/// Rendered here, not in the shared daemon renderer: the daemon's env belongs
+/// to whichever client spawned it, while the list is this process's.
+fn with_allow_list_lines(mut body: String) -> String {
+    for line in super::surface_probe::allow_list_status_lines() {
+        body.push('\n');
+        body.push_str(&line);
+    }
+    body
+}
+
+/// The tool whose handler an `ask` route runs; `None` for the static catalog.
+fn ask_route_tool(intent: &crate::protocol::smart_query::QueryIntent) -> Option<&'static str> {
+    use crate::protocol::smart_query::QueryIntent;
+    Some(match intent {
+        QueryIntent::FindCallers { .. }
+        | QueryIntent::UnderstandImplementations { .. }
+        | QueryIntent::FindImplementations { .. } => "find_references",
+        QueryIntent::FindSymbol { .. } => "search_symbols",
+        QueryIntent::FindFile { .. } => "search_files",
+        QueryIntent::FindChanges => "what_changed",
+        QueryIntent::Understand { .. } | QueryIntent::Explore { .. } => "explore",
+        QueryIntent::UnderstandSymbol { .. } => "get_symbol_context",
+        QueryIntent::SearchCode { .. } => "search_text",
+        QueryIntent::SearchKnowledge { .. } => "search_knowledge",
+        QueryIntent::RepositoryOrientation => "get_repo_map",
+        QueryIntent::FindDependents { .. } => "find_dependents",
+        QueryIntent::ToolHelp { .. } => return None,
+    })
+}
+
 /// Overlay ALL of the proxy's OWN ledger/store-derived lines onto a `status`
 /// body proxied from the daemon worker (D2-ROOT — proxy-owned state invisible to
 /// worker-rendered responses).
@@ -8561,6 +8592,17 @@ impl SymForgeServer {
                     .into_mutation_call_tool_result(error.message),
             );
         }
+        // #874: `symforge_edit` runs a granular edit tool's handler, so that tool
+        // must be on this connection's allow-list too.
+        if let Ok(plan) = build_edit_plan(request)
+            && let Some(step) = plan.steps.first()
+            && let Some(refusal) =
+                super::surface_probe::allow_list_refusal(&step.tool, Some("This edit"))
+        {
+            let message = format!("Error: {refusal}");
+            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                .into_mutation_call_tool_result(message));
+        }
         // Knowingly STILL OPEN, deliberately out of scope (same gap as the
         // retrieve facade's guard): on the daemon-CONFIGURED-but-DEGRADED
         // topology `daemon_client` is `Some`, so this does not fire, yet
@@ -8900,7 +8942,7 @@ impl SymForgeServer {
             if let Some(note) = reset_receipt {
                 body = format!("{body}\n{note}");
             }
-            return statused_tool_result(body, OutcomeClass::Found);
+            return statused_tool_result(with_allow_list_lines(body), OutcomeClass::Found);
         }
 
         let body = self.render_stel_status_body(&request);
@@ -8913,7 +8955,7 @@ impl SymForgeServer {
         } else {
             body
         };
-        statused_tool_result(body, OutcomeClass::Found)
+        statused_tool_result(with_allow_list_lines(body), OutcomeClass::Found)
     }
 
     /// One health/status line carrying ONLY the secret-dismissal record count:
@@ -9331,6 +9373,15 @@ impl SymForgeServer {
             crate::index_lifecycle::guidance::routing::resolve(&guard, q)
         };
         let assessment = smart_query::assess_route(&intent, matched_prefix);
+        // #874: the route runs another tool's handler, so that tool must be on
+        // this connection's allow-list too; refuse instead of rerouting.
+        if let Some(tool) = ask_route_tool(&intent)
+            && let Some(refusal) =
+                super::surface_probe::allow_list_refusal(tool, Some("This question"))
+        {
+            record_read_outcome(ReadOutcome::InvalidRequest);
+            return format!("Error: {refusal}");
+        }
 
         // The routed tool records its own outcome; isolate it so `ask` types
         // its answer from it below rather than inheriting it unread.
@@ -30930,6 +30981,96 @@ mod tests {
         assert!(
             result.contains("matched explicit caller/reference phrasing"),
             "result: {result}"
+        );
+    }
+
+    /// #874: an `ask` route runs another tool's handler, so it obeys the
+    /// allow-list: served when that tool is listed, refused (no rerouting) when not.
+    #[tokio::test]
+    async fn test_ask_route_obeys_the_tool_allow_list() {
+        use crate::protocol::surface_probe::SurfaceEnvVarGuard;
+        let dir = tempfile::tempdir().unwrap();
+        let content = b"fn helper() {}\nfn caller() { helper(); }\n";
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), content).unwrap();
+        let result = crate::parsing::process_file("src/lib.rs", content, LanguageId::Rust);
+        let indexed =
+            crate::live_index::store::IndexedFile::from_parse_result(result, content.to_vec());
+        let server = make_server_with_root(
+            make_live_index_ready(vec![("src/lib.rs".to_string(), indexed)]),
+            Some(dir.path().to_path_buf()),
+        );
+        let ask = |server: &SymForgeServer| {
+            let input = super::SmartQueryInput {
+                project: None,
+                query: "who calls helper".to_string(),
+                max_tokens: None,
+            };
+            let server = server.clone();
+            async move { server.ask(Parameters(input)).await }
+        };
+        let _surface = SurfaceEnvVarGuard::set("SYMFORGE_SURFACE", None);
+
+        let _tools = SurfaceEnvVarGuard::set("SYMFORGE_TOOLS", Some("ask,find_references"));
+        let served = ask(&server).await;
+        assert!(served.contains("Chosen tool: find_references"), "{served}");
+
+        let _tools = SurfaceEnvVarGuard::set("SYMFORGE_TOOLS", Some("ask,search_text"));
+        let refused = ask(&server).await;
+        assert!(
+            refused.starts_with("Error: This question needs the tool 'find_references'")
+                && refused.contains("SYMFORGE_TOOLS")
+                && !refused.contains("Chosen tool"),
+            "{refused}"
+        );
+    }
+
+    /// #874: `symforge_edit` runs a granular edit handler, so it obeys the list.
+    #[tokio::test]
+    async fn test_symforge_edit_obeys_the_tool_allow_list() {
+        use crate::protocol::surface_probe::SurfaceEnvVarGuard;
+        let dir = tempfile::tempdir().unwrap();
+        let content = b"fn helper() {}\n";
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), content).unwrap();
+        let result = crate::parsing::process_file("src/lib.rs", content, LanguageId::Rust);
+        let indexed =
+            crate::live_index::store::IndexedFile::from_parse_result(result, content.to_vec());
+        let server = make_server_with_root(
+            make_live_index_ready(vec![("src/lib.rs".to_string(), indexed)]),
+            Some(dir.path().to_path_buf()),
+        );
+        let request = crate::stel::StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("helper".to_string()),
+            body: Some("fn helper() { 1; }".to_string()),
+            ..Default::default()
+        };
+        let _surface = SurfaceEnvVarGuard::set("SYMFORGE_SURFACE", None);
+
+        let _tools = SurfaceEnvVarGuard::set("SYMFORGE_TOOLS", Some("symforge_edit"));
+        let refused = server
+            .symforge_edit_facade_tool(Parameters(request.clone()))
+            .await
+            .expect("symforge_edit dispatch");
+        let refused = serde_json::to_value(&refused).unwrap();
+        let refused = tool_result_text(&refused);
+        assert!(
+            refused.contains("This edit needs the tool 'replace_symbol_body'"),
+            "{refused}"
+        );
+
+        let _tools =
+            SurfaceEnvVarGuard::set("SYMFORGE_TOOLS", Some("symforge_edit,replace_symbol_body"));
+        let served = server
+            .symforge_edit_facade_tool(Parameters(request))
+            .await
+            .expect("symforge_edit dispatch");
+        let served = serde_json::to_value(&served).unwrap();
+        let served = tool_result_text(&served);
+        assert!(
+            served.contains("Chosen tool: replace_symbol_body"),
+            "{served}"
         );
     }
 

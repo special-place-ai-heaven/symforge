@@ -17,10 +17,182 @@ use serde_json::{Map, Value, json};
 use super::SymForgeServer;
 
 pub use crate::stel::surface::{
-    SurfaceProfile, surface_label_from_str, surface_profile_from_label, surface_profile_label,
+    SurfaceProfile, TOOL_GROUPS, TOOLS_ENV, ToolAllowList, surface_label_from_str,
+    surface_profile_from_label, surface_profile_label,
 };
 
+/// `serve --tools` value. Takes precedence over [`TOOLS_ENV`] for that process;
+/// a `OnceLock` instead of `set_var`, which is `unsafe` once threads exist.
+static TOOLS_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Install the `serve --tools` list for this process. A second call is ignored.
+pub fn set_tools_override(spec: String) {
+    let _ = TOOLS_OVERRIDE.set(spec);
+}
+
+/// The operator's per-process tool allow-list (issue #874): `serve --tools`,
+/// else [`TOOLS_ENV`]. Read per call like `SYMFORGE_SURFACE`.
+///
+/// Fails closed: an explicit `--tools`, even blank, is a list (an empty one is
+/// refused at startup), and a [`TOOLS_ENV`] value that is not UTF-8 is a list
+/// with no valid name, never "unset". Only an absent or blank [`TOOLS_ENV`]
+/// returns `None`, which leaves every surface exactly as it was.
+pub fn tool_allow_list() -> Option<ToolAllowList> {
+    if let Some(spec) = TOOLS_OVERRIDE.get() {
+        return Some(ToolAllowList::parse(spec));
+    }
+    match std::env::var_os(TOOLS_ENV)?.into_string() {
+        Ok(spec) if spec.trim().is_empty() => None,
+        Ok(spec) => Some(ToolAllowList::parse(&spec)),
+        Err(raw) => Some(ToolAllowList {
+            allowed: Vec::new(),
+            unknown: vec![format!("{} (not valid UTF-8)", raw.to_string_lossy())],
+        }),
+    }
+}
+
+/// Header the front end stamps on every proxied daemon tool call with the
+/// allow-list served on THIS connection (comma-joined allowed names). The
+/// daemon is shared by clients with different lists, so it never uses its own
+/// env for a proxied call: [`connection_tools_from_header`] is authoritative.
+pub const CONNECTION_TOOLS_HEADER: &str = "x-symforge-connection-tools";
+
+tokio::task_local! {
+    /// Allow-list of the connection whose proxied call the daemon is running.
+    static CONNECTION_TOOLS: Option<ToolAllowList>;
+}
+
+/// Allow-list to enforce inside a handler: the proxied connection's on the
+/// daemon side, else this process's own ([`tool_allow_list`]).
+pub fn connection_allow_list() -> Option<ToolAllowList> {
+    CONNECTION_TOOLS
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| tool_allow_list())
+}
+
+/// Front end: the header value for this process's allow-list, if any.
+pub fn connection_tools_header_value() -> Option<String> {
+    tool_allow_list().map(|list| list.allowed.join(","))
+}
+
+/// Daemon: the list a proxied call carries. Absent means no list; a value that
+/// is not UTF-8 is a list with no valid name (fails closed).
+pub fn connection_tools_from_header(value: Option<&[u8]>) -> Option<ToolAllowList> {
+    value.map(|bytes| match std::str::from_utf8(bytes) {
+        Ok(spec) => ToolAllowList::parse(spec),
+        Err(_) => ToolAllowList {
+            allowed: Vec::new(),
+            unknown: Vec::new(),
+        },
+    })
+}
+
+/// Run a daemon-side proxied dispatch with the connection's allow-list bound.
+pub async fn with_connection_tools<F, T>(list: Option<ToolAllowList>, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    CONNECTION_TOOLS.scope(list, future).await
+}
+
+/// Refusal text when `tool` may not run on this connection; `None` when it may.
+/// `needed_by` names the resource or tool that needed `tool`, if not the call itself.
+pub fn allow_list_refusal(tool: &str, needed_by: Option<&str>) -> Option<String> {
+    let list = connection_allow_list()?;
+    if list.allows(tool) {
+        return None;
+    }
+    let callable = list.allowed.join(", ");
+    let registered = tool == "symforge"
+        || TOOL_GROUPS
+            .iter()
+            .any(|(_, members)| members.contains(&tool));
+    Some(match needed_by {
+        Some(caller) => format!(
+            "{caller} needs the tool '{tool}', which is not in this server's tool allow-list \
+             ({TOOLS_ENV}, or serve --tools). Tools callable here: {callable}."
+        ),
+        None if !registered => {
+            format!("'{tool}' is not a tool of this server. Tools callable here: {callable}.")
+        }
+        None => format!(
+            "tool '{tool}' is not in this server's tool allow-list ({TOOLS_ENV}, or serve \
+             --tools). Tools callable here: {callable}. Use one of those; only the operator \
+             can add '{tool}' to {TOOLS_ENV}."
+        ),
+    })
+}
+
+/// Precedence rule: a set allow-list filters the FULL surface, so a
+/// `SYMFORGE_SURFACE` of `core`, `compact` or `meta` beside it is overridden.
+/// That is never silent: this conflict is reported wherever unknown names are.
+pub fn surface_env_conflict() -> Option<String> {
+    tool_allow_list()?;
+    let surface = std::env::var("SYMFORGE_SURFACE").ok()?.to_ascii_lowercase();
+    matches!(surface.as_str(), "core" | "compact" | "meta")
+        .then(|| format!("SYMFORGE_SURFACE={surface} is ignored because {TOOLS_ENV} is set"))
+}
+
+/// Startup check of the allow-list. `Err` when no listed name is available
+/// (nothing would be served); otherwise the problems to report, empty when clean.
+pub fn check_tool_allow_list() -> Result<Vec<String>, String> {
+    let Some(list) = tool_allow_list() else {
+        return Ok(Vec::new());
+    };
+    let groups: Vec<&str> = TOOL_GROUPS.iter().map(|(group, _)| *group).collect();
+    if list.allowed.is_empty() && list.unknown.is_empty() {
+        return Err(format!(
+            "{TOOLS_ENV} (or serve --tools) is blank. Use tool names or the groups {}.",
+            groups.join(", ")
+        ));
+    }
+    if list.allowed.is_empty() {
+        return Err(format!(
+            "{TOOLS_ENV} names no available tool (unknown: {}). Use tool names or the groups {}.",
+            list.unknown.join(", "),
+            groups.join(", ")
+        ));
+    }
+    let mut problems = Vec::new();
+    if !list.unknown.is_empty() {
+        problems.push(format!(
+            "{TOOLS_ENV} has unknown names, ignored: {} (groups: {})",
+            list.unknown.join(", "),
+            groups.join(", ")
+        ));
+    }
+    problems.extend(surface_env_conflict());
+    Ok(problems)
+}
+
+/// `status` lines describing the allow-list; empty when unset.
+pub fn allow_list_status_lines() -> Vec<String> {
+    let Some(list) = tool_allow_list() else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!(
+        "tools_allowed: {} of {}: {}",
+        list.allowed.len(),
+        crate::stel::surface::allow_list_tool_count(),
+        list.allowed.join(", ")
+    )];
+    if !list.unknown.is_empty() {
+        lines.push(format!(
+            "tools_allowed_unknown: {}",
+            list.unknown.join(", ")
+        ));
+    }
+    lines.extend(
+        surface_env_conflict().map(|conflict| format!("tools_allowed_conflict: {conflict}")),
+    );
+    lines
+}
+
 pub fn surface_profile_from_env() -> SurfaceProfile {
+    // An allow-list filters the full surface (see `surface_env_conflict`).
+    if tool_allow_list().is_some() {
+        return SurfaceProfile::Full;
+    }
     // Default surface is FULL (spike-gate verdict 2026-07-03: no target harness
     // rejected the then-36-tool full `tools/list`; see docs/reviews). The current
     // full surface has 40 tools. `SYMFORGE_SURFACE=compact`
@@ -107,12 +279,17 @@ pub fn compact_surface_blocks(profile: SurfaceProfile, tool_name: &str) -> bool 
         && !crate::stel::surface::COMPACT_TOOL_NAMES.contains(&tool_name)
 }
 
-/// Apply the compact-surface gate using the live `SYMFORGE_SURFACE` env profile.
+/// Apply the surface gates: the operator tool allow-list ([`TOOLS_ENV`]), then
+/// the compact-surface gate using the live `SYMFORGE_SURFACE` env profile.
 ///
 /// Returns `Err(InvalidRequest)` when the call must be rejected, else `Ok(())`.
-/// Used by the production `call_tool` and asserted directly by the surface
-/// conformance test so the test exercises the real gate, not a copy.
+/// Used by the production `call_tool` (stdio front and the HTTP `/mcp` path)
+/// and asserted directly by the surface conformance test so the test exercises
+/// the real gate, not a copy.
 pub fn enforce_compact_surface(tool_name: &str) -> Result<(), rmcp::ErrorData> {
+    if let Some(refusal) = allow_list_refusal(tool_name, None) {
+        return Err(rmcp::ErrorData::invalid_request(refusal, None));
+    }
     if compact_surface_blocks(surface_profile_from_env(), tool_name) {
         return Err(rmcp::ErrorData::invalid_request(
             format!(
@@ -147,6 +324,76 @@ pub fn server_instructions(profile: SurfaceProfile) -> Option<&'static str> {
         SurfaceProfile::Compact => Some(COMPACT_SURFACE_INSTRUCTIONS),
         SurfaceProfile::Meta => None,
     }
+}
+
+/// Instructions `get_info` sends on this connection. Unset allow-list: exactly
+/// [`server_instructions`]. Set: a generated line naming the callable tools
+/// (the static hints may name tools this connection cannot call), shortened to
+/// a count plus group names when the full form would exceed
+/// [`SERVER_INSTRUCTIONS_MAX_BYTES`].
+pub fn connection_instructions() -> Option<String> {
+    match tool_allow_list() {
+        None => server_instructions(surface_profile_from_env()).map(str::to_string),
+        Some(list) => Some(allow_list_instructions(
+            &list,
+            surface_env_conflict().as_deref(),
+        )),
+    }
+}
+
+/// The generated allow-list instructions; always within the byte cap.
+pub fn allow_list_instructions(list: &ToolAllowList, conflict: Option<&str>) -> String {
+    let total = crate::stel::surface::allow_list_tool_count();
+    let names = list.allowed.join(", ");
+    let counted = format!(
+        "{} of {total}, from the groups {}; status lists them",
+        list.allowed.len(),
+        list.touched_groups().join(", ")
+    );
+    let unknown_full = format!(" Ignored unknown names: {}.", list.unknown.join(", "));
+    let unknown_short = format!(
+        " {} unknown names were ignored; status lists them.",
+        list.unknown.len()
+    );
+    let unknown_forms: [&str; 2] = if list.unknown.is_empty() {
+        ["", ""]
+    } else {
+        [&unknown_full, &unknown_short]
+    };
+    let conflict = conflict.map(|c| format!(" {c}.")).unwrap_or_default();
+    let render = |tools: &str, unknown: &str| {
+        format!(
+            "SymForge indexes this repository. Tools on this connection ({TOOLS_ENV}): {tools}. \
+             Tool names in answers that are not listed here are not callable.{unknown}{conflict}"
+        )
+    };
+    [
+        (names.as_str(), unknown_forms[0]),
+        (names.as_str(), unknown_forms[1]),
+        (counted.as_str(), unknown_forms[0]),
+        (counted.as_str(), unknown_forms[1]),
+    ]
+    .into_iter()
+    .map(|(tools, unknown)| render(tools, unknown))
+    .find(|text| text.len() <= SERVER_INSTRUCTIONS_MAX_BYTES)
+    // The shortest form is bounded (counts, five group names, one fixed
+    // conflict sentence), so this fallback is unreachable; it is the same form.
+    .unwrap_or_else(|| render(&counted, unknown_forms[1]))
+}
+
+/// Tools `tools/list` advertises on this connection: the profile's list,
+/// narrowed to the operator allow-list when one is set. Entries are the
+/// profile's own, byte for byte.
+pub fn advertised_tools() -> Vec<Tool> {
+    let profile = surface_profile_from_env();
+    let mut tools = match profile {
+        SurfaceProfile::Compact => crate::stel::compact_surface_tools(),
+        _ => list_tools_for_profile(profile),
+    };
+    if let Some(list) = tool_allow_list() {
+        tools.retain(|tool| list.allows(tool.name.as_ref()));
+    }
+    tools
 }
 
 pub fn list_tools_for_profile(profile: SurfaceProfile) -> Vec<Tool> {
@@ -384,9 +631,110 @@ pub fn list_tools_schema_bytes(profile: SurfaceProfile) -> (usize, usize) {
     (tools.len(), bytes)
 }
 
+/// Test-only RAII guard for the process-global surface variables.
+#[cfg(test)]
+pub(crate) struct SurfaceEnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)] // test-only env guard; no concurrent env readers under --test-threads=1.
+impl SurfaceEnvVarGuard {
+    /// Set `key` to `value`, or remove it when `value` is `None`.
+    pub(crate) fn set(key: &'static str, value: Option<&str>) -> Self {
+        let previous = std::env::var_os(key);
+        match value {
+            // SAFETY: single-threaded test context; no concurrent env readers.
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            // SAFETY: single-threaded test context; no concurrent env readers.
+            None => unsafe { std::env::remove_var(key) },
+        }
+        Self { key, previous }
+    }
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)] // test-only env guard restores the serialized mutation.
+impl Drop for SurfaceEnvVarGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            // SAFETY: single-threaded test context; no concurrent env readers.
+            Some(previous) => unsafe { std::env::set_var(self.key, previous) },
+            // SAFETY: single-threaded test context; no concurrent env readers.
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Daemon side, the forwarded header is authoritative: the daemon's own env
+    /// list never applies to a proxied call, an absent header means no list, and
+    /// an undecodable header allows nothing.
+    #[tokio::test]
+    async fn forwarded_connection_list_is_authoritative_and_fails_closed() {
+        let _tools = SurfaceEnvVarGuard::set(TOOLS_ENV, Some("status"));
+        let forwarded = connection_tools_from_header(Some(b"search_text,find_references"));
+        with_connection_tools(forwarded, async {
+            assert!(allow_list_refusal("find_references", None).is_none());
+            assert!(allow_list_refusal("status", None).is_some());
+        })
+        .await;
+        with_connection_tools(connection_tools_from_header(None), async {
+            assert!(allow_list_refusal("get_repo_map", None).is_none());
+        })
+        .await;
+        let garbled = connection_tools_from_header(Some(&[0xff, 0xfe]));
+        with_connection_tools(garbled, async {
+            assert!(allow_list_refusal("status", None).is_some());
+        })
+        .await;
+        // Outside a proxied dispatch, this process's list applies.
+        assert!(allow_list_refusal("search_text", None).is_some());
+    }
+
+    #[test]
+    fn refusal_says_when_a_name_is_not_a_tool_at_all() {
+        let _tools = SurfaceEnvVarGuard::set(TOOLS_ENV, Some("status"));
+        let unknown = allow_list_refusal("serch_text", None).unwrap();
+        assert!(
+            unknown.starts_with("'serch_text' is not a tool of this server"),
+            "{unknown}"
+        );
+        let unlisted = allow_list_refusal("search_text", None).unwrap();
+        assert!(unlisted.contains("only the operator can add"), "{unlisted}");
+    }
+
+    #[test]
+    fn allow_list_instructions_stay_within_the_byte_cap_for_the_longest_list() {
+        let every: String = TOOL_GROUPS
+            .iter()
+            .flat_map(|(_, members)| members.iter().copied())
+            .collect::<Vec<_>>()
+            .join(",");
+        let unknown = vec!["an_operator_typo_that_is_quite_long"; 200].join(",");
+        let conflict = "SYMFORGE_SURFACE=compact is ignored because SYMFORGE_TOOLS is set";
+        for spec in [every.clone(), format!("{every},{unknown}")] {
+            let list = ToolAllowList::parse(&spec);
+            assert_eq!(list.allowed.len(), 40);
+            for conflict in [None, Some(conflict)] {
+                let text = allow_list_instructions(&list, conflict);
+                assert!(
+                    text.len() <= SERVER_INSTRUCTIONS_MAX_BYTES,
+                    "{} B: {text}",
+                    text.len()
+                );
+                assert!(text.contains("40 of 40") || text.contains("symforge_retrieve"));
+            }
+        }
+        // A short list is named in full.
+        let text = allow_list_instructions(&ToolAllowList::parse("read"), None);
+        assert!(text.contains("search_symbols, get_symbol"), "{text}");
+        assert!(text.contains("not callable"), "{text}");
+    }
 
     #[test]
     fn compact_surface_is_three_tools_under_h1_budget() {

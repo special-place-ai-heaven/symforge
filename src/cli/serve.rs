@@ -28,6 +28,12 @@ pub struct ServeCliArgs {
     /// Name of an environment variable holding the Bearer key.
     #[arg(long)]
     pub api_key_env: Option<String>,
+
+    /// Tool allow-list for this server: comma-separated tool or group names
+    /// (`read`, `edit`, `knowledge`, `impact`, `service`). Same as `SYMFORGE_TOOLS`,
+    /// which it overrides.
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub tools: Option<String>,
 }
 
 impl ServeCliArgs {
@@ -60,6 +66,7 @@ mod tests {
             listen: Some("0.0.0.0:9000".to_string()),
             api_key: Some("k".to_string()),
             api_key_env: None,
+            tools: None,
         };
         let args = cli.into_serve_args();
         assert_eq!(args.listen, "0.0.0.0:9000");
@@ -72,11 +79,26 @@ mod tests {
     }
 
     #[test]
+    fn serve_tools_flag_parses_and_rejects_an_empty_value() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from(["symforge", "serve", "--tools", "read,status"])
+            .expect("--tools parses");
+        match cli.command {
+            Some(crate::cli::Commands::Serve(args)) => {
+                assert_eq!(args.tools.as_deref(), Some("read,status"));
+            }
+            _ => panic!("expected the serve subcommand"),
+        }
+        assert!(crate::cli::Cli::try_parse_from(["symforge", "serve", "--tools", ""]).is_err());
+    }
+
+    #[test]
     fn into_serve_args_defaults_listen_without_explicit_flag() {
         let cli = ServeCliArgs {
             listen: None,
             api_key: None,
             api_key_env: None,
+            tools: None,
         };
         let args = cli.into_serve_args();
         assert_eq!(args.listen, DEFAULT_LISTEN);

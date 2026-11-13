@@ -266,6 +266,69 @@ async fn core_over_http_lists_core_and_still_calls_unlisted_tool() {
     server.shutdown().await;
 }
 
+/// #874 over HTTP `/mcp`: `SYMFORGE_TOOLS` narrows `tools/list` and the same
+/// gate refuses an unlisted tool with a message naming the variable.
+#[tokio::test]
+async fn tool_allow_list_over_http_lists_and_refuses() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _tools = stel_surface_env::EnvVarGuard::set("SYMFORGE_TOOLS", "status,get_symbol");
+    let _surface = stel_surface_env::EnvVarGuard::unset("SYMFORGE_SURFACE");
+    let server = start_server(test_runtime()).await;
+
+    let listed = mcp_call(
+        &server.mcp_url(),
+        jsonrpc(1, "tools/list", serde_json::json!({})),
+    )
+    .await;
+    let names: std::collections::BTreeSet<String> = listed["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        names,
+        ["get_symbol", "status"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+
+    let refused = mcp_call(
+        &server.mcp_url(),
+        jsonrpc(
+            2,
+            "tools/call",
+            serde_json::json!({"name": "health_compact", "arguments": {}}),
+        ),
+    )
+    .await;
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("SYMFORGE_TOOLS") && message.contains("'health_compact'"),
+        "{refused}"
+    );
+
+    let status = mcp_call(
+        &server.mcp_url(),
+        jsonrpc(
+            3,
+            "tools/call",
+            serde_json::json!({"name": "status", "arguments": {}}),
+        ),
+    )
+    .await;
+    let text = status["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("tools_allowed: 2 of 40: get_symbol, status"),
+        "{status}"
+    );
+
+    server.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // T018: tools/call parity (HTTP result == in-process dispatch result)
 // ---------------------------------------------------------------------------

@@ -1047,4 +1047,74 @@ mod tests {
         drop(StartupGuard(Arc::new(startup), shutdown));
         assert!(matches!(&*front.startup.borrow(), StdioStartup::Starting));
     }
+
+    /// #874 on the stdio path: `SYMFORGE_TOOLS` narrows `tools/list`, the front
+    /// refuses an unlisted tool with a recoverable message, and `status` shows
+    /// the list and the unknown names stderr alone would hide.
+    #[tokio::test]
+    async fn stdio_tool_allow_list_lists_refuses_and_reports_unknown_names() {
+        use crate::protocol::surface_probe::SurfaceEnvVarGuard;
+        let _tools = SurfaceEnvVarGuard::set(
+            "SYMFORGE_TOOLS",
+            Some("status, get_symbol,search_text,bogus"),
+        );
+        let _surface = SurfaceEnvVarGuard::set("SYMFORGE_SURFACE", None);
+        let (front, startup) = DeferredStdioServer::new(Path::new("/work/repo"));
+        startup.send_replace(StdioStartup::Ready(Arc::new(real_server())));
+        let mut client = connect(front);
+        client.initialize().await;
+
+        let tools = client.request(2, "tools/list", json!({})).await;
+        let names: Vec<&str> = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            vec!["get_symbol", "search_text", "status"],
+            "{tools}"
+        );
+
+        let refused = client.call(3, "get_repo_map", None).await;
+        let message = refused["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("'get_repo_map'")
+                && message.contains("SYMFORGE_TOOLS")
+                && message.contains("get_symbol, search_text, status"),
+            "{refused}"
+        );
+
+        let status = client.call(4, "status", None).await;
+        let text = tool_text(&status);
+        assert!(
+            text.contains("tools_allowed: 3 of 40: get_symbol, search_text, status"),
+            "{text}"
+        );
+        assert!(text.contains("tools_allowed_unknown: bogus"), "{text}");
+    }
+
+    /// The readiness probe calls `status` through the gated `call_tool`. With
+    /// `status` off the allow-list the probe is refused, yet a loading index is
+    /// still answered with the loading notice, not a wrong result.
+    #[tokio::test]
+    async fn loading_notice_survives_an_allow_list_without_status() {
+        use crate::protocol::surface_probe::SurfaceEnvVarGuard;
+        let _tools = SurfaceEnvVarGuard::set("SYMFORGE_TOOLS", Some("get_repo_map"));
+        let _surface = SurfaceEnvVarGuard::set("SYMFORGE_SURFACE", None);
+        let (front, startup) = DeferredStdioServer::new(Path::new("/work/large-repo"));
+        startup.send_replace(StdioStartup::Ready(loading_server()));
+        let mut client = connect(front.with_readiness_wait(Duration::from_millis(600)));
+        client.initialize().await;
+
+        let loading = client.call(2, "get_repo_map", None).await;
+        assert_eq!(loading["result"]["isError"], json!(true), "{loading}");
+        assert!(
+            tool_text(&loading).contains(INDEXING_IN_PROGRESS),
+            "{loading}"
+        );
+    }
 }
