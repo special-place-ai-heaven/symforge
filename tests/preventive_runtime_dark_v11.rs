@@ -1184,10 +1184,13 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Review round: the section reads `PublishedGeneration::memory_counts` (an inherent
 // method, counted once per generation) and literal sites add the `OnceLock` field.
 // Same 91 files, no bridge.
+// Embed close phase: a handle that has observed its own close reports Stopping from
+// `wait_for_change` and `runtime_view` (private `phase_after_close`). Same 91 files,
+// no bridge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "10b244ca137eea9e5c868629731f1ed38b3ffa2f22fdc08c8e96ed2d3107ec54",
+    "d8d47cdcf281b312b5927b639f593444d040f6dd1582170b162c31fa5a21cb50",
     91,
-    2496936,
+    2498626,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1459,10 +1462,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // switch, live in a `__test-internals` module of `knowledge_bridge.rs`; `store.rs`
 // compares against the replaced generation once per publication. No index_lifecycle
 // file touched, no bridge. 320 files.
+// Embed close phase: `index_lifecycle/embedded.rs` gains a private inherent method that
+// maps a pre-close phase to Stopping once the handle's `closed` flag is set, called from
+// `wait_for_change` and the bound `runtime_view`. No new edge, no bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "4caf5d8fbfff993c65cc12d73b900d1fb61a93e2ea0daee88ef0facbd7d2555c",
+    "25f5a10c55a20af424fb4972406dc49833bdc699980bc5a3903ef7cee925e9b8",
     320,
-    13076087,
+    13077777,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
