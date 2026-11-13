@@ -406,6 +406,19 @@ mod tests {
             logged.contains("non-loopback"),
             "opt-in plus token must warn that the bind is off-loopback: {logged}"
         );
+    }
+
+    /// Live wildcard listen. Ignored by default: binding `0.0.0.0` makes Windows
+    /// Firewall prompt "allow public and private networks" for every new test
+    /// binary path. The resolved-host decision is covered without a socket by
+    /// `test_sidecar_bind_policy_allows_non_loopback_with_explicit_opt_in`.
+    #[tokio::test]
+    #[ignore = "binds 0.0.0.0; triggers the Windows Firewall prompt (run with --ignored)"]
+    async fn test_sidecar_non_loopback_opt_in_really_listens_on_wildcard() {
+        let _env_lock = env_lock().await;
+        let _bind_guard = EnvVarGuard::set_str(SIDECAR_BIND_ENV, "0.0.0.0");
+        let _allow_guard = EnvVarGuard::set_str(SIDECAR_ALLOW_NON_LOOPBACK_ENV, "1");
+        let _token_guard = EnvVarGuard::set_str(SIDECAR_TOKEN_ENV, "sidecar-test-token");
 
         let handle = spawn_sidecar(LiveIndex::empty(), "127.0.0.1", None, None)
             .await
