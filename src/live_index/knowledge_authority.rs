@@ -811,7 +811,8 @@ pub fn build_knowledge_authority(
     if matches!(bridge.coverage, DerivedCoverage::Loading) {
         return KnowledgeAuthorityView::loading(content_generation);
     }
-    FULL_AUTHORITY_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(any(test, feature = "__test-internals"))]
+    FULL_AUTHORITY_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let mut units = collect_authority_units(live, source, content_generation);
     let policy = evaluate_policy(live, &units);
     apply_policy(&mut units, &policy);
@@ -951,13 +952,17 @@ pub fn build_knowledge_authority(
     }
 }
 
-/// Full [`build_knowledge_authority`] runs past the loading short-cut, in this
-/// process. Tests read it to prove a publication carried its authority.
-static FULL_AUTHORITY_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(test, feature = "__test-internals"))]
+thread_local! {
+    static FULL_AUTHORITY_BUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
+/// Full [`build_knowledge_authority`] runs past the loading short-cut, on this
+/// thread (a publication builds on the thread that publishes). Tests read it
+/// to prove a publication carried its authority.
 #[cfg(any(test, feature = "__test-internals"))]
 pub fn full_authority_builds() -> u64 {
-    FULL_AUTHORITY_BUILDS.load(std::sync::atomic::Ordering::Relaxed)
+    FULL_AUTHORITY_BUILDS.with(std::cell::Cell::get)
 }
 
 /// `previous` with every anchor restamped to `content_generation`: what a

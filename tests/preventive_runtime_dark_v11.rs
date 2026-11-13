@@ -1455,10 +1455,14 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // #876 part 2, trim: `daemon.rs` calls a private, glibc-only `malloc_trim(0)` wrapper
 // after the idle reaper unloads projects. Server-only, no index_lifecycle file, no
 // bridge. 320 files.
+// #876 review round: build counters become thread-local and, with a force-carry
+// switch, live in a `__test-internals` module of `knowledge_bridge.rs`; `store.rs`
+// compares against the replaced generation once per publication. No index_lifecycle
+// file touched, no bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "735e7215d7289510e80aba606b5d4ee2a303f64a0fdae3cd2c5ec773a44f06e5",
+    "d6d23694bfd74dd505280397885ac1d830b937a6b5f699eab870628e35eaffe7",
     320,
-    13074300,
+    13076110,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

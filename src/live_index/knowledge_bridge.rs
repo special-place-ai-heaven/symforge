@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::domain::{FileDisposition, IndexTargets, LanguageId, SourceIdentity, SymbolKind};
 
@@ -423,7 +422,8 @@ pub fn build_knowledge_bridge(
     content_generation: u64,
     limits: &BridgeLimits,
 ) -> KnowledgeBridge {
-    FULL_BRIDGE_BUILDS.fetch_add(1, AtomicOrdering::Relaxed);
+    #[cfg(any(test, feature = "__test-internals"))]
+    test_seams::FULL_BRIDGE_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let targets = targets_by_path(live);
     let code_paths: Vec<&str> = live
         .files
@@ -696,13 +696,32 @@ pub fn build_knowledge_bridge(
     }
 }
 
-/// Full [`build_knowledge_bridge`] runs in this process. Tests read it to
-/// prove a publication carried its bridge instead of rebuilding it.
-static FULL_BRIDGE_BUILDS: AtomicU64 = AtomicU64::new(0);
+/// Test seams. Thread-local on purpose: a publication builds on the thread
+/// that publishes, so a test counts only its own builds, never a concurrent
+/// test's or a background fill's.
+#[cfg(any(test, feature = "__test-internals"))]
+mod test_seams {
+    use std::cell::Cell;
 
+    thread_local! {
+        pub(super) static FULL_BRIDGE_BUILDS: Cell<u64> = const { Cell::new(0) };
+        pub(super) static FORCE_CARRY: Cell<bool> = const { Cell::new(false) };
+    }
+}
+
+/// Full [`build_knowledge_bridge`] runs on this thread. Tests read it to
+/// prove a publication carried its bridge instead of rebuilding it.
 #[cfg(any(test, feature = "__test-internals"))]
 pub fn full_bridge_builds() -> u64 {
-    FULL_BRIDGE_BUILDS.load(AtomicOrdering::Relaxed)
+    test_seams::FULL_BRIDGE_BUILDS.with(std::cell::Cell::get)
+}
+
+/// Negative control: while on, publications on this thread carry the
+/// previous bridge whatever changed, so a test can show its equivalence
+/// check catches a stale carry.
+#[cfg(any(test, feature = "__test-internals"))]
+pub fn force_bridge_carry_for_test(on: bool) {
+    test_seams::FORCE_CARRY.with(|force| force.set(on));
 }
 
 /// The paths whose file changed between `previous` and `live`, when every one
@@ -762,12 +781,19 @@ pub(crate) fn carry_knowledge_bridge(
     previous_live: &LiveIndex,
     previous: &KnowledgeBridge,
     live: &LiveIndex,
+    code_only: Option<&[&str]>,
     content_generation: u64,
 ) -> Option<KnowledgeBridge> {
     let referenced = previous.referenced_symbols.as_ref()?;
-    let changed = code_only_changes(previous_live, live)?;
+    #[cfg(any(test, feature = "__test-internals"))]
+    if test_seams::FORCE_CARRY.with(std::cell::Cell::get) {
+        let mut bridge = previous.clone();
+        restamp_bridge(&mut bridge, content_generation);
+        return Some(bridge);
+    }
+    let changed = code_only?;
     let mut resolved_paths: Option<BTreeSet<&str>> = None;
-    for path in changed {
+    for &path in changed {
         let (old, new) = (&previous_live.files[path], &live.files[path]);
         if old.content_hash == new.content_hash && old.symbols == new.symbols {
             continue;
@@ -793,6 +819,11 @@ pub(crate) fn carry_knowledge_bridge(
             return None;
         }
     }
+    // ponytail: a deep copy, because every anchor stamps the content
+    // generation, so a value equal to a fresh build cannot share the previous
+    // allocation (~60 MiB on this repository, against ~1.2 GB to rebuild).
+    // Upgrade path: stamp the generation at read time from the owning
+    // `PublishedGeneration` and share the bridge by `Arc`.
     let mut bridge = previous.clone();
     restamp_bridge(&mut bridge, content_generation);
     Some(bridge)

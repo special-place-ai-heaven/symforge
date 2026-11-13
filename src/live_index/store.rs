@@ -2212,13 +2212,15 @@ fn build_published_authority(
 /// hashes, symbols and mtimes, and the `.symforge-knowledge.toml` policy, which
 /// may name any file), the bridge, the source and source version, the code
 /// signals, the secret policy version and the content generation. `bridge`
-/// must already be the previous bridge or carried from it. Then, with the
+/// must already be the previous bridge or carried from it, and `code_only`
+/// is whether [`code_only_changes`] held between the two indices. Then, with the
 /// source, source version, code signals and secret policy unchanged, no policy
 /// file, and every changed file code-only, every input but the generation is
 /// the same.
 fn carried_authority(
     previous: &PublishedGeneration,
     live: &LiveIndex,
+    code_only: bool,
     bridge: &KnowledgeBridge,
     source_version: Option<&SourceVersion>,
     code_signals: &Arc<CodeSignalsSnapshot>,
@@ -2243,7 +2245,7 @@ fn carried_authority(
         && secret_policy(previous.manifest.as_deref()) == secret_policy(manifest)
         && !previous.live.files.contains_key(POLICY_PATH)
         && !live.files.contains_key(POLICY_PATH)
-        && code_only_changes(&previous.live, live).is_some();
+        && code_only;
     if !reusable {
         return None;
     }
@@ -5600,6 +5602,8 @@ impl SharedIndexHandle {
         // the new content generation: `carry_knowledge_bridge` proves the
         // result equals a full build, which costs ~1.2 GB of allocation and
         // ~1.8 s on this repository (issue #876).
+        // One comparison against the replaced generation serves both carries.
+        let code_only = code_only_changes(&previous.live, &live);
         let mut bridge_carried = false;
         let bridge = if deferred_owner.is_some() {
             Arc::new(KnowledgeBridge::loading())
@@ -5616,6 +5620,7 @@ impl SharedIndexHandle {
                                 &previous.live,
                                 &previous.bridge,
                                 &live,
+                                code_only.as_deref(),
                                 content_generation,
                             )
                         })
@@ -5640,6 +5645,7 @@ impl SharedIndexHandle {
                 carried_authority(
                     &previous,
                     &live,
+                    code_only.is_some(),
                     &bridge,
                     source_version.as_deref(),
                     &code_signals,

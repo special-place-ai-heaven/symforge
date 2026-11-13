@@ -2,32 +2,58 @@
 //! authority instead of rebuilding them when its change cannot reach
 //! knowledge, and what it carries equals a from-scratch build.
 //!
-//! One test in this binary on purpose: it reads process-wide build counters,
-//! which a concurrently running test would move.
+//! Every step asserts both directions: the published bridge and authority
+//! equal a fresh build over that generation's own index, and the build
+//! counters moved exactly when the step's change could reach knowledge. The
+//! counters are per thread and a publication builds on the thread that
+//! publishes, so concurrent tests and background fills cannot move them.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use symforge::domain::WorkingTreeState;
 use symforge::knowledge::SECRET_POLICY_VERSION;
-use symforge::live_index::LiveIndex;
 use symforge::live_index::knowledge_authority::{
     AuthorityLimits, AuthorityTemporalIndex, KnowledgeAuthorityView, build_knowledge_authority,
     full_authority_builds,
 };
 use symforge::live_index::knowledge_bridge::{
-    BridgeLimits, KnowledgeBridge, build_knowledge_bridge, full_bridge_builds,
+    BridgeLimits, BridgeResolution, DerivedCoverage, KnowledgeBridge, build_knowledge_bridge,
+    force_bridge_carry_for_test, full_bridge_builds,
 };
 use symforge::live_index::single_file::{ReindexResult, remove_file, update_file_from_disk};
-use symforge::live_index::store::{PublishedGeneration, SharedIndex};
+use symforge::live_index::store::{PublishedGeneration, SharedIndex, SharedIndexHandle};
+use symforge::live_index::{LiveIndex, persist};
 
+/// Links a code path, names a symbol defined once, a symbol defined in more
+/// files than the ambiguous-sample budget keeps (so the bridge is truncated),
+/// and a symbol nothing defines yet.
 const GUIDE: &str = "# Guide\n\nStart at [alpha](../src/alpha.rs).\n\n\
-`alpha_entry` runs first, `shared_name` exists twice, and `later_name` does not exist yet.\n";
+`alpha_entry` runs first, `shared_name` is everywhere, and `later_name` does not exist yet.\n";
+/// More definitions of `shared_name` than `max_ambiguous_samples` (8).
+const DUPLICATES: usize = 10;
 
 fn write(root: &Path, rel: &str, text: &str) {
     let path = root.join(rel);
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     std::fs::write(path, text).expect("write");
+}
+
+fn git(root: &Path, args: &[&str]) {
+    let status = symforge::process_util::hidden_command("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@invalid",
+        ])
+        .args(args)
+        .output()
+        .expect("git");
+    assert!(status.status.success(), "git {args:?} failed");
 }
 
 fn fresh_bridge(generation: &PublishedGeneration) -> KnowledgeBridge {
@@ -63,46 +89,108 @@ fn fresh_authority(
     )
 }
 
-/// The generation's bridge and authority equal a from-scratch build over its
-/// own index at its own content generation.
-fn assert_matches_fresh(step: &str, generation: &PublishedGeneration) {
+/// Whether the generation's bridge and authority equal a from-scratch build
+/// over its own index at its own content generation.
+fn matches_fresh(generation: &PublishedGeneration) -> (bool, bool) {
     let bridge = fresh_bridge(generation);
-    assert!(
+    let authority = fresh_authority(generation, &bridge);
+    (
         *generation.bridge == bridge,
-        "{step}: published bridge differs from a fresh build"
-    );
-    assert!(
-        *generation.authority == fresh_authority(generation, &bridge),
-        "{step}: published authority differs from a fresh build"
-    );
+        *generation.authority == authority,
+    )
 }
 
-/// Publish one step and report whether the bridge and authority were rebuilt.
-fn step(
-    shared: &SharedIndex,
-    name: &str,
-    publish: impl FnOnce(),
-) -> (Arc<PublishedGeneration>, bool, bool) {
-    let pinned = shared.published_generation();
-    let pinned_bridge = Arc::clone(&pinned.bridge);
-    let (bridges, authorities) = (full_bridge_builds(), full_authority_builds());
-    publish();
-    let rebuilt_bridge = full_bridge_builds() != bridges;
-    let rebuilt_authority = full_authority_builds() != authorities;
-    let current = shared.published_generation();
-    assert!(
-        current.publication_generation > pinned.publication_generation,
-        "{name}: nothing was published"
-    );
-    assert_matches_fresh(name, &current);
-    // The generation a session pinned before the step still answers from the
-    // bridge it was built with, and that bridge is still right for it.
-    assert!(
-        Arc::ptr_eq(&pinned.bridge, &pinned_bridge),
-        "{name}: pinned bridge moved"
-    );
-    assert_matches_fresh(&format!("{name} (pinned)"), &pinned);
-    (current, rebuilt_bridge, rebuilt_authority)
+fn assert_matches_fresh(step: &str, generation: &PublishedGeneration) {
+    let (bridge, authority) = matches_fresh(generation);
+    assert!(bridge, "{step}: bridge differs from a fresh build");
+    assert!(authority, "{step}: authority differs from a fresh build");
+}
+
+fn digest(generation: &PublishedGeneration) -> String {
+    symforge::hash::digest_hex(
+        format!("{:?}{:?}", generation.bridge, generation.authority).as_bytes(),
+    )
+}
+
+/// A generation held the way a session holds it, with what it answered from
+/// when it was pinned.
+struct Pinned {
+    step: String,
+    generation: Arc<PublishedGeneration>,
+    bridge: *const KnowledgeBridge,
+    digest: String,
+}
+
+struct Harness<'a> {
+    root: &'a Path,
+    shared: SharedIndex,
+    pinned: Vec<Pinned>,
+}
+
+impl Harness<'_> {
+    fn reindex(&self, rel: &str) {
+        let outcome = update_file_from_disk(&self.shared, self.root, rel);
+        assert!(
+            matches!(outcome, ReindexResult::Reindexed),
+            "{rel}: {outcome:?}"
+        );
+    }
+
+    /// Publish one step; assert it published, equals a fresh build, and
+    /// rebuilt the bridge and authority exactly when expected.
+    fn step(
+        &mut self,
+        name: &str,
+        expect_bridge_rebuild: bool,
+        expect_authority_rebuild: bool,
+        publish: impl FnOnce(&Self),
+    ) -> Arc<PublishedGeneration> {
+        let before = self.shared.published_generation();
+        self.pinned.push(Pinned {
+            step: name.to_string(),
+            bridge: Arc::as_ptr(&before.bridge),
+            digest: digest(&before),
+            generation: Arc::clone(&before),
+        });
+        let (bridges, authorities) = (full_bridge_builds(), full_authority_builds());
+        publish(self);
+        let rebuilt = (
+            full_bridge_builds() != bridges,
+            full_authority_builds() != authorities,
+        );
+        let after = self.shared.published_generation();
+        assert!(
+            after.publication_generation > before.publication_generation,
+            "{name}: nothing was published"
+        );
+        assert_eq!(
+            rebuilt,
+            (expect_bridge_rebuild, expect_authority_rebuild),
+            "{name}: (bridge, authority) rebuilt"
+        );
+        assert_matches_fresh(name, &after);
+        after
+    }
+
+    /// Every generation pinned along the way still holds the same bridge
+    /// allocation with the same content, and that content is still right for
+    /// its own index and content generation.
+    fn assert_pins_hold(&self) {
+        for pin in &self.pinned {
+            assert!(
+                std::ptr::eq(Arc::as_ptr(&pin.generation.bridge), pin.bridge),
+                "{}: pinned bridge moved",
+                pin.step
+            );
+            assert_eq!(
+                digest(&pin.generation),
+                pin.digest,
+                "{}: pinned knowledge changed",
+                pin.step
+            );
+            assert_matches_fresh(&format!("{} (pinned)", pin.step), &pin.generation);
+        }
+    }
 }
 
 #[test]
@@ -114,108 +202,238 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
         "src/alpha.rs",
         "pub fn alpha_entry() -> u64 {\n    1\n}\n",
     );
-    write(root, "src/dup_a.rs", "pub fn shared_name() {}\n");
-    write(root, "src/dup_b.rs", "pub fn shared_name() {}\n");
+    for n in 0..DUPLICATES {
+        write(
+            root,
+            &format!("src/dup_{n}.rs"),
+            "pub fn shared_name() {}\n",
+        );
+    }
     write(
         root,
         "src/unrelated.rs",
         "pub fn unrelated() -> u64 {\n    1\n}\n",
     );
+    write(root, "src/notes.rs", "pub fn notes() {}\n");
     write(root, "docs/guide.md", GUIDE);
+    write(root, "CODEOWNERS", "/src/ @fixture-team\n");
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "fixture"]);
+
+    // Fresh load.
     let shared = LiveIndex::load(root).expect("load");
     let initial = shared.published_generation();
+    assert_matches_fresh("fresh load", &initial);
     assert!(
-        initial.bridge.forward.len() >= 3,
-        "fixture must link a path and symbols"
+        matches!(initial.bridge.coverage, DerivedCoverage::Truncated { .. }),
+        "fixture must truncate the bridge: {:?}",
+        initial.bridge.coverage
     );
-    assert_matches_fresh("initial", &initial);
-
-    let reindex = |rel: &str| {
-        let outcome = update_file_from_disk(&shared, root, rel);
-        assert!(
-            matches!(outcome, ReindexResult::Reindexed),
-            "{rel}: {outcome:?}"
-        );
+    assert!(
+        initial.bridge.forward.iter().any(|link| matches!(
+            link.resolution,
+            BridgeResolution::ResolvedDeclaredSet { .. }
+        )),
+        "fixture must carry an ownership selector"
+    );
+    let mut h = Harness {
+        root,
+        shared,
+        pinned: Vec::new(),
     };
 
-    // A code file nothing points at: carried, with a new content generation.
-    let before = shared.published_generation().content_generation;
-    let (after, bridge, authority) = step(&shared, "unrelated edit", || {
-        write(
-            root,
-            "src/unrelated.rs",
-            "pub fn unrelated() -> u64 {\n    2\n}\n",
-        );
-        reindex("src/unrelated.rs");
-    });
-    assert!(
-        after.content_generation > before,
-        "edit must be a content change"
+    // Clean to dirty: the source version moves, so authority rebuilds; the
+    // bridge rebuilds only if the source identity moved with it.
+    let source_before = h.shared.published_generation().source.clone();
+    let before = h.shared.published_generation();
+    let (bridges, authorities) = (full_bridge_builds(), full_authority_builds());
+    write(
+        root,
+        "src/unrelated.rs",
+        "pub fn unrelated() -> u64 {\n    2\n}\n",
     );
-    assert!(!bridge && !authority, "unrelated edit rebuilt knowledge");
+    h.reindex("src/unrelated.rs");
+    let after = h.shared.published_generation();
+    assert_eq!(
+        before.source_version.as_ref().map(|v| v.working_tree),
+        Some(WorkingTreeState::Clean)
+    );
+    assert_eq!(
+        after.source_version.as_ref().map(|v| v.working_tree),
+        Some(WorkingTreeState::Dirty)
+    );
+    assert_eq!(
+        full_bridge_builds() != bridges,
+        after.source != source_before,
+        "clean-to-dirty: bridge rebuilt exactly when the source identity moved"
+    );
+    assert!(
+        full_authority_builds() != authorities,
+        "clean-to-dirty: authority must rebuild"
+    );
+    assert_matches_fresh("clean-to-dirty", &after);
 
-    // Same bytes, newer mtime: carried.
-    let (_, bridge, authority) = step(&shared, "hash-skip", || {
+    // A code file under an ownership selector that nothing links, on a
+    // truncated bridge: carried, at a new content generation.
+    let after = h.step("unrelated edit, truncated bridge", false, false, |h| {
+        write(
+            h.root,
+            "src/unrelated.rs",
+            "pub fn unrelated() -> u64 {\n    3\n}\n",
+        );
+        h.reindex("src/unrelated.rs");
+    });
+    assert!(after.content_generation > before.content_generation);
+    assert!(matches!(
+        after.bridge.coverage,
+        DerivedCoverage::Truncated { .. }
+    ));
+
+    h.step("hash-skip", false, false, |h| {
         std::thread::sleep(Duration::from_millis(1100));
-        let bytes = std::fs::read(root.join("src/unrelated.rs")).expect("read");
-        std::fs::write(root.join("src/unrelated.rs"), bytes).expect("rewrite");
-        let outcome = update_file_from_disk(&shared, root, "src/unrelated.rs");
+        let bytes = std::fs::read(h.root.join("src/unrelated.rs")).expect("read");
+        std::fs::write(h.root.join("src/unrelated.rs"), bytes).expect("rewrite");
+        let outcome = update_file_from_disk(&h.shared, h.root, "src/unrelated.rs");
         assert!(matches!(outcome, ReindexResult::HashSkip), "{outcome:?}");
     });
-    assert!(!bridge && !authority, "hash-skip rebuilt knowledge");
-
-    // The code file now defines a name the guide refers to: rebuilt.
-    let (_, bridge, _) = step(&shared, "referenced symbol added", || {
+    h.step("new code file changes ownership counts", true, true, |h| {
+        write(h.root, "src/extra.rs", "pub fn extra() {}\n");
+        h.reindex("src/extra.rs");
+    });
+    h.step("ownership selector change", true, true, |h| {
         write(
-            root,
-            "src/unrelated.rs",
-            "pub fn unrelated() -> u64 {\n    2\n}\n\npub fn later_name() {}\n",
+            h.root,
+            "CODEOWNERS",
+            "/src/ @fixture-team\n/docs/ @fixture-docs\n",
         );
-        reindex("src/unrelated.rs");
+        h.reindex("CODEOWNERS");
     });
-    assert!(bridge, "a newly defined referenced name must rebuild");
-
-    // One of two definitions of an ambiguous name moves: rebuilt.
-    let (_, bridge, _) = step(&shared, "ambiguous match edit", || {
-        write(root, "src/dup_b.rs", "// moved\npub fn shared_name() {}\n");
-        reindex("src/dup_b.rs");
-    });
-    assert!(bridge, "editing a referenced symbol's file must rebuild");
-
-    // The linked file changes: rebuilt.
-    let (_, bridge, _) = step(&shared, "linked file edit", || {
+    h.step("referenced symbol added", true, true, |h| {
         write(
-            root,
+            h.root,
+            "src/unrelated.rs",
+            "pub fn unrelated() -> u64 {\n    3\n}\n\npub fn later_name() {}\n",
+        );
+        h.reindex("src/unrelated.rs");
+    });
+    h.step("ambiguous match edit", true, true, |h| {
+        write(
+            h.root,
+            "src/dup_3.rs",
+            "// moved\npub fn shared_name() {}\n",
+        );
+        h.reindex("src/dup_3.rs");
+    });
+    h.step("linked file edit", true, true, |h| {
+        write(
+            h.root,
             "src/alpha.rs",
             "pub fn alpha_entry() -> u64 {\n    2\n}\n",
         );
-        reindex("src/alpha.rs");
+        h.reindex("src/alpha.rs");
     });
-    assert!(bridge, "editing a linked file must rebuild");
-
-    // The knowledge file itself changes: rebuilt.
-    let (_, bridge, authority) = step(&shared, "knowledge edit", || {
-        write(root, "docs/guide.md", &format!("{GUIDE}\nOne more line.\n"));
-        reindex("docs/guide.md");
+    h.step("knowledge edit", true, true, |h| {
+        write(
+            h.root,
+            "docs/guide.md",
+            &format!("{GUIDE}\nOne more line.\n"),
+        );
+        h.reindex("docs/guide.md");
     });
-    assert!(bridge && authority, "editing knowledge must rebuild");
 
-    // Delete: the path set shrinks, rebuilt.
-    let (_, bridge, _) = step(&shared, "delete", || {
-        std::fs::remove_file(root.join("src/unrelated.rs")).expect("delete");
-        assert!(remove_file(&shared, "src/unrelated.rs"), "delete published");
+    // A policy file may name any file, so with one present an unrelated code
+    // edit still carries the bridge but rebuilds authority.
+    h.step("policy file added", true, true, |h| {
+        write(h.root, ".symforge-knowledge.toml", "version = 1\n");
+        h.reindex(".symforge-knowledge.toml");
     });
-    assert!(bridge, "a delete must rebuild");
-
-    // Rename: one path leaves and another arrives, rebuilt at each step.
-    let (_, bridge, _) = step(&shared, "rename (remove)", || {
-        std::fs::rename(root.join("src/dup_a.rs"), root.join("src/dup_c.rs")).expect("rename");
-        assert!(remove_file(&shared, "src/dup_a.rs"), "remove published");
+    h.step("unrelated edit with a policy file", false, true, |h| {
+        write(h.root, "src/extra.rs", "pub fn extra() -> u8 {\n    1\n}\n");
+        h.reindex("src/extra.rs");
     });
-    assert!(bridge, "a rename's removal must rebuild");
-    let (_, bridge, _) = step(&shared, "rename (add)", || reindex("src/dup_c.rs"));
-    assert!(bridge, "a rename's addition must rebuild");
+    h.step("policy file edit", true, true, |h| {
+        write(
+            h.root,
+            ".symforge-knowledge.toml",
+            "version = 1\n# edited\n",
+        );
+        h.reindex(".symforge-knowledge.toml");
+    });
+    h.step("policy file removed", true, true, |h| {
+        std::fs::remove_file(h.root.join(".symforge-knowledge.toml")).expect("delete");
+        assert!(remove_file(&h.shared, ".symforge-knowledge.toml"));
+    });
 
-    // The very first generation still answers from its own knowledge.
-    assert_matches_fresh("initial (still pinned)", &initial);
+    // A code file becomes knowledge: notes.rs is renamed to notes.md.
+    h.step("code to knowledge (remove .rs)", true, true, |h| {
+        std::fs::rename(h.root.join("src/notes.rs"), h.root.join("src/notes.md")).expect("rename");
+        assert!(remove_file(&h.shared, "src/notes.rs"));
+    });
+    h.step("code to knowledge (add .md)", true, true, |h| {
+        h.reindex("src/notes.md")
+    });
+    h.step("delete", true, true, |h| {
+        std::fs::remove_file(h.root.join("src/unrelated.rs")).expect("delete");
+        assert!(remove_file(&h.shared, "src/unrelated.rs"));
+    });
+    h.assert_pins_hold();
+
+    // Snapshot restore, then the first publication after it.
+    let placement = {
+        let binding = match symforge::discovery::resolve_root_candidate(
+            root,
+            symforge::domain::RootCandidateSource::LaunchCwd,
+            symforge::domain::RootRequestMode::Automatic,
+        ) {
+            symforge::domain::RootResolution::Bound(binding) => binding,
+            other => panic!("fixture root should bind: {other:?}"),
+        };
+        symforge::discovery::resolve_state_placement(&binding)
+    };
+    persist::checkpoint_shared_index(&h.shared, root, &placement).expect("checkpoint");
+    let snapshot = persist::load_snapshot(root, &placement).expect("snapshot");
+    let restored = SharedIndexHandle::shared(persist::snapshot_to_live_index(snapshot, root));
+    let restored_initial = restored.published_generation();
+    let placeholder = matches!(restored_initial.bridge.coverage, DerivedCoverage::Loading);
+    if !placeholder {
+        assert_matches_fresh("restored", &restored_initial);
+    }
+    let mut r = Harness {
+        root,
+        shared: restored,
+        pinned: Vec::new(),
+    };
+    r.step(
+        "first publication after restore",
+        placeholder,
+        placeholder,
+        |r| {
+            write(r.root, "src/extra.rs", "pub fn extra() -> u8 {\n    2\n}\n");
+            r.reindex("src/extra.rs");
+        },
+    );
+    r.assert_pins_hold();
+
+    // Negative control: forcing the carry over a knowledge edit must leave a
+    // bridge the equivalence check rejects.
+    let (bridges, _) = (full_bridge_builds(), full_authority_builds());
+    force_bridge_carry_for_test(true);
+    write(
+        root,
+        "docs/guide.md",
+        "# Guide\n\nRewritten without links.\n",
+    );
+    h.reindex("docs/guide.md");
+    force_bridge_carry_for_test(false);
+    assert_eq!(
+        full_bridge_builds(),
+        bridges,
+        "the forced carry must not rebuild"
+    );
+    let (bridge_ok, _) = matches_fresh(&h.shared.published_generation());
+    assert!(
+        !bridge_ok,
+        "a stale carried bridge must fail the equivalence check"
+    );
 }
