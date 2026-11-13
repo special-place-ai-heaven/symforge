@@ -1516,8 +1516,9 @@ fn update_steps(
                 {
                     bail!(
                         "symforge update failed: the staged binary reports {staged}, not the latest \
-                         published {latest}. The registry already has {latest}, but npm on this \
-                         machine still resolves `latest` to {staged}; try again in a few minutes. \
+                         published {latest}. npm was asked to stage exactly {latest} and delivered \
+                         {staged}; the registry may still be publishing it, so try again in a \
+                         few minutes. \
                          {untouched}"
                     );
                 }
@@ -2051,8 +2052,8 @@ mod tests {
             .to_string();
         assert!(
             msg.contains(
-                "The registry already has 11.18.2, but npm on this machine still resolves \
-                 `latest` to 11.18.1; try again in a few minutes."
+                "npm was asked to stage exactly 11.18.2 and delivered 11.18.1; the registry may \
+                 still be publishing it, so try again in a few minutes."
             ),
             "{msg}"
         );

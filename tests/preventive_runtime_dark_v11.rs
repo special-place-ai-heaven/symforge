@@ -1445,9 +1445,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // view argument checks; per-alias resource lists (`protocol/mod.rs`). No index_lifecycle
 // file touched; calls only, no bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "f36edf2d8a781db93a6968dd52780604b418047332cbe5894d991ec28f0a1ebd",
+    "d68e255d9db237fc61a2cda1fc6db001b8f5f67bf7e30c71612b37d7d80329d5",
     320,
-    13055633,
+    13055684,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
