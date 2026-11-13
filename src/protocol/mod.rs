@@ -2137,9 +2137,10 @@ impl ServerHandler for SymForgeServer {
     {
         // FR-310/FR-311: static list surface — constructor seeds
         // `result_type: Some(COMPLETE)` (FR-305 pinned shape); 1h TTL, Public
-        // (`resource_definitions()` embeds no workspace data).
+        // (`resource_definitions()` embeds no workspace data). The #874 tool
+        // allow-list filter is per process, so Public still holds.
         std::future::ready(Ok(ListResourcesResult::with_all_items(
-            self.resource_definitions(),
+            self.advertised_resource_definitions(),
         )
         .with_ttl_ms(3_600_000)
         .with_cache_scope(rmcp::model::CacheScope::Public)))
@@ -2155,7 +2156,7 @@ impl ServerHandler for SymForgeServer {
         // FR-310/FR-311: static list surface — same cache policy as
         // `list_resources`.
         std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(
-            self.resource_template_definitions(),
+            self.advertised_resource_template_definitions(),
         )
         .with_ttl_ms(3_600_000)
         .with_cache_scope(rmcp::model::CacheScope::Public)))

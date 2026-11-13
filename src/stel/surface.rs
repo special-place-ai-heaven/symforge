@@ -33,6 +33,11 @@ pub const TOOLS_ENV: &str = "SYMFORGE_TOOLS";
 
 /// Named groups accepted in [`TOOLS_ENV`]. Together they are exactly the 40
 /// advertised full-surface tools, each in one group (pinned by a test).
+///
+/// Groups are by topic, to cut context cost; they are NOT a permission
+/// boundary by capability. Three tools outside `edit` write: `secret_remediate`
+/// and `index_folder` (in `service`) and `curate_knowledge` (in `knowledge`),
+/// so `read,service` is not read-only.
 pub const TOOL_GROUPS: [(&str, &[&str]); 5] = [
     (
         "read",

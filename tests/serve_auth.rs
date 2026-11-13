@@ -185,3 +185,63 @@ async fn no_key_loopback_skips_auth() {
     );
     server.shutdown().await;
 }
+
+// (e) #874: a bad tool allow-list refuses `serve` before any bind (exit 2).
+// Each case runs the real binary on loopback, so the `--tools` flag (the input
+// that wins over `SYMFORGE_TOOLS`) is exercised end to end.
+fn serve_refusal(args: &[&str], tools_env: Option<std::ffi::OsString>) -> (Option<i32>, String) {
+    let home = tempfile::tempdir().expect("temp home");
+    let cwd = tempfile::tempdir().expect("temp cwd");
+    let mut command = symforge::process_util::hidden_command(env!("CARGO_BIN_EXE_symforge"));
+    command
+        .current_dir(cwd.path())
+        .env("SYMFORGE_HOME", home.path())
+        .env("SYMFORGE_NO_DAEMON", "1")
+        .env_remove("SYMFORGE_SURFACE")
+        .env_remove("SYMFORGE_TOOLS")
+        .args(["serve", "--listen", "127.0.0.1:0"])
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    if let Some(value) = tools_env {
+        command.env("SYMFORGE_TOOLS", value);
+    }
+    let output = command.output().expect("spawn symforge serve");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn serve_tools_flag_with_unknown_name_refuses_to_start() {
+    let (code, stderr) = serve_refusal(&["--tools", "bogus"], None);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("bogus"), "{stderr}");
+}
+
+#[test]
+fn serve_tools_flag_blank_refuses_instead_of_serving_everything() {
+    // A restrictive env list must not be hidden by a blank flag.
+    let (code, stderr) = serve_refusal(&["--tools", " "], Some("status".into()));
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("blank"), "{stderr}");
+}
+
+#[test]
+fn serve_refuses_a_tools_env_that_is_not_utf8() {
+    #[cfg(windows)]
+    let invalid = {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[0xD800])
+    };
+    #[cfg(unix)]
+    let invalid = {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![0xff])
+    };
+    let (code, stderr) = serve_refusal(&[], Some(invalid));
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("not valid UTF-8"), "{stderr}");
+}

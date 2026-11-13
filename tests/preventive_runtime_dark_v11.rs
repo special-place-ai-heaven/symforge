@@ -1423,10 +1423,14 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // `protocol/surface_probe.rs`, called from `protocol/mod.rs`, `protocol/tools.rs`,
 // `server/admin/api_v1.rs`, `server/serve.rs` and `cli/entry.rs`. No index_lifecycle
 // file touched; calls only, no bridge. 319 files.
+// Review round: the allow-list also gates resource reads and lists
+// (`protocol/resources.rs`), `ask` routes and `symforge_edit` steps (`protocol/tools.rs`),
+// and rides to the daemon as a header bound around `execute_tool_call` (`daemon.rs`).
+// No index_lifecycle file touched; calls only, no bridge. 319 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "2ab0aa159cbc1d476eb923e1ed3334d0b260815ecdc041a51070ebe5026defce",
+    "2d1b2b5c703e209cb036e6d8760ea0f62e91b0fe327cdaefbc4dc49527b4d45f",
     319,
-    12985466,
+    13003995,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

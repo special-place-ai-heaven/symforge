@@ -76,6 +76,36 @@ impl ResourceRequest {
             Self::RepoHealth | Self::ToolsCatalog | Self::Glossary => None,
         }
     }
+
+    /// The tool whose handler renders this resource, for the #874 allow-list.
+    /// `None` only for static text (catalog, glossary).
+    fn gate_tool(&self) -> Option<&'static str> {
+        match self {
+            Self::RepoHealth => Some("health"),
+            _ => self.outcome_tool(),
+        }
+    }
+}
+
+/// [`ResourceRequest::gate_tool`] for a listed resource or template URI.
+fn listed_gate_tool(uri: &str) -> Option<&'static str> {
+    match uri {
+        REPO_HEALTH_URI => Some("health"),
+        REPO_OUTLINE_URI | REPO_MAP_URI => Some("get_repo_map"),
+        REPO_CHANGES_URI => Some("what_changed"),
+        FILE_CONTEXT_TEMPLATE => Some("get_file_context"),
+        FILE_CONTENT_TEMPLATE => Some("get_file_content"),
+        SYMBOL_DETAIL_TEMPLATE => Some("get_symbol"),
+        SYMBOL_CONTEXT_TEMPLATE => Some("get_symbol_context"),
+        _ => None,
+    }
+}
+
+/// Whether a listed resource may be advertised on this connection: its tool,
+/// if any, passes the allow-list. Always true when no list is set.
+fn listed_resource_allowed(uri: &str) -> bool {
+    listed_gate_tool(uri)
+        .is_none_or(|tool| crate::protocol::surface_probe::allow_list_refusal(tool, None).is_none())
 }
 
 impl SymForgeServer {
@@ -120,6 +150,20 @@ impl SymForgeServer {
         ]
     }
 
+    /// [`Self::resource_definitions`] narrowed to the #874 allow-list.
+    pub(crate) fn advertised_resource_definitions(&self) -> Vec<Resource> {
+        let mut resources = self.resource_definitions();
+        resources.retain(|resource| listed_resource_allowed(&resource.uri));
+        resources
+    }
+
+    /// [`Self::resource_template_definitions`] narrowed to the #874 allow-list.
+    pub(crate) fn advertised_resource_template_definitions(&self) -> Vec<ResourceTemplate> {
+        let mut templates = self.resource_template_definitions();
+        templates.retain(|template| listed_resource_allowed(&template.uri_template));
+        templates
+    }
+
     pub(crate) fn resource_template_definitions(&self) -> Vec<ResourceTemplate> {
         vec![
             make_resource_template(
@@ -155,6 +199,18 @@ impl SymForgeServer {
     ) -> Result<ReadResourceResult, McpError> {
         let request =
             parse_resource_uri(uri).map_err(|error| McpError::invalid_params(error, None))?;
+        // #874: a resource runs its tool's handler, so it obeys the allow-list.
+        if let Some(tool) = request.gate_tool()
+            && let Some(refusal) = crate::protocol::surface_probe::allow_list_refusal(
+                tool,
+                Some(&format!("The resource '{uri}'")),
+            )
+        {
+            return Err(McpError::invalid_request(
+                refusal,
+                Some(serde_json::json!({ "uri": uri, "tool": tool })),
+            ));
+        }
         let tool = request.outcome_tool();
         let (text, recorded) = with_read_outcome_scope(self.render_resource_text(request)).await;
         let text = text.map_err(|error| McpError::invalid_params(error, None))?;
@@ -1417,5 +1473,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #874: a resource runs its tool's handler, so it obeys `SYMFORGE_TOOLS`:
+    /// refused when that tool is not allowed, served when it is, and the lists
+    /// advertise only what can be read. Unset leaves the lists byte-identical.
+    #[tokio::test]
+    async fn resources_obey_the_tool_allow_list() {
+        use crate::protocol::surface_probe::SurfaceEnvVarGuard;
+        let server = make_server();
+        let _surface = SurfaceEnvVarGuard::set("SYMFORGE_SURFACE", None);
+        let unset_resources;
+        let unset_templates;
+        {
+            let _tools = SurfaceEnvVarGuard::set("SYMFORGE_TOOLS", None);
+            unset_resources =
+                serde_json::to_string(&server.advertised_resource_definitions()).unwrap();
+            unset_templates =
+                serde_json::to_string(&server.advertised_resource_template_definitions()).unwrap();
+            assert_eq!(
+                unset_resources,
+                serde_json::to_string(&server.resource_definitions()).unwrap()
+            );
+            assert_eq!(
+                unset_templates,
+                serde_json::to_string(&server.resource_template_definitions()).unwrap()
+            );
+        }
+        let uri = build_uri(
+            "symforge://file/content",
+            &[("path", Some("src/main.rs".to_string()))],
+        );
+
+        let _tools = SurfaceEnvVarGuard::set("SYMFORGE_TOOLS", Some("status"));
+        let refused = server
+            .read_resource_uri(&uri)
+            .await
+            .expect_err("file content needs get_file_content");
+        assert!(
+            refused.message.contains("get_file_content")
+                && refused.message.contains("SYMFORGE_TOOLS")
+                && refused.message.contains(&uri),
+            "{}",
+            refused.message
+        );
+        assert!(server.read_resource_uri(REPO_HEALTH_URI).await.is_err());
+        // Static text needs no tool.
+        assert!(server.read_resource_uri(GLOSSARY_URI).await.is_ok());
+        let listed: Vec<String> = server
+            .advertised_resource_definitions()
+            .iter()
+            .map(|r| r.uri.clone())
+            .collect();
+        assert_eq!(listed, vec![TOOLS_CATALOG_URI, GLOSSARY_URI]);
+        assert!(server.advertised_resource_template_definitions().is_empty());
+
+        let _tools = SurfaceEnvVarGuard::set("SYMFORGE_TOOLS", Some("get_file_content"));
+        assert!(server.read_resource_uri(&uri).await.is_ok());
+        let templates: Vec<String> = server
+            .advertised_resource_template_definitions()
+            .iter()
+            .map(|t| t.uri_template.clone())
+            .collect();
+        assert_eq!(templates, vec![FILE_CONTENT_TEMPLATE]);
     }
 }

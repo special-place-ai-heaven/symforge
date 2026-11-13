@@ -31,14 +31,96 @@ pub fn set_tools_override(spec: String) {
 }
 
 /// The operator's per-process tool allow-list (issue #874): `serve --tools`,
-/// else [`TOOLS_ENV`]. `None` when unset or blank, which leaves every surface
-/// exactly as it was. Read per call like `SYMFORGE_SURFACE`.
+/// else [`TOOLS_ENV`]. Read per call like `SYMFORGE_SURFACE`.
+///
+/// Fails closed: an explicit `--tools`, even blank, is a list (an empty one is
+/// refused at startup), and a [`TOOLS_ENV`] value that is not UTF-8 is a list
+/// with no valid name, never "unset". Only an absent or blank [`TOOLS_ENV`]
+/// returns `None`, which leaves every surface exactly as it was.
 pub fn tool_allow_list() -> Option<ToolAllowList> {
-    let spec = match TOOLS_OVERRIDE.get() {
-        Some(spec) => spec.clone(),
-        None => std::env::var(TOOLS_ENV).ok()?,
-    };
-    (!spec.trim().is_empty()).then(|| ToolAllowList::parse(&spec))
+    if let Some(spec) = TOOLS_OVERRIDE.get() {
+        return Some(ToolAllowList::parse(spec));
+    }
+    match std::env::var_os(TOOLS_ENV)?.into_string() {
+        Ok(spec) if spec.trim().is_empty() => None,
+        Ok(spec) => Some(ToolAllowList::parse(&spec)),
+        Err(raw) => Some(ToolAllowList {
+            allowed: Vec::new(),
+            unknown: vec![format!("{} (not valid UTF-8)", raw.to_string_lossy())],
+        }),
+    }
+}
+
+/// Header the front end stamps on every proxied daemon tool call with the
+/// allow-list served on THIS connection (comma-joined allowed names). The
+/// daemon is shared by clients with different lists, so it never uses its own
+/// env for a proxied call: [`connection_tools_from_header`] is authoritative.
+pub const CONNECTION_TOOLS_HEADER: &str = "x-symforge-connection-tools";
+
+tokio::task_local! {
+    /// Allow-list of the connection whose proxied call the daemon is running.
+    static CONNECTION_TOOLS: Option<ToolAllowList>;
+}
+
+/// Allow-list to enforce inside a handler: the proxied connection's on the
+/// daemon side, else this process's own ([`tool_allow_list`]).
+pub fn connection_allow_list() -> Option<ToolAllowList> {
+    CONNECTION_TOOLS
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| tool_allow_list())
+}
+
+/// Front end: the header value for this process's allow-list, if any.
+pub fn connection_tools_header_value() -> Option<String> {
+    tool_allow_list().map(|list| list.allowed.join(","))
+}
+
+/// Daemon: the list a proxied call carries. Absent means no list; a value that
+/// is not UTF-8 is a list with no valid name (fails closed).
+pub fn connection_tools_from_header(value: Option<&[u8]>) -> Option<ToolAllowList> {
+    value.map(|bytes| match std::str::from_utf8(bytes) {
+        Ok(spec) => ToolAllowList::parse(spec),
+        Err(_) => ToolAllowList {
+            allowed: Vec::new(),
+            unknown: Vec::new(),
+        },
+    })
+}
+
+/// Run a daemon-side proxied dispatch with the connection's allow-list bound.
+pub async fn with_connection_tools<F, T>(list: Option<ToolAllowList>, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    CONNECTION_TOOLS.scope(list, future).await
+}
+
+/// Refusal text when `tool` may not run on this connection; `None` when it may.
+/// `needed_by` names the resource or tool that needed `tool`, if not the call itself.
+pub fn allow_list_refusal(tool: &str, needed_by: Option<&str>) -> Option<String> {
+    let list = connection_allow_list()?;
+    if list.allows(tool) {
+        return None;
+    }
+    let callable = list.allowed.join(", ");
+    let registered = tool == "symforge"
+        || TOOL_GROUPS
+            .iter()
+            .any(|(_, members)| members.contains(&tool));
+    Some(match needed_by {
+        Some(caller) => format!(
+            "{caller} needs the tool '{tool}', which is not in this server's tool allow-list \
+             ({TOOLS_ENV}, or serve --tools). Tools callable here: {callable}."
+        ),
+        None if !registered => {
+            format!("'{tool}' is not a tool of this server. Tools callable here: {callable}.")
+        }
+        None => format!(
+            "tool '{tool}' is not in this server's tool allow-list ({TOOLS_ENV}, or serve \
+             --tools). Tools callable here: {callable}. Use one of those; only the operator \
+             can add '{tool}' to {TOOLS_ENV}."
+        ),
+    })
 }
 
 /// Precedence rule: a set allow-list filters the FULL surface, so a
@@ -58,6 +140,12 @@ pub fn check_tool_allow_list() -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     };
     let groups: Vec<&str> = TOOL_GROUPS.iter().map(|(group, _)| *group).collect();
+    if list.allowed.is_empty() && list.unknown.is_empty() {
+        return Err(format!(
+            "{TOOLS_ENV} (or serve --tools) is blank. Use tool names or the groups {}.",
+            groups.join(", ")
+        ));
+    }
     if list.allowed.is_empty() {
         return Err(format!(
             "{TOOLS_ENV} names no available tool (unknown: {}). Use tool names or the groups {}.",
@@ -199,18 +287,8 @@ pub fn compact_surface_blocks(profile: SurfaceProfile, tool_name: &str) -> bool 
 /// and asserted directly by the surface conformance test so the test exercises
 /// the real gate, not a copy.
 pub fn enforce_compact_surface(tool_name: &str) -> Result<(), rmcp::ErrorData> {
-    if let Some(list) = tool_allow_list()
-        && !list.allows(tool_name)
-    {
-        return Err(rmcp::ErrorData::invalid_request(
-            format!(
-                "tool '{tool_name}' is not in this server's tool allow-list ({TOOLS_ENV}, or \
-                 serve --tools). Tools callable here: {}. Use one of those; only the operator \
-                 can add '{tool_name}' to {TOOLS_ENV}.",
-                list.allowed.join(", ")
-            ),
-            None,
-        ));
+    if let Some(refusal) = allow_list_refusal(tool_name, None) {
+        return Err(rmcp::ErrorData::invalid_request(refusal, None));
     }
     if compact_surface_blocks(surface_profile_from_env(), tool_name) {
         return Err(rmcp::ErrorData::invalid_request(
@@ -592,6 +670,43 @@ impl Drop for SurfaceEnvVarGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Daemon side, the forwarded header is authoritative: the daemon's own env
+    /// list never applies to a proxied call, an absent header means no list, and
+    /// an undecodable header allows nothing.
+    #[tokio::test]
+    async fn forwarded_connection_list_is_authoritative_and_fails_closed() {
+        let _tools = SurfaceEnvVarGuard::set(TOOLS_ENV, Some("status"));
+        let forwarded = connection_tools_from_header(Some(b"search_text,find_references"));
+        with_connection_tools(forwarded, async {
+            assert!(allow_list_refusal("find_references", None).is_none());
+            assert!(allow_list_refusal("status", None).is_some());
+        })
+        .await;
+        with_connection_tools(connection_tools_from_header(None), async {
+            assert!(allow_list_refusal("get_repo_map", None).is_none());
+        })
+        .await;
+        let garbled = connection_tools_from_header(Some(&[0xff, 0xfe]));
+        with_connection_tools(garbled, async {
+            assert!(allow_list_refusal("status", None).is_some());
+        })
+        .await;
+        // Outside a proxied dispatch, this process's list applies.
+        assert!(allow_list_refusal("search_text", None).is_some());
+    }
+
+    #[test]
+    fn refusal_says_when_a_name_is_not_a_tool_at_all() {
+        let _tools = SurfaceEnvVarGuard::set(TOOLS_ENV, Some("status"));
+        let unknown = allow_list_refusal("serch_text", None).unwrap();
+        assert!(
+            unknown.starts_with("'serch_text' is not a tool of this server"),
+            "{unknown}"
+        );
+        let unlisted = allow_list_refusal("search_text", None).unwrap();
+        assert!(unlisted.contains("only the operator can add"), "{unlisted}");
+    }
 
     #[test]
     fn allow_list_instructions_stay_within_the_byte_cap_for_the_longest_list() {

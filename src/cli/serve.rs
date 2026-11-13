@@ -79,6 +79,20 @@ mod tests {
     }
 
     #[test]
+    fn serve_tools_flag_parses_and_rejects_an_empty_value() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from(["symforge", "serve", "--tools", "read,status"])
+            .expect("--tools parses");
+        match cli.command {
+            Some(crate::cli::Commands::Serve(args)) => {
+                assert_eq!(args.tools.as_deref(), Some("read,status"));
+            }
+            _ => panic!("expected the serve subcommand"),
+        }
+        assert!(crate::cli::Cli::try_parse_from(["symforge", "serve", "--tools", ""]).is_err());
+    }
+
+    #[test]
     fn into_serve_args_defaults_listen_without_explicit_flag() {
         let cli = ServeCliArgs {
             listen: None,

@@ -28,7 +28,8 @@ use serde::Serialize;
 
 use crate::cli::harness::{AttachEntry, HarnessRegistry, HarnessState, HarnessStatus};
 use crate::protocol::surface_probe::{
-    SurfaceProfile, advertised_tools, surface_profile_from_env, tool_allow_list,
+    SurfaceProfile, advertised_tools, surface_env_conflict, surface_profile_from_env,
+    tool_allow_list,
 };
 use crate::server::ServerRuntime;
 use crate::server::aap::{AapDetection, AapPresets, EmbedPinComparison, IntegrationMode};
@@ -289,6 +290,8 @@ pub struct SurfaceView {
     pub allow_list: bool,
     /// Allow-list entries that named no tool or group.
     pub allow_list_unknown: Vec<String>,
+    /// A `SYMFORGE_SURFACE` value the allow-list overrides, reported as a conflict.
+    pub allow_list_conflict: Option<String>,
 }
 
 impl SurfaceView {
@@ -306,6 +309,7 @@ impl SurfaceView {
             tools,
             allow_list: allow_list.is_some(),
             allow_list_unknown: allow_list.map(|list| list.unknown).unwrap_or_default(),
+            allow_list_conflict: surface_env_conflict(),
         }
     }
 }

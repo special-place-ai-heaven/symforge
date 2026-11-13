@@ -3123,6 +3123,16 @@ impl DaemonSessionClient {
                 crate::protocol::surface_probe::surface_profile_from_env(),
             ),
         );
+        // #874: this adapter's tool allow-list, so a tool that dispatches to
+        // other handlers daemon-side (`ask`) honors it. Only same-version
+        // daemons are used (`daemon_health_matches`), so the header is read.
+        let request = match crate::protocol::surface_probe::connection_tools_header_value() {
+            Some(tools) => request.header(
+                crate::protocol::surface_probe::CONNECTION_TOOLS_HEADER,
+                tools,
+            ),
+            None => request,
+        };
         let response = request
             .send()
             .await
@@ -6187,6 +6197,13 @@ async fn call_tool_handler(
     // not this daemon process's env. `None` (older adapter / direct attach) leaves
     // it unbound -> env fallback (unchanged behavior).
     let connection_surface = connection_surface_from_headers(&headers);
+    // #874: the connection's tool allow-list, authoritative over this daemon's
+    // own env (shared by clients with different lists). Absent means none.
+    let connection_tools = crate::protocol::surface_probe::connection_tools_from_header(
+        headers
+            .get(crate::protocol::surface_probe::CONNECTION_TOOLS_HEADER)
+            .map(|value| value.as_bytes()),
+    );
     match state
         .governor
         .execute_non_abortable(&tool_name, async move {
@@ -6215,9 +6232,12 @@ async fn call_tool_handler(
                         // beside the evidence receipt (`READ_OUTCOME_HEADER`).
                         let (result, outcome) =
                             crate::protocol::result_status::with_read_outcome_scope(
-                                crate::protocol::surface_probe::with_connection_surface(
-                                    connection_surface,
-                                    execute_tool_call(runtime, &tool_name_owned, params),
+                                crate::protocol::surface_probe::with_connection_tools(
+                                    connection_tools,
+                                    crate::protocol::surface_probe::with_connection_surface(
+                                        connection_surface,
+                                        execute_tool_call(runtime, &tool_name_owned, params),
+                                    ),
                                 ),
                             )
                             .await;
