@@ -10,7 +10,10 @@
 
 use std::sync::Arc;
 
-use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Resource,
+    ResourceTemplate,
+};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer};
 use serde_json::{Map, Value};
@@ -31,15 +34,23 @@ pub(crate) struct ServeProjects {
     /// Operator order; the first entry also owns the process-level stores.
     repos: Vec<ServedRepo>,
     allow_index_folder: bool,
+    /// The `--project` roots worktree rerouting may write to; `None` when serve
+    /// runs on its working directory, where rerouting behaves as before.
+    fixed_roots: Option<crate::worktree::ServeRoots>,
 }
 
 impl ServeProjects {
     /// `repos` must be non-empty; startup refuses an empty or invalid list.
-    pub(crate) fn new(repos: Vec<ServedRepo>, allow_index_folder: bool) -> Self {
+    pub(crate) fn new(
+        repos: Vec<ServedRepo>,
+        allow_index_folder: bool,
+        fixed_roots: Option<crate::worktree::ServeRoots>,
+    ) -> Self {
         debug_assert!(!repos.is_empty(), "serve always has one repository");
         Self {
             repos,
             allow_index_folder,
+            fixed_roots,
         }
     }
 
@@ -141,9 +152,7 @@ impl ServeProjects {
             && self.serves_several()
             && matches!(tool.as_str(), "status" | "health" | "health_compact")
         {
-            return Ok(CallToolResponse::Complete(CallToolResult::success(vec![
-                ContentBlock::text(self.server_view()),
-            ])));
+            return Ok(self.server_view_call(front, &tool, arguments));
         }
         let target = match self.select(project.as_deref()) {
             Ok(target) => target,
@@ -153,7 +162,11 @@ impl ServeProjects {
             request.arguments = None;
         }
         // Boxed: this future sits inside `call_tool`'s own future.
-        Box::pin(target.dispatch_gated_tool_call(request, context)).await
+        let call = Box::pin(target.dispatch_gated_tool_call(request, context));
+        match self.fixed_roots.as_ref() {
+            Some(roots) => crate::worktree::with_serve_roots(Arc::clone(roots), call).await,
+            None => call.await,
+        }
     }
 
     /// `projects` fan-out over the fixed repositories, rebuilt per call from each
@@ -217,6 +230,8 @@ impl ServeProjects {
         .await;
         match outcome {
             Ok(Ok((text, found))) => {
+                // No project evidence: the answer spans repositories and names each
+                // in its `── project: <alias> ──` header instead.
                 let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
                 let class = if found {
                     OutcomeClass::Found
@@ -234,7 +249,37 @@ impl ServeProjects {
     }
 
     /// `status`, `health` and `health_compact` without `project` on a
-    /// multi-repository server: one observed row per repository.
+    /// multi-repository server. Arguments pass the same checks as any call; one
+    /// that acts on or pages a single repository is refused, since this view
+    /// has none to apply it to.
+    fn server_view_call(
+        &self,
+        front: &SymForgeServer,
+        tool: &str,
+        arguments: &mut Map<String, Value>,
+    ) -> CallToolResponse {
+        let mut checked = Some(std::mem::take(arguments));
+        if let Err(refused) = front.refuse_invalid_arguments(tool, &mut checked) {
+            return CallToolResponse::Complete(refused);
+        }
+        let checked = checked.unwrap_or_default();
+        if let Some(name) = checked.iter().find_map(|(name, value)| {
+            let view_only = tool == "status" && name == "detail";
+            (!view_only && !value.is_null()).then_some(name)
+        }) {
+            return refusal(format!(
+                "Error: project_routing: '{name}' applies to one repository; pass project with \
+                 one of: {}.",
+                self.alias_list()
+            ));
+        }
+        // No project evidence: this answer describes every repository, each row
+        // naming its own, so no single repository's evidence would be true.
+        let mut result = CallToolResult::success(vec![ContentBlock::text(self.server_view())]);
+        attach_status(&mut result, OutcomeClass::Found);
+        CallToolResponse::Complete(result)
+    }
+
     fn server_view(&self) -> String {
         let mut lines = vec!["── served repositories ──".to_string()];
         for repo in &self.repos {
@@ -253,6 +298,50 @@ impl ServeProjects {
         }
         lines.push("Pass project=ALIAS for the full report of one repository.".to_string());
         lines.join("\n")
+    }
+
+    /// `resources/list` on a multi-repository server: each repository-bound
+    /// resource once per alias, carrying `?project=`, so every listed URI reads.
+    /// Static resources (tool catalog, glossary) stay listed once.
+    pub(crate) fn per_alias_resources(&self, resources: Vec<Resource>) -> Vec<Resource> {
+        let mut listed = Vec::new();
+        for resource in resources {
+            if !resource.uri.starts_with("symforge://repo/") {
+                listed.push(resource);
+                continue;
+            }
+            for repo in &self.repos {
+                let mut routed = resource.clone();
+                if let Ok(mut url) = reqwest::Url::parse(&resource.uri) {
+                    url.query_pairs_mut().append_pair("project", &repo.alias);
+                    routed.uri = url.to_string();
+                }
+                routed.name = format!("{} ({})", resource.name, repo.alias);
+                listed.push(routed);
+            }
+        }
+        listed
+    }
+
+    /// `resources/templates/list` on a multi-repository server: every template
+    /// takes the repository as a `project` parameter.
+    pub(crate) fn project_templates(
+        &self,
+        templates: Vec<ResourceTemplate>,
+    ) -> Vec<ResourceTemplate> {
+        templates
+            .into_iter()
+            .map(|mut template| {
+                let separator = if template.uri_template.contains('?') {
+                    '&'
+                } else {
+                    '?'
+                };
+                template.uri_template =
+                    format!("{}{separator}project={{project}}", template.uri_template);
+                template
+            })
+            .collect()
     }
 
     /// Route one `resources/read`: a `project` query parameter names the

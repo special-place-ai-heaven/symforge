@@ -500,50 +500,128 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn edits_cannot_reroute_into_an_unlisted_worktree() {
+async fn edits_reroute_only_into_listed_worktrees() {
     let base = tempfile::TempDir::new().expect("base");
-    let a = base.path().join("a");
-    let b = fixture_repo("beta.rs", "beta_only_fn");
-    std::fs::create_dir(&a).expect("repo a");
-    std::fs::write(a.join("alpha.rs"), "pub fn alpha_only_fn() {}\n").expect("seed");
-    git(&a, &["init", "-q"]);
-    git(&a, &["add", "."]);
-    git(&a, &["commit", "-q", "-m", "seed"]);
-    let worktree = base.path().join("unlisted");
-    git(
-        &a,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            "side",
-            &worktree.display().to_string(),
-        ],
-    );
-    let before = std::fs::read(worktree.join("alpha.rs")).expect("worktree file");
-    let served = start(args(vec![spec("a", &a), spec("b", b.path())], false)).await;
-
-    let (text, is_error) = call(
-        &served.url,
-        "edit_within_symbol",
+    let main = base.path().join("main");
+    std::fs::create_dir(&main).expect("repo main");
+    std::fs::write(main.join("alpha.rs"), "pub fn alpha_only_fn() {}\n").expect("seed");
+    git(&main, &["init", "-q"]);
+    git(&main, &["add", "."]);
+    git(&main, &["commit", "-q", "-m", "seed"]);
+    let listed = base.path().join("listed");
+    let unlisted = base.path().join("unlisted");
+    for (worktree, branch) in [(&listed, "listed"), (&unlisted, "unlisted")] {
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch,
+                &worktree.display().to_string(),
+            ],
+        );
+    }
+    let served = start(args(vec![spec("main", &main), spec("wt", &listed)], false)).await;
+    let edit = |working_directory: &Path| {
         serde_json::json!({
-            "project": "a",
+            "project": "main",
             "path": "alpha.rs",
             "name": "alpha_only_fn",
             "old_text": "{}",
-            "new_text": "{ }",
-            "working_directory": worktree.display().to_string(),
-        }),
-    )
-    .await;
+            "new_text": "{ /* edited */ }",
+            "working_directory": working_directory.display().to_string(),
+        })
+    };
+
+    let before = std::fs::read(unlisted.join("alpha.rs")).expect("unlisted file");
+    let (text, is_error) = call(&served.url, "edit_within_symbol", edit(&unlisted)).await;
     assert!(is_error, "an unlisted worktree must be refused: {text}");
     assert!(
-        text.contains("TargetPathRefused") && text.contains("(a, b)"),
+        text.contains("TargetPathRefused")
+            && text.contains("the operator listed (main, wt); omit working_directory"),
         "{text}"
     );
-    let after = std::fs::read(worktree.join("alpha.rs")).expect("worktree file");
+    let after = std::fs::read(unlisted.join("alpha.rs")).expect("unlisted file");
     assert_eq!(after, before, "the unlisted worktree is unchanged");
+
+    let (text, is_error) = call(&served.url, "edit_within_symbol", edit(&listed)).await;
+    assert!(!is_error, "a listed worktree is a permitted target: {text}");
+    let written = std::fs::read_to_string(listed.join("alpha.rs")).expect("listed file");
+    assert!(written.contains("/* edited */"), "{written}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn server_view_checks_its_arguments() {
+    let repos = two_repos().await;
+    let url = &repos.served.url;
+
+    let response = rpc(
+        url,
+        "tools/call",
+        serde_json::json!({"name": "status", "arguments": {}}),
+    )
+    .await;
+    assert_eq!(
+        response["result"]["_meta"]["symforge/result_status"]["outcome_class"],
+        serde_json::json!("found"),
+        "{response}"
+    );
+    let (reset, is_error) = call(
+        url,
+        "status",
+        serde_json::json!({"reset_calibration": true}),
+    )
+    .await;
+    assert!(
+        is_error && reset.contains("'reset_calibration'") && reset.contains("pass project"),
+        "{reset}"
+    );
+    let (unknown, is_error) = call(url, "health", serde_json::json!({"no_such_argument": 1})).await;
+    assert!(is_error, "an unknown argument is refused: {unknown}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn listed_resources_name_their_repository() {
+    let repos = two_repos().await;
+    let url = &repos.served.url;
+    let listed = rpc(url, "resources/list", serde_json::json!({})).await;
+    let uris: Vec<&str> = listed["result"]["resources"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{listed}"))
+        .iter()
+        .filter_map(|resource| resource["uri"].as_str())
+        .collect();
+    for uri in [
+        "symforge://repo/map?project=a",
+        "symforge://repo/map?project=b",
+    ] {
+        assert!(uris.contains(&uri), "{uri} missing from {uris:?}");
+    }
+    assert!(
+        !uris.contains(&"symforge://repo/map"),
+        "no bare repository URI: {uris:?}"
+    );
+    let read = rpc(
+        url,
+        "resources/read",
+        serde_json::json!({"uri": "symforge://repo/map?project=a"}),
+    )
+    .await;
+    assert!(read["result"]["contents"][0]["text"].is_string(), "{read}");
+
+    let templates = rpc(url, "resources/templates/list", serde_json::json!({})).await;
+    let all_take_project = templates["result"]["resourceTemplates"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{templates}"))
+        .iter()
+        .all(|template| {
+            template["uriTemplate"]
+                .as_str()
+                .is_some_and(|text| text.ends_with("project={project}"))
+        });
+    assert!(all_take_project, "{templates}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

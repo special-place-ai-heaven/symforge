@@ -623,6 +623,7 @@ fn bind_project_spec(spec: &ProjectSpec) -> Result<crate::domain::RootBinding, S
 fn build_serve_runtime(
     repos: Vec<LoadedRepo>,
     allow_index_folder: bool,
+    fixed_roots: Option<crate::worktree::ServeRoots>,
     auth: AuthConfig,
 ) -> ServerRuntime {
     // #875: the first listed repository also owns the process-level stores: the
@@ -658,7 +659,11 @@ fn build_serve_runtime(
     // answers exactly as it did before routing existed.
     let mut front = served[0].server.clone();
     front.serve_projects = Some(Arc::new(
-        crate::protocol::serve_projects::ServeProjects::new(served, allow_index_folder),
+        crate::protocol::serve_projects::ServeProjects::new(
+            served,
+            allow_index_folder,
+            fixed_roots,
+        ),
     ));
     let protocol = Arc::new(front);
     // P2-F (resolved): the governor is now consulted on the `/mcp` HTTP path.
@@ -821,15 +826,16 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
         .map(|spec| bind_project_spec(spec).map(|binding| (spec.alias.clone(), binding)))
         .collect::<Result<Vec<_>, _>>()?;
     refuse_overlapping_roots(&bindings)?;
-    if !bindings.is_empty() {
-        // Worktree rerouting on edit tools may not leave the listed roots.
-        crate::worktree::restrict_rerouting_to_serve_roots(
+    // Worktree rerouting on edit tools may not leave the listed roots; the
+    // registry carries them, so each serve enforces its own set.
+    let fixed_roots = (!bindings.is_empty()).then(|| {
+        Arc::new(
             bindings
                 .iter()
                 .map(|(alias, binding)| (alias.clone(), binding.canonical_root.clone()))
-                .collect(),
-        );
-    }
+                .collect::<Vec<_>>(),
+        )
+    });
 
     let phase = std::time::Instant::now();
     let loaded = if bindings.is_empty() {
@@ -882,7 +888,7 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
             .directory()
             .cloned();
     let phase = std::time::Instant::now();
-    let runtime = build_serve_runtime(repos, args.allow_index_folder, auth.clone());
+    let runtime = build_serve_runtime(repos, args.allow_index_folder, fixed_roots, auth.clone());
     tracing::info!("serve: runtime built in {:?}", phase.elapsed());
 
     // US1 (FR-001/002/003): an explicit operator-chosen `--listen` is honored

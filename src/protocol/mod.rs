@@ -2146,11 +2146,17 @@ impl ServerHandler for SymForgeServer {
         // `result_type: Some(COMPLETE)` (FR-305 pinned shape); 1h TTL, Public
         // (`resource_definitions()` embeds no workspace data). The #874 tool
         // allow-list filter is per process, so Public still holds.
-        std::future::ready(Ok(ListResourcesResult::with_all_items(
-            self.advertised_resource_definitions(),
-        )
-        .with_ttl_ms(3_600_000)
-        .with_cache_scope(rmcp::model::CacheScope::Public)))
+        // #875: a multi-repository serve lists repository resources per alias.
+        // The list is a function of the process's fixed set, so Public still holds.
+        let resources = match self.serve_projects.as_ref() {
+            Some(projects) if projects.serves_several() => {
+                projects.per_alias_resources(self.advertised_resource_definitions())
+            }
+            _ => self.advertised_resource_definitions(),
+        };
+        std::future::ready(Ok(ListResourcesResult::with_all_items(resources)
+            .with_ttl_ms(3_600_000)
+            .with_cache_scope(rmcp::model::CacheScope::Public)))
     }
 
     fn list_resource_templates(
@@ -2162,11 +2168,15 @@ impl ServerHandler for SymForgeServer {
     + '_ {
         // FR-310/FR-311: static list surface — same cache policy as
         // `list_resources`.
-        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(
-            self.advertised_resource_template_definitions(),
-        )
-        .with_ttl_ms(3_600_000)
-        .with_cache_scope(rmcp::model::CacheScope::Public)))
+        let templates = match self.serve_projects.as_ref() {
+            Some(projects) if projects.serves_several() => {
+                projects.project_templates(self.advertised_resource_template_definitions())
+            }
+            _ => self.advertised_resource_template_definitions(),
+        };
+        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(templates)
+            .with_ttl_ms(3_600_000)
+            .with_cache_scope(rmcp::model::CacheScope::Public)))
     }
 
     fn read_resource(

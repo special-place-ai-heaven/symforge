@@ -413,25 +413,48 @@ impl Default for WorktreeAwareEditHook {
     }
 }
 
-/// #875: the repositories a `symforge serve --project` process was started
-/// with, as `(alias, canonical root)`. Unset on every other surface.
-static FIXED_SERVE_ROOTS: OnceLock<Vec<(String, PathBuf)>> = OnceLock::new();
+/// The roots a `symforge serve --project` process serves, as `(alias, root)`.
+pub type ServeRoots = std::sync::Arc<Vec<(String, PathBuf)>>;
 
-/// Restrict worktree rerouting to the operator's `--project` roots. Called once
-/// by `serve` when it has `--project` entries; later calls are ignored.
-pub fn restrict_rerouting_to_serve_roots(roots: Vec<(String, PathBuf)>) {
-    let _ = FIXED_SERVE_ROOTS.set(roots);
+tokio::task_local! {
+    /// #875: bound by the serve router around each routed call, so the edit
+    /// hook enforces the listed roots of the serve that is answering. Unbound
+    /// on every other surface, where rerouting behaves as before.
+    static SERVE_ROOTS: ServeRoots;
 }
 
-/// A rerouted write must land in one of the fixed roots; the refusal names them.
+/// Run one routed serve call with its listed roots in scope.
+pub async fn with_serve_roots<F: std::future::Future>(roots: ServeRoots, call: F) -> F::Output {
+    SERVE_ROOTS.scope(roots, call).await
+}
+
+/// The worktree root a rerouted write resolved to: the target path with the
+/// file's depth below the indexed root removed. `None` when it cannot be
+/// derived, which the caller treats as a refusal.
+fn rerouted_worktree_root(resolved: &ResolvedTarget, repo_root: &Path) -> Option<PathBuf> {
+    let depth = resolved
+        .indexed_path
+        .strip_prefix(canonicalize_or_identity(repo_root))
+        .ok()?
+        .components()
+        .count();
+    resolved
+        .target_path
+        .ancestors()
+        .nth(depth)
+        .map(Path::to_path_buf)
+}
+
+/// A rerouted write must land in one of the listed roots; the refusal names them.
 fn check_fixed_serve_root(
-    working_directory: &Path,
+    target_root: Option<&Path>,
+    target_path: &Path,
     fixed: &[(String, PathBuf)],
 ) -> Result<(), WorktreeError> {
-    let target_root = canonicalize_or_identity(working_directory);
-    if fixed
-        .iter()
-        .any(|(_, root)| canonicalize_or_identity(root) == target_root)
+    if let Some(target_root) = target_root
+        && fixed
+            .iter()
+            .any(|(_, root)| canonicalize_or_identity(root) == target_root)
     {
         return Ok(());
     }
@@ -441,11 +464,16 @@ fn check_fixed_serve_root(
         .collect::<Vec<_>>()
         .join(", ");
     Err(WorktreeError::TargetPathRefused {
-        path: target_root,
-        reason: format!(
-            "this server writes only to the repositories the operator listed ({aliases});              omit working_directory or pass one of those roots"
-        ),
+        path: target_path.to_path_buf(),
+        reason: serve_roots_refusal(&aliases),
     })
+}
+
+fn serve_roots_refusal(aliases: &str) -> String {
+    format!(
+        "this server writes only to the repositories the operator listed ({aliases}); omit \
+         working_directory or pass one of those roots"
+    )
 }
 
 impl EditHook for WorktreeAwareEditHook {
@@ -470,9 +498,11 @@ impl EditHook for WorktreeAwareEditHook {
         )
         .map_err(|e| e.to_string())?;
         if resolved.rerouted
-            && let (Some(fixed), Some(cwd)) = (FIXED_SERVE_ROOTS.get(), ctx.working_directory)
+            && let Ok(fixed) = SERVE_ROOTS.try_with(std::sync::Arc::clone)
         {
-            check_fixed_serve_root(cwd, fixed).map_err(|e| e.to_string())?;
+            let target_root = rerouted_worktree_root(&resolved, ctx.repo_root);
+            check_fixed_serve_root(target_root.as_deref(), &resolved.target_path, &fixed)
+                .map_err(|e| e.to_string())?;
         }
         Ok(resolved)
     }
@@ -569,16 +599,42 @@ mod tests {
     fn fixed_serve_roots_admit_only_listed_roots() {
         let listed = tempfile::TempDir::new().expect("listed root");
         let other = tempfile::TempDir::new().expect("other root");
+        let listed_root = canonicalize(listed.path()).expect("canonical");
+        let other_root = canonicalize(other.path()).expect("canonical");
         let fixed = vec![("a".to_string(), listed.path().to_path_buf())];
-        assert!(check_fixed_serve_root(listed.path(), &fixed).is_ok());
-        let refused = check_fixed_serve_root(other.path(), &fixed)
+        let file = other_root.join("x.rs");
+        assert!(check_fixed_serve_root(Some(&listed_root), &file, &fixed).is_ok());
+        let refused = check_fixed_serve_root(Some(&other_root), &file, &fixed)
             .expect_err("an unlisted worktree is refused")
             .to_string();
-        assert!(
-            refused.starts_with("TargetPathRefused") && refused.contains("(a)"),
-            "{refused}"
+        assert_eq!(
+            refused,
+            format!(
+                "TargetPathRefused: rerouted target `{}` is refused \u{2014} this server writes \
+                 only to the repositories the operator listed (a); omit working_directory or \
+                 pass one of those roots",
+                file.display()
+            )
+        );
+        assert!(check_fixed_serve_root(None, &file, &fixed).is_err());
+    }
+
+    #[test]
+    fn rerouted_worktree_root_strips_the_file_depth() {
+        let root = tempfile::TempDir::new().expect("root");
+        let resolved = ResolvedTarget {
+            target_path: PathBuf::from("/wt/src/lib.rs"),
+            indexed_path: canonicalize(root.path())
+                .expect("canonical")
+                .join("src/lib.rs"),
+            rerouted: true,
+        };
+        assert_eq!(
+            rerouted_worktree_root(&resolved, root.path()),
+            Some(PathBuf::from("/wt"))
         );
     }
+
     use std::fs;
 
     fn run_git(args: &[&str], cwd: &Path) {

@@ -1440,10 +1440,14 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // facade relay allow-list check (`protocol/tools.rs`), root overlap refusal, typed and
 // argument-checked fan-out, server-level status view, prompt refusal and admin labels.
 // No index_lifecycle file touched; calls only, no bridge. 320 files.
+// #875 delta round: serve roots move from a process global to a task-local bound by the
+// serve router (`worktree.rs`, `protocol/serve_projects.rs`, `server/serve.rs`); server
+// view argument checks; per-alias resource lists (`protocol/mod.rs`). No index_lifecycle
+// file touched; calls only, no bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "7cf95fa5411a9307b0169000797e9f2a51088532911b932f267704f99cff733b",
+    "9e0230e44e85679575cac02304b1af4e2fbc7fcba56245ea0195e89352c35211",
     320,
-    13045042,
+    13051512,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
