@@ -807,6 +807,9 @@ pub struct TextSearchResult {
     pub withheld_policy_files: usize,
     /// In-scope files withheld for size (oversized data or per-file ceiling).
     pub withheld_size_files: usize,
+    /// Structural search only: candidate files whose parse was cancelled at
+    /// the deadline (or failed), so they were not searched.
+    pub unparsed_files: usize,
 }
 
 pub const SUPPRESSED_TEXT_MATCH_DISPLAY_CAP: usize = 100;
@@ -1502,6 +1505,7 @@ fn search_structural_with_compiler(
     //     propagate as UnsupportedStructuralLanguage (index/filter bug).
     // Conflating the two was the original Unit 5 bug; split buckets fix it.
     let mut any_parse_succeeded = false;
+    let mut unparsed_files = 0usize;
     let mut first_syntax_error: Option<String> = None;
     let mut first_unsupported_error: Option<String> = None;
 
@@ -1534,10 +1538,18 @@ fn search_structural_with_compiler(
         let structural_matches = match compiled {
             Ok(compiled_pattern) => {
                 any_parse_succeeded = true;
-                crate::parsing::ast_grep::structural_search_with_compiled(
+                match crate::parsing::ast_grep::structural_search_with_compiled(
                     &content_str,
                     compiled_pattern,
-                )
+                ) {
+                    Ok(found) => found,
+                    Err(_) => {
+                        // Parse cancelled at the deadline (or failed): the
+                        // file was not searched, so count it, never match it.
+                        unparsed_files += 1;
+                        continue;
+                    }
+                }
             }
             Err(e) => {
                 // compile_structural_pattern returns two distinguishable error
@@ -1673,6 +1685,7 @@ fn search_structural_with_compiler(
             excluded_knowledge_files: 0,
             withheld_policy_files: 0,
             withheld_size_files: 0,
+            unparsed_files,
         },
         index,
         options,
@@ -2004,6 +2017,7 @@ where
         ),
         withheld_policy_files: 0,
         withheld_size_files: 0,
+        unparsed_files: 0,
     };
     let (policy, size) = count_in_scope_withheld_files(index, options, glob_filters);
     result.withheld_policy_files = policy;

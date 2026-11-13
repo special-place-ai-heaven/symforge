@@ -512,6 +512,7 @@ fn project_text(
         excluded_knowledge_files: found.excluded_knowledge_files as u64,
         withheld_policy_files: found.withheld_policy_files as u64,
         withheld_size_files: found.withheld_size_files as u64,
+        unparsed_files: found.unparsed_files as u64,
         regex: executed.is_regex,
         structural: executed.structural,
         ranked: executed.options.ranked,

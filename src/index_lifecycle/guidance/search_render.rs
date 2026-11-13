@@ -417,6 +417,16 @@ pub(crate) fn append_excluded_knowledge_note(message: String, excluded: usize) -
     )
 }
 
+/// Names the structural-search candidates whose parse hit the deadline, so a
+/// missing match is never read as "the file does not contain it".
+pub(crate) fn append_unparsed_note(message: String, unparsed: usize) -> String {
+    if unparsed == 0 {
+        return message;
+    }
+    let noun = if unparsed == 1 { "file" } else { "files" };
+    format!("{message}\nThis search skipped {unparsed} {noun} whose parse was cancelled or failed.")
+}
+
 pub(crate) fn append_withheld_admission_note(
     message: String,
     policy: usize,
@@ -556,10 +566,13 @@ pub fn search_text_result_view(
                 no_match_suggestions(suggestion_ctx)
             )
         };
-        return append_withheld_admission_note(
-            append_excluded_knowledge_note(message, result.excluded_knowledge_files),
-            result.withheld_policy_files,
-            result.withheld_size_files,
+        return append_unparsed_note(
+            append_withheld_admission_note(
+                append_excluded_knowledge_note(message, result.excluded_knowledge_files),
+                result.withheld_policy_files,
+                result.withheld_size_files,
+            ),
+            result.unparsed_files,
         );
     }
 
@@ -595,10 +608,13 @@ pub fn search_text_result_view(
                 lines.push(format!("  {name}"));
             }
         }
-        return append_withheld_admission_note(
-            lines.join("\n"),
-            result.withheld_policy_files,
-            result.withheld_size_files,
+        return append_unparsed_note(
+            append_withheld_admission_note(
+                lines.join("\n"),
+                result.withheld_policy_files,
+                result.withheld_size_files,
+            ),
+            result.unparsed_files,
         );
     }
     for file in &result.files {
@@ -752,10 +768,13 @@ pub fn search_text_result_view(
                 .to_string(),
         );
     }
-    append_withheld_admission_note(
-        lines.join("\n"),
-        result.withheld_policy_files,
-        result.withheld_size_files,
+    append_unparsed_note(
+        append_withheld_admission_note(
+            lines.join("\n"),
+            result.withheld_policy_files,
+            result.withheld_size_files,
+        ),
+        result.unparsed_files,
     )
 }
 
@@ -787,10 +806,13 @@ pub fn search_text_count_view(
             .iter()
             .map(|file| format!("{}: {}", file.path, file.matches.len())),
     );
-    append_withheld_admission_note(
-        lines.join("\n"),
-        found.withheld_policy_files,
-        found.withheld_size_files,
+    append_unparsed_note(
+        append_withheld_admission_note(
+            lines.join("\n"),
+            found.withheld_policy_files,
+            found.withheld_size_files,
+        ),
+        found.unparsed_files,
     )
 }
 

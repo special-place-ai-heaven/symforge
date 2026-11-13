@@ -571,6 +571,7 @@ fn test_search_text_result_view_group_by_symbol_keeps_duplicate_names_separate()
             excluded_knowledge_files: 0,
             withheld_policy_files: 0,
             withheld_size_files: 0,
+            unparsed_files: 0,
         }),
         Some("symbol"),
         None,
@@ -602,7 +603,25 @@ fn empty_text_search_result(
         excluded_knowledge_files: 0,
         withheld_policy_files: 0,
         withheld_size_files: 0,
+        unparsed_files: 0,
     })
+}
+
+#[test]
+fn structural_zero_hit_names_files_skipped_by_a_cancelled_parse() {
+    let mut result = empty_text_search_result("structural 'fn $NAME() {}'").unwrap();
+    result.unparsed_files = 1;
+    let rendered = search_text_result_view(
+        Ok(result),
+        None,
+        None,
+        None,
+        SearchSuggestionContext::default(),
+    );
+    assert!(
+        rendered.ends_with("This search skipped 1 file whose parse was cancelled or failed."),
+        "missing skipped-file note: {rendered}"
+    );
 }
 
 #[test]

@@ -13,8 +13,10 @@ use ast_grep_core::language::Language;
 use ast_grep_core::matcher::PatternBuilder;
 use ast_grep_core::meta_var::MetaVariable;
 use ast_grep_core::tree_sitter::{LanguageExt, StrDoc, TSLanguage};
-use ast_grep_core::{Pattern, PatternError};
+use ast_grep_core::{AstGrep, Pattern, PatternError};
 use std::borrow::Cow;
+use std::time::Duration;
+use tree_sitter::Parser;
 
 /// Wrapper that implements ast-grep's `Language` trait for a SymForge `LanguageId`.
 #[derive(Clone)]
@@ -166,14 +168,34 @@ pub fn compile_structural_pattern(
     })
 }
 
-/// Search `source` using an already compiled ast-grep pattern.
+/// Search `source` using an already compiled ast-grep pattern. The parse is
+/// bounded by the indexer's deadline; a cancelled parse is an error, not an
+/// empty match list.
 pub fn structural_search_with_compiled(
     source: &str,
     compiled: &CompiledStructuralPattern,
-) -> Vec<StructuralMatch> {
-    let root = compiled.lang.ast_grep(source);
+) -> Result<Vec<StructuralMatch>, String> {
+    structural_search_within(source, compiled, super::PARSE_DEADLINE)
+}
 
-    root.root()
+fn structural_search_within(
+    source: &str,
+    compiled: &CompiledStructuralPattern,
+    deadline: Duration,
+) -> Result<Vec<StructuralMatch>, String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&compiled.lang.get_ts_language())
+        .map_err(|e| format!("failed to set tree-sitter language: {e}"))?;
+    let tree = super::parse_within(&mut parser, source, deadline)?;
+    let root = AstGrep::doc(StrDoc {
+        src: source.to_string(),
+        lang: compiled.lang.clone(),
+        tree,
+    });
+
+    Ok(root
+        .root()
         .find_all(&compiled.pattern)
         .map(|node_match| {
             let start = node_match.start_pos();
@@ -213,7 +235,7 @@ pub fn structural_search_with_compiled(
                 captures,
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Search `source` for occurrences of an ast-grep `pattern` in the given language.
@@ -226,12 +248,23 @@ pub fn structural_search(
     is_tsx: bool,
 ) -> Result<Vec<StructuralMatch>, String> {
     let compiled = compile_structural_pattern(pattern_str, lang, is_tsx)?;
-    Ok(structural_search_with_compiled(source, &compiled))
+    structural_search_with_compiled(source, &compiled)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structural_search_past_its_deadline_is_an_error() {
+        let source = "fn f() { let x = 1; }\n".repeat(20_000);
+        let compiled = compile_structural_pattern("fn $NAME() { $$$ }", &LanguageId::Rust, false)
+            .expect("pattern should compile");
+        let Err(err) = structural_search_within(&source, &compiled, Duration::ZERO) else {
+            panic!("a zero deadline must cancel the parse");
+        };
+        assert!(err.contains("cancelled"), "unexpected error: {err}");
+    }
 
     #[test]
     fn test_structural_search_rust_function() {

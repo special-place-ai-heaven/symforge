@@ -14333,6 +14333,7 @@ mod tests {
                 excluded_knowledge_files: excluded,
                 withheld_policy_files: 0,
                 withheld_size_files: 0,
+                unparsed_files: 0,
             }
         }
 

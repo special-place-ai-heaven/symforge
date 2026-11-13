@@ -369,11 +369,11 @@ pub(crate) fn parse_source_tree(
 
 /// Upper bound on one tree-sitter parse. The largest file in this repository
 /// parses in about 140 ms, so a parse still running here is pathological.
-const PARSE_DEADLINE: Duration = Duration::from_secs(10);
+pub(crate) const PARSE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Parse `source`, cancelling cooperatively once `deadline` has elapsed.
 /// A cancelled parse is an error that says so, never a tree.
-fn parse_within(
+pub(crate) fn parse_within(
     parser: &mut Parser,
     source: &str,
     deadline: Duration,
