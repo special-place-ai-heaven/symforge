@@ -30,9 +30,11 @@ use std::time::{Duration, Instant};
 use symforge::knowledge::SECRET_POLICY_VERSION;
 use symforge::live_index::LiveIndex;
 use symforge::live_index::knowledge_authority::{
-    AuthorityLimits, AuthorityTemporalIndex, build_knowledge_authority,
+    AuthorityLimits, AuthorityTemporalIndex, build_knowledge_authority, full_authority_builds,
 };
-use symforge::live_index::knowledge_bridge::{BridgeLimits, build_knowledge_bridge};
+use symforge::live_index::knowledge_bridge::{
+    BridgeLimits, build_knowledge_bridge, full_bridge_builds,
+};
 use symforge::live_index::single_file::{ReindexResult, update_file_from_disk};
 
 struct Counting;
@@ -189,6 +191,7 @@ fn measure_single_file_publication_allocation() {
     let stride = (targets.len() / changes.max(1)).max(1);
     let targets: Vec<String> = targets.into_iter().step_by(stride).take(changes).collect();
 
+    let builds_before = (full_bridge_builds(), full_authority_builds());
     let mut held = VecDeque::new();
     let mut per_change = Vec::new();
     for (i, rel) in targets.iter().enumerate() {
@@ -214,14 +217,16 @@ fn measure_single_file_publication_allocation() {
         let retained = LIVE.load(Ordering::Relaxed) as i64 - live_before as i64;
         per_change.push((allocated, elapsed, retained));
     }
+    let builds_after_changes = (full_bridge_builds(), full_authority_builds());
     // Same bytes again, newer mtime: the hash-skip lane skips the parse but
     // still publishes a generation, so this separates parse cost from
-    // publication cost.
+    // publication cost. The pause moves `mtime_secs` to a new second, without
+    // which a hash-skip publishes nothing.
     let mut hash_skip = Vec::new();
     for rel in &targets {
         let path = root.join(rel);
         let bytes = std::fs::read(&path).expect("read target");
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(1100));
         std::fs::write(&path, bytes).expect("rewrite target");
         let published_before = shared.published_generation().publication_generation;
         let alloc_before = ALLOCATED.load(Ordering::Relaxed);
@@ -236,6 +241,7 @@ fn measure_single_file_publication_allocation() {
         let published = shared.published_generation().publication_generation != published_before;
         hash_skip.push((allocated, elapsed, published));
     }
+    let builds_after_skips = (full_bridge_builds(), full_authority_builds());
     // Attribution: rebuild, off to the side, the derived parts a publication
     // builds from the whole index, using the current generation's inputs.
     let generation = shared.published_generation();
@@ -289,6 +295,7 @@ fn measure_single_file_publication_allocation() {
     drop(held);
     let live_unpinned = LIVE.load(Ordering::Relaxed);
     let rss_unpinned = rss_label();
+    let trim = malloc_trim_report();
 
     let n = per_change.len().max(1) as u64;
     let total_alloc: u64 = per_change.iter().map(|(a, _, _)| a).sum();
@@ -297,7 +304,11 @@ fn measure_single_file_publication_allocation() {
     times.sort();
 
     println!("── issue #876 publication measurement ──");
-    println!("os={} corpus_files_copied={copied}", std::env::consts::OS);
+    println!(
+        "os={} corpus_files_copied={copied} MALLOC_ARENA_MAX={}",
+        std::env::consts::OS,
+        std::env::var("MALLOC_ARENA_MAX").unwrap_or_else(|_| "unset".to_string())
+    );
     println!(
         "index: files={} content={:.1} MiB references={} trigram_entries={}",
         counts.files,
@@ -329,6 +340,15 @@ fn measure_single_file_publication_allocation() {
             *retained as f64 / (1024.0 * 1024.0)
         );
     }
+    println!(
+        "full knowledge builds: {} bridge and {} authority over {} changes;          {} bridge and {} authority over {} hash-skips",
+        builds_after_changes.0 - builds_before.0,
+        builds_after_changes.1 - builds_before.1,
+        per_change.len(),
+        builds_after_skips.0 - builds_after_changes.0,
+        builds_after_skips.1 - builds_after_changes.1,
+        hash_skip.len()
+    );
     let skips = hash_skip.len().max(1) as u64;
     println!(
         "hash-skip publication (n={}, {} published a generation): mean {:.1} MiB allocated, \
@@ -355,4 +375,25 @@ fn measure_single_file_publication_allocation() {
         "resident: before load {rss_empty}, loaded {rss_loaded}, \
          with {pinned} pinned {rss_pinned}, unpinned {rss_unpinned}"
     );
+    println!("{trim}");
+}
+
+/// `malloc_trim(0)` once, after the pinned generations are released: the
+/// resident memory it hands back and what it costs. glibc only.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn malloc_trim_report() -> String {
+    let before = rss_label();
+    let started = Instant::now();
+    // SAFETY: malloc_trim takes a pad size and touches only allocator state.
+    let released = unsafe { libc::malloc_trim(0) };
+    format!(
+        "malloc_trim(0): resident {before} -> {} in {:.1} ms (released={released})",
+        rss_label(),
+        started.elapsed().as_secs_f64() * 1e3
+    )
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn malloc_trim_report() -> String {
+    "malloc_trim(0): not measured (glibc only)".to_string()
 }
