@@ -587,7 +587,49 @@ pub(crate) fn process_may_be_alive(pid: u32) -> bool {
     // SAFETY: signal 0 performs existence/permission checking only and does not
     // deliver a signal. ESRCH is the sole definitive "process is gone" result.
     let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    let exists = result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+    // kill(pid, 0) succeeds for a zombie: an exited process its parent has
+    // not reaped. It runs nothing and will never heartbeat again.
+    exists && !process_is_zombie(pid)
+}
+
+/// Linux: the whole thread group has exited. `/proc/<pid>/stat` shows the
+/// leader as `Z` once the MAIN thread exits, even while other threads still
+/// run, so a dead leader counts only when `/proc/<pid>/status` also reports a
+/// single thread. Either file unreadable or unparsable answers `false` (not
+/// known dead), leaving the `kill` verdict in force.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_is_zombie(pid: libc::pid_t) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| proc_stat_is_dead(&stat))
+        && std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .is_ok_and(|status| proc_status_threads(&status) == Some(1))
+}
+
+/// The `Threads:` count in a `/proc/<pid>/status` file; `None` if absent.
+#[cfg(any(target_os = "linux", test))]
+fn proc_status_threads(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Threads:"))
+        .and_then(|rest| rest.trim().parse().ok())
+}
+
+/// A `/proc/<pid>/stat` line whose state is `Z` (zombie) or `X` (dead). The
+/// state is the first field after the LAST `)`, because the command name in
+/// parentheses may itself contain spaces or parentheses. Unparsable: `false`.
+#[cfg(any(target_os = "linux", test))]
+fn proc_stat_is_dead(stat: &str) -> bool {
+    stat.rfind(')')
+        .and_then(|close| stat[close + 1..].split_whitespace().next())
+        .is_some_and(|state| matches!(state, "Z" | "X"))
+}
+
+/// Other Unix (macOS, BSD): `kill(pid, 0)` reports a zombie as present and
+/// there is no `/proc` to ask, so a zombie stays alive to the pid rule and is
+/// closed by the session TTL instead.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn process_is_zombie(_pid: libc::pid_t) -> bool {
+    false
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -909,6 +951,88 @@ pub fn check_stale(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Issue #876: the `/proc/<pid>/stat` state parser, on fixed strings so it
+    /// runs on every platform. The state follows the LAST `)`.
+    #[test]
+    fn test_proc_stat_is_dead_reads_state_after_last_paren() {
+        assert!(proc_stat_is_dead("42 (symforge) Z 1 42 42 0 -1"));
+        assert!(proc_stat_is_dead("42 (symforge) X 1 42 42 0 -1"));
+        assert!(proc_stat_is_dead("42 (a) b) Z 1 42"), "comm with `) `");
+        assert!(!proc_stat_is_dead("42 (a) Z) S 1 42"), "Z inside comm");
+        assert!(!proc_stat_is_dead("42 (symforge) S 1 42 42 0 -1"));
+        assert!(!proc_stat_is_dead("42 (symforge) R 1 42 42 0 -1"));
+        assert!(!proc_stat_is_dead(""));
+        assert!(!proc_stat_is_dead("42 (symforge)"));
+        assert!(!proc_stat_is_dead("42 symforge Z"), "no paren at all");
+    }
+
+    #[test]
+    fn test_proc_status_threads_reads_the_threads_line() {
+        let status = "Name:\tsymforge\nState:\tZ (zombie)\nThreads:\t3\nSigQ:\t0/1\n";
+        assert_eq!(proc_status_threads(status), Some(3));
+        assert_eq!(proc_status_threads("Threads:\t1\n"), Some(1));
+        assert_eq!(proc_status_threads("Name:\tx\n"), None);
+        assert_eq!(proc_status_threads("Threads:\tmany\n"), None);
+    }
+
+    /// Issue #876 review: a process whose MAIN thread exited (as `pthread_exit`
+    /// does) while a worker still runs shows its leader as `Z` in `/proc/<pid>/stat`.
+    /// It is alive and must not be judged dead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn test_process_whose_main_thread_exited_with_a_live_worker_is_alive() {
+        extern "C" fn worker(_: *mut libc::c_void) -> *mut libc::c_void {
+            // SAFETY: plain libc calls in the forked child; `_exit` ends the
+            // whole process without running parent-owned destructors.
+            unsafe {
+                libc::sleep(30);
+                libc::_exit(0)
+            }
+        }
+        // SAFETY: the child runs only async-signal-tolerant libc calls
+        // (pthread_create, pthread_exit, sleep, _exit) and never returns into
+        // the test harness; the parent reaps it below.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // SAFETY: forked child; a zeroed pthread_t is a valid out slot.
+            // The raw `exit` syscall (not `exit_group`) ends only this, the
+            // leader thread, without unwinding: `pthread_exit` would force an
+            // unwind through Rust frames, which aborts the whole process.
+            unsafe {
+                let mut thread: libc::pthread_t = std::mem::zeroed();
+                if libc::pthread_create(&mut thread, std::ptr::null(), worker, std::ptr::null_mut())
+                    != 0
+                {
+                    libc::_exit(2);
+                }
+                libc::syscall(libc::SYS_exit, 0);
+                libc::_exit(3);
+            }
+        }
+        // Wait (bounded) until the leader shows as dead in `stat`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let leader_dead = loop {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            if proc_stat_is_dead(&stat) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let alive = process_may_be_alive(pid as u32);
+        // SAFETY: `pid` is this test's own child; kill then reap it.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+        assert!(leader_dead, "the leader never showed Z in /proc/<pid>/stat");
+        assert!(alive, "a live worker thread keeps the process alive");
+    }
 
     fn with_temp_control(f: impl FnOnce(&ControlStateDir, &Path)) {
         let tmp = TempDir::new().unwrap();

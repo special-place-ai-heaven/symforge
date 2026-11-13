@@ -2540,6 +2540,7 @@ mod tests {
                 live: Arc::new(live),
                 health: Arc::new(health),
                 outline: Arc::clone(&base.outline),
+                memory_counts: std::sync::OnceLock::new(),
             }
         };
 

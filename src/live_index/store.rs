@@ -1664,9 +1664,44 @@ pub struct PublishedGeneration {
     pub live: Arc<LiveIndex>,
     pub health: Arc<PublishedIndexState>,
     pub outline: Arc<RepoOutlineView>,
+    /// Issue #876: `live`'s memory figures, counted at most once per
+    /// generation. Every construction starts it empty (`OnceLock::new()`); a
+    /// generation is immutable once built, so the count can never go stale.
+    pub memory_counts: std::sync::OnceLock<IndexMemoryCounts>,
+}
+
+/// What one published index holds, counted from its file map and trigram index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexMemoryCounts {
+    pub files: usize,
+    pub content_bytes: usize,
+    pub references: usize,
+    pub trigram_entries: usize,
+}
+
+impl IndexMemoryCounts {
+    pub(crate) fn count(index: &LiveIndex) -> Self {
+        let (content_bytes, references) =
+            index.files.values().fold((0, 0), |(bytes, refs), file| {
+                (bytes + file.content.len(), refs + file.references.len())
+            });
+        Self {
+            files: index.files.len(),
+            content_bytes,
+            references,
+            trigram_entries: index.trigram_index.posting_count(),
+        }
+    }
 }
 
 impl PublishedGeneration {
+    /// This generation's memory figures: counted on first request, then read.
+    pub fn memory_counts(&self) -> IndexMemoryCounts {
+        *self
+            .memory_counts
+            .get_or_init(|| IndexMemoryCounts::count(&self.live))
+    }
+
     pub fn source_response_envelope(&self) -> Option<SourceResponseEnvelope> {
         let manifest = self.manifest.as_ref()?;
         Some(SourceResponseEnvelope {
@@ -2634,6 +2669,7 @@ impl SharedIndexHandle {
             live: Arc::clone(&live),
             health: Arc::clone(&published_state),
             outline: Arc::clone(&published_repo_outline),
+            memory_counts: std::sync::OnceLock::new(),
         });
         let current_source_id = source
             .as_ref()
@@ -2843,6 +2879,7 @@ impl SharedIndexHandle {
             live,
             health: published_state,
             outline,
+            memory_counts: std::sync::OnceLock::new(),
         })
     }
 
@@ -3703,6 +3740,7 @@ impl SharedIndexHandle {
             live: Arc::clone(&previous.live),
             health: Arc::clone(&previous.health),
             outline: Arc::clone(&previous.outline),
+            memory_counts: std::sync::OnceLock::new(),
         });
         self.published_source_set
             .store(Arc::new(previous_source_set.next_after_current_publish(
@@ -3768,6 +3806,7 @@ impl SharedIndexHandle {
             live: Arc::clone(&previous.live),
             health: Arc::clone(&previous.health),
             outline: Arc::clone(&previous.outline),
+            memory_counts: std::sync::OnceLock::new(),
         });
         self.published_source_set
             .store(Arc::new(previous_source_set.next_after_current_publish(
@@ -3812,6 +3851,7 @@ impl SharedIndexHandle {
             live: Arc::clone(&previous.live),
             health: Arc::clone(&previous.health),
             outline: Arc::clone(&previous.outline),
+            memory_counts: std::sync::OnceLock::new(),
         });
         self.published_source_set
             .store(Arc::new(previous_source_set.next_after_current_publish(
@@ -3878,6 +3918,7 @@ impl SharedIndexHandle {
             live: Arc::clone(&previous.live),
             health: Arc::clone(&previous.health),
             outline: Arc::clone(&previous.outline),
+            memory_counts: std::sync::OnceLock::new(),
         });
         self.published_source_set
             .store(Arc::new(previous_source_set.next_after_current_publish(
@@ -3906,6 +3947,7 @@ impl SharedIndexHandle {
             live: Arc::clone(&previous.live),
             health: Arc::clone(&previous.health),
             outline: Arc::clone(&previous.outline),
+            memory_counts: std::sync::OnceLock::new(),
         });
         self.published_source_set
             .store(Arc::new(previous_source_set.next_after_current_publish(
@@ -5543,6 +5585,7 @@ impl SharedIndexHandle {
             live: Arc::clone(&live),
             health: Arc::clone(&published_state),
             outline: Arc::clone(&published_repo_outline),
+            memory_counts: std::sync::OnceLock::new(),
         });
         let current_source_id = source
             .as_ref()

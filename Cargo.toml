@@ -195,7 +195,8 @@ cap-std = "4.0.3"
 
 [target.'cfg(windows)'.dependencies]
 # Native Win32 calls: the self-update move-aside fallback (cli/update.rs),
-# sidecar process waits, and filesystem identity queries.
+# sidecar process waits, filesystem identity queries, and the process
+# resident-memory line in health.
 windows = { version = "0.62", features = [
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
@@ -204,6 +205,7 @@ windows = { version = "0.62", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
+    "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
 

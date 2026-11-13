@@ -2176,6 +2176,74 @@ fn health_binding_view<'a>(
     }
 }
 
+/// Issue #876: one published index's memory figures as a health line: file
+/// count, file content bytes, stored references and trigram posting entries.
+pub(crate) fn index_memory_counts(counts: crate::live_index::store::IndexMemoryCounts) -> String {
+    let crate::live_index::store::IndexMemoryCounts {
+        files,
+        content_bytes,
+        references,
+        trigram_entries,
+    } = counts;
+    format!(
+        "files={files} content_bytes={content_bytes} references={references} trigram_entries={trigram_entries}"
+    )
+}
+
+/// The `── Memory ──` section: process resident memory read from the OS now,
+/// and the counts of the generation this report was captured from (counted
+/// once per generation, see `PublishedGeneration::memory_counts`). A platform or
+/// read failure says so; it never prints a number it did not read.
+fn format_memory_health(generation: &crate::live_index::store::PublishedGeneration) -> String {
+    let resident = match process_resident_bytes() {
+        Ok(bytes) => format!("process_resident_bytes={bytes}"),
+        Err(reason) => format!("process_resident_bytes: not measured ({reason})"),
+    };
+    format!(
+        "── Memory ──\n{resident}\nproject {}",
+        index_memory_counts(generation.memory_counts())
+    )
+}
+
+/// This process's resident memory in bytes: Linux `VmRSS` from
+/// `/proc/self/status`, Windows the working set.
+fn process_resident_bytes() -> Result<u64, &'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status")
+            .map_err(|_| "reading /proc/self/status failed")?;
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+            .map(|kib| kib * 1024)
+            .ok_or("no VmRSS line in /proc/self/status")
+    }
+    #[cfg(windows)]
+    {
+        windows_working_set_bytes().ok_or("GetProcessMemoryInfo failed")
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        Err("no resident-memory reader on this platform")
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_working_set_bytes() -> Option<u64> {
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters = PROCESS_MEMORY_COUNTERS::default();
+    let size = u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS>()).ok()?;
+    // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no close;
+    // `counters` is a live, writable PROCESS_MEMORY_COUNTERS of exactly `size`
+    // bytes for the duration of the call.
+    unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) }.ok()?;
+    u64::try_from(counters.WorkingSetSize).ok()
+}
+
 /// The full `health` report. Section order is the MCP contract.
 pub(crate) fn render_health_report(
     inputs: &HealthReportInputs<'_>,
@@ -2210,6 +2278,10 @@ pub(crate) fn render_health_report(
         crate::live_index::store::configured_inflight_byte_budget(),
         &inputs.settled_unreadable,
     ));
+    // Issue #876: from the same entry capture, so the counts are this report's
+    // generation; every lane (local, daemon session, embed) renders it.
+    result.push('\n');
+    result.push_str(&format_memory_health(&generation));
     result.push('\n');
     result.push_str(&format!(
         "── Worktree-awareness misuse ──\nedit tool calls without working_directory (last hour): {}",
@@ -2294,4 +2366,33 @@ pub(crate) fn render_health_compact(
     result.push_str(&secret_dismissals_line(inputs.repo_root));
     result.push_str(&process.trailing);
     result
+}
+
+#[cfg(test)]
+mod memory_section_tests {
+    use super::*;
+
+    /// Issue #876: the shared memory section prints what it read and, where
+    /// it read nothing, says so instead of a zero.
+    #[test]
+    fn test_memory_section_reports_counts_and_measured_resident_memory() {
+        let shared = crate::live_index::store::LiveIndex::empty();
+        let section = format_memory_health(&shared.published_generation());
+        let lines: Vec<&str> = section.lines().collect();
+        assert_eq!(lines[0], "── Memory ──");
+        #[cfg(any(target_os = "linux", windows))]
+        {
+            let bytes: u64 = lines[1]
+                .strip_prefix("process_resident_bytes=")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("measured line expected: {section}"));
+            assert!(bytes > 0, "{section}");
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        assert!(lines[1].contains("not measured ("), "{section}");
+        assert_eq!(
+            lines[2],
+            "project files=0 content_bytes=0 references=0 trigram_entries=0"
+        );
+    }
 }
