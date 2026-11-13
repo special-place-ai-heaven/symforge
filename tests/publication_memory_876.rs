@@ -296,6 +296,11 @@ fn measure_single_file_publication_allocation() {
     let live_unpinned = LIVE.load(Ordering::Relaxed);
     let rss_unpinned = rss_label();
     let trim = malloc_trim_report();
+    // Unload: the whole index goes, as when the daemon drops an idle project.
+    drop(shared);
+    let live_unloaded = LIVE.load(Ordering::Relaxed);
+    let rss_unloaded = rss_label();
+    let unload_trim = malloc_trim_report();
 
     let n = per_change.len().max(1) as u64;
     let total_alloc: u64 = per_change.iter().map(|(a, _, _)| a).sum();
@@ -375,7 +380,11 @@ fn measure_single_file_publication_allocation() {
         "resident: before load {rss_empty}, loaded {rss_loaded}, \
          with {pinned} pinned {rss_pinned}, unpinned {rss_unpinned}"
     );
-    println!("{trim}");
+    println!("after releasing the pinned generations, {trim}");
+    println!(
+        "after unloading the index: live heap {:.1} MiB, resident {rss_unloaded}; {unload_trim}",
+        mib(live_unloaded)
+    );
 }
 
 /// `malloc_trim(0)` once, after the pinned generations are released: the
