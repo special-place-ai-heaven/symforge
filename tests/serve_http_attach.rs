@@ -539,8 +539,8 @@ async fn cross_project_targeting_is_refused_over_http() {
         );
         // The refusal must name the /mcp transport so it is honest for the caller.
         assert!(
-            text.contains("/mcp HTTP transport"),
-            "{name} refusal should name the /mcp transport, got:\n{text}"
+            text.contains("single-repository /mcp HTTP transport"),
+            "{name} refusal should name the single-repository /mcp transport, got:\n{text}"
         );
         // Semantic refusals are typed MCP errors, never isError:false (the
         // incident's "refusal returned as success" defect).

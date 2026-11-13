@@ -5450,7 +5450,7 @@ impl SymForgeServer {
         Some(
             "Error: project_routing: cross-project queries (project/projects) require the daemon: the \
              working set of open projects lives on the daemon transport, not on \
-             the /mcp HTTP transport, stdio/embed, or while the daemon is \
+             a single-repository /mcp HTTP transport, stdio/embed, or while the daemon is \
              unreachable. Start the daemon to query across projects."
                 .to_string(),
         )

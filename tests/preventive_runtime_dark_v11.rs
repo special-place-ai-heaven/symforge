@@ -1429,10 +1429,17 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // No index_lifecycle file touched; calls only, no bridge. 319 files.
 // Test-only: a `daemon.rs` test module case proving the daemon binds and the
 // adapter sends the allow-list header. No bridge. 319 files.
+// Issue #875: `serve --project ALIAS=PATH`. New candidate `protocol/serve_projects.rs`
+// (routing registry); `protocol/mod.rs` splits `call_tool` and routes resource reads;
+// `server/serve.rs` loads each root through the existing `admit_project` path and starts
+// `restart_watcher` per repository; `daemon.rs` widens the cross-project read helpers to
+// `pub(crate)`; wording in `protocol/surface_probe.rs` and `protocol/tools.rs`. Calls
+// only into existing accessors (`data_plane().read()`, `published_state()`); no
+// index_lifecycle file touched, no bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "0047ac986c0274908ec17bb4b1bc269d60c013d0ab8cfe6ae7b477462abdc979",
-    319,
-    13007851,
+    "56e889ee2876bc010b301a1068e8657efe628b44549675a085f4b1d3b9ca8378",
+    320,
+    13034117,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

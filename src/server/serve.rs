@@ -576,21 +576,12 @@ fn bind_project_spec(spec: &ProjectSpec) -> Result<crate::domain::RootBinding, S
     }
 }
 
-/// Construct the [`ServerRuntime`] from a resolved index + auth config.
+/// Construct the [`ServerRuntime`] over every loaded repository (#875).
 ///
-/// Builds the **same** [`SymForgeServer`] the stdio path constructs (one shared
-/// dispatcher, no logic fork), a default [`RequestGovernor`], and opens the
-/// durable STEL [`StelLedgerStore`] under the project's symforge data dir. If the
-/// store cannot open it degrades to [`StelLedgerStore::Disabled`] (serving
-/// continues — FR-011). When there is no project root the ledger store is left
-/// `None` (no data dir to anchor it).
-///
-/// US3/T028+T029: the durable store is opened **before** the protocol
-/// dispatcher so the same `Arc<StelLedgerStore>` is shared into both the
-/// dispatcher (write-through on each `symforge`/`symforge_edit` invocation via
-/// `finalize_symforge_with_ledger`) and the [`ServerRuntime`] (read path for
-/// the `status` summary). One physical store = one durable ledger path, so no
-/// economics row is counted twice across the in-memory and durable sinks.
+/// Builds one [`SymForgeServer`] per repository through [`build_repo_server`]
+/// (the same dispatcher stdio constructs, no logic fork), puts them in the
+/// `/mcp` routing registry, and adds a default [`RequestGovernor`]. The runtime
+/// ledger summary and the API-key store belong to the first listed repository.
 fn build_serve_runtime(
     repos: Vec<LoadedRepo>,
     allow_index_folder: bool,
