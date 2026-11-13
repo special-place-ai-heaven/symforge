@@ -13,8 +13,9 @@
 edition = "2024"
 rust-version = "1.88"
 name = "rmcp"
-version = "3.5.0"
+version = "3.10.0"
 build = "build.rs"
+exclude = ["tests/test_package_license.rs"]
 autolib = false
 autobins = false
 autoexamples = false
@@ -26,7 +27,6 @@ documentation = "https://docs.rs/rmcp"
 readme = "README.md"
 license = "Apache-2.0"
 repository = "https://github.com/modelcontextprotocol/rust-sdk/"
-resolver = "2"
 
 [package.metadata.docs.rs]
 features = [
@@ -99,7 +99,6 @@ macros = [
 ]
 request-state = [
     "dep:hmac",
-    "dep:sha2",
     "dep:zeroize",
     "base64",
 ]
@@ -134,6 +133,12 @@ server-side-http = [
     "tower",
     "base64",
 ]
+skills-fs = [
+    "server",
+    "base64",
+    "dep:cap-std",
+    "dep:yaml_serde",
+]
 tower = ["dep:tower-service"]
 transport-async-rw = [
     "tokio/io-util",
@@ -147,6 +152,7 @@ transport-child-process = [
 transport-io = [
     "transport-async-rw",
     "tokio/io-std",
+    "tokio/net",
 ]
 transport-streamable-http-client = [
     "client-side-sse",
@@ -184,6 +190,18 @@ which-command = [
 [lib]
 name = "rmcp"
 path = "src/lib.rs"
+
+[[test]]
+name = "test_abandoned_request_cancel"
+path = "tests/test_abandoned_request_cancel.rs"
+required-features = [
+    "server",
+    "client",
+]
+
+[[test]]
+name = "test_async_rw_max_line_length"
+path = "tests/test_async_rw_max_line_length.rs"
 
 [[test]]
 name = "test_auth_error_classification"
@@ -463,6 +481,14 @@ name = "test_server_initialization"
 path = "tests/test_server_initialization.rs"
 
 [[test]]
+name = "test_skill_catalog"
+path = "tests/test_skill_catalog.rs"
+
+[[test]]
+name = "test_skills"
+path = "tests/test_skills.rs"
+
+[[test]]
 name = "test_sse_concurrent_streams"
 path = "tests/test_sse_concurrent_streams.rs"
 required-features = [
@@ -472,6 +498,10 @@ required-features = [
     "transport-streamable-http-client",
     "reqwest",
 ]
+
+[[test]]
+name = "test_stateless_http_server_requests"
+path = "tests/test_stateless_http_server_requests.rs"
 
 [[test]]
 name = "test_stateless_protocol_version"
@@ -559,6 +589,15 @@ name = "test_streamable_http_init_timeout"
 path = "tests/test_streamable_http_init_timeout.rs"
 
 [[test]]
+name = "test_streamable_http_initialize_error"
+path = "tests/test_streamable_http_initialize_error.rs"
+required-features = [
+    "client",
+    "transport-streamable-http-client",
+    "transport-streamable-http-client-reqwest",
+]
+
+[[test]]
 name = "test_streamable_http_json_response"
 path = "tests/test_streamable_http_json_response.rs"
 required-features = [
@@ -598,6 +637,19 @@ required-features = [
 ]
 
 [[test]]
+name = "test_streamable_http_reconnect_classification"
+path = "tests/test_streamable_http_reconnect_classification.rs"
+
+[[test]]
+name = "test_streamable_http_response_limits"
+path = "tests/test_streamable_http_response_limits.rs"
+required-features = ["transport-streamable-http-client-reqwest"]
+
+[[test]]
+name = "test_streamable_http_session_isolation"
+path = "tests/test_streamable_http_session_isolation.rs"
+
+[[test]]
 name = "test_streamable_http_session_store"
 path = "tests/test_streamable_http_session_store.rs"
 required-features = [
@@ -626,6 +678,14 @@ required-features = [
     "client",
     "transport-streamable-http-server",
     "reqwest",
+]
+
+[[test]]
+name = "test_streamable_http_status_metadata"
+path = "tests/test_streamable_http_status_metadata.rs"
+required-features = [
+    "transport-streamable-http-client",
+    "transport-streamable-http-client-reqwest",
 ]
 
 [[test]]
@@ -694,6 +754,11 @@ required-features = [
 ]
 
 [[test]]
+name = "test_unix_socket_response_limits"
+path = "tests/test_unix_socket_response_limits.rs"
+required-features = ["transport-streamable-http-client-unix-socket"]
+
+[[test]]
 name = "test_unix_socket_transport"
 path = "tests/test_unix_socket_transport.rs"
 required-features = [
@@ -734,6 +799,10 @@ optional = true
 
 [dependencies.bytes]
 version = "1"
+optional = true
+
+[dependencies.cap-std]
+version = "4"
 optional = true
 
 [dependencies.futures]
@@ -808,7 +877,7 @@ optional = true
 default-features = false
 
 [dependencies.rmcp-macros]
-version = "3.5.0"
+version = "3.10.0"
 optional = true
 
 [dependencies.schemars]
@@ -828,7 +897,6 @@ version = "1.0"
 
 [dependencies.sha2]
 version = "0.11"
-optional = true
 
 [dependencies.sse-stream]
 version = "0.2.4"
@@ -873,6 +941,10 @@ optional = true
 version = "8"
 optional = true
 
+[dependencies.yaml_serde]
+version = "0.10"
+optional = true
+
 [dependencies.zeroize]
 version = "1"
 optional = true
@@ -903,7 +975,7 @@ version = "0.1"
 features = ["tokio"]
 
 [dev-dependencies.rstest]
-version = "0.27.0"
+version = "0.28.0"
 
 [dev-dependencies.schemars]
 version = "1.1.0"
@@ -912,6 +984,9 @@ features = ["chrono04"]
 [dev-dependencies.serde_json]
 version = "1.0"
 features = ["arbitrary_precision"]
+
+[dev-dependencies.tempfile]
+version = "3"
 
 [dev-dependencies.tokio]
 version = "1"
@@ -951,6 +1026,9 @@ features = [
     "now",
 ]
 default-features = false
+
+[target."cfg(unix)".dependencies.libc]
+version = "0.2"
 
 [lints.clippy]
 exhaustive_enums = "warn"

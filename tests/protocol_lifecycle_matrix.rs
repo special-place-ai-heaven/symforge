@@ -10,11 +10,15 @@
 //! after a successful `initialize`; its in-loop `initialize` also recorded the
 //! REQUESTED protocol version as peer info instead of the negotiated one, so
 //! `ping` on a session negotiated down from 2026-07-28 answered
-//! method-not-found. Both are patched in `vendor/rmcp` (see
+//! method-not-found. rmcp 3.10.0 still has both for an inline opener (a
+//! non-discover request with full 2026-07-28 `_meta`) followed by `initialize`,
+//! and aborts the server on a notification sent between discover and
+//! `initialize`. All three are patched in `vendor/rmcp` (see
 //! `vendor/rmcp/SYMFORGE-PATCH.md`).
 //!
-//! 54 rows: {init, discover_then_init} x 4 initialize versions x 6 `_meta`
-//! shapes, plus discover_only x 6 shapes. Each row asserts four methods.
+//! 102 rows: {init, discover_then_init, discover_cancel_then_init,
+//! inline_then_init} x 4 initialize versions x 6 `_meta` shapes, plus
+//! discover_only x 6 shapes. Each row asserts four methods.
 #![cfg(feature = "server")]
 
 use std::io::{BufRead, BufReader, Write};
@@ -56,7 +60,9 @@ fn metas() -> Vec<(&'static str, Option<Value>)> {
 /// - a session whose client completed `initialize` is a session-lifecycle
 ///   session even if `server/discover` came first, so no per-request metadata
 ///   is required;
-/// - a discover-only session demands version + capabilities on every request;
+/// - a discover-only session demands version + capabilities on every request,
+///   except `ping`: discover selects no lifecycle, and the spec permits ping
+///   before one exists;
 /// - `ping` exists only on the legacy lifecycle.
 ///
 /// Returned values are prefixes of [`Session::call`] outcomes, so an ERR cell
@@ -66,6 +72,9 @@ fn expected(lifecycle: &str, meta: &str, method: &str) -> &'static str {
         lifecycle == "discover_only" || matches!(meta, "pv_modern" | "full_modern");
     let complete_meta = matches!(meta, "full_modern" | "full_legacy");
     if inline_request && !complete_meta {
+        if method == "ping" && lifecycle == "discover_only" {
+            return "OK";
+        }
         return MISSING_META;
     }
     if method == "ping" && inline_request {
@@ -191,7 +200,13 @@ fn lifecycle_and_request_meta_matrix_matches_contract() {
 
     let mut rows = 0;
     let mut red = Vec::new();
-    for lifecycle in ["init", "discover_then_init", "discover_only"] {
+    for lifecycle in [
+        "init",
+        "discover_then_init",
+        "discover_cancel_then_init",
+        "inline_then_init",
+        "discover_only",
+    ] {
         let versions: &[&str] = if lifecycle == "discover_only" {
             &["-"]
         } else {
@@ -211,6 +226,21 @@ fn lifecycle_and_request_meta_matrix_matches_contract() {
                         session.call("server/discover", json!({ "_meta": full_modern() }));
                     steps_ok &= outcome.starts_with("OK");
                     steps.push(format!("discover:{outcome}"));
+                }
+                if lifecycle == "discover_cancel_then_init" {
+                    // A client whose discover timed out SHOULD cancel it
+                    // before falling back to `initialize`.
+                    steps_ok &= session.send(&json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": { "requestId": 1, "reason": "timeout" }
+                    }));
+                    steps.push("cancel".to_string());
+                }
+                if lifecycle == "inline_then_init" {
+                    let outcome = session.call("tools/list", json!({ "_meta": full_modern() }));
+                    steps_ok &= outcome.starts_with("OK");
+                    steps.push(format!("inline:{outcome}"));
                 }
                 if lifecycle != "discover_only" {
                     let outcome = session.call(
@@ -253,10 +283,10 @@ fn lifecycle_and_request_meta_matrix_matches_contract() {
         }
     }
 
-    assert_eq!(rows, 54, "the matrix must cover all 54 rows");
+    assert_eq!(rows, 102, "the matrix must cover all 102 rows");
     assert!(
         red.is_empty(),
-        "{} of 54 rows violate the lifecycle contract:\n{}",
+        "{} of 102 rows violate the lifecycle contract:\n{}",
         red.len(),
         red.join("\n")
     );

@@ -51,25 +51,17 @@ impl ServiceRole for RoleServer {
         }
     }
 
-    fn enforce_request_association(
-        request: &Self::Req,
-        peer_info: Option<&Self::PeerInfo>,
-        in_request_handler_scope: bool,
-    ) -> Result<(), ServiceError> {
-        let restricted = matches!(
-            request,
-            ServerRequest::CreateMessageRequest(_)
-                | ServerRequest::ListRootsRequest(_)
-                | ServerRequest::ElicitRequest(_)
-        );
-        if !restricted {
-            return Ok(());
-        }
-        let strict =
-            peer_info.is_some_and(|info| info.protocol_version >= ProtocolVersion::V_2026_07_28);
-        if strict && !in_request_handler_scope {
+    fn enforce_outbound_request(peer: &Peer<Self>) -> Result<(), ServiceError> {
+        // Same order as `RequestContext::protocol_version`: the version the
+        // current request names wins. Outside a handler, fall back to the version
+        // an inline session (e.g. discover on stdio) opened on, since it never
+        // stores peer info, then to peer info.
+        let version = originating_protocol_version()
+            .or_else(|| peer.inline_protocol_version())
+            .or_else(|| peer.peer_info().map(|info| info.protocol_version.clone()));
+        if version.is_some_and(|version| version >= ProtocolVersion::V_2026_07_28) {
             return Err(ServiceError::McpError(ErrorData::invalid_request(
-                "SEP-2260: server-to-client requests must be associated with an originating client request",
+                "server-to-client requests are not allowed on protocol 2026-07-28 or later; return InputRequiredResult instead",
                 None,
             )));
         }
@@ -568,9 +560,14 @@ where
     let mut transport = transport.into_transport();
     let id_provider = <Arc<AtomicU32RequestIdProvider>>::default();
 
-    // Get initialize request; the MCP spec permits ping before initialize.
+    let (peer, peer_rx) = Peer::new(id_provider.clone(), None);
+
+    // Select the lifecycle only after an initialize request or the first valid
+    // non-discover request with complete inline metadata. A discover request is
+    // a bootstrap probe: respond to it, but remain open to either lifecycle.
+    // The MCP spec also permits ping before initialize.
     // See: https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#initialization
-    let (request, id) = loop {
+    let (initialize_request, id) = loop {
         let msg = expect_next_message(&mut transport, "initialize request").await?;
         match msg {
             ClientJsonRpcMessage::Request(req)
@@ -589,7 +586,97 @@ where
                         )
                     })?;
             }
-            ClientJsonRpcMessage::Request(req) => break (req.request, req.id),
+            ClientJsonRpcMessage::Request(req) => {
+                let id = req.id;
+                let mut request = match req.request {
+                    ClientRequest::InitializeRequest(request) => break (request, id),
+                    request => request,
+                };
+                let missing_metadata = request
+                    .get_meta()
+                    .missing_required_keys(&ProtocolVersion::V_2026_07_28);
+                let requested_version = match request.get_meta().protocol_version() {
+                    Some(version) if missing_metadata.is_empty() => version,
+                    _ => {
+                        transport
+                            .send(ServerJsonRpcMessage::error(
+                                missing_request_metadata_error(&missing_metadata),
+                                Some(id),
+                            ))
+                            .await
+                            .map_err(|error| {
+                                ServerInitializeError::transport::<T>(
+                                    error,
+                                    "sending pre-init metadata error response",
+                                )
+                            })?;
+                        continue;
+                    }
+                };
+
+                if matches!(request, ClientRequest::DiscoverRequest(_)) {
+                    // No lifecycle exists yet, so the handler gets a peer that
+                    // cannot reach the client.
+                    let (bootstrap_peer, _) = Peer::new(id_provider.clone(), None);
+                    let context = RequestContext {
+                        ct: ct.child_token(),
+                        id: id.clone(),
+                        meta: std::mem::take(request.get_meta_mut()),
+                        extensions: std::mem::take(request.extensions_mut()),
+                        peer: bootstrap_peer,
+                    };
+                    let response = match service.handle_request(request, context).await {
+                        Ok(result) => ServerJsonRpcMessage::response(result, id),
+                        Err(error) => ServerJsonRpcMessage::error(error, Some(id)),
+                    };
+                    transport.send(response).await.map_err(|error| {
+                        ServerInitializeError::transport::<T>(
+                            error,
+                            "sending bootstrap request response",
+                        )
+                    })?;
+                    continue;
+                }
+
+                let supported_versions = service.supported_protocol_versions();
+                if !supported_versions.contains(&requested_version) {
+                    transport
+                        .send(ServerJsonRpcMessage::error(
+                            ErrorData::unsupported_protocol_version(
+                                requested_version,
+                                &supported_versions,
+                            ),
+                            Some(id),
+                        ))
+                        .await
+                        .map_err(|error| {
+                            ServerInitializeError::transport::<T>(
+                                error,
+                                "sending unsupported inline version response",
+                            )
+                        })?;
+                    continue;
+                }
+                peer.set_inline_protocol_version(requested_version);
+                // Dispatch the request from inside the service loop rather than
+                // inline: its handler may send notifications through `peer`, which
+                // only complete once the loop drains `peer_rx`.
+                return Ok(serve_inner(
+                    service,
+                    transport,
+                    peer,
+                    peer_rx,
+                    VecDeque::from([ClientJsonRpcMessage::request(request, id)]),
+                    ct,
+                ));
+            }
+            // SYMFORGE-PATCH: a notification selects no lifecycle, so it must not
+            // abort the session. The common case is `notifications/cancelled` for a
+            // discover that timed out, sent before the client falls back to
+            // `initialize`. Nothing is in flight here, so there is nothing to act on.
+            ClientJsonRpcMessage::Notification(notification) => {
+                tracing::debug!(?notification, "ignoring pre-lifecycle notification");
+            }
             other => {
                 return Err(ServerInitializeError::ExpectedInitializeRequest(Some(
                     other,
@@ -597,48 +684,9 @@ where
             }
         }
     };
-
-    let initialize_request = match request {
-        ClientRequest::InitializeRequest(request) => request,
-        request => {
-            let missing_metadata = request
-                .get_meta()
-                .missing_required_keys(&ProtocolVersion::V_2026_07_28);
-            if !missing_metadata.is_empty() {
-                transport
-                    .send(ServerJsonRpcMessage::error(
-                        missing_request_metadata_error(&missing_metadata),
-                        Some(id.clone()),
-                    ))
-                    .await
-                    .map_err(|error| {
-                        ServerInitializeError::transport::<T>(
-                            error,
-                            "sending pre-init metadata error response",
-                        )
-                    })?;
-                return Err(ServerInitializeError::ExpectedInitializeRequest(Some(
-                    ClientJsonRpcMessage::request(request, id),
-                )));
-            }
-            let (peer, peer_rx) = Peer::new(id_provider, None);
-            peer.require_request_metadata();
-            // Dispatch the request from inside the service loop rather than
-            // inline: its handler may send notifications through `peer`, which
-            // only complete once the loop drains `peer_rx`.
-            return Ok(serve_inner(
-                service,
-                transport,
-                peer,
-                peer_rx,
-                VecDeque::from([ClientJsonRpcMessage::request(request, id)]),
-                ct,
-            ));
-        }
-    };
     let requested_protocol_version = initialize_request.params.protocol_version.clone();
     let mut negotiated_peer_info = initialize_request.params.clone();
-    let (peer, peer_rx) = Peer::new(id_provider, Some(negotiated_peer_info.clone()));
+    peer.set_peer_info(negotiated_peer_info.clone());
     let request = ClientRequest::InitializeRequest(initialize_request);
     let context = RequestContext {
         ct: ct.child_token(),
@@ -845,10 +893,8 @@ impl Peer<RoleServer> {
         }
     }
 
-    /// # SEP-2260: request association
-    ///
-    /// From protocol version `2026-07-28` this must be issued while handling a
-    /// client request; see [`OriginatingRequestId`].
+    /// Errors on protocol `2026-07-28` or later, which forbids server-to-client
+    /// requests; return an [`InputRequiredResult`](crate::model::InputRequiredResult) instead.
     #[deprecated(
         since = "1.8.0",
         note = "Sampling is deprecated by SEP-2577 and will be removed in a future release. See https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2577"
@@ -883,10 +929,8 @@ impl Peer<RoleServer> {
         }
     }
     method!(
-        /// # SEP-2260: request association
-        ///
-        /// From protocol version `2026-07-28` this must be issued while handling a
-        /// client request; see [`OriginatingRequestId`].
+        /// Errors on protocol `2026-07-28` or later, which forbids server-to-client
+        /// requests; return an [`InputRequiredResult`](crate::model::InputRequiredResult) instead.
         #[deprecated(
             since = "1.8.0",
             note = "Roots is deprecated by SEP-2577 and will be removed in a future release. See https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2577"
@@ -895,18 +939,14 @@ impl Peer<RoleServer> {
     );
     #[cfg(feature = "elicitation")]
     method!(
-        /// # SEP-2260: request association
-        ///
-        /// From protocol version `2026-07-28` this must be issued while handling a
-        /// client request; see [`OriginatingRequestId`].
+        /// Errors on protocol `2026-07-28` or later, which forbids server-to-client
+        /// requests; return an [`InputRequiredResult`](crate::model::InputRequiredResult) instead.
         peer_req create_elicitation ElicitRequest(ElicitRequestParams) => ElicitResult
     );
     #[cfg(feature = "elicitation")]
     method!(
-        /// # SEP-2260: request association
-        ///
-        /// From protocol version `2026-07-28` this must be issued while handling a
-        /// client request; see [`OriginatingRequestId`].
+        /// Errors on protocol `2026-07-28` or later, which forbids server-to-client
+        /// requests; return an [`InputRequiredResult`](crate::model::InputRequiredResult) instead.
         peer_req_with_timeout create_elicitation_with_timeout ElicitRequest(ElicitRequestParams) => ElicitResult
     );
 
@@ -1136,10 +1176,8 @@ impl Peer<RoleServer> {
     /// # }
     /// ```
     ///
-    /// # SEP-2260: request association
-    ///
-    /// From protocol version `2026-07-28` this must be issued while handling a
-    /// client request; see [`OriginatingRequestId`].
+    /// Errors on protocol `2026-07-28` or later, which forbids server-to-client
+    /// requests; return an [`InputRequiredResult`](crate::model::InputRequiredResult) instead.
     #[cfg(all(feature = "schemars", feature = "elicitation"))]
     pub async fn elicit<T>(&self, message: impl Into<String>) -> Result<Option<T>, ElicitationError>
     where
@@ -1202,10 +1240,8 @@ impl Peer<RoleServer> {
     /// # }
     /// ```
     ///
-    /// # SEP-2260: request association
-    ///
-    /// From protocol version `2026-07-28` this must be issued while handling a
-    /// client request; see [`OriginatingRequestId`].
+    /// Errors on protocol `2026-07-28` or later, which forbids server-to-client
+    /// requests; return an [`InputRequiredResult`](crate::model::InputRequiredResult) instead.
     #[cfg(all(feature = "schemars", feature = "elicitation"))]
     pub async fn elicit_with_timeout<T>(
         &self,
@@ -1215,6 +1251,10 @@ impl Peer<RoleServer> {
     where
         T: ElicitationSafe + for<'de> serde::Deserialize<'de>,
     {
+        // Reject on 2026-07-28 before the capability check, which would
+        // otherwise answer `CapabilityNotSupported` first.
+        RoleServer::enforce_outbound_request(self)?;
+
         // Check if client supports form elicitation capability
         if !self
             .supported_elicitation_modes()
@@ -1302,10 +1342,8 @@ impl Peer<RoleServer> {
     /// }
     /// ```
     ///
-    /// # SEP-2260: request association
-    ///
-    /// From protocol version `2026-07-28` this must be issued while handling a
-    /// client request; see [`OriginatingRequestId`].
+    /// Errors on protocol `2026-07-28` or later, which forbids server-to-client
+    /// requests; return an [`InputRequiredResult`](crate::model::InputRequiredResult) instead.
     #[cfg(feature = "elicitation")]
     pub async fn elicit_url(
         &self,
@@ -1358,10 +1396,8 @@ impl Peer<RoleServer> {
     /// }
     /// ```
     ///
-    /// # SEP-2260: request association
-    ///
-    /// From protocol version `2026-07-28` this must be issued while handling a
-    /// client request; see [`OriginatingRequestId`].
+    /// Errors on protocol `2026-07-28` or later, which forbids server-to-client
+    /// requests; return an [`InputRequiredResult`](crate::model::InputRequiredResult) instead.
     #[cfg(feature = "elicitation")]
     pub async fn elicit_url_with_timeout(
         &self,
@@ -1370,6 +1406,10 @@ impl Peer<RoleServer> {
         elicitation_id: impl Into<String>,
         timeout: Option<std::time::Duration>,
     ) -> Result<ElicitationAction, ElicitationError> {
+        // Reject on 2026-07-28 before the capability check, which would
+        // otherwise answer `CapabilityNotSupported` first.
+        RoleServer::enforce_outbound_request(self)?;
+
         // Check if client supports url elicitation
         if !self
             .supported_elicitation_modes()

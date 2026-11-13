@@ -335,9 +335,18 @@ async fn discover_first_serves_full_surface_without_handshake() {
         .iter()
         .filter_map(Value::as_str)
         .collect();
-    assert!(
-        versions.contains(&MODERN_VERSION),
-        "discover must list {MODERN_VERSION}, got {versions:?}"
+    // FR-307: the advertised set is the frozen allow-list, exactly; an rmcp bump
+    // must not widen or reorder it.
+    assert_eq!(
+        versions,
+        [
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25",
+            MODERN_VERSION
+        ],
+        "discover must advertise exactly the frozen allow-list"
     );
 
     // Then the full service surface on the same connection.

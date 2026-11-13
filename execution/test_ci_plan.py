@@ -98,7 +98,7 @@ class CodeChanged(unittest.TestCase):
         self.assertFalse(self.classify(list(old), old, bump_only))
 
     def test_vendored_files_are_code(self):
-        self.assertTrue(self.classify(["vendor/rmcp/README.md"]))
+        self.assertTrue(self.classify(["vendor/tree-sitter-scss/README.md"]))
 
     def test_documents_tests_read_are_code(self):
         self.assertFalse(self.classify(["docs/guide.md", "specs/030-x/plan.md"]))
