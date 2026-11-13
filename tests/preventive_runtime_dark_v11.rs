@@ -1470,9 +1470,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // test for calls inside parenthesized expressions. No index_lifecycle file touched,
 // no bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "d52bb9961294db834b741ca5acc17e611bace88cea05c168e3bf88fdbda76a14",
+    "11549ce6819956adf591fdb60c637552e0cce15598685c903800f3c53871ffb5",
     320,
-    13079145,
+    13081134,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

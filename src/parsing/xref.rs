@@ -860,7 +860,7 @@ fn extract_python_value_refs(
         let mut value_ident: Option<Node> = None;
         let mut value_attr: Option<Node> = None;
 
-        for capture in m.captures {
+        for capture in m.captures() {
             match value_capture_names[capture.index as usize] {
                 "ref.value" => value_ident = Some(capture.node),
                 "ref.value_attr" => value_attr = Some(capture.node),
@@ -961,7 +961,7 @@ fn extract_python_string_type_refs(
         matches.advance();
         matches.get()
     } {
-        for capture in m.captures {
+        for capture in m.captures() {
             if string_capture_names[capture.index as usize] != "ref.string" {
                 continue;
             }
@@ -1042,7 +1042,7 @@ fn extract_rust_value_refs(
             matches.advance();
             matches.get()
         } {
-            for capture in m.captures {
+            for capture in m.captures() {
                 if def_capture_names[capture.index as usize] != "const.def" {
                     continue;
                 }
@@ -1083,7 +1083,7 @@ fn extract_rust_value_refs(
         matches.advance();
         matches.get()
     } {
-        for capture in m.captures {
+        for capture in m.captures() {
             if value_capture_names[capture.index as usize] != "ref.value" {
                 continue;
             }
@@ -1173,7 +1173,7 @@ fn extract_rust_qualified_value_refs(
         matches.advance();
         matches.get()
     } {
-        for capture in m.captures {
+        for capture in m.captures() {
             if capture_names[capture.index as usize] != "ref.qualified_value" {
                 continue;
             }
@@ -1480,7 +1480,7 @@ pub fn extract_references(
         let mut ref_implements: Option<Node> = None;
         let mut ref_implements_target: Option<Node> = None;
 
-        for capture in m.captures {
+        for capture in m.captures() {
             let name = capture_names[capture.index as usize];
             let node = capture.node;
             match name {

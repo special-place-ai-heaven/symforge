@@ -145,7 +145,7 @@ fn find_containing_path<'tree>(
     }
     path.push(node);
     for index in 0..node.child_count() {
-        let Some(child) = node.child(index as u32) else {
+        let Some(child) = node.child(index) else {
             continue;
         };
         let child_range = child.byte_range();
@@ -254,7 +254,7 @@ fn callable_signature_start_byte(node: Node<'_>) -> Option<usize> {
         .child_by_field_name("body")
         .map_or(node.end_byte(), |body| body.start_byte());
     for index in 0..node.child_count() {
-        let child = node.child(index as u32)?;
+        let child = node.child(index)?;
         if child.start_byte() >= body_start {
             break;
         }
@@ -278,7 +278,7 @@ fn callable_signature_start_byte(node: Node<'_>) -> Option<usize> {
 
 fn first_non_metadata_child_start(node: Node<'_>, before: usize) -> Result<Option<usize>, ()> {
     for index in 0..node.child_count() {
-        let Some(child) = node.child(index as u32) else {
+        let Some(child) = node.child(index) else {
             return Err(());
         };
         if child.start_byte() >= before {
@@ -338,7 +338,7 @@ fn header_region_is_clean(node: Node<'_>, start: usize, end: usize) -> bool {
         return false;
     }
     (0..node.child_count()).all(|index| {
-        node.child(index as u32)
+        node.child(index)
             .is_none_or(|child| header_region_is_clean(child, start, end))
     })
 }
@@ -469,7 +469,7 @@ mod tests {
             if node.kind() == kind {
                 return Some(node);
             }
-            (0..node.child_count()).find_map(|index| find_kind(node.child(index as u32)?, kind))
+            (0..node.child_count()).find_map(|index| find_kind(node.child(index)?, kind))
         }
 
         let local = find_kind(root, "local_function_statement")
@@ -604,7 +604,7 @@ mod tests {
             if node.kind() == kind {
                 return Some(node);
             }
-            (0..node.child_count()).find_map(|index| first_kind(node.child(index as u32)?, kind))
+            (0..node.child_count()).find_map(|index| first_kind(node.child(index)?, kind))
         }
 
         let malformed_prefix = "class C { @Anno(1 + ) void f() { target(); } }";
@@ -724,7 +724,7 @@ mod tests {
             if node.kind() == kind {
                 return Some(node);
             }
-            (0..node.child_count()).find_map(|index| find_kind(node.child(index as u32)?, kind))
+            (0..node.child_count()).find_map(|index| find_kind(node.child(index)?, kind))
         }
         let declaration = find_kind(tree.root_node(), "struct_specifier")
             .expect("C++ grammar should expose the struct declaration");

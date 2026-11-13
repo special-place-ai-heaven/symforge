@@ -365,12 +365,12 @@ fn profile_pipeline() {
     // SAFETY: installed before any tree-sitter object exists in this process
     // (this binary holds one test), so no block is freed by the wrong allocator.
     unsafe {
-        tree_sitter::set_allocator(
-            Some(ts_malloc),
-            Some(ts_calloc),
-            Some(ts_realloc),
-            Some(ts_free),
-        );
+        tree_sitter::set_allocator(Some(tree_sitter::Allocator {
+            malloc: ts_malloc,
+            calloc: ts_calloc,
+            realloc: ts_realloc,
+            free: ts_free,
+        }));
     }
     let captured = Capture(Arc::new(Mutex::new(Vec::new())));
     let writer = captured.clone();
