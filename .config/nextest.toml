@@ -86,5 +86,5 @@ threads-required = "num-test-threads"
 # main; the same tests pass serially. Class TIMING, same remedy as the
 # ArcSwap test above: the machine to themselves.
 [[profile.default.overrides]]
-filter = "test(/cli::hook::tests::.*http_response/)"
+filter = "test(/cli::hook::tests::.*http_(response|body)/)"
 threads-required = "num-test-threads"
