@@ -10,8 +10,8 @@
 //! after a successful `initialize`; its in-loop `initialize` also recorded the
 //! REQUESTED protocol version as peer info instead of the negotiated one, so
 //! `ping` on a session negotiated down from 2026-07-28 answered
-//! method-not-found. Both are patched in `vendor/rmcp` (see
-//! `vendor/rmcp/SYMFORGE-PATCH.md`).
+//! method-not-found. Both are fixed upstream as of rmcp 3.10.0, which serves
+//! discover before any lifecycle exists; this matrix remains the regression gate.
 //!
 //! 54 rows: {init, discover_then_init} x 4 initialize versions x 6 `_meta`
 //! shapes, plus discover_only x 6 shapes. Each row asserts four methods.
@@ -56,7 +56,9 @@ fn metas() -> Vec<(&'static str, Option<Value>)> {
 /// - a session whose client completed `initialize` is a session-lifecycle
 ///   session even if `server/discover` came first, so no per-request metadata
 ///   is required;
-/// - a discover-only session demands version + capabilities on every request;
+/// - a discover-only session demands version + capabilities on every request,
+///   except `ping`: discover selects no lifecycle, and the spec permits ping
+///   before one exists;
 /// - `ping` exists only on the legacy lifecycle.
 ///
 /// Returned values are prefixes of [`Session::call`] outcomes, so an ERR cell
@@ -66,6 +68,9 @@ fn expected(lifecycle: &str, meta: &str, method: &str) -> &'static str {
         lifecycle == "discover_only" || matches!(meta, "pv_modern" | "full_modern");
     let complete_meta = matches!(meta, "full_modern" | "full_legacy");
     if inline_request && !complete_meta {
+        if method == "ping" && lifecycle == "discover_only" {
+            return "OK";
+        }
         return MISSING_META;
     }
     if method == "ping" && inline_request {
