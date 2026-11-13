@@ -1444,10 +1444,18 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // serve router (`worktree.rs`, `protocol/serve_projects.rs`, `server/serve.rs`); server
 // view argument checks; per-alias resource lists (`protocol/mod.rs`). No index_lifecycle
 // file touched; calls only, no bridge. 320 files.
+// Issue #876 part 2: publication carries the previous knowledge bridge and authority
+// when a change is code-only (`live_index/knowledge_bridge.rs` `carry_knowledge_bridge`,
+// `code_only_changes`, restamp helpers; `knowledge_authority.rs` `restamped_authority`;
+// `store.rs` `carried_authority` and the call in `swap_and_publish_...`), plus two
+// allocation fixes inside `build_knowledge_bridge`. New items are private or
+// `pub(crate)` except two build counters behind `__test-internals`; one inherent impl
+// on a private type, no trait impl, macro, registration or re-export. No index_lifecycle
+// file touched; its existing calls into publication are unchanged. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "d68e255d9db237fc61a2cda1fc6db001b8f5f67bf7e30c71612b37d7d80329d5",
+    "3320a4a15c9b52222b2bc3df2a01767a97f574192ff4ac1812f5fdf3843dffcf",
     320,
-    13055684,
+    13073407,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

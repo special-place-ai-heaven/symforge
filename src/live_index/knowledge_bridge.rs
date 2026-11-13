@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::domain::{FileDisposition, IndexTargets, LanguageId, SourceIdentity, SymbolKind};
 
@@ -219,6 +220,12 @@ pub struct KnowledgeBridge {
     pub knowledge_links: Vec<KnowledgeKnowledgeLink>,
     pub reverse_knowledge: BTreeMap<KnowledgeAnchorId, Vec<u32>>,
     pub coverage: DerivedCoverage,
+    /// Every symbol selector the knowledge files name, admitted by the budget
+    /// or not. `Some` only on a full build, where it lets a later publication
+    /// prove that a code edit cannot change this bridge
+    /// ([`carry_knowledge_bridge`]). Placeholders keep `None` and are never
+    /// carried.
+    pub(crate) referenced_symbols: Option<BTreeSet<String>>,
 }
 
 impl KnowledgeBridge {
@@ -416,6 +423,7 @@ pub fn build_knowledge_bridge(
     content_generation: u64,
     limits: &BridgeLimits,
 ) -> KnowledgeBridge {
+    FULL_BRIDGE_BUILDS.fetch_add(1, AtomicOrdering::Relaxed);
     let targets = targets_by_path(live);
     let code_paths: Vec<&str> = live
         .files
@@ -505,7 +513,7 @@ pub fn build_knowledge_bridge(
             match &candidate.selector {
                 CandidateSelector::Path(selector) => {
                     let Some(target_path) =
-                        resolve_repo_path(path, selector, live.files.keys().map(String::as_str))
+                        resolve_repo_path(path, selector, |path| live.files.contains_key(path))
                     else {
                         continue;
                     };
@@ -684,7 +692,208 @@ pub fn build_knowledge_bridge(
         knowledge_links,
         reverse_knowledge,
         coverage: budget.coverage(),
+        referenced_symbols: Some(referenced_symbols),
     }
+}
+
+/// Full [`build_knowledge_bridge`] runs in this process. Tests read it to
+/// prove a publication carried its bridge instead of rebuilding it.
+static FULL_BRIDGE_BUILDS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(any(test, feature = "__test-internals"))]
+pub fn full_bridge_builds() -> u64 {
+    FULL_BRIDGE_BUILDS.load(AtomicOrdering::Relaxed)
+}
+
+/// The paths whose file changed between `previous` and `live`, when every one
+/// of them is a code-only file present in both with the same language and
+/// targets. `None` when any change can reach knowledge: a path added or
+/// removed, targets changed anywhere, or a changed file that is knowledge on
+/// either side.
+///
+/// A file whose `Arc` is shared by both indices is the same record and is not
+/// a change. This is what a publication compares against the generation it
+/// replaces, so the cost is a pointer per file, not a re-read.
+pub(crate) fn code_only_changes<'a>(
+    previous: &LiveIndex,
+    live: &'a LiveIndex,
+) -> Option<Vec<&'a str>> {
+    if previous.files.len() != live.files.len() {
+        return None;
+    }
+    let previous_targets = targets_by_path(previous);
+    let targets = targets_by_path(live);
+    if previous_targets != targets {
+        return None;
+    }
+    let mut changed = Vec::new();
+    for (path, file) in &live.files {
+        let old = previous.files.get(path)?;
+        if std::sync::Arc::ptr_eq(old, file) {
+            continue;
+        }
+        if old.language != file.language
+            || targets_for_file(path, old, &targets).includes_knowledge()
+            || targets_for_file(path, file, &targets).includes_knowledge()
+        {
+            return None;
+        }
+        changed.push(path.as_str());
+    }
+    Some(changed)
+}
+
+/// The bridge a fresh [`build_knowledge_bridge`] would produce over `live` at
+/// `content_generation`, derived from `previous` (a full build over
+/// `previous_live` with the same source), or `None` when only a full build is
+/// correct.
+///
+/// A build reads the source, the content generation, the limits, the Indexed
+/// targets in the manifest, the set of file paths, and each file's language,
+/// content, content hash and symbols; nothing else (not mtime, not
+/// references). So the bridge is unchanged, apart from the generation stamped
+/// in its anchors, when every changed file is code-only (see
+/// [`code_only_changes`]) and each such file either kept its content hash and
+/// symbols, or is a file no link resolves to and whose old and new symbols
+/// name nothing a knowledge file refers to. Symbol links to other files are
+/// untouched: their matches, counts and samples come only from files that
+/// define a referenced name.
+pub(crate) fn carry_knowledge_bridge(
+    previous_live: &LiveIndex,
+    previous: &KnowledgeBridge,
+    live: &LiveIndex,
+    content_generation: u64,
+) -> Option<KnowledgeBridge> {
+    let referenced = previous.referenced_symbols.as_ref()?;
+    let changed = code_only_changes(previous_live, live)?;
+    let mut resolved_paths: Option<BTreeSet<&str>> = None;
+    for path in changed {
+        let (old, new) = (&previous_live.files[path], &live.files[path]);
+        if old.content_hash == new.content_hash && old.symbols == new.symbols {
+            continue;
+        }
+        let names_referenced =
+            old.symbols.iter().chain(&new.symbols).any(|symbol| {
+                symbol.kind != SymbolKind::Section && referenced.contains(&symbol.name)
+            });
+        if names_referenced {
+            return None;
+        }
+        let resolved = resolved_paths.get_or_insert_with(|| {
+            previous
+                .forward
+                .iter()
+                .filter_map(|link| match &link.resolution {
+                    BridgeResolution::ResolvedExact(anchor) => Some(code_anchor_path(anchor)),
+                    _ => None,
+                })
+                .collect()
+        });
+        if resolved.contains(path) {
+            return None;
+        }
+    }
+    let mut bridge = previous.clone();
+    restamp_bridge(&mut bridge, content_generation);
+    Some(bridge)
+}
+
+fn code_anchor_path(anchor: &CodeAnchor) -> &str {
+    match &anchor.id {
+        CodeAnchorId::File { path } => path,
+        CodeAnchorId::Symbol { symbol, .. } => &symbol.path,
+    }
+}
+
+/// Set every anchor's `content_generation`. Every struct is destructured and
+/// every enum matched in full, so a new anchor-bearing field cannot be added
+/// without the compiler sending it through here.
+fn restamp_bridge(bridge: &mut KnowledgeBridge, content_generation: u64) {
+    let KnowledgeBridge {
+        cards,
+        forward,
+        reverse_exact: _,
+        ownership_selectors: _,
+        knowledge_links,
+        reverse_knowledge: _,
+        coverage: _,
+        referenced_symbols: _,
+    } = bridge;
+    for KnowledgeCard { anchor, roles: _ } in cards {
+        restamp_knowledge_anchor(anchor, content_generation);
+    }
+    for KnowledgeCodeLink {
+        id: _,
+        evidence,
+        evidence_kind: _,
+        resolution,
+    } in forward
+    {
+        restamp_knowledge_anchor(evidence, content_generation);
+        match resolution {
+            BridgeResolution::ResolvedExact(anchor) => {
+                restamp_code_anchor(anchor, content_generation);
+            }
+            BridgeResolution::ResolvedDeclaredSet {
+                selector_anchor,
+                matched_count: _,
+            } => restamp_knowledge_anchor(selector_anchor, content_generation),
+            BridgeResolution::Ambiguous {
+                candidate_count: _,
+                bounded_samples,
+            } => {
+                for anchor in bounded_samples {
+                    restamp_code_anchor(anchor, content_generation);
+                }
+            }
+            BridgeResolution::Missing => {}
+        }
+    }
+    for KnowledgeKnowledgeLink {
+        evidence,
+        resolution,
+    } in knowledge_links
+    {
+        restamp_knowledge_anchor(evidence, content_generation);
+        match resolution {
+            KnowledgeLinkResolution::ResolvedExact(anchor) => {
+                restamp_knowledge_anchor(anchor, content_generation);
+            }
+            KnowledgeLinkResolution::Ambiguous {
+                candidate_count: _,
+                bounded_samples,
+            } => {
+                for anchor in bounded_samples {
+                    restamp_knowledge_anchor(anchor, content_generation);
+                }
+            }
+            KnowledgeLinkResolution::Missing => {}
+        }
+    }
+}
+
+pub(crate) fn restamp_knowledge_anchor(anchor: &mut KnowledgeAnchor, content_generation: u64) {
+    let KnowledgeAnchor {
+        id: _,
+        source: _,
+        content_generation: stamp,
+        path: _,
+        content_hash: _,
+        byte_range: _,
+        line_range: _,
+    } = anchor;
+    *stamp = content_generation;
+}
+
+pub(crate) fn restamp_code_anchor(anchor: &mut CodeAnchor, content_generation: u64) {
+    let CodeAnchor {
+        source: _,
+        content_generation: stamp,
+        id: _,
+        content_hash: _,
+        line_range: _,
+    } = anchor;
+    *stamp = content_generation;
 }
 
 fn derive_knowledge_cards(
@@ -891,14 +1100,19 @@ fn symbol_index(
         if !targets_for_file(path, file, targets).includes_code() {
             continue;
         }
+        // Built on the first referenced symbol only: a file with many of them
+        // would otherwise rescan its prefix once per symbol.
+        let mut lines: Option<NewlineIndex> = None;
         for symbol in &file.symbols {
             if symbol.kind == SymbolKind::Section || !referenced_symbols.contains(&symbol.name) {
                 continue;
             }
-            let symbol_line_range = line_range(
-                &file.content,
-                symbol.byte_range.0 as usize..symbol.byte_range.1 as usize,
-            );
+            let symbol_line_range = lines
+                .get_or_insert_with(|| NewlineIndex::new(&file.content))
+                .line_range(
+                    &file.content,
+                    symbol.byte_range.0 as usize..symbol.byte_range.1 as usize,
+                );
             let anchor = CodeAnchor {
                 source: source.clone(),
                 content_generation,
@@ -1250,10 +1464,10 @@ fn is_license_path(path: &str) -> bool {
     .any(|candidate| stem.eq_ignore_ascii_case(candidate))
 }
 
-fn resolve_repo_path<'a>(
+fn resolve_repo_path(
     evidence_path: &str,
     selector: &str,
-    existing_paths: impl Iterator<Item = &'a str>,
+    exists: impl Fn(&str) -> bool,
 ) -> Option<String> {
     if is_external_link(selector) {
         return None;
@@ -1262,20 +1476,19 @@ fn resolve_repo_path<'a>(
     if selector.is_empty() {
         return None;
     }
-    let existing: BTreeSet<&str> = existing_paths.collect();
     let root_relative = selector.trim_start_matches('/');
     if selector.starts_with('/') {
         return normalize_repo_path(root_relative);
     }
     if !selector.starts_with("./") && !selector.starts_with("../") {
         let direct = normalize_repo_path(root_relative)?;
-        if existing.contains(direct.as_str()) {
+        if exists(&direct) {
             return Some(direct);
         }
         let parent = evidence_path.rsplit_once('/').map(|(parent, _)| parent);
         if let Some(parent) = parent {
             let relative = normalize_repo_path(&format!("{parent}/{selector}"))?;
-            if existing.contains(relative.as_str()) {
+            if exists(&relative) {
                 return Some(relative);
             }
         }
@@ -1376,6 +1589,38 @@ fn line_range(content: &[u8], range: Range<usize>) -> Range<u32> {
         }
     };
     u32::try_from(start).unwrap_or(u32::MAX)..u32::try_from(end).unwrap_or(u32::MAX)
+}
+
+/// Newline positions of one file, so [`line_range`] costs a binary search
+/// instead of a scan of the file's prefix.
+struct NewlineIndex(Vec<usize>);
+
+impl NewlineIndex {
+    fn new(content: &[u8]) -> Self {
+        Self(
+            content
+                .iter()
+                .enumerate()
+                .filter_map(|(at, byte)| (*byte == b'\n').then_some(at))
+                .collect(),
+        )
+    }
+
+    /// Exactly [`line_range`] over the same content.
+    fn line_range(&self, content: &[u8], range: Range<usize>) -> Range<u32> {
+        let start_byte = range.start.min(content.len());
+        let end_byte = range.end.min(content.len());
+        let newlines_before = |byte: usize| self.0.partition_point(|&at| at < byte);
+        let start = newlines_before(start_byte).saturating_add(1);
+        let end = if end_byte <= start_byte {
+            start
+        } else if content.get(end_byte - 1) == Some(&b'\n') {
+            newlines_before(end_byte).saturating_add(1)
+        } else {
+            newlines_before(end_byte).saturating_add(2)
+        };
+        u32::try_from(start).unwrap_or(u32::MAX)..u32::try_from(end).unwrap_or(u32::MAX)
+    }
 }
 
 fn file_code_anchor(
@@ -2327,5 +2572,29 @@ mod tests {
             evidence <= 32,
             "RoleEvidence grew to {evidence} B; an anchor or similar payload is back"
         );
+    }
+
+    #[test]
+    fn newline_index_matches_line_range_for_every_range() {
+        for content in [
+            &b""[..],
+            b"\n",
+            b"a",
+            b"a\nb",
+            b"a\nb\n",
+            b"\n\nab\n\ncd",
+            b"x\r\ny\n",
+        ] {
+            let index = NewlineIndex::new(content);
+            for start in 0..=content.len() + 1 {
+                for end in 0..=content.len() + 1 {
+                    assert_eq!(
+                        index.line_range(content, start..end),
+                        line_range(content, start..end),
+                        "{content:?} {start}..{end}"
+                    );
+                }
+            }
+        }
     }
 }
