@@ -43,8 +43,8 @@ CODE_DOCS = {"README.md", "AGENTS.md"}
 CODE_PREFIXES = (
     "src/", "tests/", "benches/", "scripts/", "execution/", "npm/",
     ".github/", ".specify/", ".config/", ".cargo/", "specs/020-",
-    # Vendored crates build from their own files (vendor/tree-sitter-scss
-    # compiles its grammar sources).
+    # Vendored crates embed their own files (vendor/rmcp/src/lib.rs does
+    # include_str!("../README.md")).
     "vendor/",
 )
 # Where a Rust test, the bench, or a harness script could name a document.

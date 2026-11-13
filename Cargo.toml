@@ -235,6 +235,11 @@ rusqlite = { version = "0.42", features = ["bundled"] }
 # Upstream build.rs uses `-Wno-unused-parameter` which MSVC rejects.
 # Patched copy uses `flag_if_supported` so the flag is silently skipped on MSVC.
 tree-sitter-scss = { path = "vendor/tree-sitter-scss" }
+# rmcp 3.10.0 with three lifecycle fixes: a successful initialize clears an inline
+# lifecycle latched by an earlier request and records the negotiated protocol
+# version as peer info; a pre-lifecycle notification no longer aborts the server.
+# See vendor/rmcp/SYMFORGE-PATCH.md; drop on upstream fix.
+rmcp = { path = "vendor/rmcp" }
 
 [profile.release]
 lto = true
