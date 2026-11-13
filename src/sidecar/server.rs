@@ -408,12 +408,16 @@ mod tests {
         );
     }
 
-    /// Live wildcard listen. Ignored by default: binding `0.0.0.0` makes Windows
+    /// Live wildcard listen. Ignored on Windows: binding `0.0.0.0` makes Windows
     /// Firewall prompt "allow public and private networks" for every new test
-    /// binary path. The resolved-host decision is covered without a socket by
+    /// binary path. Linux and macOS still run it. The resolved-host decision is
+    /// covered on every platform, without a socket, by
     /// `test_sidecar_bind_policy_allows_non_loopback_with_explicit_opt_in`.
     #[tokio::test]
-    #[ignore = "binds 0.0.0.0; triggers the Windows Firewall prompt (run with --ignored)"]
+    #[cfg_attr(
+        windows,
+        ignore = "binds 0.0.0.0; triggers the Windows Firewall prompt (run with --ignored)"
+    )]
     async fn test_sidecar_non_loopback_opt_in_really_listens_on_wildcard() {
         let _env_lock = env_lock().await;
         let _bind_guard = EnvVarGuard::set_str(SIDECAR_BIND_ENV, "0.0.0.0");
