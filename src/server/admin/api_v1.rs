@@ -434,7 +434,12 @@ impl SystemSnapshot {
         let project = runtime.project_name().to_string();
         // An empty index over no project root still names the configured project;
         // report it only when there are indexed files OR a non-default name.
-        let indexed_projects = if published.file_count > 0 || project != "project" {
+        let served = runtime.protocol().serve_projects.as_ref();
+        // #875: a serve with several repositories lists every alias it serves;
+        // the counts below describe the first, which owns the process stores.
+        let indexed_projects = if let Some(projects) = served.filter(|p| p.repos().len() > 1) {
+            projects.aliases()
+        } else if published.file_count > 0 || project != "project" {
             vec![project]
         } else {
             vec![]

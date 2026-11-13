@@ -6604,7 +6604,7 @@ async fn close_session_handler(
 ///
 /// Returns `Err(message)` for any contract violation; the message is surfaced to
 /// the caller as an `InvalidRequest`-class tool response.
-fn resolve_targets(
+pub(crate) fn resolve_targets(
     project: Option<&str>,
     projects: Option<&[String]>,
     active_project_id: &str,
@@ -6701,7 +6701,7 @@ fn targets_selects(targets: &Targets, project_id: &str) -> bool {
 /// meta verbs are NEVER cross-project (they stay single-project on the active
 /// project) — kept in one place so the read route (`execute_tool_call`) and the
 /// freshness-refresh gate (`call_tool_handler`) agree by construction.
-fn is_cross_project_read_verb(tool_name: &str) -> bool {
+pub(crate) fn is_cross_project_read_verb(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "search_symbols"
@@ -6957,6 +6957,37 @@ fn reject_unsupported_cross_project_scoping(
         _ => {}
     }
     Ok(())
+}
+
+/// #875: the `symforge serve` fan-out — the same dispatch the daemon read route
+/// performs for a cross-project read, over a working set and project indexes the
+/// caller built from its fixed repositories (every target already validated).
+pub(crate) fn serve_cross_project_read(
+    tool_name: &str,
+    params: serde_json::Value,
+    targets: Targets,
+    working_set: &WorkingSet,
+    project_indexes: &HashMap<
+        String,
+        crate::live_index::index_lifecycle::activation::ProjectRuntimeHandle,
+    >,
+    ccr_server: &SymForgeServer,
+) -> anyhow::Result<String> {
+    match tool_name {
+        "search_knowledge" => execute_cross_project_knowledge(
+            decode_params::<SearchKnowledgeInput>(params)?,
+            targets,
+            project_indexes,
+            ccr_server,
+        ),
+        "review_knowledge" => execute_cross_project_review(
+            decode_params::<ReviewKnowledgeInput>(params)?,
+            targets,
+            project_indexes,
+            ccr_server,
+        ),
+        _ => execute_cross_project_read(tool_name, params, targets, working_set),
+    }
 }
 
 /// Feature 012 (Phase 3): execute one of the three cross-project READ verbs

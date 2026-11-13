@@ -34,6 +34,17 @@ pub struct ServeCliArgs {
     /// which it overrides.
     #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub tools: Option<String>,
+
+    /// Serve this repository under ALIAS; repeat for several. Clients pick one
+    /// with the `project` parameter. Without it, serve indexes the working
+    /// directory's repository as before.
+    #[arg(long = "project", value_name = "ALIAS=PATH")]
+    pub project: Vec<String>,
+
+    /// Let clients call `index_folder` (refused by default: the repositories
+    /// are fixed by the operator). Only with at most one `--project`.
+    #[arg(long)]
+    pub allow_index_folder: bool,
 }
 
 impl ServeCliArgs {
@@ -50,8 +61,11 @@ impl ServeCliArgs {
             api_key: self.api_key,
             api_key_env: self.api_key_env,
             bound_addr_tx: None,
-            // The operator CLI always discovers the workspace from its CWD.
+            // The operator CLI discovers the workspace from its CWD unless
+            // `--project` names the repositories.
             workspace_root: None,
+            projects: self.project,
+            allow_index_folder: self.allow_index_folder,
         }
     }
 }
@@ -67,6 +81,8 @@ mod tests {
             api_key: Some("k".to_string()),
             api_key_env: None,
             tools: None,
+            project: Vec::new(),
+            allow_index_folder: false,
         };
         let args = cli.into_serve_args();
         assert_eq!(args.listen, "0.0.0.0:9000");
@@ -93,12 +109,37 @@ mod tests {
     }
 
     #[test]
+    fn serve_project_flags_parse_repeatedly() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from([
+            "symforge",
+            "serve",
+            "--project",
+            r"a=C:\repos\a",
+            "--project",
+            "b=/srv/b=1",
+            "--allow-index-folder",
+        ])
+        .expect("--project parses");
+        match cli.command {
+            Some(crate::cli::Commands::Serve(args)) => {
+                let args = args.into_serve_args();
+                assert_eq!(args.projects, vec![r"a=C:\repos\a", "b=/srv/b=1"]);
+                assert!(args.allow_index_folder);
+            }
+            _ => panic!("expected the serve subcommand"),
+        }
+    }
+
+    #[test]
     fn into_serve_args_defaults_listen_without_explicit_flag() {
         let cli = ServeCliArgs {
             listen: None,
             api_key: None,
             api_key_env: None,
             tools: None,
+            project: Vec::new(),
+            allow_index_folder: false,
         };
         let args = cli.into_serve_args();
         assert_eq!(args.listen, DEFAULT_LISTEN);

@@ -186,6 +186,8 @@ Workspace state lives under `.symforge/`: the snapshot and its quarantine, pre-w
 | `SYMFORGE_INDEXING_THREADS` | Cap the parse thread pool, for tight-RAM hosts and PID-1 embedders; default is rayon's |
 | `SYMFORGE_WORKTREE_AWARE` | Worktree routing for edit calls that pass `working_directory`; enabled when unset, and any value other than empty, `1`, `true`, `yes`, `on`, or `explicit` turns it off |
 
+`symforge serve --project ALIAS=PATH` (repeatable) serves several repositories from one process; a client picks one with `project: ALIAS` and searches several with `projects`. With more than one listed, a call without `project` is refused with the list of aliases. Without `--project`, serve indexes the working directory's repository as before. The set is fixed by the operator: a client `index_folder` is refused unless `--allow-index-folder` is passed, which is accepted for one repository only. Each repository gets its own file watcher at startup, and `health` with its `project` reports that watcher's state.
+
 > [!WARNING]
 > The daemon and `serve` HTTP are local coordination surfaces, not remote production APIs. The daemon binds loopback only unless `SYMFORGE_DAEMON_ALLOW_NON_LOOPBACK` is set, and that opt-in warns.
 

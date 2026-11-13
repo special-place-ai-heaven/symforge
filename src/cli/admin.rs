@@ -163,6 +163,7 @@ pub fn start_operator_server(
         api_key_env,
         bound_addr_tx: Some(bound_tx),
         workspace_root,
+        ..ServeArgs::default()
     };
     std::thread::Builder::new()
         .name("symforge-serve".to_string())
