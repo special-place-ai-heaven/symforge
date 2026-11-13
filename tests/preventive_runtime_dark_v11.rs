@@ -1415,10 +1415,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // one of them in `index_lifecycle/guidance/knowledge_model.rs`); the zombie rule also
 // requires a single thread in `/proc/<pid>/status`; `terminate_process` polls through
 // the shared liveness check. Inherent method and calls only; no bridge. 319 files.
+// Test-only: the sidecar's live `0.0.0.0` listen test is split from its resolve test and
+// ignored on Windows only (Firewall prompt); `sidecar/server.rs` test module only, no bridge.
+// 319 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "8edca4c09860536788f255cd076aea6e2168fec3fc6b2c12a4692ecf4162e69b",
+    "50545f8ebcc566182917a2efb06f6562a9a25919295409aeed6847fd423c691b",
     319,
-    12962703,
+    12963608,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
