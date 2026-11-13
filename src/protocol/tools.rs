@@ -1434,6 +1434,17 @@ fn append_daemon_staleness_warning(mut proxied_health: String, frontend_version:
     proxied_health
 }
 
+/// Append this front end's tool allow-list lines (#874) to a `status` body.
+/// Rendered here, not in the shared daemon renderer: the daemon's env belongs
+/// to whichever client spawned it, while the list is this process's.
+fn with_allow_list_lines(mut body: String) -> String {
+    for line in super::surface_probe::allow_list_status_lines() {
+        body.push('\n');
+        body.push_str(&line);
+    }
+    body
+}
+
 /// Overlay ALL of the proxy's OWN ledger/store-derived lines onto a `status`
 /// body proxied from the daemon worker (D2-ROOT — proxy-owned state invisible to
 /// worker-rendered responses).
@@ -8900,7 +8911,7 @@ impl SymForgeServer {
             if let Some(note) = reset_receipt {
                 body = format!("{body}\n{note}");
             }
-            return statused_tool_result(body, OutcomeClass::Found);
+            return statused_tool_result(with_allow_list_lines(body), OutcomeClass::Found);
         }
 
         let body = self.render_stel_status_body(&request);
@@ -8913,7 +8924,7 @@ impl SymForgeServer {
         } else {
             body
         };
-        statused_tool_result(body, OutcomeClass::Found)
+        statused_tool_result(with_allow_list_lines(body), OutcomeClass::Found)
     }
 
     /// One health/status line carrying ONLY the secret-dismissal record count:

@@ -312,6 +312,10 @@ pub enum ServeError {
     /// Secure-default policy refused the requested bind (non-loopback, no key).
     #[error(transparent)]
     Startup(#[from] super::auth::AuthStartupError),
+    /// The tool allow-list (`SYMFORGE_TOOLS` / `--tools`) names something that
+    /// is not available, or conflicts with `SYMFORGE_SURFACE` (#874).
+    #[error("{0}")]
+    ToolAllowList(String),
     /// The socket could not be bound (e.g. address already in use).
     #[error("failed to bind {addr}: {source}")]
     Bind {
@@ -580,6 +584,13 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     crate::live_index::index_lifecycle::activation::activate_surface(
         crate::live_index::index_lifecycle::process_runtime::SurfaceKind::Serve,
     );
+    // #874: serve refuses any allow-list problem before binding; stdio, whose
+    // stderr is usually hidden, warns and reports it in `status` instead.
+    match crate::protocol::surface_probe::check_tool_allow_list() {
+        Ok(problems) if problems.is_empty() => {}
+        Ok(problems) => return Err(ServeError::ToolAllowList(problems.join("; "))),
+        Err(fatal) => return Err(ServeError::ToolAllowList(fatal)),
+    }
     let api_key = resolve_api_key(args.api_key.as_deref(), args.api_key_env.as_deref());
     let auth = AuthConfig::new(api_key);
 
@@ -957,6 +968,28 @@ mod tests {
             .await
             .expect_err("non-loopback + no key must refuse");
         assert!(matches!(err, ServeError::Startup(_)));
+    }
+
+    /// #874: an unknown `SYMFORGE_TOOLS` name refuses serve before any bind,
+    /// even when a valid name remains (stdio would warn instead).
+    #[tokio::test]
+    async fn run_refuses_an_unknown_tool_allow_list_name() {
+        use crate::protocol::surface_probe::SurfaceEnvVarGuard;
+        let _tools = SurfaceEnvVarGuard::set("SYMFORGE_TOOLS", Some("status,bogus"));
+        let _surface = SurfaceEnvVarGuard::set("SYMFORGE_SURFACE", None);
+        let args = ServeArgs {
+            listen: "127.0.0.1:0".to_string(),
+            explicit_listen: true,
+            api_key: None,
+            api_key_env: None,
+            bound_addr_tx: None,
+            workspace_root: None,
+        };
+        let err = run(args).await.expect_err("unknown name must refuse");
+        assert!(
+            matches!(&err, ServeError::ToolAllowList(text) if text.contains("bogus")),
+            "{err}"
+        );
     }
 
     #[tokio::test]

@@ -28,6 +28,12 @@ pub struct ServeCliArgs {
     /// Name of an environment variable holding the Bearer key.
     #[arg(long)]
     pub api_key_env: Option<String>,
+
+    /// Tool allow-list for this server: comma-separated tool or group names
+    /// (`read`, `edit`, `knowledge`, `impact`, `service`). Same as `SYMFORGE_TOOLS`,
+    /// which it overrides.
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub tools: Option<String>,
 }
 
 impl ServeCliArgs {
@@ -60,6 +66,7 @@ mod tests {
             listen: Some("0.0.0.0:9000".to_string()),
             api_key: Some("k".to_string()),
             api_key_env: None,
+            tools: None,
         };
         let args = cli.into_serve_args();
         assert_eq!(args.listen, "0.0.0.0:9000");
@@ -77,6 +84,7 @@ mod tests {
             listen: None,
             api_key: None,
             api_key_env: None,
+            tools: None,
         };
         let args = cli.into_serve_args();
         assert_eq!(args.listen, DEFAULT_LISTEN);

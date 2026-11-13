@@ -2103,8 +2103,9 @@ impl ServerHandler for SymForgeServer {
             env!("CARGO_PKG_VERSION"),
         ));
         // SF-ADOPT-04: same env-driven profile `list_tools` serves, so the
-        // instructions only name tools this connection can call.
-        match surface_probe::server_instructions(surface_probe::surface_profile_from_env()) {
+        // instructions only name tools this connection can call (#874: with a
+        // tool allow-list set, a generated line names exactly those tools).
+        match surface_probe::connection_instructions() {
             Some(text) => config.with_instructions(text),
             None => config,
         }
@@ -2397,11 +2398,7 @@ impl ServerHandler for SymForgeServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
-        let profile = surface_probe::surface_profile_from_env();
-        let tools = match profile {
-            surface_probe::SurfaceProfile::Compact => crate::stel::compact_surface_tools(),
-            _ => surface_probe::list_tools_for_profile(profile),
-        };
+        let tools = surface_probe::advertised_tools();
         // FR-305 pinned struct shape: the constructor seeds
         // `result_type: Some(COMPLETE)`. FR-310/FR-311: 1h TTL, Public — the
         // surface is fixed per-process (`SYMFORGE_SURFACE` is env-driven), and a
@@ -2412,6 +2409,9 @@ impl ServerHandler for SymForgeServer {
         // discloses schemas the compact dispatch gate will refuse; a compact
         // list reaching core or full hides callable tools. Ordering is
         // deterministic (router insertion order), verified by test (SC-313).
+        // The #874 tool allow-list (`SYMFORGE_TOOLS` / `serve --tools`) keeps
+        // Public correct for the same reason: it is per process, never per
+        // request or per API key, so one origin still serves one list.
         Ok(ListToolsResult::with_all_items(tools)
             .with_ttl_ms(3_600_000)
             .with_cache_scope(rmcp::model::CacheScope::Public))

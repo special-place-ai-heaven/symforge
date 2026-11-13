@@ -28,7 +28,7 @@ use serde::Serialize;
 
 use crate::cli::harness::{AttachEntry, HarnessRegistry, HarnessState, HarnessStatus};
 use crate::protocol::surface_probe::{
-    SurfaceProfile, list_tools_for_profile, surface_profile_from_env,
+    SurfaceProfile, advertised_tools, surface_profile_from_env, tool_allow_list,
 };
 use crate::server::ServerRuntime;
 use crate::server::aap::{AapDetection, AapPresets, EmbedPinComparison, IntegrationMode};
@@ -284,20 +284,28 @@ pub struct SurfaceView {
     pub tool_count: usize,
     /// Advertised tool names on the active surface.
     pub tools: Vec<String>,
+    /// Whether an operator tool allow-list (`SYMFORGE_TOOLS` / `serve --tools`)
+    /// narrows `tools`.
+    pub allow_list: bool,
+    /// Allow-list entries that named no tool or group.
+    pub allow_list_unknown: Vec<String>,
 }
 
 impl SurfaceView {
-    /// Build from the live `SYMFORGE_SURFACE` env profile.
+    /// Build from the live `SYMFORGE_SURFACE` env profile and tool allow-list.
     pub fn from_env() -> Self {
         let profile = surface_profile_from_env();
-        let tools: Vec<String> = list_tools_for_profile(profile)
+        let tools: Vec<String> = advertised_tools()
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
+        let allow_list = tool_allow_list();
         Self {
             profile: profile_label(profile).to_string(),
             tool_count: tools.len(),
             tools,
+            allow_list: allow_list.is_some(),
+            allow_list_unknown: allow_list.map(|list| list.unknown).unwrap_or_default(),
         }
     }
 }
