@@ -12,20 +12,20 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use symforge::domain::WorkingTreeState;
+use symforge::domain::{LanguageId, WorkingTreeState};
 use symforge::knowledge::SECRET_POLICY_VERSION;
 use symforge::live_index::knowledge_authority::{
     AuthorityLimits, AuthorityTemporalIndex, KnowledgeAuthorityView, build_knowledge_authority,
     full_authority_builds,
 };
 use symforge::live_index::knowledge_bridge::{
-    BridgeLimits, BridgeResolution, DerivedCoverage, KnowledgeBridge, build_knowledge_bridge,
-    force_bridge_carry_for_test, force_partial_bridge_update_for_test, full_bridge_builds,
-    partial_bridge_updates,
+    BridgeLimits, BridgeResolution, CodeAnchorId, DerivedCoverage, KnowledgeBridge,
+    build_knowledge_bridge, force_bridge_carry_for_test, force_partial_bridge_update_for_test,
+    full_bridge_builds, partial_bridge_updates,
 };
 use symforge::live_index::single_file::{ReindexResult, remove_file, update_file_from_disk};
 use symforge::live_index::store::{PublishedGeneration, SharedIndex, SharedIndexHandle};
-use symforge::live_index::{LiveIndex, persist};
+use symforge::live_index::{IndexedFile, LiveIndex, persist};
 
 /// Links a code path, names a symbol defined once, a symbol defined in more
 /// files than the ambiguous-sample budget keeps (so the bridge is truncated),
@@ -111,6 +111,30 @@ fn digest(generation: &PublishedGeneration) -> String {
     symforge::hash::digest_hex(
         format!("{:?}{:?}", generation.bridge, generation.authority).as_bytes(),
     )
+}
+
+/// The kept samples of the ambiguous `shared_name` selector, as
+/// `(path, kind)` pairs in bridge order.
+fn shared_name_samples(generation: &PublishedGeneration) -> Vec<(String, String)> {
+    generation
+        .bridge
+        .forward
+        .iter()
+        .find_map(|link| match &link.resolution {
+            BridgeResolution::Ambiguous {
+                bounded_samples, ..
+            } => Some(bounded_samples),
+            _ => None,
+        })
+        .expect("shared_name stays ambiguous")
+        .iter()
+        .filter_map(|anchor| match &anchor.id {
+            CodeAnchorId::Symbol { symbol, .. } => {
+                Some((symbol.path.clone(), format!("{:?}", symbol.kind)))
+            }
+            CodeAnchorId::File { .. } => None,
+        })
+        .collect()
 }
 
 /// A generation held the way a session holds it, with what it answered from
@@ -400,6 +424,90 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
                 "// moved\npub fn shared_name() {}\n",
             );
             h.reindex("src/dup_9.rs");
+        },
+    );
+    // Same name, same count, another kind: only the anchor's kind moves.
+    let kind_changed = h.step(
+        "referenced symbol changes kind",
+        Bridge::Partial,
+        false,
+        |h| {
+            write(
+                h.root,
+                "src/dup_3.rs",
+                "// moved\npub struct shared_name;\n",
+            );
+            h.reindex("src/dup_3.rs");
+        },
+    );
+    assert!(
+        shared_name_samples(&kind_changed)
+            .iter()
+            .any(|(path, kind)| path == "src/dup_3.rs" && kind != "Function"),
+        "the kept dup_3 sample must carry the new kind"
+    );
+    // dup_7 holds the last kept sample, so a second definition in it sorts
+    // past the cap: an edit there keeps one anchor and drops the other.
+    let at_cap = h.step(
+        "second definition at the sample cap",
+        Bridge::Full,
+        true,
+        |h| {
+            write(
+                h.root,
+                "src/dup_7.rs",
+                "pub fn shared_name() {}\n\npub fn shared_name() {}\n",
+            );
+            h.reindex("src/dup_7.rs");
+        },
+    );
+    let samples = shared_name_samples(&at_cap);
+    assert_eq!(samples.len(), 8, "{samples:?}");
+    assert_eq!(
+        samples.last().map(|(path, _)| path.as_str()),
+        Some("src/dup_7.rs"),
+        "dup_7 must hold the last kept sample: {samples:?}"
+    );
+    assert_eq!(
+        samples
+            .iter()
+            .filter(|(path, _)| path == "src/dup_7.rs")
+            .count(),
+        1,
+        "dup_7's second definition must fall past the cap: {samples:?}"
+    );
+    h.step("edit across the sample cap", Bridge::Partial, false, |h| {
+        write(
+            h.root,
+            "src/dup_7.rs",
+            "// moved\npub fn shared_name() {}\n\npub fn shared_name() {}\n",
+        );
+        h.reindex("src/dup_7.rs");
+    });
+    h.step(
+        "two linked files in one publication",
+        Bridge::Partial,
+        false,
+        |h| {
+            write(
+                h.root,
+                "src/alpha.rs",
+                "// header\n\npub fn alpha_entry() -> u64 {\n    4\n}\n// note\n",
+            );
+            write(
+                h.root,
+                "src/dup_2.rs",
+                "// moved\npub fn shared_name() {}\n",
+            );
+            let mut index = h.shared.write();
+            for rel in ["src/alpha.rs", "src/dup_2.rs"] {
+                let bytes = std::fs::read(h.root.join(rel)).expect("read");
+                let parsed = symforge::parsing::process_file(rel, &bytes, LanguageId::Rust);
+                index.update_file(
+                    rel.to_string(),
+                    IndexedFile::from_parse_result(parsed, bytes),
+                );
+            }
         },
     );
     // A referenced name disappears from one file: resolutions change.

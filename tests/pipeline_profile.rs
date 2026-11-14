@@ -662,20 +662,18 @@ fn profile_pipeline() {
     // Control: a file no knowledge link resolves to and none of whose symbol
     // names is a selector, so the carry should hold.
     let linked = resolved_link_targets(&shared);
-    let forcing = rust_files
+    let doc_named = rust_files
         .iter()
         .filter(|(rel, _)| {
-            linked.contains(rel)
-                || shared
-                    .read()
-                    .get_file(rel)
-                    .is_some_and(|file| file.symbols.iter().any(|s| docs.contains(&s.name)))
+            shared
+                .read()
+                .get_file(rel)
+                .is_some_and(|file| file.symbols.iter().any(|s| docs.contains(&s.name)))
         })
         .count();
     println!(
-        "Rust files under src/ where an edit that changes how often a selector-named symbol \
-         is defined forces a full bridge + authority build (selector replica or resolved \
-         link target): {forcing} of {}",
+        "Rust files under src/ that define a doc-named symbol (a static count, not a \
+         measurement of rebuilds): {doc_named} of {}",
         rust_files.len()
     );
     let control = rust_files.iter().find(|(rel, lines)| {

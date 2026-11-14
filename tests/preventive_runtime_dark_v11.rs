@@ -1478,10 +1478,12 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Issue #876 partial update: `live_index/knowledge_bridge.rs` and
 // `live_index/store.rs` update the carried bridge in place; the only new
 // import is the `SymbolRecord` domain type. No index_lifecycle edge, no bridge.
+// A comment in `live_index/store.rs` names the partial update. Comment only, no
+// bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "02f00fda305ffe47070ee04649a022a7db3eafc6d95885a358a41355768639ab",
+    "3e1be650c20ea56db9a0f5a48efea422826ab3de4968092d5f5ffe585cdf1419",
     320,
-    13093641,
+    13093716,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
