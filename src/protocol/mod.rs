@@ -2249,21 +2249,31 @@ impl ServerHandler for SymForgeServer {
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         surface_probe::enforce_compact_surface(request.name.as_ref())?;
+        let tool = request.name.clone();
+        let version = context.protocol_version();
         // #875: a `symforge serve` with operator-fixed repositories routes the
         // call to one of them here, after the gate above and before any evidence,
         // so each answer names its own repository. The gate runs exactly once.
-        if let Some(projects) = self.serve_projects.as_ref() {
-            return projects.route_tool_call(self, request, context).await;
-        }
-        self.dispatch_gated_tool_call(request, context).await
+        let mut response = match self.serve_projects.as_ref() {
+            Some(projects) => projects.route_tool_call(self, request, context).await?,
+            None => self.dispatch_gated_tool_call(request, context).await?,
+        };
+        attach_structured_output(tool.as_ref(), version.as_ref(), &mut response);
+        Ok(response)
     }
 
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
-        let tools = surface_probe::advertised_tools();
+        let mut tools = surface_probe::advertised_tools();
+        // 2025-06-18+ defines `outputSchema`; older revisions get today's bytes.
+        // The list is still a function of (process, revision) alone, never of
+        // the caller, so the Public cache below still holds per revision.
+        if surface_probe::defines_structured_output(context.protocol_version().as_ref()) {
+            tools = surface_probe::with_output_schemas(tools);
+        }
         // FR-305 pinned struct shape: the constructor seeds
         // `result_type: Some(COMPLETE)`. FR-310/FR-311: 1h TTL, Public — the
         // surface is fixed per-process (`SYMFORGE_SURFACE` is env-driven), and a
@@ -2347,6 +2357,36 @@ impl ServerHandler for SymForgeServer {
         tracing::info!("client initialized");
         self.bind_workspace_from_client_roots(&context.peer).await;
     }
+}
+
+/// `structuredContent` for a [`surface_probe::STRUCTURED_OUTPUT_TOOLS`] result on
+/// a revision that defines it: a copy of the project evidence this result's
+/// `_meta` already carries, so it reports exactly what the call observed and is
+/// scoped to the repository the call was routed to. The text content is never
+/// touched. An error result (a refusal) gets none, and an existing value or a
+/// result without evidence is left as it is rather than filled in.
+pub(crate) fn attach_structured_output(
+    tool: &str,
+    version: Option<&rmcp::model::ProtocolVersion>,
+    response: &mut rmcp::model::CallToolResponse,
+) {
+    if !surface_probe::STRUCTURED_OUTPUT_TOOLS.contains(&tool)
+        || !surface_probe::defines_structured_output(version)
+    {
+        return;
+    }
+    let rmcp::model::CallToolResponse::Complete(result) = response else {
+        return;
+    };
+    if result.is_error == Some(true) || result.structured_content.is_some() {
+        return;
+    }
+    result.structured_content = result
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.0.get(result_status::PROJECT_EVIDENCE_META_KEY))
+        .filter(|evidence| evidence.is_object())
+        .cloned();
 }
 
 impl SymForgeServer {
