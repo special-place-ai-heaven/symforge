@@ -396,6 +396,34 @@ pub fn advertised_tools() -> Vec<Tool> {
     tools
 }
 
+/// Tools whose results carry `structuredContent` on MCP 2025-06-18 and later:
+/// the selected-project evidence the call observed, the object `_meta` already
+/// carries under `symforge/project_evidence`. The other tools' data never
+/// crosses the daemon wire as structure (the proxy returns rendered text), so
+/// they stay text-only rather than report structure parsed back out of text.
+pub const STRUCTURED_OUTPUT_TOOLS: [&str; 2] = ["status", "health"];
+
+/// Whether `version` defines `outputSchema` / `structuredContent` (2025-06-18+).
+/// No observed version is treated as legacy: it sees the text-only bytes.
+pub fn defines_structured_output(version: Option<&rmcp::model::ProtocolVersion>) -> bool {
+    version.is_some_and(|version| {
+        version.as_str() >= rmcp::model::ProtocolVersion::V_2025_06_18.as_str()
+    })
+}
+
+/// `tools` with the minimal `outputSchema` on [`STRUCTURED_OUTPUT_TOOLS`]. Minimal
+/// because the full `tools/list` byte budget pays for it on every session.
+pub fn with_output_schemas(mut tools: Vec<Tool>) -> Vec<Tool> {
+    for tool in &mut tools {
+        if STRUCTURED_OUTPUT_TOOLS.contains(&tool.name.as_ref()) {
+            let mut schema = Map::new();
+            schema.insert("type".to_string(), Value::from("object"));
+            tool.output_schema = Some(Arc::new(schema));
+        }
+    }
+    tools
+}
+
 pub fn list_tools_for_profile(profile: SurfaceProfile) -> Vec<Tool> {
     match profile {
         SurfaceProfile::Full => slimmed_router_tools(|name| name != "symforge"),
@@ -621,9 +649,10 @@ pub fn symforge_edit_schema_bytes() -> usize {
         .len()
 }
 
-/// UTF-8 JSON byte length of `tools/list` payload for the given profile.
+/// UTF-8 JSON byte length of `tools/list` payload for the given profile, as
+/// served to a 2025-06-18+ client: the largest payload, `outputSchema` included.
 pub fn list_tools_schema_bytes(profile: SurfaceProfile) -> (usize, usize) {
-    let tools = list_tools_for_profile(profile);
+    let tools = with_output_schemas(list_tools_for_profile(profile));
     let payload = json!({ "tools": tools });
     let bytes = serde_json::to_string(&payload)
         .expect("compact probe tools must serialize")

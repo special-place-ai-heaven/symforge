@@ -1487,10 +1487,19 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Query pool: `live_index/store.rs` runs that ordered helper on its own
 // bounded rayon pool instead of the indexing pool, so an admission parse
 // cannot delay a search or scout. No index_lifecycle edge, no bridge. 320 files.
+// MCP structured output: `protocol/mod.rs`, `protocol/deferred_stdio.rs` and
+// `protocol/surface_probe.rs` add `outputSchema` / `structuredContent` for
+// `status` and `health` on 2025-06-18+, copied from the existing `_meta`
+// evidence. Protocol layer only; no live_index or index_lifecycle file touched,
+// no bridge. 320 files.
+// Serve server view: `protocol/serve_projects.rs` gives the multi-repository
+// no-`project` `status`/`health` view a `structuredContent` built from the
+// same `published_state()` rows its text already reads; `server/serve.rs` adds
+// a test. No index_lifecycle edge, no bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "5fb3f52ed876606388068a66eb5bfbde418a517e9a9bdb01b2f949edaf8d41df",
+    "0b3b42a54a55ee390a8ab57d25c341cd21f04245ee76fe7e3d411da741b759bd",
     320,
-    13132015,
+    13151753,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

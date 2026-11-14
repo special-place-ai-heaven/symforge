@@ -204,6 +204,101 @@ impl DeferredStdioServer {
     }
 }
 
+impl DeferredStdioServer {
+    /// The tool-call answer before structured output is attached.
+    async fn answer_tool_call(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        // An off-surface or unknown tool is refused the way the real server
+        // refuses it, ready or not: its router is the shell's.
+        super::surface_probe::enforce_compact_surface(request.name.as_ref())?;
+        if !self.shell.tool_router.has_route(request.name.as_ref()) {
+            return Err(ErrorData::invalid_params("tool not found", None));
+        }
+        let diagnostic = matches!(
+            request.name.as_ref(),
+            "status" | "health" | "health_compact"
+        );
+        let started = Instant::now();
+        let progress_token = context.meta.get_progress_token();
+        let mut next_progress = started;
+        let mut startup = self.startup.clone();
+        loop {
+            let phase = startup.borrow_and_update().clone();
+            match phase {
+                StdioStartup::Failed(reason) => {
+                    return Ok(front_answer(
+                        ResultStatus::new(OutcomeClass::InternalFailure)
+                            .into_call_tool_result(self.failed_text(&reason)),
+                    ));
+                }
+                StdioStartup::Starting if diagnostic => {
+                    let text = format!(
+                        "{}\nProject root: {}\nIf a tool call still reports loading after its \
+                         wait, retry the same call.",
+                        self.indexing_line(),
+                        self.project_root,
+                    );
+                    return Ok(front_answer(CallToolResult::success(vec![
+                        ContentBlock::text(text),
+                    ])));
+                }
+                StdioStartup::Starting => {}
+                StdioStartup::Ready(server) if diagnostic => {
+                    let mut response = server.call_tool(request, context).await?;
+                    if let CallToolResponse::Complete(result) = &mut response
+                        && reports_loading(result)
+                    {
+                        result
+                            .content
+                            .insert(0, ContentBlock::text(self.indexing_line()));
+                    }
+                    return Ok(response);
+                }
+                StdioStartup::Ready(server) => {
+                    let seen_ready = self.index_seen_ready.load(Ordering::Acquire);
+                    if seen_ready || !index_loading(&server, &context).await {
+                        self.index_seen_ready.store(true, Ordering::Release);
+                        let response = server.call_tool(request.clone(), context.clone()).await?;
+                        // A plain guard refusal after the index was seen ready: a
+                        // later load, such as a retry, is in flight. Such tools
+                        // record nothing, so retrying through dispatch is safe.
+                        if !is_loading_refusal(&response) {
+                            return Ok(response);
+                        }
+                    }
+                }
+            }
+
+            let waited = started.elapsed();
+            if waited >= self.readiness_wait {
+                return Ok(self.not_ready_result(waited));
+            }
+            if let Some(token) = &progress_token
+                && Instant::now() >= next_progress
+            {
+                let progress = ProgressNotificationParam::new(token.clone(), waited.as_secs_f64())
+                    .with_message(self.indexing_line());
+                let _ = context.peer.notify_progress(progress).await;
+                next_progress = Instant::now() + PROGRESS_INTERVAL;
+            }
+            let pause = READINESS_POLL.min(self.readiness_wait - waited);
+            tokio::select! {
+                _ = context.ct.cancelled() => return Ok(self.not_ready_result(started.elapsed())),
+                changed = startup.changed() => {
+                    // A dropped sender publishes nothing more; keep polling.
+                    if changed.is_err() {
+                        tokio::time::sleep(pause).await;
+                    }
+                }
+                _ = tokio::time::sleep(pause) => {}
+            }
+        }
+    }
+}
+
 /// An answer the front built itself. No project is bound behind it yet, so it
 /// carries the explicit evidence-unavailable marker every tool result must
 /// carry (FR-319) rather than no evidence at all.
@@ -296,91 +391,13 @@ impl ServerHandler for DeferredStdioServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        // An off-surface or unknown tool is refused the way the real server
-        // refuses it, ready or not: its router is the shell's.
-        super::surface_probe::enforce_compact_surface(request.name.as_ref())?;
-        if !self.shell.tool_router.has_route(request.name.as_ref()) {
-            return Err(ErrorData::invalid_params("tool not found", None));
-        }
-        let diagnostic = matches!(
-            request.name.as_ref(),
-            "status" | "health" | "health_compact"
-        );
-        let started = Instant::now();
-        let progress_token = context.meta.get_progress_token();
-        let mut next_progress = started;
-        let mut startup = self.startup.clone();
-        loop {
-            let phase = startup.borrow_and_update().clone();
-            match phase {
-                StdioStartup::Failed(reason) => {
-                    return Ok(front_answer(
-                        ResultStatus::new(OutcomeClass::InternalFailure)
-                            .into_call_tool_result(self.failed_text(&reason)),
-                    ));
-                }
-                StdioStartup::Starting if diagnostic => {
-                    let text = format!(
-                        "{}\nProject root: {}\nIf a tool call still reports loading after its \
-                         wait, retry the same call.",
-                        self.indexing_line(),
-                        self.project_root,
-                    );
-                    return Ok(front_answer(CallToolResult::success(vec![
-                        ContentBlock::text(text),
-                    ])));
-                }
-                StdioStartup::Starting => {}
-                StdioStartup::Ready(server) if diagnostic => {
-                    let mut response = server.call_tool(request, context).await?;
-                    if let CallToolResponse::Complete(result) = &mut response
-                        && reports_loading(result)
-                    {
-                        result
-                            .content
-                            .insert(0, ContentBlock::text(self.indexing_line()));
-                    }
-                    return Ok(response);
-                }
-                StdioStartup::Ready(server) => {
-                    let seen_ready = self.index_seen_ready.load(Ordering::Acquire);
-                    if seen_ready || !index_loading(&server, &context).await {
-                        self.index_seen_ready.store(true, Ordering::Release);
-                        let response = server.call_tool(request.clone(), context.clone()).await?;
-                        // A plain guard refusal after the index was seen ready: a
-                        // later load, such as a retry, is in flight. Such tools
-                        // record nothing, so retrying through dispatch is safe.
-                        if !is_loading_refusal(&response) {
-                            return Ok(response);
-                        }
-                    }
-                }
-            }
-
-            let waited = started.elapsed();
-            if waited >= self.readiness_wait {
-                return Ok(self.not_ready_result(waited));
-            }
-            if let Some(token) = &progress_token
-                && Instant::now() >= next_progress
-            {
-                let progress = ProgressNotificationParam::new(token.clone(), waited.as_secs_f64())
-                    .with_message(self.indexing_line());
-                let _ = context.peer.notify_progress(progress).await;
-                next_progress = Instant::now() + PROGRESS_INTERVAL;
-            }
-            let pause = READINESS_POLL.min(self.readiness_wait - waited);
-            tokio::select! {
-                _ = context.ct.cancelled() => return Ok(self.not_ready_result(started.elapsed())),
-                changed = startup.changed() => {
-                    // A dropped sender publishes nothing more; keep polling.
-                    if changed.is_err() {
-                        tokio::time::sleep(pause).await;
-                    }
-                }
-                _ = tokio::time::sleep(pause) => {}
-            }
-        }
+        // Front answers (`status` while starting) get the same structured
+        // output a runtime answer gets; the helper leaves a runtime answer as is.
+        let tool = request.name.clone();
+        let version = context.protocol_version();
+        let mut response = self.answer_tool_call(request, context).await?;
+        super::attach_structured_output(tool.as_ref(), version.as_ref(), &mut response);
+        Ok(response)
     }
 
     async fn read_resource(
@@ -1116,5 +1133,225 @@ mod tests {
             tool_text(&loading).contains(INDEXING_IN_PROGRESS),
             "{loading}"
         );
+    }
+
+    /// Every negotiated revision, oldest first, as a stdio client opens it:
+    /// `initialize` up to 2025-11-25, inline `_meta` on 2026-07-28.
+    const REVISIONS: [&str; 5] = [
+        "2024-11-05",
+        "2025-03-26",
+        "2025-06-18",
+        "2025-11-25",
+        "2026-07-28",
+    ];
+
+    fn inline_meta(revision: &str) -> Option<Value> {
+        (revision >= "2026-07-28").then(|| {
+            json!({
+                "io.modelcontextprotocol/protocolVersion": revision,
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": {"name": "deferred-stdio-test", "version": "0"},
+            })
+        })
+    }
+
+    /// Open `revision` and return the server capabilities it was offered.
+    async fn open_at(client: &mut Client, revision: &str) -> Value {
+        if let Some(meta) = inline_meta(revision) {
+            let discover = client
+                .request(1, "server/discover", json!({"_meta": meta}))
+                .await;
+            return discover["result"]["capabilities"].clone();
+        }
+        let init = client
+            .request(
+                1,
+                "initialize",
+                json!({
+                    "protocolVersion": revision,
+                    "capabilities": {},
+                    "clientInfo": {"name": "deferred-stdio-test", "version": "0"}
+                }),
+            )
+            .await;
+        assert_eq!(init["result"]["protocolVersion"], json!(revision), "{init}");
+        client
+            .send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await;
+        init["result"]["capabilities"].clone()
+    }
+
+    fn with_meta(mut params: Value, revision: &str) -> Value {
+        if let Some(meta) = inline_meta(revision) {
+            params["_meta"] = meta;
+        }
+        params
+    }
+
+    /// No revision is offered a capability this server cannot honour: no
+    /// logging, no resource subscriptions, no list-changed notifications.
+    #[tokio::test]
+    async fn every_revision_is_offered_exactly_tools_prompts_and_resources() {
+        for revision in REVISIONS {
+            let (front, _startup) = DeferredStdioServer::new(Path::new("/work/repo"));
+            let mut client = connect(front);
+            let capabilities = open_at(&mut client, revision).await;
+            let mut keys: Vec<&str> = capabilities
+                .as_object()
+                .unwrap_or_else(|| panic!("{revision}: {capabilities}"))
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["prompts", "resources", "tools"], "{revision}");
+            for (area, flag) in [
+                ("tools", "listChanged"),
+                ("prompts", "listChanged"),
+                ("resources", "listChanged"),
+                ("resources", "subscribe"),
+            ] {
+                assert!(
+                    capabilities[area].get(flag).is_none(),
+                    "{revision}: {area}.{flag} must stay unadvertised: {capabilities}"
+                );
+            }
+        }
+    }
+
+    /// 2025-06-18+ lists an `outputSchema` on exactly the structured tools and
+    /// answers them with `structuredContent` that validates against it: the
+    /// `_meta` project evidence, copied. Older revisions see neither, and every
+    /// revision gets the same `status` text.
+    #[tokio::test]
+    async fn structured_output_is_served_only_to_revisions_that_define_it() {
+        use crate::protocol::surface_probe::{STRUCTURED_OUTPUT_TOOLS, SurfaceEnvVarGuard};
+        let _tools = SurfaceEnvVarGuard::set("SYMFORGE_TOOLS", None);
+        let _surface = SurfaceEnvVarGuard::set("SYMFORGE_SURFACE", None);
+        let mut status_texts = Vec::new();
+        for revision in REVISIONS {
+            let defines = revision >= "2025-06-18";
+            let (front, startup) = DeferredStdioServer::new(Path::new("/work/repo"));
+            startup.send_replace(StdioStartup::Ready(Arc::new(real_server())));
+            let mut client = connect(front);
+            open_at(&mut client, revision).await;
+
+            let list = client
+                .request(2, "tools/list", with_meta(json!({}), revision))
+                .await;
+            let tools = list["result"]["tools"].as_array().expect("tools");
+            let mut schema_of = std::collections::HashMap::new();
+            for tool in tools {
+                let name = tool["name"].as_str().unwrap();
+                let structured = STRUCTURED_OUTPUT_TOOLS.contains(&name);
+                match tool.get("outputSchema") {
+                    Some(schema) => {
+                        assert!(defines && structured, "{revision} {name}: {schema}");
+                        assert_eq!(schema, &json!({"type": "object"}), "{revision} {name}");
+                        schema_of.insert(name.to_string(), schema.clone());
+                    }
+                    None => assert!(!(defines && structured), "{revision} {name}"),
+                }
+            }
+
+            for (id, tool) in (3u64..).zip(STRUCTURED_OUTPUT_TOOLS) {
+                let reply = client
+                    .request(
+                        id,
+                        "tools/call",
+                        with_meta(json!({"name": tool, "arguments": {}}), revision),
+                    )
+                    .await;
+                let result = &reply["result"];
+                assert_ne!(result["isError"], json!(true), "{revision} {tool}: {reply}");
+                if defines {
+                    let structured = &result["structuredContent"];
+                    // The schema is `{"type": "object"}`: validating is the type check.
+                    assert_eq!(schema_of[tool]["type"], json!("object"));
+                    assert!(structured.is_object(), "{revision} {tool}: {reply}");
+                    assert_eq!(
+                        structured, &result["_meta"]["symforge/project_evidence"],
+                        "{revision} {tool}: structured output is the observed evidence"
+                    );
+                } else {
+                    assert!(
+                        result.get("structuredContent").is_none(),
+                        "{revision} {tool}: {reply}"
+                    );
+                }
+                if tool == "status" {
+                    status_texts.push(result["content"].clone());
+                }
+            }
+
+            // A refused call is a refusal: no structured output rides on it.
+            let refused = client
+                .request(
+                    9,
+                    "tools/call",
+                    with_meta(
+                        json!({"name": "status", "arguments": {"no_such_argument": 1}}),
+                        revision,
+                    ),
+                )
+                .await;
+            assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
+            assert!(
+                refused["result"].get("structuredContent").is_none(),
+                "{revision}: {refused}"
+            );
+        }
+        assert!(
+            status_texts.windows(2).all(|pair| pair[0] == pair[1]),
+            "status text is identical on every revision: {status_texts:?}"
+        );
+    }
+
+    /// The attach seam never edits content, and skips other tools, legacy
+    /// revisions, error results and results without evidence.
+    #[test]
+    fn attach_structured_output_never_touches_text() {
+        let v_new = ProtocolVersion::V_2025_06_18;
+        let v_old = ProtocolVersion::V_2025_03_26;
+        let evidence = json!({"project_id": "p", "index_state": "Ready"});
+        let make = |is_error: bool, with_evidence: bool| {
+            let content = vec![ContentBlock::text("status text")];
+            let mut result = if is_error {
+                CallToolResult::error(content)
+            } else {
+                CallToolResult::success(content)
+            };
+            if with_evidence {
+                let mut meta = rmcp::model::JsonObject::new();
+                meta.insert(PROJECT_EVIDENCE_META_KEY.to_string(), evidence.clone());
+                result = result.with_meta(Some(rmcp::model::MetaObject(meta)));
+            }
+            CallToolResponse::Complete(result)
+        };
+        let structured = |response: &CallToolResponse| match response {
+            CallToolResponse::Complete(result) => result.structured_content.clone(),
+            _ => unreachable!(),
+        };
+        let content = |response: &CallToolResponse| match response {
+            CallToolResponse::Complete(result) => serde_json::to_value(&result.content).unwrap(),
+            _ => unreachable!(),
+        };
+
+        let mut served = make(false, true);
+        let before = content(&served);
+        crate::protocol::attach_structured_output("status", Some(&v_new), &mut served);
+        assert_eq!(structured(&served), Some(evidence.clone()));
+        assert_eq!(content(&served), before, "text bytes unchanged");
+
+        for (tool, version, is_error, with_evidence) in [
+            ("search_text", Some(&v_new), false, true),
+            ("status", Some(&v_old), false, true),
+            ("status", None, false, true),
+            ("status", Some(&v_new), true, true),
+            ("status", Some(&v_new), false, false),
+        ] {
+            let mut response = make(is_error, with_evidence);
+            crate::protocol::attach_structured_output(tool, version, &mut response);
+            assert_eq!(structured(&response), None, "{tool} {version:?} {is_error}");
+        }
     }
 }
