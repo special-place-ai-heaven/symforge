@@ -706,8 +706,30 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
         "authority carried over the unresolved link must fail the equivalence check"
     );
 
+    // Recover from the deliberately wrong generation above: an added knowledge
+    // path is not code-only, so production rebuilds the bridge and the
+    // authority in full. Written inline rather than through `h.step`, which
+    // would pin the stale generation for `assert_pins_hold` to reject. The
+    // guide and its links stay as they are.
+    let (bridges, authorities) = (full_bridge_builds(), full_authority_builds());
+    write(root, "docs/recover.md", "# Recover\n\nNo links here.\n");
+    h.reindex("docs/recover.md");
+    // Read before `assert_matches_fresh`, which builds both itself.
+    assert_eq!(
+        full_bridge_builds() - bridges,
+        1,
+        "an added path must rebuild the bridge in full"
+    );
+    assert_eq!(
+        full_authority_builds() - authorities,
+        1,
+        "an added path must rebuild authority in full"
+    );
+    assert_matches_fresh("recovery", &h.shared.published_generation());
+
     // Negative control: forcing the carry over a knowledge edit must leave a
-    // bridge the equivalence check rejects.
+    // bridge the equivalence check rejects. It starts from a generation that
+    // equals a fresh build, so the failure comes from the forced carry alone.
     let (bridges, authorities) = (full_bridge_builds(), full_authority_builds());
     force_bridge_carry_for_test(true);
     write(
