@@ -46,6 +46,23 @@ Embedders keep their own response bytes and check them with `ReplayOutcome::resp
 
 AAP S14-S16 add opt-in refresh-safe snapshot reads for Graph, File, SymbolSearch, and References via `EmbeddedSourceHandle::query_allowing_refresh`; the claim keeps the prior publication identity and reports `Refreshing`. Strict `query` remains Current-only, and mutating/mixed-disk variants are refused before freshening. `change_version` plus blocking `wait_for_change` provide lossless phase/publication event waits. `begin_graph_publication_lease` pins one Graph snapshot across pages for at most 30 seconds; no more than eight leases are live per source, and expired leases return `GraphPublicationLeaseExpired`.
 
+## [11.21.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.20.5...v11.21.0) (2026-11-14)
+
+
+### Features
+
+* **protocol:** structured output for status and health ([#906](https://github.com/special-place-ai-heaven/symforge/issues/906)) ([15a19df](https://github.com/special-place-ai-heaven/symforge/commit/15a19df7e50a7909025fe82782bd52ff03723dc5))
+
+
+### Bug Fixes
+
+* **watcher:** key the forced session exit seam to one root ([#907](https://github.com/special-place-ai-heaven/symforge/issues/907)) ([5b93340](https://github.com/special-place-ai-heaven/symforge/commit/5b93340c7152ec7eae9436a52153775af6705d38))
+
+
+### Performance Improvements
+
+* parallelise scout probes, structural and text search ([#905](https://github.com/special-place-ai-heaven/symforge/issues/905)) ([e9f403b](https://github.com/special-place-ai-heaven/symforge/commit/e9f403bbe6733471adfb018d5101c22ca1aa6ece))
+
 ## [11.20.5](https://github.com/special-place-ai-heaven/symforge/compare/v11.20.4...v11.20.5) (2026-11-14)
 
 
