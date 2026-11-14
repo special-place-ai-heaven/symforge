@@ -49,6 +49,7 @@ use symforge::live_index::knowledge_authority::{
 };
 use symforge::live_index::knowledge_bridge::{
     BridgeLimits, BridgeResolution, CodeAnchorId, build_knowledge_bridge, full_bridge_builds,
+    partial_bridge_updates,
 };
 use symforge::live_index::search::{
     TextSearchOptions, search_structural, search_symbols, search_text,
@@ -672,8 +673,9 @@ fn profile_pipeline() {
         })
         .count();
     println!(
-        "Rust files under src/ where any content edit forces a full bridge + authority build \
-         (selector replica or resolved link target): {forcing} of {}",
+        "Rust files under src/ where an edit that changes how often a selector-named symbol \
+         is defined forces a full bridge + authority build (selector replica or resolved \
+         link target): {forcing} of {}",
         rust_files.len()
     );
     let control = rust_files.iter().find(|(rel, lines)| {
@@ -1102,12 +1104,16 @@ fn profile_updates(
     let authority =
         symforge::live_index::index_lifecycle::activation::project_source_authority(root);
     let mut samples = Samples::default();
-    let (mut bridge_builds, mut authority_builds) = (0, 0);
+    let (mut bridge_builds, mut authority_builds, mut partials) = (0, 0, 0);
     let mut alloc_total = 0u64;
     for i in 0..reps {
         let bytes = edited(&original, kind, i).into_bytes();
         std::fs::write(&path, &bytes).expect("write target");
-        let before = (full_bridge_builds(), full_authority_builds());
+        let before = (
+            full_bridge_builds(),
+            full_authority_builds(),
+            partial_bridge_updates(),
+        );
         let source_before = shared.published_generation().source.clone();
         let alloc_before = ALLOCATED.load(Ordering::Relaxed);
         let (outcome, total) = time(|| update_file_from_disk(shared, root, rel));
@@ -1122,6 +1128,7 @@ fn profile_updates(
         wait_for_knowledge(shared);
         bridge_builds += full_bridge_builds() - before.0;
         authority_builds += full_authority_builds() - before.1;
+        partials += partial_bridge_updates() - before.2;
         let status = format!(
             "{:?}",
             shared.read().get_file(rel).expect("indexed").parse_status
@@ -1181,6 +1188,7 @@ fn profile_updates(
     println!(
         "{label} {rel} ({lines} lines, {kind_label}, parse status {status_before}): \
          full rebuilds bridge {bridge_builds}/{reps} authority {authority_builds}/{reps}; \
+         partial bridge updates {partials}/{reps}; \
          file is a resolved knowledge-link target: {linked}; mean {:.1} MiB allocated per call",
         mib(alloc_total / reps.max(1) as u64)
     );

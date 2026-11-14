@@ -20,7 +20,8 @@ use symforge::live_index::knowledge_authority::{
 };
 use symforge::live_index::knowledge_bridge::{
     BridgeLimits, BridgeResolution, DerivedCoverage, KnowledgeBridge, build_knowledge_bridge,
-    force_bridge_carry_for_test, full_bridge_builds,
+    force_bridge_carry_for_test, force_partial_bridge_update_for_test, full_bridge_builds,
+    partial_bridge_updates,
 };
 use symforge::live_index::single_file::{ReindexResult, remove_file, update_file_from_disk};
 use symforge::live_index::store::{PublishedGeneration, SharedIndex, SharedIndexHandle};
@@ -121,6 +122,17 @@ struct Pinned {
     digest: String,
 }
 
+/// How a step must produce its bridge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bridge {
+    /// Carried as is, anchors restamped.
+    Carry,
+    /// Carried with the anchors into changed code files recomputed.
+    Partial,
+    /// Built from scratch.
+    Full,
+}
+
 struct Harness<'a> {
     root: &'a Path,
     shared: SharedIndex,
@@ -137,11 +149,11 @@ impl Harness<'_> {
     }
 
     /// Publish one step; assert it published, equals a fresh build, and
-    /// rebuilt the bridge and authority exactly when expected.
+    /// produced the bridge and authority exactly the expected way.
     fn step(
         &mut self,
         name: &str,
-        expect_bridge_rebuild: bool,
+        expect_bridge: Bridge,
         expect_authority_rebuild: bool,
         publish: impl FnOnce(&Self),
     ) -> Arc<PublishedGeneration> {
@@ -152,21 +164,31 @@ impl Harness<'_> {
             digest: digest(&before),
             generation: Arc::clone(&before),
         });
-        let (bridges, authorities) = (full_bridge_builds(), full_authority_builds());
-        publish(self);
-        let rebuilt = (
-            full_bridge_builds() != bridges,
-            full_authority_builds() != authorities,
+        let (bridges, partials, authorities) = (
+            full_bridge_builds(),
+            partial_bridge_updates(),
+            full_authority_builds(),
         );
+        publish(self);
+        let bridge = match (
+            full_bridge_builds() != bridges,
+            partial_bridge_updates() != partials,
+        ) {
+            (false, false) => Bridge::Carry,
+            (false, true) => Bridge::Partial,
+            (true, false) => Bridge::Full,
+            (true, true) => panic!("{name}: one publication both updated and rebuilt"),
+        };
+        let rebuilt_authority = full_authority_builds() != authorities;
         let after = self.shared.published_generation();
         assert!(
             after.publication_generation > before.publication_generation,
             "{name}: nothing was published"
         );
         assert_eq!(
-            rebuilt,
-            (expect_bridge_rebuild, expect_authority_rebuild),
-            "{name}: (bridge, authority) rebuilt"
+            (bridge, rebuilt_authority),
+            (expect_bridge, expect_authority_rebuild),
+            "{name}: (bridge, authority rebuilt)"
         );
         assert_matches_fresh(name, &after);
         after
@@ -276,32 +298,42 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
 
     // A code file under an ownership selector that nothing links, on a
     // truncated bridge: carried, at a new content generation.
-    let after = h.step("unrelated edit, truncated bridge", false, false, |h| {
-        write(
-            h.root,
-            "src/unrelated.rs",
-            "pub fn unrelated() -> u64 {\n    3\n}\n",
-        );
-        h.reindex("src/unrelated.rs");
-    });
+    let after = h.step(
+        "unrelated edit, truncated bridge",
+        Bridge::Carry,
+        false,
+        |h| {
+            write(
+                h.root,
+                "src/unrelated.rs",
+                "pub fn unrelated() -> u64 {\n    3\n}\n",
+            );
+            h.reindex("src/unrelated.rs");
+        },
+    );
     assert!(after.content_generation > before.content_generation);
     assert!(matches!(
         after.bridge.coverage,
         DerivedCoverage::Truncated { .. }
     ));
 
-    h.step("hash-skip", false, false, |h| {
+    h.step("hash-skip", Bridge::Carry, false, |h| {
         std::thread::sleep(Duration::from_millis(1100));
         let bytes = std::fs::read(h.root.join("src/unrelated.rs")).expect("read");
         std::fs::write(h.root.join("src/unrelated.rs"), bytes).expect("rewrite");
         let outcome = update_file_from_disk(&h.shared, h.root, "src/unrelated.rs");
         assert!(matches!(outcome, ReindexResult::HashSkip), "{outcome:?}");
     });
-    h.step("new code file changes ownership counts", true, true, |h| {
-        write(h.root, "src/extra.rs", "pub fn extra() {}\n");
-        h.reindex("src/extra.rs");
-    });
-    h.step("ownership selector change", true, true, |h| {
+    h.step(
+        "new code file changes ownership counts",
+        Bridge::Full,
+        true,
+        |h| {
+            write(h.root, "src/extra.rs", "pub fn extra() {}\n");
+            h.reindex("src/extra.rs");
+        },
+    );
+    h.step("ownership selector change", Bridge::Full, true, |h| {
         write(
             h.root,
             "CODEOWNERS",
@@ -309,7 +341,7 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
         );
         h.reindex("CODEOWNERS");
     });
-    h.step("referenced symbol added", true, true, |h| {
+    h.step("referenced symbol added", Bridge::Full, true, |h| {
         write(
             h.root,
             "src/unrelated.rs",
@@ -317,7 +349,10 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
         );
         h.reindex("src/unrelated.rs");
     });
-    h.step("ambiguous match edit", true, true, |h| {
+    // A changed file that a link resolves to, with every referenced name still
+    // defined the same number of times: only its anchors are recomputed, and
+    // authority, which never reads a code anchor's lines or hash, is carried.
+    h.step("ambiguous match edit", Bridge::Partial, false, |h| {
         write(
             h.root,
             "src/dup_3.rs",
@@ -325,7 +360,7 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
         );
         h.reindex("src/dup_3.rs");
     });
-    h.step("linked file edit", true, true, |h| {
+    h.step("linked file edit", Bridge::Partial, false, |h| {
         write(
             h.root,
             "src/alpha.rs",
@@ -333,7 +368,50 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
         );
         h.reindex("src/alpha.rs");
     });
-    h.step("knowledge edit", true, true, |h| {
+    // Symbols unchanged but the hash moved: the anchors carry the hash, so
+    // this is an update, not a plain carry.
+    h.step("linked file comment append", Bridge::Partial, false, |h| {
+        write(
+            h.root,
+            "src/alpha.rs",
+            "pub fn alpha_entry() -> u64 {\n    2\n}\n// note\n",
+        );
+        h.reindex("src/alpha.rs");
+    });
+    // The symbol's start line, part of its anchor id, moves.
+    h.step("linked symbol moves down", Bridge::Partial, false, |h| {
+        write(
+            h.root,
+            "src/alpha.rs",
+            "// header\n\npub fn alpha_entry() -> u64 {\n    2\n}\n// note\n",
+        );
+        h.reindex("src/alpha.rs");
+    });
+    // dup_9 defines `shared_name` but sorts past the eight kept samples, so
+    // no anchor in the bridge points into it.
+    h.step(
+        "match beyond the sample cutoff",
+        Bridge::Carry,
+        false,
+        |h| {
+            write(
+                h.root,
+                "src/dup_9.rs",
+                "// moved\npub fn shared_name() {}\n",
+            );
+            h.reindex("src/dup_9.rs");
+        },
+    );
+    // A referenced name disappears from one file: resolutions change.
+    h.step("linked symbol renamed", Bridge::Full, true, |h| {
+        write(
+            h.root,
+            "src/alpha.rs",
+            "// header\n\npub fn alpha_start() -> u64 {\n    2\n}\n// note\n",
+        );
+        h.reindex("src/alpha.rs");
+    });
+    h.step("knowledge edit", Bridge::Full, true, |h| {
         write(
             h.root,
             "docs/guide.md",
@@ -344,15 +422,20 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
 
     // A policy file may name any file, so with one present an unrelated code
     // edit still carries the bridge but rebuilds authority.
-    h.step("policy file added", true, true, |h| {
+    h.step("policy file added", Bridge::Full, true, |h| {
         write(h.root, ".symforge-knowledge.toml", "version = 1\n");
         h.reindex(".symforge-knowledge.toml");
     });
-    h.step("unrelated edit with a policy file", false, true, |h| {
-        write(h.root, "src/extra.rs", "pub fn extra() -> u8 {\n    1\n}\n");
-        h.reindex("src/extra.rs");
-    });
-    h.step("policy file edit", true, true, |h| {
+    h.step(
+        "unrelated edit with a policy file",
+        Bridge::Carry,
+        true,
+        |h| {
+            write(h.root, "src/extra.rs", "pub fn extra() -> u8 {\n    1\n}\n");
+            h.reindex("src/extra.rs");
+        },
+    );
+    h.step("policy file edit", Bridge::Full, true, |h| {
         write(
             h.root,
             ".symforge-knowledge.toml",
@@ -360,20 +443,20 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
         );
         h.reindex(".symforge-knowledge.toml");
     });
-    h.step("policy file removed", true, true, |h| {
+    h.step("policy file removed", Bridge::Full, true, |h| {
         std::fs::remove_file(h.root.join(".symforge-knowledge.toml")).expect("delete");
         assert!(remove_file(&h.shared, ".symforge-knowledge.toml"));
     });
 
     // A code file becomes knowledge: notes.rs is renamed to notes.md.
-    h.step("code to knowledge (remove .rs)", true, true, |h| {
+    h.step("code to knowledge (remove .rs)", Bridge::Full, true, |h| {
         std::fs::rename(h.root.join("src/notes.rs"), h.root.join("src/notes.md")).expect("rename");
         assert!(remove_file(&h.shared, "src/notes.rs"));
     });
-    h.step("code to knowledge (add .md)", true, true, |h| {
+    h.step("code to knowledge (add .md)", Bridge::Full, true, |h| {
         h.reindex("src/notes.md")
     });
-    h.step("delete", true, true, |h| {
+    h.step("delete", Bridge::Full, true, |h| {
         std::fs::remove_file(h.root.join("src/unrelated.rs")).expect("delete");
         assert!(remove_file(&h.shared, "src/unrelated.rs"));
     });
@@ -406,7 +489,11 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
     };
     r.step(
         "first publication after restore",
-        placeholder,
+        if placeholder {
+            Bridge::Full
+        } else {
+            Bridge::Carry
+        },
         placeholder,
         |r| {
             write(r.root, "src/extra.rs", "pub fn extra() -> u8 {\n    2\n}\n");
@@ -414,6 +501,35 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
         },
     );
     r.assert_pins_hold();
+
+    // Negative control for the partial update: with the per-name count check
+    // skipped, bringing back a name the guide refers to only refreshes
+    // alpha.rs's file anchor and leaves `alpha_entry` unresolved, which the
+    // equivalence check must reject.
+    let (bridges, partials) = (full_bridge_builds(), partial_bridge_updates());
+    force_partial_bridge_update_for_test(true);
+    write(
+        root,
+        "src/alpha.rs",
+        "pub fn alpha_entry() -> u64 {\n    3\n}\n",
+    );
+    h.reindex("src/alpha.rs");
+    force_partial_bridge_update_for_test(false);
+    assert_eq!(
+        full_bridge_builds(),
+        bridges,
+        "the forced update must not rebuild"
+    );
+    assert_ne!(
+        partial_bridge_updates(),
+        partials,
+        "the forced update must take the partial path"
+    );
+    let (bridge_ok, _) = matches_fresh(&h.shared.published_generation());
+    assert!(
+        !bridge_ok,
+        "a partial update that skips the count check must fail the equivalence check"
+    );
 
     // Negative control: forcing the carry over a knowledge edit must leave a
     // bridge the equivalence check rejects.
