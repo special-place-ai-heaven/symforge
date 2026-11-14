@@ -1187,10 +1187,13 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Embed close phase: a handle that has observed its own close reports Stopping from
 // `wait_for_change` and `runtime_view` (private `phase_after_close`). Same 91 files,
 // no bridge.
+// Bounded structural parse: the embed text-search wire carries `unparsed_files` and
+// the shared search renderer names files whose parse was cancelled. Field copies and
+// a pure render helper. Same 91 files, no bridge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "d8d47cdcf281b312b5927b639f593444d040f6dd1582170b162c31fa5a21cb50",
+    "02226b2999ab85ff43e1039e08a696a8a470a949e59d37aab8303eb64766331b",
     91,
-    2498626,
+    2501633,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1469,10 +1472,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // become plain expressions, two Perl comments are reworded, and `xref.rs` gains a
 // test for calls inside parenthesized expressions. No index_lifecycle file touched,
 // no bridge. 320 files.
+// Bounded structural parse: `ast_grep.rs` parses through `parsing::parse_within` and
+// `live_index/search.rs` counts cancelled files; index_lifecycle files only copy the
+// new count and render it. No new edge, no bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "d52bb9961294db834b741ca5acc17e611bace88cea05c168e3bf88fdbda76a14",
+    "474126899f2801f070bce51df7e72670c1e546ea3d40e1dd90ce61006af36c83",
     320,
-    13079145,
+    13086832,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

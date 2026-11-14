@@ -168,6 +168,9 @@ pub struct TextSearchResult {
     pub excluded_knowledge_files: u64,
     pub withheld_policy_files: u64,
     pub withheld_size_files: u64,
+    /// Structural search: candidate files whose parse was cancelled or failed.
+    #[serde(default)]
+    pub unparsed_files: u64,
     pub regex: bool,
     pub structural: bool,
     pub ranked: bool,

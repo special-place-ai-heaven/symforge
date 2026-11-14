@@ -311,6 +311,7 @@ pub(super) fn render_routed(
                 excluded_knowledge_files: value.excluded_knowledge_files as usize,
                 withheld_policy_files: value.withheld_policy_files as usize,
                 withheld_size_files: value.withheld_size_files as usize,
+                unparsed_files: value.unparsed_files as usize,
                 files: files
                     .iter()
                     .map(|file| engine::TextFileMatches {

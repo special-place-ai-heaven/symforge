@@ -10,7 +10,9 @@ pub mod resolver;
 pub mod xref;
 
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::panic;
+use std::time::{Duration, Instant};
 
 use tree_sitter::Parser;
 
@@ -362,9 +364,44 @@ pub(crate) fn parse_source_tree(
         .set_language(&ts_language)
         .map_err(|e| format!("failed to set language: {e}"))?;
 
-    parser
-        .parse(source, None)
-        .ok_or_else(|| "tree-sitter parse returned None".to_string())
+    parse_within(&mut parser, source, PARSE_DEADLINE)
+}
+
+/// Upper bound on one tree-sitter parse. The largest file in this repository
+/// parses in about 140 ms, so a parse still running here is pathological.
+pub(crate) const PARSE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Parse `source`, cancelling cooperatively once `deadline` has elapsed.
+/// A cancelled parse is an error that says so, never a tree.
+pub(crate) fn parse_within(
+    parser: &mut Parser,
+    source: &str,
+    deadline: Duration,
+) -> Result<tree_sitter::Tree, String> {
+    let started = Instant::now();
+    let mut cancelled = false;
+    let mut check_deadline = |_: &tree_sitter::ParseState| {
+        if started.elapsed() >= deadline {
+            cancelled = true;
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+    let bytes = source.as_bytes();
+    let tree = parser.parse_with_options(
+        &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
+        None,
+        Some(tree_sitter::ParseOptions::new().progress_callback(&mut check_deadline)),
+    );
+    match tree {
+        Some(tree) => Ok(tree),
+        None if cancelled => Err(format!(
+            "tree-sitter parse cancelled at the {} ms deadline",
+            deadline.as_millis()
+        )),
+        None => Err("tree-sitter parse returned None".to_string()),
+    }
 }
 
 pub(crate) fn parse_source(
@@ -522,7 +559,7 @@ fn parse_source_scored(source: &str, language: &LanguageId) -> Option<(ParseSour
         _ => return None,
     };
     parser.set_language(&ts_language).ok()?;
-    let tree = parser.parse(source, None)?;
+    let tree = parse_within(&mut parser, source, PARSE_DEADLINE).ok()?;
     let error_nodes = count_error_nodes(&tree.root_node());
     // `.h` headers are never `.tsx`; the flavor flag is irrelevant here.
     let output = parse_source(source, language, false).ok()?;
@@ -1170,6 +1207,23 @@ fn symbol_diff_pairs(source: &str, symbols: &[SymbolRecord]) -> Vec<(String, Str
 mod tests {
     use super::*;
     use crate::domain::{FileOutcome, LanguageId, SymbolKind};
+
+    #[test]
+    fn parse_past_its_deadline_is_reported_as_cancelled() {
+        let source = "fn f() { let x = 1; }\n".repeat(20_000);
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+
+        let err = parse_within(&mut parser, &source, Duration::ZERO)
+            .expect_err("a zero deadline must cancel the parse");
+        assert!(err.contains("cancelled"), "unexpected error: {err}");
+
+        let tree = parse_within(&mut parser, &source, PARSE_DEADLINE)
+            .expect("the production deadline must let this parse finish");
+        assert!(!tree.root_node().has_error());
+    }
 
     fn diff_test_symbol(name: &str, byte_range: (u32, u32)) -> SymbolRecord {
         SymbolRecord {

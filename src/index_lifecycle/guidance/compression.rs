@@ -792,6 +792,7 @@ mod tests {
             excluded_knowledge_files: 0,
             withheld_policy_files: 0,
             withheld_size_files: 0,
+            unparsed_files: 0,
         };
         compact_text_search_result(&mut result, "disk");
         let lines: Vec<_> = result.files[0]
