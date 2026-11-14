@@ -152,7 +152,8 @@ impl ServeProjects {
             && self.serves_several()
             && matches!(tool.as_str(), "status" | "health" | "health_compact")
         {
-            return Ok(self.server_view_call(front, &tool, arguments));
+            let version = context.protocol_version();
+            return Ok(self.server_view_call(front, &tool, arguments, version.as_ref()));
         }
         let target = match self.select(project.as_deref()) {
             Ok(target) => target,
@@ -257,6 +258,7 @@ impl ServeProjects {
         front: &SymForgeServer,
         tool: &str,
         arguments: &mut Map<String, Value>,
+        version: Option<&rmcp::model::ProtocolVersion>,
     ) -> CallToolResponse {
         let mut checked = Some(std::mem::take(arguments));
         if let Err(refused) = front.refuse_invalid_arguments(tool, &mut checked) {
@@ -274,30 +276,54 @@ impl ServeProjects {
             ));
         }
         // No project evidence: this answer describes every repository, each row
-        // naming its own, so no single repository's evidence would be true.
-        let mut result = CallToolResult::success(vec![ContentBlock::text(self.server_view())]);
+        // naming its own, so no single repository's evidence would be true. Its
+        // structured form is those rows, so a revision that lists an
+        // `outputSchema` for this tool still gets the structured result it promises.
+        let (text, rows) = self.server_view();
+        let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+        if super::surface_probe::defines_structured_output(version)
+            && super::surface_probe::STRUCTURED_OUTPUT_TOOLS.contains(&tool)
+        {
+            result.structured_content = Some(rows);
+        }
         attach_status(&mut result, OutcomeClass::Found);
         CallToolResponse::Complete(result)
     }
 
-    fn server_view(&self) -> String {
+    /// The server view as text and as the `structuredContent` object, both from
+    /// one read of each repository so the two never disagree.
+    fn server_view(&self) -> (String, Value) {
         let mut lines = vec!["── served repositories ──".to_string()];
+        let mut rows = Vec::with_capacity(self.repos.len());
         for repo in &self.repos {
             let published = repo.server.index.data_plane().published_state();
             let root = repo
                 .server
                 .capture_repo_root()
-                .map(|root| root.display().to_string())
-                .unwrap_or_else(|| "(unbound)".to_string());
+                .map(|root| root.display().to_string());
             let index = format!("{:?}", published.status).to_lowercase();
             let watcher = format!("{:?}", repo.server.watcher_info.lock().state).to_lowercase();
             lines.push(format!(
-                "name={} root={root} index={index} files={} symbols={} watcher={watcher}",
-                repo.alias, published.file_count, published.symbol_count
+                "name={} root={} index={index} files={} symbols={} watcher={watcher}",
+                repo.alias,
+                root.as_deref().unwrap_or("(unbound)"),
+                published.file_count,
+                published.symbol_count
             ));
+            rows.push(serde_json::json!({
+                "name": repo.alias,
+                "root": root,
+                "index": index,
+                "files": published.file_count,
+                "symbols": published.symbol_count,
+                "watcher": watcher,
+            }));
         }
         lines.push("Pass project=ALIAS for the full report of one repository.".to_string());
-        lines.join("\n")
+        (
+            lines.join("\n"),
+            serde_json::json!({ "repositories": rows }),
+        )
     }
 
     /// `resources/list` on a multi-repository server: each repository-bound

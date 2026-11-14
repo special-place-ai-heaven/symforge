@@ -1413,4 +1413,122 @@ mod tests {
             chosen.port()
         );
     }
+
+    /// One `/mcp` request at `version`; 2026-07-28 also carries its required
+    /// per-request `_meta` and method headers.
+    async fn serve_rpc(
+        url: &str,
+        version: &str,
+        method: &str,
+        mut params: serde_json::Value,
+    ) -> serde_json::Value {
+        let modern = version == "2026-07-28";
+        if modern {
+            params["_meta"] = serde_json::json!({
+                "io.modelcontextprotocol/protocolVersion": version,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            });
+        }
+        let mut request = reqwest::Client::new()
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Authorization", "Bearer sf_serve_view_key")
+            .header("MCP-Protocol-Version", version);
+        if modern {
+            request = request.header("Mcp-Method", method);
+            if let Some(name) = params["name"].as_str() {
+                request = request.header("Mcp-Name", name.to_string());
+            }
+        }
+        let body = request
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+            }))
+            .send()
+            .await
+            .expect("request sent")
+            .json::<serde_json::Value>()
+            .await
+            .expect("JSON-RPC body");
+        assert!(body.get("error").is_none(), "{method} at {version}: {body}");
+        body["result"].clone()
+    }
+
+    /// A multi-repository serve lists an `outputSchema` for `status`/`health`
+    /// on 2025-06-18+, so the no-`project` server view must return a conforming
+    /// `structuredContent` there (spec MUST; SDK clients reject its absence),
+    /// with text unchanged and legacy revisions still text-only.
+    #[tokio::test]
+    async fn multi_repo_server_view_returns_structured_content_where_schema_listed() {
+        let loaded = |alias: &str| LoadedRepo {
+            alias: alias.to_string(),
+            index: LiveIndex::empty(),
+            repo_root: None,
+            state_placement: None,
+        };
+        let runtime = build_serve_runtime(
+            vec![loaded("a"), loaded("b")],
+            false,
+            None,
+            AuthConfig::new(Some("sf_serve_view_key".to_string())),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = super::super::apply_bearer_auth(
+            mcp_http::build_mcp_router(&runtime, addr),
+            AuthLayerState::new(runtime.auth().clone(), true),
+        );
+        let join = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}/mcp");
+
+        let mut texts = Vec::new();
+        for version in ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"] {
+            let structured = version >= "2025-06-18";
+            let listed = serve_rpc(&url, version, "tools/list", serde_json::json!({})).await;
+            for tool in ["status", "health"] {
+                let entry = listed["tools"]
+                    .as_array()
+                    .and_then(|tools| tools.iter().find(|t| t["name"] == tool))
+                    .unwrap_or_else(|| panic!("{tool} listed at {version}"));
+                assert_eq!(entry.get("outputSchema").is_some(), structured, "{version}");
+                let result = serve_rpc(
+                    &url,
+                    version,
+                    "tools/call",
+                    serde_json::json!({"name": tool, "arguments": {}}),
+                )
+                .await;
+                assert_ne!(result["isError"], true, "{tool} at {version}: {result}");
+                let rows = result.get("structuredContent");
+                if structured {
+                    let rows = rows.unwrap_or_else(|| panic!("{tool} at {version}: {result}"));
+                    let aliases: Vec<_> = rows["repositories"]
+                        .as_array()
+                        .expect("object with repositories rows")
+                        .iter()
+                        .map(|row| row["name"].clone())
+                        .collect();
+                    assert_eq!(aliases, ["a", "b"], "{tool} at {version}");
+                } else {
+                    assert!(rows.is_none(), "{tool} at {version}: {result}");
+                }
+                texts.push(result["content"][0]["text"].as_str().map(str::to_string));
+            }
+        }
+        assert!(
+            texts[0]
+                .as_deref()
+                .is_some_and(|t| t.contains("── served repositories ──"))
+        );
+        assert!(
+            texts.windows(2).all(|pair| pair[0] == pair[1]),
+            "text is byte-identical on every revision: {texts:?}"
+        );
+        join.abort();
+    }
 }
