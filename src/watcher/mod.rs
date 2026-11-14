@@ -782,8 +782,13 @@ pub struct WatcherTaskHandle {
     pub stop_token: Arc<AtomicBool>,
 }
 
+/// Test-only: the root whose next active watcher session exits once, as if
+/// its event channel had closed. Keyed by root because every watcher in the
+/// process polls this seam, including ones other tests leave running (the
+/// detached `start_operator_server` servers); a bare flag was consumed by
+/// whichever watcher polled first.
 #[cfg(test)]
-static FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE: AtomicBool = AtomicBool::new(false);
+static FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Test-only: runs once right after the fresh-instance sweep returns.
 #[cfg(test)]
@@ -1234,8 +1239,12 @@ pub async fn run_watcher_with_stop(
                         break 'watcher;
                     }
                     #[cfg(test)]
-                    if FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE.swap(false, Ordering::AcqRel) {
-                        break;
+                    {
+                        let mut forced = FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE.lock();
+                        if forced.as_deref() == Some(repo_root.as_path()) {
+                            *forced = None;
+                            break;
+                        }
                     }
 
                     if sweep_after_verify
@@ -1759,12 +1768,41 @@ mod tests {
 
     #[tokio::test]
     async fn active_watcher_restart_latches_unavailable_freshness() {
+        // A bystander watcher already polling the seam, as the detached
+        // operator servers of other tests are in a serial in-process run. The
+        // forced exit is armed for `project` only, so the bystander must not
+        // take it.
+        let bystander_root = TempDir::new().unwrap();
+        create_test_source(bystander_root.path(), "src/lib.rs", b"fn lib() {}\n");
+        let bystander_shared =
+            crate::live_index::store::LiveIndex::load(bystander_root.path()).unwrap();
+        let bystander_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let bystander_stop = Arc::new(AtomicBool::new(false));
+        let bystander = tokio::spawn(run_watcher_with_stop(
+            bystander_root.path().to_path_buf(),
+            bystander_shared.clone(),
+            Arc::clone(&bystander_info),
+            Arc::clone(&bystander_stop),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while bystander_info.lock().state != WatcherState::Active {
+            assert!(
+                Instant::now() < deadline,
+                "bystander watcher never went active"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
         let project = TempDir::new().unwrap();
         create_test_source(project.path(), "src/main.rs", b"fn main() {}\n");
         let shared = crate::live_index::store::LiveIndex::load(project.path()).unwrap();
         let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
         let stop_token = Arc::new(AtomicBool::new(false));
-        FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE.store(true, Ordering::Release);
+        *FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE.lock() = Some(project.path().to_path_buf());
+        // Several of the bystander's 50 ms polls pass while the switch is armed
+        // and its own watcher has not started, so a seam any watcher could take
+        // is taken here. This only sharpens that failure; it never gates a pass.
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         let watcher = tokio::spawn(run_watcher_with_stop(
             project.path().to_path_buf(),
@@ -1787,12 +1825,27 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
+        // Read before stopping: cancellation latches the bystander too.
+        let bystander_restarted = matches!(
+            bystander_shared.freshness_status().as_ref(),
+            crate::domain::FreshnessStatus::Degraded { reason_codes, .. }
+                if reason_codes.contains(&crate::domain::FreshnessReason::WatcherUnavailable)
+        );
         stop_token.store(true, Ordering::Release);
+        bystander_stop.store(true, Ordering::Release);
         tokio::time::timeout(Duration::from_secs(3), watcher)
             .await
             .expect("watcher must stop after the forced restart")
             .expect("watcher task must not panic");
+        tokio::time::timeout(Duration::from_secs(3), bystander)
+            .await
+            .expect("bystander watcher must stop")
+            .expect("bystander watcher task must not panic");
 
+        assert!(
+            !bystander_restarted,
+            "a forced exit armed for one root must not restart another root's watcher"
+        );
         assert!(
             latched,
             "an active watcher restart must latch the uncovered restart window"

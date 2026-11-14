@@ -1496,10 +1496,14 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // no-`project` `status`/`health` view a `structuredContent` built from the
 // same `published_state()` rows its text already reads; `server/serve.rs` adds
 // a test. No index_lifecycle edge, no bridge. 320 files.
+// Watcher forced-exit seam: `watcher/mod.rs` keys the test-only
+// `FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE` switch to one root so a watcher
+// another test left running cannot take it; its test gains a bystander
+// watcher. cfg(test) only; no index_lifecycle edge, no bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "0b3b42a54a55ee390a8ab57d25c341cd21f04245ee76fe7e3d411da741b759bd",
+    "68c7a32e85082c1ebe8f56efa9dfea084a68f7fd7c7b31afa60bb25b7555851a",
     320,
-    13151753,
+    13154563,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
