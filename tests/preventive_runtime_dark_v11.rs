@@ -1190,10 +1190,15 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Bounded structural parse: the embed text-search wire carries `unparsed_files` and
 // the shared search renderer names files whose parse was cancelled. Field copies and
 // a pure render helper. Same 91 files, no bridge.
+// Structural rewrite: `index_lifecycle/embed_batch.rs` adds inherent
+// `preview_structural_rewrite` / `apply_structural_rewrite` on the embedded
+// handle, calling outward into `edit_safety::structural_rewrite` and the
+// existing staged-batch kernel; `guidance/request_refusal.rs` lists the new
+// `rewrite` argument. Same 91 files, no bridge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "02226b2999ab85ff43e1039e08a696a8a470a949e59d37aab8303eb64766331b",
+    "794f7ec312d26741515dc254c6e75678c3f8e1be8b16f7737502ba97d2baf641",
     91,
-    2501633,
+    2508067,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1500,10 +1505,16 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // `FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE` switch to one root so a watcher
 // another test left running cannot take it; its test gains a bystander
 // watcher. cfg(test) only; no index_lifecycle edge, no bridge. 320 files.
+// Structural rewrite: new `edit_safety/structural_rewrite.rs` (no
+// index_lifecycle edge; the language filter is parsed by each lane) plans an
+// ast-grep rewrite that `protocol/edit_tools.rs` (roster file, one new
+// `guidance::filters` call) and the embed handle stage through the existing
+// batch pipeline; `parsing` gains the rewrite and an error-node count. No
+// trait, registration or re-export bridge into the dark directory. 321 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "68c7a32e85082c1ebe8f56efa9dfea084a68f7fd7c7b31afa60bb25b7555851a",
-    320,
-    13154563,
+    "bf3308dac64657d065a97c451b74785e9ff56742408e00d15b7d271ca8f10eec",
+    321,
+    13186047,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

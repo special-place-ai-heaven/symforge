@@ -5,5 +5,6 @@ pub(crate) mod preview;
 pub(crate) mod rename;
 pub(crate) mod secret_remediation;
 pub mod structural;
+pub mod structural_rewrite;
 pub mod tee;
 pub mod trust;

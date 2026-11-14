@@ -546,6 +546,17 @@ fn count_error_nodes(root: &Node) -> usize {
     count
 }
 
+/// ERROR and MISSING nodes in `source` parsed as `language`: the measure an
+/// edit compares before and after so it never leaves a file parsing worse.
+pub(crate) fn syntax_error_count(
+    source: &str,
+    language: &LanguageId,
+    is_tsx: bool,
+) -> Result<usize, String> {
+    let tree = parse_source_tree(source, language, is_tsx)?;
+    Ok(count_error_nodes(&tree.root_node()))
+}
+
 /// Parse `source` under `language` and return the symbol output alongside the
 /// ERROR/MISSING node count, so [`resolve_c_header_parse`] can pick the grammar
 /// that parses a `.h` header with fewer errors. Returns `None` on a parse

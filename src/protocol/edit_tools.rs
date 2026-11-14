@@ -2013,7 +2013,7 @@ impl SymForgeServer {
     /// Set dry_run=true for a read-only preview that makes no file changes.
     #[tool(
         name = "batch_edit",
-        description = "Apply many symbol-addressed edits atomically across files (all resolve or none write); dry_run=true previews. Not a single-symbol edit (replace_symbol_body / insert_symbol).",
+        description = "Apply symbol edits or an ast-grep rewrite across files atomically (all or none write); dry_run=true previews. Not a single-symbol edit (replace_symbol_body / insert_symbol).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2027,7 +2027,12 @@ impl SymForgeServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let dry_run = params.0.dry_run.unwrap_or(false);
-        let operation_count = params.0.edits.len();
+        // Structural mode is one operation whatever number of sites it rewrites.
+        let operation_count = if params.0.rewrite.is_some() {
+            1
+        } else {
+            params.0.edits.len()
+        };
         let output = self.batch_edit(params).await;
         let status = classify_edit_output(&output, dry_run);
         let operation_statuses = match status {
@@ -2063,6 +2068,18 @@ impl SymForgeServer {
             return refusal;
         }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
+        match (&params.0.rewrite, params.0.edits.is_empty()) {
+            (Some(rewrite), true) => return self.batch_structural_rewrite(&params.0, rewrite),
+            (Some(_), false) => {
+                return "Error: pass `edits` or `rewrite`, not both. No files were modified."
+                    .to_string();
+            }
+            (None, true) => {
+                return "Error: batch_edit needs `edits` (or a structural `rewrite`). No files were modified."
+                    .to_string();
+            }
+            (None, false) => {}
+        }
         let batch_paths: Vec<String> = params.0.edits.iter().map(|e| e.path.clone()).collect();
         {
             let guard = self.index.data_plane().read();
@@ -2149,6 +2166,101 @@ impl SymForgeServer {
                             .iter()
                             .map(|edit| edit.working_directory.as_deref()),
                     ),
+                );
+                result
+            }
+            Err(e) => {
+                fail_mutation_replay(&idempotency, &e);
+                e
+            }
+        }
+    }
+
+    /// `batch_edit` structural mode. The plan is computed once from the index;
+    /// its files then take the symbol-addressed batch's path: read gate,
+    /// freshen and confinement, project-config trust, replay guard, staging
+    /// through the edit hooks, and the shared commit kernel.
+    fn batch_structural_rewrite(
+        &self,
+        input: &edit::BatchEditInput,
+        rewrite: &crate::edit_safety::structural_rewrite::StructuralRewrite,
+    ) -> String {
+        let plan = {
+            let guard = self.index.data_plane().read();
+            loading_guard!(guard);
+            let language = match crate::index_lifecycle::guidance::filters::parse_language_filter(
+                rewrite.language.as_deref(),
+            ) {
+                Ok(language) => language,
+                Err(error) => return crate::edit_safety::structural_rewrite::refusal(error),
+            };
+            let plan = match crate::edit_safety::structural_rewrite::plan_structural_rewrite(
+                &guard, rewrite, language,
+            ) {
+                Ok(plan) => plan,
+                Err(refusal) => return refusal,
+            };
+            if let Some(notice) = plan
+                .files
+                .iter()
+                .find_map(|file| crate::protocol::read_gate::unverified_notice(&guard, &file.path))
+            {
+                return notice;
+            }
+            plan
+        };
+        let paths: Vec<String> = plan.files.iter().map(|file| file.path.clone()).collect();
+        let (repo_root, source_authority) = match prepare_batch_paths_for_edit(self, &paths) {
+            Ok(prepared) => prepared,
+            Err(e) => return e,
+        };
+        let project_state = self.capture_project_state_dir();
+        let project_config_trust_suffix = match project_config_trust_response_suffix(&repo_root) {
+            Ok(suffix) => suffix,
+            Err(message) => return message,
+        };
+        let dry_run = input.dry_run.unwrap_or(false);
+        let idempotency = match begin_mutation_replay(
+            self,
+            "batch_edit",
+            input,
+            input.idempotency_key.as_deref(),
+            dry_run,
+        ) {
+            Ok(idempotency) => idempotency,
+            Err(output) => return output,
+        };
+        match edit::execute_structural_rewrite(
+            self.index.data_plane(),
+            &repo_root,
+            project_state.as_ref(),
+            &plan,
+            dry_run,
+            input.working_directory.as_deref().map(std::path::Path::new),
+        ) {
+            Ok((summaries, written_paths)) => {
+                let write_semantics = if dry_run {
+                    edit_format::EditWriteSemantics::DryRunNoWrites
+                } else {
+                    edit_format::EditWriteSemantics::TransactionalWriteRollbackAndReindex
+                };
+                let impact = paths
+                    .first()
+                    .and_then(|primary| self.impact_footer_text(primary));
+                let mut result = edit_body::render_batch_edit_answer(&edit_body::BatchEditAnswer {
+                    match_type: edit_format::MatchType::Exact,
+                    authority: source_authority,
+                    semantics: write_semantics,
+                    evidence: &plan.evidence(),
+                    body: &edit_format::format_batch_summary(&summaries, plan.files.len()),
+                    trust: project_config_trust_suffix.as_deref(),
+                    impact: impact.as_deref(),
+                });
+                complete_mutation_replay(
+                    &idempotency,
+                    &mut result,
+                    &written_paths,
+                    std::iter::once(input.working_directory.as_deref()),
                 );
                 result
             }

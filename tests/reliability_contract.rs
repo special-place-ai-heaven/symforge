@@ -341,6 +341,31 @@ fn a_nested_unknown_key_is_refused_and_the_clean_call_succeeds() {
 }
 
 #[test]
+fn an_unknown_key_inside_a_structural_rewrite_is_refused_and_the_clean_call_succeeds() {
+    let (_dir, mut client) = ready_server();
+    let rewrite = json!({
+        "rewrite": { "pattern": "target_fn($$$A)", "template": "target_fn($$$A)" },
+        "dry_run": true
+    });
+    let control = client.call("batch_edit", rewrite.clone());
+    assert_not_refused(&control, "batch_edit rewrite control");
+    assert!(
+        !text_of(&control).contains("does not accept"),
+        "{}",
+        text_of(&control)
+    );
+    let mut bad = rewrite;
+    bad["rewrite"]["zz_unknown"] = json!(1);
+    let refused = client.call("batch_edit", bad);
+    assert_unknown_argument_refusal(&refused, "batch_edit", "zz_unknown", "edits");
+    assert!(
+        text_of(&refused).contains("rewrite"),
+        "nested refusal must locate the key: {}",
+        text_of(&refused)
+    );
+}
+
+#[test]
 fn serde_aliases_are_accepted() {
     let (_dir, mut client) = ready_server();
     // `symbol` is an alias of `name`, `body` of `new_body` (src/protocol/edit.rs).

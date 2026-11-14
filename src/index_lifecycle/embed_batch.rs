@@ -19,11 +19,12 @@ use crate::edit_safety::structural::{
     insert_after_position, insert_before_position, prepare_replace, replacement_splice_range,
     select_edit_within_body, splice_footprints_overlap,
 };
+use crate::edit_safety::structural_rewrite::{RewritePlan, plan_structural_rewrite, refusal};
 use crate::embed::parity::edit::{
     BatchEditAction, BatchEditApplied, BatchEditPreview, BatchEditRequest, BatchFilePreview,
     BatchInsertRequest, BatchRenamePlan, BatchRenamePreview, BatchRenameRequest,
     EditApplyAuthority, EditBody, EditError, EditErrorKind, EditTarget, InsertPosition,
-    InsertRequest, RoutedBatchApplied, RoutedBatchPart,
+    InsertRequest, RoutedBatchApplied, RoutedBatchPart, StructuralRewriteRequest,
 };
 use crate::embed::parity::replay::{
     OutcomeKind, ReplayKey, ReplayOutcome, ReplayState, ReplayStore, RequestFingerprint,
@@ -1640,4 +1641,170 @@ fn batch_insert_as_edits(request: &BatchInsertRequest) -> Result<BatchEditReques
             })
             .collect(),
     })
+}
+
+/// MCP's `batch_edit` structural-mode plan over this snapshot: the same
+/// planner, so the same refusal text, carried as MCP prints it.
+fn plan_rewrite(
+    snapshot: &EmbeddedQuerySnapshot,
+    request: &StructuralRewriteRequest,
+) -> Result<RewritePlan, EditErrorKind> {
+    let language = super::guidance::filters::parse_language_filter(request.language.as_deref())
+        .map_err(|error| EditErrorKind::StructuralRewriteRefused {
+            message: refusal(error),
+        })?;
+    plan_structural_rewrite(&snapshot.generation.live, request, language)
+        .map_err(|message| EditErrorKind::StructuralRewriteRefused { message })
+}
+
+/// Stage every planned file against the bytes it was planned from, admitted
+/// before and after as a rename's files are.
+fn stage_rewrite(
+    snapshot: &EmbeddedQuerySnapshot,
+    plan: &RewritePlan,
+) -> Result<Vec<StagedImage>, EditErrorKind> {
+    let mut staged = Vec::with_capacity(plan.files.len());
+    for planned in &plan.files {
+        let file = snapshot
+            .generation
+            .live
+            .get_file(&planned.path)
+            .ok_or(EditErrorKind::FileNotAdmitted)?;
+        if file.content != planned.original {
+            return Err(EditErrorKind::StaleContent);
+        }
+        if !admitted(snapshot, file) {
+            return Err(EditErrorKind::UnsafeContent);
+        }
+        let absolute = crate::discovery::resolve_repo_path(&snapshot.root, &planned.path)
+            .map_err(|_| EditErrorKind::InvalidPath)?
+            .ok_or(EditErrorKind::FileNotAdmitted)?;
+        let targets =
+            crate::domain::IndexTargets::for_path(&file.relative_path, Some(&file.language));
+        if !matches!(
+            classify_stable_content_for_root(
+                &snapshot.root,
+                &file.relative_path,
+                targets,
+                &planned.replacement,
+            ),
+            StableContentAdmission::Admitted
+        ) {
+            return Err(EditErrorKind::UnsafeContent);
+        }
+        staged.push(StagedImage {
+            relative: PathBuf::from(&planned.path),
+            absolute,
+            original: Some(file.content.clone()),
+            replacement: planned.replacement.clone(),
+            owner_only: false,
+        });
+    }
+    Ok(staged)
+}
+
+/// MCP's structural-mode answer before its write.
+fn pending_rewrite(plan: &RewritePlan, dry_run: bool) -> PendingAnswer {
+    let files = plan
+        .files
+        .iter()
+        .zip(plan.summaries(dry_run))
+        .map(|(file, summary)| BatchFileParts {
+            path: file.path.clone(),
+            summaries: vec![summary],
+            tee: None,
+            reroute: String::new(),
+        })
+        .collect::<Vec<_>>();
+    PendingAnswer {
+        match_type: MatchType::Exact,
+        evidence: plan.evidence(),
+        body: BatchBody::Summaries {
+            file_count: files.len(),
+            files,
+        },
+        primary: plan
+            .files
+            .first()
+            .map(|file| file.path.clone())
+            .unwrap_or_default(),
+    }
+}
+
+impl EmbeddedSourceHandle {
+    /// MCP `batch_edit` structural mode, dry run: the exact postimages a
+    /// real run would write.
+    pub fn preview_structural_rewrite(
+        &self,
+        request: &StructuralRewriteRequest,
+    ) -> Result<BatchEditPreview, EditError> {
+        let snapshot = self.capture_query_snapshot(b"preview-structural-rewrite")?;
+        answer::enforce_trust(&snapshot)?;
+        let plan = plan_rewrite(&snapshot, request).map_err(EditError::Edit)?;
+        let staged = stage_rewrite(&snapshot, &plan).map_err(EditError::Edit)?;
+        let body = preview_answer(&snapshot, pending_rewrite(&plan, true));
+        let diff = render_safe_batch(staged.iter().map(|image| {
+            (
+                image.relative.to_str().expect("indexed UTF-8 path"),
+                image.original.as_deref().expect("indexed source"),
+                image.replacement.as_slice(),
+            )
+        }))
+        .map_err(|_| EditError::Edit(EditErrorKind::UnsafeContent))?;
+        Ok(BatchEditPreview {
+            files: staged
+                .iter()
+                .map(|image| BatchFilePreview {
+                    path: image.relative.to_string_lossy().to_string(),
+                    old_file_hash: digest_hex(image.original.as_deref().expect("indexed source")),
+                    proposed_file_hash: digest_hex(&image.replacement),
+                })
+                .collect(),
+            action_count: plan.sites(),
+            publication_identity: snapshot.publication_identity,
+            source_version: snapshot.source_version,
+            rendered: diff.rendered,
+            truncated: diff.truncated,
+            redacted: diff.redacted,
+            body,
+        })
+    }
+
+    /// MCP `batch_edit` structural mode, applied through the staged batch
+    /// kernel under one replay key. Like MCP, the rewrite is planned before
+    /// the replay record is consulted.
+    pub fn apply_structural_rewrite(
+        &self,
+        request: &StructuralRewriteRequest,
+        authority: &EditApplyAuthority,
+        operation_key: &str,
+    ) -> Result<BatchEditApplied, EditError> {
+        let snapshot = self.capture_query_snapshot(b"apply-structural-rewrite")?;
+        answer::enforce_trust(&snapshot)?;
+        let plan = plan_rewrite(&snapshot, request).map_err(EditError::Edit)?;
+        let replay_paths = plan.files.iter().map(|file| file.path.clone()).collect();
+        let fingerprint = RequestFingerprint::for_json(
+            "embed_structural_rewrite_v1",
+            &serde_json::json!({"scope": authority.scope, "rewrite": request}),
+        )
+        .map_err(|_| EditError::Edit(EditErrorKind::ReplayUnavailable))?;
+        self.apply_staged_batch(
+            snapshot,
+            authority,
+            operation_key,
+            fingerprint,
+            replay_paths,
+            StagedAnswer {
+                tool: "batch_edit",
+                tee: true,
+                stage: Box::new(move |snapshot| {
+                    let plan = plan_rewrite(snapshot, request)?;
+                    Ok((
+                        stage_rewrite(snapshot, &plan)?,
+                        pending_rewrite(&plan, false),
+                    ))
+                }),
+            },
+        )
+    }
 }

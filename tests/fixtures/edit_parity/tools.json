@@ -221,6 +221,40 @@
         "dry_run": true
       },
       "expected": "Edit safety: text-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/widget.rs:4`\n[DRY RUN] Would edit within `Widget::size` in src/widget.rs (1 replacement(s))"
+    },
+    {
+      "name": "structural rewrite preview",
+      "tool": "batch_edit",
+      "input": {
+        "rewrite": {
+          "pattern": "target()",
+          "template": "target() * 3"
+        },
+        "dry_run": true
+      },
+      "expected": "Edit safety: structural-edit-safe\nMatch type: exact\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: 3 structural match(es) across 2 file(s)\n2 edit(s) across 2 file(s):\n  [DRY RUN] Would src/lib.rs — rewrote 2 structural match(es) (120 → 128 bytes)\n  [DRY RUN] Would src/other.rs — rewrote 1 structural match(es) (58 → 62 bytes)\n\n[impact: 1 dependents]"
+    },
+    {
+      "name": "structural rewrite apply",
+      "tool": "batch_edit",
+      "input": {
+        "rewrite": {
+          "pattern": "target()",
+          "template": "target() * 3"
+        }
+      },
+      "expected": "Edit safety: structural-edit-safe\nMatch type: exact\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: transactional write + rollback + reindex\nEvidence: 3 structural match(es) across 2 file(s)\n2 edit(s) across 2 file(s):\n  src/lib.rs — rewrote 2 structural match(es) (120 → 128 bytes)\n  Tee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n  src/other.rs — rewrote 1 structural match(es) (58 → 62 bytes)\n  Tee snapshot: `<tee>` preserves `src/other.rs` before this write.\n\n[impact: 1 dependents]"
+    },
+    {
+      "name": "structural rewrite refused",
+      "tool": "batch_edit",
+      "input": {
+        "rewrite": {
+          "pattern": "never_called($A)",
+          "template": "x($A)"
+        }
+      },
+      "expected": "Error: structural rewrite refused: the pattern matched nothing in 3 file(s) in scope. No files were modified."
     }
   ]
 }

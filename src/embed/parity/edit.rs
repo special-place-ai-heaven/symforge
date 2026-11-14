@@ -10,6 +10,9 @@ use crate::embed::lifecycle::public_api::EmbedSourceRefusal;
 mod wire;
 pub use wire::*;
 
+/// `batch_edit` structural mode: an ast-grep `pattern` rewritten as `template`.
+pub use crate::edit_safety::structural_rewrite::StructuralRewrite as StructuralRewriteRequest;
+
 /// MCP's answer text for one edit: the text the matching MCP edit tool
 /// (`replace_symbol_body`, `insert_symbol`, `delete_symbol`,
 /// `edit_within_symbol`, `batch_edit`, `batch_insert`, `batch_rename`) returns
@@ -609,6 +612,12 @@ pub enum EditErrorKind {
     /// Enforce mode refused the edit: the project's config is untrusted.
     /// Carries MCP's exact `ProjectConfigTrustEnforced` refusal text.
     ProjectConfigTrustEnforced {
+        message: String,
+    },
+    /// `batch_edit` structural mode refused the rewrite (no match, an
+    /// overlap, a broken template, a syntax regression). Carries MCP's exact
+    /// refusal text.
+    StructuralRewriteRefused {
         message: String,
     },
 }

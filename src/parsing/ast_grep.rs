@@ -238,6 +238,81 @@ fn structural_search_within(
         .collect())
 }
 
+/// Rewrite every match of `compiled` in `source` with ast-grep's own template
+/// engine (`TemplateFix`): metavariable substitution and re-indentation are
+/// ast-grep's, not ours. Returns the new source and the number of rewritten
+/// sites (`0` leaves `source` unchanged). Refuses, naming the lines, when two
+/// matches overlap (a nested match); a template naming a metavariable the
+/// pattern does not capture is refused before any parse.
+pub fn structural_rewrite_with_compiled(
+    source: &str,
+    compiled: &CompiledStructuralPattern,
+    template: &str,
+) -> Result<(String, usize), String> {
+    use ast_grep_core::replacer::{Replacer, TemplateFix};
+
+    let fix = match TemplateFix::try_new(template, &compiled.lang) {
+        Ok(fix) => fix,
+        Err(never) => match never {},
+    };
+    let defined = compiled.pattern.defined_vars();
+    let mut unknown: Vec<&str> = fix
+        .used_vars()
+        .into_iter()
+        .filter(|name| !defined.contains(name))
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        let named = unknown
+            .iter()
+            .map(|name| format!("${name}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "rewrite template names {named}, which the pattern does not capture"
+        ));
+    }
+
+    let mut parser = Parser::new();
+    parser
+        .set_language(&compiled.lang.get_ts_language())
+        .map_err(|e| format!("failed to set tree-sitter language: {e}"))?;
+    let tree = super::parse_within(&mut parser, source, super::PARSE_DEADLINE)?;
+    let root = AstGrep::doc(StrDoc {
+        src: source.to_string(),
+        lang: compiled.lang.clone(),
+        tree,
+    });
+    let mut edits: Vec<(std::ops::Range<usize>, Vec<u8>, usize)> = root
+        .root()
+        .find_all(&compiled.pattern)
+        .map(|node_match| {
+            (
+                fix.get_replaced_range(&node_match, &compiled.pattern),
+                fix.generate_replacement(&node_match),
+                node_match.start_pos().line() + 1,
+            )
+        })
+        .collect();
+    edits.sort_by_key(|(range, _, _)| (range.start, range.end));
+    if let Some(pair) = edits
+        .windows(2)
+        .find(|pair| pair[1].0.start < pair[0].0.end)
+    {
+        return Err(format!(
+            "matches at lines {} and {} overlap; narrow the pattern so no match contains another",
+            pair[0].2, pair[1].2
+        ));
+    }
+    let mut rewritten = source.as_bytes().to_vec();
+    for (range, replacement, _) in edits.iter().rev() {
+        rewritten.splice(range.clone(), replacement.iter().copied());
+    }
+    let rewritten =
+        String::from_utf8(rewritten).map_err(|_| "rewrite produced invalid UTF-8".to_string())?;
+    Ok((rewritten, edits.len()))
+}
+
 /// Search `source` for occurrences of an ast-grep `pattern` in the given language.
 ///
 /// Returns an error string if the pattern cannot be compiled (e.g., syntax error).
@@ -415,5 +490,75 @@ export function App() {
             "TSX grammar must match the JSX component function"
         );
         assert!(matches[0].text.contains("App"));
+    }
+
+    fn rewrite(
+        source: &str,
+        pattern: &str,
+        template: &str,
+        lang: LanguageId,
+    ) -> Result<(String, usize), String> {
+        let compiled = compile_structural_pattern(pattern, &lang, false)?;
+        structural_rewrite_with_compiled(source, &compiled, template)
+    }
+
+    #[test]
+    fn rewrite_substitutes_metavariables_in_rust_python_and_typescript() {
+        let rust = rewrite(
+            "fn f() { old(1); old(a, b); }\n",
+            "old($$$ARGS)",
+            "new($$$ARGS)",
+            LanguageId::Rust,
+        )
+        .expect("rust rewrite");
+        assert_eq!(rust, ("fn f() { new(1); new(a, b); }\n".to_string(), 2));
+
+        let python = rewrite(
+            "x = old(1)\ny = old(2)\n",
+            "old($A)",
+            "new($A, 0)",
+            LanguageId::Python,
+        )
+        .expect("python rewrite");
+        assert_eq!(python, ("x = new(1, 0)\ny = new(2, 0)\n".to_string(), 2));
+
+        let ts = rewrite(
+            "const a = old(1);\n",
+            "old($A)",
+            "renamed($A)",
+            LanguageId::TypeScript,
+        )
+        .expect("typescript rewrite");
+        assert_eq!(ts, ("const a = renamed(1);\n".to_string(), 1));
+    }
+
+    #[test]
+    fn rewrite_without_a_match_leaves_the_source() {
+        let source = "fn f() {}\n";
+        assert_eq!(
+            rewrite(source, "old($A)", "new($A)", LanguageId::Rust).unwrap(),
+            (source.to_string(), 0)
+        );
+    }
+
+    #[test]
+    fn rewrite_refuses_a_template_variable_the_pattern_does_not_capture() {
+        let err = rewrite("old(1);", "old($A)", "new($B)", LanguageId::Rust).unwrap_err();
+        assert!(
+            err.contains("$B") && err.contains("does not capture"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rewrite_refuses_overlapping_matches() {
+        let err = rewrite(
+            "fn f() { old(old(1)); }\n",
+            "old($A)",
+            "new($A)",
+            LanguageId::Rust,
+        )
+        .unwrap_err();
+        assert!(err.contains("overlap"), "{err}");
     }
 }
