@@ -571,6 +571,45 @@ fn indexing_thread_pool() -> &'static rayon::ThreadPool {
     })
 }
 
+thread_local! {
+    static SERIAL_ORACLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: run `work` with every [`ordered_parallel_map`] on this thread
+/// (and the paths that gate a fast lane on [`serial_oracle_active`]) taking
+/// the original serial route, so a test can compare both over one corpus.
+#[cfg(test)]
+pub(crate) fn with_serial_oracle<R>(work: impl FnOnce() -> R) -> R {
+    SERIAL_ORACLE.with(|flag| flag.set(true));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+    SERIAL_ORACLE.with(|flag| flag.set(false));
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// Whether the calling thread is inside [`with_serial_oracle`]; always false
+/// outside tests.
+pub(crate) fn serial_oracle_active() -> bool {
+    SERIAL_ORACLE.with(std::cell::Cell::get)
+}
+
+/// Map `items` on the indexing pool, returning results in input order. The
+/// pool is the bounded one the load already owns, so no thread is created; a
+/// caller already on the pool runs inline. Callers must be off the async
+/// runtime's workers (the tool handlers run inside `off_async_worker`).
+pub(crate) fn ordered_parallel_map<T, R>(
+    items: &[T],
+    work: impl Fn(&T) -> R + Sync + Send,
+) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+{
+    if serial_oracle_active() || items.len() < 2 {
+        return items.iter().map(work).collect();
+    }
+    indexing_thread_pool().install(|| items.par_iter().map(work).collect())
+}
+
 /// Env override for the peak concurrent in-memory read budget enforced during
 /// the admission gate. Value is parsed as a byte count.
 const MAX_INFLIGHT_BYTES_ENV: &str = "SYMFORGE_MAX_INFLIGHT_BYTES";
