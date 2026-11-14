@@ -57,17 +57,18 @@ fn git(root: &Path, args: &[&str]) {
     assert!(status.status.success(), "git {args:?} failed");
 }
 
-fn fresh_bridge(generation: &PublishedGeneration) -> KnowledgeBridge {
+fn fresh_bridge(generation: &PublishedGeneration, content_generation: u64) -> KnowledgeBridge {
     build_knowledge_bridge(
         &generation.live,
         generation.source.as_deref().expect("bound source"),
-        generation.content_generation,
+        content_generation,
         &BridgeLimits::default(),
     )
 }
 
 fn fresh_authority(
     generation: &PublishedGeneration,
+    content_generation: u64,
     bridge: &KnowledgeBridge,
 ) -> KnowledgeAuthorityView {
     build_knowledge_authority(
@@ -77,7 +78,7 @@ fn fresh_authority(
             .source_version
             .as_deref()
             .expect("source version"),
-        generation.content_generation,
+        content_generation,
         bridge,
         &AuthorityTemporalIndex::from_published(generation),
         generation
@@ -93,12 +94,29 @@ fn fresh_authority(
 /// Whether the generation's bridge and authority equal a from-scratch build
 /// over its own index at its own content generation.
 fn matches_fresh(generation: &PublishedGeneration) -> (bool, bool) {
-    let bridge = fresh_bridge(generation);
-    let authority = fresh_authority(generation, &bridge);
+    let bridge = fresh_bridge(generation, generation.content_generation);
+    let authority = fresh_authority(generation, generation.content_generation, &bridge);
     (
         *generation.bridge == bridge,
         *generation.authority == authority,
     )
+}
+
+/// Whether a carried authority would have passed the equivalence check on the
+/// publication from `before` to `after`: a build over all of `before`'s inputs
+/// with only the content generation moved to `after`'s, which is what
+/// `restamped_authority` publishes when the carry is taken, compared with a
+/// fresh build over `after`. It stands in for the carry only because
+/// `before` already equals a fresh build over itself (every step asserts
+/// that). Calls `build_knowledge_authority`, so it moves the counter: call it
+/// only after a step's own counter reads.
+fn carried_authority_would_match(
+    before: &PublishedGeneration,
+    after: &PublishedGeneration,
+) -> bool {
+    let stamp = after.content_generation;
+    let carried = fresh_authority(before, stamp, &fresh_bridge(before, stamp));
+    carried == fresh_authority(after, stamp, &fresh_bridge(after, stamp))
 }
 
 fn assert_matches_fresh(step: &str, generation: &PublishedGeneration) {
@@ -194,16 +212,17 @@ impl Harness<'_> {
             full_authority_builds(),
         );
         publish(self);
-        let bridge = match (
-            full_bridge_builds() != bridges,
-            partial_bridge_updates() != partials,
-        ) {
-            (false, false) => Bridge::Carry,
-            (false, true) => Bridge::Partial,
-            (true, false) => Bridge::Full,
-            (true, true) => panic!("{name}: one publication both updated and rebuilt"),
+        let counts = (
+            full_bridge_builds() - bridges,
+            partial_bridge_updates() - partials,
+            full_authority_builds() - authorities,
+        );
+        let (bridge, rebuilt_authority) = match counts {
+            (0, 0, a @ (0 | 1)) => (Bridge::Carry, a == 1),
+            (0, 1, a @ (0 | 1)) => (Bridge::Partial, a == 1),
+            (1, 0, a @ (0 | 1)) => (Bridge::Full, a == 1),
+            _ => panic!("{name}: (full bridge, partial, full authority) builds {counts:?}"),
         };
-        let rebuilt_authority = full_authority_builds() != authorities;
         let after = self.shared.published_generation();
         assert!(
             after.publication_generation > before.publication_generation,
@@ -216,6 +235,20 @@ impl Harness<'_> {
         );
         assert_matches_fresh(name, &after);
         after
+    }
+
+    /// The generation the last step published from.
+    fn last_pinned(&self) -> &PublishedGeneration {
+        &self.pinned.last().expect("a step ran").generation
+    }
+
+    /// A step that rebuilt authority must also have needed to: carrying the
+    /// previous one would fail the equivalence check.
+    fn assert_carry_would_fail(&self, name: &str, after: &PublishedGeneration) {
+        assert!(
+            !carried_authority_would_match(self.last_pinned(), after),
+            "{name}: a carried authority must fail the equivalence check"
+        );
     }
 
     /// Every generation pinned along the way still holds the same bridge
@@ -319,6 +352,10 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
         "clean-to-dirty: authority must rebuild"
     );
     assert_matches_fresh("clean-to-dirty", &after);
+    assert!(
+        !carried_authority_would_match(&before, &after),
+        "clean-to-dirty: a carried authority must fail the equivalence check"
+    );
 
     // A code file under an ownership selector that nothing links, on a
     // truncated bridge: carried, at a new content generation.
@@ -340,6 +377,10 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
         after.bridge.coverage,
         DerivedCoverage::Truncated { .. }
     ));
+    assert!(
+        carried_authority_would_match(h.last_pinned(), &after),
+        "unrelated edit: the counterfactual must be able to come out equal"
+    );
 
     h.step("hash-skip", Bridge::Carry, false, |h| {
         std::thread::sleep(Duration::from_millis(1100));
@@ -499,6 +540,9 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
                 "src/dup_2.rs",
                 "// moved\npub fn shared_name() {}\n",
             );
+            // `update_file` directly, skipping `resolve_repo_path`, admission
+            // and the mtime: this shows one publication carrying two changed
+            // files is handled, not that any production path batches them.
             let mut index = h.shared.write();
             for rel in ["src/alpha.rs", "src/dup_2.rs"] {
                 let bytes = std::fs::read(h.root.join(rel)).expect("read");
@@ -530,11 +574,12 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
 
     // A policy file may name any file, so with one present an unrelated code
     // edit still carries the bridge but rebuilds authority.
-    h.step("policy file added", Bridge::Full, true, |h| {
+    let after = h.step("policy file added", Bridge::Full, true, |h| {
         write(h.root, ".symforge-knowledge.toml", "version = 1\n");
         h.reindex(".symforge-knowledge.toml");
     });
-    h.step(
+    h.assert_carry_would_fail("policy file added", &after);
+    let after = h.step(
         "unrelated edit with a policy file",
         Bridge::Carry,
         true,
@@ -543,7 +588,13 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
             h.reindex("src/extra.rs");
         },
     );
-    h.step("policy file edit", Bridge::Full, true, |h| {
+    // This policy names no file, so here a carry would have been right: the
+    // rebuild is the price of not reading the policy before deciding.
+    assert!(
+        carried_authority_would_match(h.last_pinned(), &after),
+        "unrelated edit with a policy file: a policy naming no file leaves authority unchanged"
+    );
+    let after = h.step("policy file edit", Bridge::Full, true, |h| {
         write(
             h.root,
             ".symforge-knowledge.toml",
@@ -551,10 +602,12 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
         );
         h.reindex(".symforge-knowledge.toml");
     });
-    h.step("policy file removed", Bridge::Full, true, |h| {
+    h.assert_carry_would_fail("policy file edit", &after);
+    let after = h.step("policy file removed", Bridge::Full, true, |h| {
         std::fs::remove_file(h.root.join(".symforge-knowledge.toml")).expect("delete");
         assert!(remove_file(&h.shared, ".symforge-knowledge.toml"));
     });
+    h.assert_carry_would_fail("policy file removed", &after);
 
     // A code file becomes knowledge: notes.rs is renamed to notes.md.
     h.step("code to knowledge (remove .rs)", Bridge::Full, true, |h| {
@@ -614,7 +667,11 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
     // skipped, bringing back a name the guide refers to only refreshes
     // alpha.rs's file anchor and leaves `alpha_entry` unresolved, which the
     // equivalence check must reject.
-    let (bridges, partials) = (full_bridge_builds(), partial_bridge_updates());
+    let (bridges, partials, authorities) = (
+        full_bridge_builds(),
+        partial_bridge_updates(),
+        full_authority_builds(),
+    );
     force_partial_bridge_update_for_test(true);
     write(
         root,
@@ -623,6 +680,12 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
     );
     h.reindex("src/alpha.rs");
     force_partial_bridge_update_for_test(false);
+    // Read before `matches_fresh`, which builds authority itself.
+    assert_eq!(
+        full_authority_builds(),
+        authorities,
+        "the forced update is code-only, so authority must be carried"
+    );
     assert_eq!(
         full_bridge_builds(),
         bridges,
@@ -633,15 +696,19 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
         partials,
         "the forced update must take the partial path"
     );
-    let (bridge_ok, _) = matches_fresh(&h.shared.published_generation());
+    let (bridge_ok, authority_ok) = matches_fresh(&h.shared.published_generation());
     assert!(
         !bridge_ok,
         "a partial update that skips the count check must fail the equivalence check"
     );
+    assert!(
+        !authority_ok,
+        "authority carried over the unresolved link must fail the equivalence check"
+    );
 
     // Negative control: forcing the carry over a knowledge edit must leave a
     // bridge the equivalence check rejects.
-    let (bridges, _) = (full_bridge_builds(), full_authority_builds());
+    let (bridges, authorities) = (full_bridge_builds(), full_authority_builds());
     force_bridge_carry_for_test(true);
     write(
         root,
@@ -650,14 +717,25 @@ fn publications_carry_knowledge_only_when_a_fresh_build_would_equal_it() {
     );
     h.reindex("docs/guide.md");
     force_bridge_carry_for_test(false);
+    // A knowledge edit is not code-only, so authority rebuilds, over the
+    // stale bridge.
+    assert_eq!(
+        full_authority_builds() - authorities,
+        1,
+        "a knowledge edit must rebuild authority"
+    );
     assert_eq!(
         full_bridge_builds(),
         bridges,
         "the forced carry must not rebuild"
     );
-    let (bridge_ok, _) = matches_fresh(&h.shared.published_generation());
+    let (bridge_ok, authority_ok) = matches_fresh(&h.shared.published_generation());
     assert!(
         !bridge_ok,
         "a stale carried bridge must fail the equivalence check"
+    );
+    assert!(
+        !authority_ok,
+        "authority built over a stale bridge must fail the equivalence check"
     );
 }

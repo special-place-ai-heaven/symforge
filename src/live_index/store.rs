@@ -5600,9 +5600,10 @@ impl SharedIndexHandle {
         //
         // A content publish that only edits code files, each defining every
         // referenced name as often as before, carries the previous bridge
-        // with its anchors restamped to the new content generation; an edit
-        // to a file a document points at also recomputes the anchors into
-        // that file (the partial update). `carry_knowledge_bridge` proves the
+        // with its anchors restamped to the new content generation. A changed
+        // code file holding any bridge anchor, as a link's exact resolution or
+        // as a kept sample of an ambiguous selector, also has those anchors
+        // recomputed (the partial update). `carry_knowledge_bridge` proves the
         // result equals a full build, which costs ~1.2 GB of allocation and
         // ~1.8 s on this repository (issue #876).
         // One comparison against the replaced generation serves both carries,

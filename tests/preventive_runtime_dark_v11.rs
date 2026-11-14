@@ -1481,9 +1481,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // A comment in `live_index/store.rs` names the partial update. Comment only, no
 // bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "3e1be650c20ea56db9a0f5a48efea422826ab3de4968092d5f5ffe585cdf1419",
+    "9adcd38a1f62d389bd7058924942b912b343339c84eb454d815af7ede81a2750",
     320,
-    13093716,
+    13093801,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
