@@ -1484,10 +1484,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // `live_index/search.rs` map per-file work through a new ordered helper on the
 // existing indexing pool in `live_index/store.rs`. No index_lifecycle edge, no
 // bridge. 320 files.
+// Query pool: `live_index/store.rs` runs that ordered helper on its own
+// bounded rayon pool instead of the indexing pool, so an admission parse
+// cannot delay a search or scout. No index_lifecycle edge, no bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "9b144dcb9138dad9ae96d8fc16ffd55559249d85c8271c0e05ae3549dfd81190",
+    "5fb3f52ed876606388068a66eb5bfbde418a517e9a9bdb01b2f949edaf8d41df",
     320,
-    13129594,
+    13132015,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

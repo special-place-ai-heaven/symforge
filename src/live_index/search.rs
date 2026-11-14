@@ -1902,7 +1902,7 @@ where
 
     // Single scan per file: count every visible hit for overflow reporting while
     // retaining only the bounded match lines needed for output/ranking. Files
-    // scan independently on the indexing pool; the buckets are then totally
+    // scan independently on the query pool; the buckets are then totally
     // ordered below (count, then unique path), so the scan order is invisible.
     let scans = crate::live_index::store::ordered_parallel_map(&candidate_paths, |path| {
         let file = index.get_file(path)?;

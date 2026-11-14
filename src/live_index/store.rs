@@ -517,10 +517,11 @@ fn indexing_thread_stack_size() -> usize {
     }
 }
 
-/// Env override for the indexing pool's worker count. The pool is the ONLY
-/// background machinery an embed-feature index load creates (lazy, compute
-/// only — no watchers/timers/runtimes), so a tight-RAM PID-1 embedder can cap
-/// it explicitly. Invalid or zero values fall back to rayon's default.
+/// Env override for the worker count of the indexing and query pools. They
+/// are the ONLY background machinery an embed-feature index load creates
+/// (lazy, compute only — no watchers/timers/runtimes), so a tight-RAM PID-1
+/// embedder can cap them explicitly. Invalid or zero values fall back to
+/// rayon's default.
 const INDEXING_THREADS_ENV: &str = "SYMFORGE_INDEXING_THREADS";
 
 fn indexing_thread_count() -> Option<usize> {
@@ -539,36 +540,48 @@ fn indexing_thread_count() -> Option<usize> {
 }
 
 fn indexing_thread_pool() -> &'static rayon::ThreadPool {
-    INDEXING_THREAD_POOL.get_or_init(|| {
-        let builder = rayon::ThreadPoolBuilder::new()
-            .thread_name(|index| format!("symforge-index-{}", index));
-        let builder = match indexing_thread_count() {
-            Some(count) => {
-                info!(
-                    count,
-                    env = INDEXING_THREADS_ENV,
-                    "initializing indexing thread pool with explicit worker count"
-                );
-                builder.num_threads(count)
-            }
-            None => builder,
-        };
+    INDEXING_THREAD_POOL.get_or_init(|| build_bounded_pool("symforge-index"))
+}
 
-        #[cfg(windows)]
-        let builder = {
-            let stack_size = indexing_thread_stack_size();
+/// Pool for [`ordered_parallel_map`], kept apart from the indexing pool: a
+/// rayon worker serves its own and stolen work before injected jobs, so a
+/// query installed into a pool busy with an admission parse would wait for
+/// that parse to drain. Same thread cap and stack size as the indexing pool.
+static QUERY_THREAD_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+
+fn query_thread_pool() -> &'static rayon::ThreadPool {
+    QUERY_THREAD_POOL.get_or_init(|| build_bounded_pool("symforge-query"))
+}
+
+fn build_bounded_pool(name: &'static str) -> rayon::ThreadPool {
+    let builder =
+        rayon::ThreadPoolBuilder::new().thread_name(move |index| format!("{name}-{index}"));
+    let builder = match indexing_thread_count() {
+        Some(count) => {
             info!(
-                stack_size,
-                env = INDEXING_THREAD_STACK_SIZE_ENV,
-                "initializing indexing thread pool with explicit worker stack size"
+                count,
+                pool = name,
+                env = INDEXING_THREADS_ENV,
+                "initializing thread pool with explicit worker count"
             );
-            builder.stack_size(stack_size)
-        };
+            builder.num_threads(count)
+        }
+        None => builder,
+    };
 
-        builder
-            .build()
-            .expect("indexing thread pool should initialize")
-    })
+    #[cfg(windows)]
+    let builder = {
+        let stack_size = indexing_thread_stack_size();
+        info!(
+            stack_size,
+            pool = name,
+            env = INDEXING_THREAD_STACK_SIZE_ENV,
+            "initializing thread pool with explicit worker stack size"
+        );
+        builder.stack_size(stack_size)
+    };
+
+    builder.build().expect("thread pool should initialize")
 }
 
 thread_local! {
@@ -592,10 +605,10 @@ pub(crate) fn serial_oracle_active() -> bool {
     SERIAL_ORACLE.with(std::cell::Cell::get)
 }
 
-/// Map `items` on the indexing pool, returning results in input order. The
-/// pool is the bounded one the load already owns, so no thread is created; a
-/// caller already on the pool runs inline. Callers must be off the async
-/// runtime's workers (the tool handlers run inside `off_async_worker`).
+/// Map `items` on the query pool, returning results in input order. The pool
+/// is bounded and separate from the indexing pool, so a running admission
+/// parse cannot delay it. Callers must be off the async runtime's workers
+/// (the tool handlers run inside `off_async_worker`).
 pub(crate) fn ordered_parallel_map<T, R>(
     items: &[T],
     work: impl Fn(&T) -> R + Sync + Send,
@@ -607,7 +620,7 @@ where
     if serial_oracle_active() || items.len() < 2 {
         return items.iter().map(work).collect();
     }
-    indexing_thread_pool().install(|| items.par_iter().map(work).collect())
+    query_thread_pool().install(|| items.par_iter().map(work).collect())
 }
 
 /// Env override for the peak concurrent in-memory read budget enforced during
@@ -8254,6 +8267,53 @@ mod tests {
     use tempfile::TempDir;
 
     static COUPLING_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// A query map must not wait on admission work: park every indexing
+    /// worker, then require `ordered_parallel_map` to finish while they stay
+    /// parked. On a shared pool the map is an injected job no parked worker
+    /// can pick up, so this would time out.
+    #[test]
+    fn ordered_parallel_map_runs_while_indexing_pool_is_saturated() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let workers = indexing_thread_pool().current_num_threads();
+        let parked = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicBool::new(false));
+        let saturate = {
+            let (parked, released) = (Arc::clone(&parked), Arc::clone(&released));
+            std::thread::spawn(move || {
+                indexing_thread_pool().install(|| {
+                    (0..workers).into_par_iter().with_max_len(1).for_each(|_| {
+                        parked.fetch_add(1, Ordering::SeqCst);
+                        while !released.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    })
+                })
+            })
+        };
+        while parked.load(Ordering::SeqCst) < workers {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let query = std::thread::spawn(move || {
+            done_tx
+                .send(ordered_parallel_map(&[1, 2, 3], |value| value * 2))
+                .unwrap();
+        });
+        let outcome = done_rx.recv_timeout(Duration::from_secs(10));
+
+        released.store(true, Ordering::SeqCst);
+        saturate.join().unwrap();
+        query.join().unwrap();
+        assert_eq!(
+            outcome.expect("query map waited on the saturated indexing pool"),
+            vec![2, 4, 6]
+        );
+    }
 
     #[cfg(feature = "server")]
     #[test]

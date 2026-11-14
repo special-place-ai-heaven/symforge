@@ -1214,7 +1214,7 @@ where
     // Spec 036 FR-020: one transient-retry budget for the whole scout.
     let retry_budget = os_response::current_budget();
     // The per-file metadata read and binary probe are independent I/O, so they
-    // run on the indexing pool; everything order-sensitive (issues, accounting,
+    // run on the query pool; everything order-sensitive (issues, accounting,
     // failure records, cancellation) stays in the serial fold below, in the
     // discovered order, exactly as before.
     let observations = crate::live_index::store::ordered_parallel_map(&discovered, |entry| {
@@ -4957,7 +4957,7 @@ mod tests {
         }
 
         /// The serial scout loop this module shipped before the per-file I/O
-        /// moved onto the indexing pool, kept verbatim as the equivalence oracle.
+        /// moved onto the query pool, kept verbatim as the equivalence oracle.
         fn serial_scout_oracle<F, P>(
             discovered: Vec<DiscoveredEntry>,
             metadata_reader: F,
