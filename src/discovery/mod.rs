@@ -1074,7 +1074,7 @@ pub(crate) fn scout_repository_with_exclusions_cancellable(
 
 fn scout_repository_with_metadata<F>(root: &Path, metadata_reader: F) -> Result<ScoutPlan>
 where
-    F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+    F: Fn(&Path) -> std::io::Result<std::fs::Metadata> + Sync,
 {
     scout_repository_with_io(root, metadata_reader, read_binary_probe)
 }
@@ -1085,8 +1085,8 @@ fn scout_repository_with_io<F, P>(
     probe_reader: P,
 ) -> Result<ScoutPlan>
 where
-    F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
-    P: FnMut(&Path, usize) -> std::io::Result<Vec<u8>>,
+    F: Fn(&Path) -> std::io::Result<std::fs::Metadata> + Sync,
+    P: Fn(&Path, usize) -> std::io::Result<Vec<u8>> + Sync,
 {
     scout_repository_with_io_and_exclusions(
         root,
@@ -1105,8 +1105,8 @@ pub(crate) fn scout_single_path_with_io<F, P>(
     probe_reader: P,
 ) -> Result<ScoutedEntry>
 where
-    F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
-    P: FnMut(&Path, usize) -> std::io::Result<Vec<u8>>,
+    F: Fn(&Path) -> std::io::Result<std::fs::Metadata> + Sync,
+    P: Fn(&Path, usize) -> std::io::Result<Vec<u8>> + Sync,
 {
     let language = LanguageId::from_path(relative_path);
     let targets = IndexTargets::for_path(relative_path, language.as_ref());
@@ -1147,8 +1147,8 @@ fn scout_repository_with_io_and_exclusions<F, P>(
     probe_reader: P,
 ) -> Result<ScoutPlan>
 where
-    F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
-    P: FnMut(&Path, usize) -> std::io::Result<Vec<u8>>,
+    F: Fn(&Path) -> std::io::Result<std::fs::Metadata> + Sync,
+    P: Fn(&Path, usize) -> std::io::Result<Vec<u8>> + Sync,
 {
     scout_repository_with_io_and_exclusions_cancellable(
         root,
@@ -1167,8 +1167,8 @@ fn scout_repository_with_io_and_exclusions_cancellable<F, P>(
     cancel: Option<&AtomicBool>,
 ) -> Result<ScoutPlan>
 where
-    F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
-    P: FnMut(&Path, usize) -> std::io::Result<Vec<u8>>,
+    F: Fn(&Path) -> std::io::Result<std::fs::Metadata> + Sync,
+    P: Fn(&Path, usize) -> std::io::Result<Vec<u8>> + Sync,
 {
     let (discovered, walk_issues) =
         discover_all_files_with_exclusions_and_issues_cancellable(root, exclusions, cancel)?;
@@ -1185,13 +1185,13 @@ where
 fn scout_entries_with_io<F, P>(
     discovered: Vec<DiscoveredEntry>,
     metadata_reader: F,
-    mut probe_reader: P,
+    probe_reader: P,
     mut issues: Vec<ScoutIssue>,
     cancel: Option<&AtomicBool>,
 ) -> Result<ScoutPlan>
 where
-    F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
-    P: FnMut(&Path, usize) -> std::io::Result<Vec<u8>>,
+    F: Fn(&Path) -> std::io::Result<std::fs::Metadata> + Sync,
+    P: Fn(&Path, usize) -> std::io::Result<Vec<u8>> + Sync,
 {
     // The compatibility walk supplies path candidates only. Its metadata fallback
     // is not authoritative here: this observation either yields real metadata or a
@@ -1213,15 +1213,32 @@ where
 
     // Spec 036 FR-020: one transient-retry budget for the whole scout.
     let retry_budget = os_response::current_budget();
-    for mut entry in discovered {
+    // The per-file metadata read and binary probe are independent I/O, so they
+    // run on the query pool; everything order-sensitive (issues, accounting,
+    // failure records, cancellation) stays in the serial fold below, in the
+    // discovered order, exactly as before.
+    let observations = crate::live_index::store::ordered_parallel_map(&discovered, |entry| {
+        observe_scout_entry(
+            entry,
+            &metadata_reader,
+            &probe_reader,
+            &retry_budget,
+            cancel,
+        )
+    });
+    for (mut entry, observation) in discovered.into_iter().zip(observations) {
         check_scout_cancelled(cancel)?;
-        let (catalog_path, path_reason) = catalog_path_projection(&entry.relative_os_path);
+        let Some(observation) = observation else {
+            // Only a raised cancel flag skips an observation, and it never
+            // lowers again, so the check above has already returned.
+            anyhow::bail!("embedded reload cancelled during scout");
+        };
+        let catalog_path = observation.catalog_path;
         let public_id = catalog_path.public_id.clone();
-        let metadata = match metadata_reader(&entry.absolute_path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
+        let (metadata, decision) = match observation.outcome {
+            Ok(observed) => observed,
+            Err(kind) => {
                 degraded = true;
-                let kind = crate::discovery::os_response::stored_kind_of(&error);
                 let issue = ScoutIssue {
                     path_id: Some(public_id),
                     safe_path: catalog_path.normalized_utf8.clone(),
@@ -1268,42 +1285,10 @@ where
         };
 
         entry.file_size = metadata.len();
-        let decision = if let Some(reason) = path_reason {
-            ScoutDecision::MetadataOnly { reason }
-        } else if let Some(rule_id) =
-            crate::knowledge::sensitive_path_rule_at(&entry.relative_path, &entry.absolute_path)
-        {
-            ScoutDecision::MetadataOnly {
-                reason: MetadataOnlyReason::SensitivePath {
-                    rule_id: rule_id.to_string(),
-                },
-            }
-        } else {
-            match scout_decision_for_discovered(&entry, None) {
-                ScoutDecision::Ingest { .. } => match os_response::retry_transient(
-                    &retry_budget,
-                    Some(&entry.absolute_path),
-                    || {
-                        probe_reader(
-                            &entry.absolute_path,
-                            crate::domain::index::BINARY_SNIFF_BYTES,
-                        )
-                        .map_err(os_response::AccessFailure::capture)
-                    },
-                ) {
-                    Ok(sample) => scout_decision_for_discovered(&entry, Some(&sample)),
-                    Err(cause) => {
-                        degraded = true;
-                        os_response::record_failure(&entry.absolute_path, &cause);
-                        ScoutDecision::Unavailable {
-                            stage: AccessStage::Probe,
-                            kind: cause.stored_kind(),
-                        }
-                    }
-                },
-                terminal => terminal,
-            }
-        };
+        if let Some(cause) = &observation.probe_failure {
+            degraded = true;
+            os_response::record_failure(&entry.absolute_path, cause);
+        }
         check_scout_cancelled(cancel)?;
         if matches!(decision, ScoutDecision::Ingest { .. }) {
             admitted_content_bytes = admitted_content_bytes.saturating_add(entry.file_size);
@@ -1335,7 +1320,6 @@ where
         )?;
         entries.push(scouted_entry);
     }
-
     entries.sort_by_cached_key(|entry| {
         scout_order_key(
             entry.path.normalized_utf8.as_deref(),
@@ -1571,11 +1555,91 @@ fn read_binary_probe(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> 
     Ok(bytes)
 }
 
+/// What the scout's per-file I/O observed for one discovered entry: its
+/// catalog path, then either the metadata read failure kind or the metadata
+/// plus the admission decision, and the classified probe failure (recorded by
+/// the serial fold so the failure log fills in discovered order).
+struct ScoutObservation {
+    catalog_path: CatalogPath,
+    outcome: std::result::Result<(std::fs::Metadata, ScoutDecision), AccessErrorKind>,
+    probe_failure: Option<os_response::OsCause>,
+}
+
+/// The order-independent half of one scout step. `None` means the cancel flag
+/// was raised before this entry's I/O ran.
+fn observe_scout_entry<F, P>(
+    entry: &DiscoveredEntry,
+    metadata_reader: &F,
+    probe_reader: &P,
+    retry_budget: &os_response::RetryBudget,
+    cancel: Option<&AtomicBool>,
+) -> Option<ScoutObservation>
+where
+    F: Fn(&Path) -> std::io::Result<std::fs::Metadata> + Sync,
+    P: Fn(&Path, usize) -> std::io::Result<Vec<u8>> + Sync,
+{
+    if check_scout_cancelled(cancel).is_err() {
+        return None;
+    }
+    let (catalog_path, path_reason) = catalog_path_projection(&entry.relative_os_path);
+    let metadata = match metadata_reader(&entry.absolute_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Some(ScoutObservation {
+                catalog_path,
+                outcome: Err(os_response::stored_kind_of(&error)),
+                probe_failure: None,
+            });
+        }
+    };
+    let file_size = metadata.len();
+    let mut probe_failure = None;
+    let decision = if let Some(reason) = path_reason {
+        ScoutDecision::MetadataOnly { reason }
+    } else if let Some(rule_id) =
+        crate::knowledge::sensitive_path_rule_at(&entry.relative_path, &entry.absolute_path)
+    {
+        ScoutDecision::MetadataOnly {
+            reason: MetadataOnlyReason::SensitivePath {
+                rule_id: rule_id.to_string(),
+            },
+        }
+    } else {
+        match scout_decision_for_discovered(entry, file_size, None) {
+            ScoutDecision::Ingest { .. } => {
+                match os_response::retry_transient(retry_budget, Some(&entry.absolute_path), || {
+                    probe_reader(
+                        &entry.absolute_path,
+                        crate::domain::index::BINARY_SNIFF_BYTES,
+                    )
+                    .map_err(os_response::AccessFailure::capture)
+                }) {
+                    Ok(sample) => scout_decision_for_discovered(entry, file_size, Some(&sample)),
+                    Err(cause) => {
+                        let decision = ScoutDecision::Unavailable {
+                            stage: AccessStage::Probe,
+                            kind: cause.stored_kind(),
+                        };
+                        probe_failure = Some(cause);
+                        decision
+                    }
+                }
+            }
+            terminal => terminal,
+        }
+    };
+    Some(ScoutObservation {
+        catalog_path,
+        outcome: Ok((metadata, decision)),
+        probe_failure,
+    })
+}
 fn scout_decision_for_discovered(
     entry: &DiscoveredEntry,
+    file_size: u64,
     content_sample: Option<&[u8]>,
 ) -> ScoutDecision {
-    let admission = classify_admission(&entry.absolute_path, entry.file_size, content_sample);
+    let admission = classify_admission(&entry.absolute_path, file_size, content_sample);
     match admission.tier {
         AdmissionTier::Normal => ScoutDecision::Ingest {
             targets: IndexTargets::for_path(&entry.relative_path, entry.language.as_ref()),
@@ -4864,12 +4928,12 @@ mod tests {
             let tmp = TempDir::new().unwrap();
             create_file(tmp.path(), ".env", "placeholder=true\n");
 
-            let mut probed = Vec::new();
+            let probed = std::sync::Mutex::new(Vec::new());
             let plan = scout_repository_with_io(
                 tmp.path(),
                 |path| std::fs::metadata(path),
                 |path, _max_bytes| {
-                    probed.push(path.to_path_buf());
+                    probed.lock().unwrap().push(path.to_path_buf());
                     Ok(Vec::new())
                 },
             )
@@ -4886,7 +4950,293 @@ mod tests {
                     reason: MetadataOnlyReason::SensitivePath { rule_id }
                 } if rule_id == "path.environment-credentials"
             ));
-            assert!(probed.is_empty(), "path policy must run before content I/O");
+            assert!(
+                probed.lock().unwrap().is_empty(),
+                "path policy must run before content I/O"
+            );
+        }
+
+        /// The serial scout loop this module shipped before the per-file I/O
+        /// moved onto the query pool, kept verbatim as the equivalence oracle.
+        fn serial_scout_oracle<F, P>(
+            discovered: Vec<DiscoveredEntry>,
+            metadata_reader: F,
+            mut probe_reader: P,
+            mut issues: Vec<ScoutIssue>,
+            cancel: Option<&AtomicBool>,
+        ) -> Result<ScoutPlan>
+        where
+            F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+            P: FnMut(&Path, usize) -> std::io::Result<Vec<u8>>,
+        {
+            // The compatibility walk supplies path candidates only. Its metadata fallback
+            // is not authoritative here: this observation either yields real metadata or a
+            // typed issue, never a fabricated size.
+            let mut admitted_content_bytes = 0u64;
+            let limits = DiscoveryLimits::from_env();
+            // Exact compact-JSON array framing for the canonical logical metadata records.
+            let mut catalog_metadata_bytes = 2u64;
+            let mut entries = Vec::with_capacity(discovered.len());
+            let mut degraded = !issues.is_empty();
+
+            for issue in &issues {
+                catalog_metadata_bytes = account_catalog_metadata_record(
+                    catalog_metadata_bytes,
+                    &("issue", issue),
+                    limits.max_catalog_metadata_bytes,
+                )?;
+            }
+
+            // Spec 036 FR-020: one transient-retry budget for the whole scout.
+            let retry_budget = os_response::current_budget();
+            for mut entry in discovered {
+                check_scout_cancelled(cancel)?;
+                let (catalog_path, path_reason) = catalog_path_projection(&entry.relative_os_path);
+                let public_id = catalog_path.public_id.clone();
+                let metadata = match metadata_reader(&entry.absolute_path) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        degraded = true;
+                        let kind = crate::discovery::os_response::stored_kind_of(&error);
+                        let issue = ScoutIssue {
+                            path_id: Some(public_id),
+                            safe_path: catalog_path.normalized_utf8.clone(),
+                            kind: ScoutIssueKind::DirectoryEntryUnreadable { kind },
+                            safe_message: "metadata unavailable".to_string(),
+                        };
+                        catalog_metadata_bytes = account_catalog_metadata_record(
+                            catalog_metadata_bytes,
+                            &("issue", &issue),
+                            limits.max_catalog_metadata_bytes,
+                        )?;
+                        issues.push(issue);
+                        let scouted_entry = ScoutedEntry {
+                            path: catalog_path,
+                            absolute_path: Some(entry.absolute_path),
+                            stamp: FileStamp {
+                                size: entry.file_size,
+                                created_hint: None,
+                                modified_hint: None,
+                                platform_id: None,
+                            },
+                            language: entry.language,
+                            classification: entry.classification,
+                            decision: ScoutDecision::Unavailable {
+                                stage: AccessStage::Metadata,
+                                kind,
+                            },
+                        };
+                        catalog_metadata_bytes = account_catalog_metadata_record(
+                            catalog_metadata_bytes,
+                            &(
+                                "entry",
+                                &scouted_entry.path,
+                                scouted_entry.stamp.size,
+                                &scouted_entry.language,
+                                scouted_entry.classification,
+                                &scouted_entry.decision,
+                            ),
+                            limits.max_catalog_metadata_bytes,
+                        )?;
+                        entries.push(scouted_entry);
+                        continue;
+                    }
+                };
+
+                entry.file_size = metadata.len();
+                let decision = if let Some(reason) = path_reason {
+                    ScoutDecision::MetadataOnly { reason }
+                } else if let Some(rule_id) = crate::knowledge::sensitive_path_rule_at(
+                    &entry.relative_path,
+                    &entry.absolute_path,
+                ) {
+                    ScoutDecision::MetadataOnly {
+                        reason: MetadataOnlyReason::SensitivePath {
+                            rule_id: rule_id.to_string(),
+                        },
+                    }
+                } else {
+                    match scout_decision_for_discovered(&entry, entry.file_size, None) {
+                        ScoutDecision::Ingest { .. } => match os_response::retry_transient(
+                            &retry_budget,
+                            Some(&entry.absolute_path),
+                            || {
+                                probe_reader(
+                                    &entry.absolute_path,
+                                    crate::domain::index::BINARY_SNIFF_BYTES,
+                                )
+                                .map_err(os_response::AccessFailure::capture)
+                            },
+                        ) {
+                            Ok(sample) => scout_decision_for_discovered(
+                                &entry,
+                                entry.file_size,
+                                Some(&sample),
+                            ),
+                            Err(cause) => {
+                                degraded = true;
+                                os_response::record_failure(&entry.absolute_path, &cause);
+                                ScoutDecision::Unavailable {
+                                    stage: AccessStage::Probe,
+                                    kind: cause.stored_kind(),
+                                }
+                            }
+                        },
+                        terminal => terminal,
+                    }
+                };
+                check_scout_cancelled(cancel)?;
+                if matches!(decision, ScoutDecision::Ingest { .. }) {
+                    admitted_content_bytes = admitted_content_bytes.saturating_add(entry.file_size);
+                }
+                let scouted_entry = ScoutedEntry {
+                    path: catalog_path,
+                    absolute_path: Some(entry.absolute_path),
+                    stamp: FileStamp {
+                        size: entry.file_size,
+                        created_hint: metadata.created().ok(),
+                        modified_hint: metadata.modified().ok(),
+                        platform_id: None,
+                    },
+                    language: entry.language,
+                    classification: entry.classification,
+                    decision,
+                };
+                catalog_metadata_bytes = account_catalog_metadata_record(
+                    catalog_metadata_bytes,
+                    &(
+                        "entry",
+                        &scouted_entry.path,
+                        scouted_entry.stamp.size,
+                        &scouted_entry.language,
+                        scouted_entry.classification,
+                        &scouted_entry.decision,
+                    ),
+                    limits.max_catalog_metadata_bytes,
+                )?;
+                entries.push(scouted_entry);
+            }
+
+            entries.sort_by_cached_key(|entry| {
+                scout_order_key(
+                    entry.path.normalized_utf8.as_deref(),
+                    Some(entry.path.public_id.as_str()),
+                )
+            });
+            let collision_issues = path_identity_collision_issues(&entries);
+            if !collision_issues.is_empty() {
+                degraded = true;
+                for issue in collision_issues {
+                    catalog_metadata_bytes = account_catalog_metadata_record(
+                        catalog_metadata_bytes,
+                        &("issue", &issue),
+                        limits.max_catalog_metadata_bytes,
+                    )?;
+                    issues.push(issue);
+                }
+            }
+            issues.sort_by_cached_key(|issue| {
+                scout_order_key(issue.safe_path.as_deref(), issue.path_id.as_deref())
+            });
+
+            Ok(ScoutPlan {
+                coverage: if degraded {
+                    CoverageStatus::Degraded
+                } else {
+                    CoverageStatus::Complete
+                },
+                usage: ManifestResourceUsage {
+                    catalog_entries: entries.len() as u64,
+                    catalog_metadata_bytes,
+                    admitted_content_bytes,
+                },
+                entries,
+                issues,
+            })
+        }
+
+        /// The parallel per-file observation must produce the plan the serial
+        /// loop did, verdict for verdict: ingest, binary, lockfile, sensitive
+        /// path, ignored, metadata failure and probe failure, in one order.
+        #[test]
+        fn parallel_scout_matches_the_serial_oracle() {
+            let tmp = TempDir::new().unwrap();
+            for i in 0..40 {
+                create_file(tmp.path(), &format!("src/m{i:02}.rs"), "fn f() {}\n");
+            }
+            create_file(tmp.path(), "nested/.ignore", "skipped.rs\n");
+            create_file(tmp.path(), "nested/skipped.rs", "fn s() {}\n");
+            create_file(tmp.path(), "nested/deep/.ignore", "*.tmp\n");
+            create_file(tmp.path(), "nested/deep/kept.py", "x = 1\n");
+            create_file(tmp.path(), "nested/deep/gone.tmp", "x\n");
+            create_file(tmp.path(), ".env", "placeholder=true\n");
+            create_file(tmp.path(), "Cargo.lock", "# lock\n");
+            create_file(tmp.path(), "README.md", "# readme\n");
+            create_file(tmp.path(), "no_metadata.rs", "fn n() {}\n");
+            create_file(tmp.path(), "no_probe.rs", "fn p() {}\n");
+            std::fs::write(tmp.path().join("blob.rs"), [0u8, 1, 2, 0, 255, 0]).unwrap();
+
+            let metadata = |path: &Path| {
+                if path.ends_with("no_metadata.rs") {
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                } else {
+                    std::fs::metadata(path)
+                }
+            };
+            let probe = |path: &Path, max_bytes: usize| {
+                if path.ends_with("no_probe.rs") {
+                    Err(io::Error::from(io::ErrorKind::NotFound))
+                } else {
+                    read_binary_probe(path, max_bytes)
+                }
+            };
+            let (discovered, walk_issues) =
+                discover_all_files_with_exclusions_and_issues_cancellable(
+                    tmp.path(),
+                    &SourceExclusions::default(),
+                    None,
+                )
+                .expect("walk");
+            let parallel = scout_entries_with_io(
+                discovered.clone(),
+                metadata,
+                probe,
+                walk_issues.clone(),
+                None,
+            )
+            .expect("parallel scout");
+            let serial = serial_scout_oracle(discovered, metadata, probe, walk_issues, None)
+                .expect("serial scout");
+
+            assert_eq!(format!("{parallel:?}"), format!("{serial:?}"));
+            assert_eq!(parallel.coverage, CoverageStatus::Degraded);
+            let decision_of = |name: &str| {
+                parallel
+                    .entries
+                    .iter()
+                    .find(|entry| entry.path.normalized_utf8.as_deref() == Some(name))
+                    .map(|entry| entry.decision.clone())
+            };
+            assert!(matches!(
+                decision_of("no_probe.rs"),
+                Some(ScoutDecision::Unavailable {
+                    stage: AccessStage::Probe,
+                    ..
+                })
+            ));
+            assert!(matches!(
+                decision_of("no_metadata.rs"),
+                Some(ScoutDecision::Unavailable {
+                    stage: AccessStage::Metadata,
+                    ..
+                })
+            ));
+            assert!(decision_of("nested/skipped.rs").is_none());
+            assert!(decision_of("nested/deep/gone.tmp").is_none());
+            assert!(matches!(
+                decision_of("src/m07.rs"),
+                Some(ScoutDecision::Ingest { .. })
+            ));
         }
 
         /// A root that IS `.aws` leaves the relative path `credentials`, which
@@ -4931,12 +5281,12 @@ mod tests {
                 .set_len(HARD_SKIP_BYTES + 1)
                 .unwrap();
 
-            let mut probes = Vec::new();
+            let probes = std::sync::Mutex::new(Vec::new());
             let plan = scout_repository_with_io(
                 tmp.path(),
                 |path| std::fs::metadata(path),
                 |path, max_bytes| {
-                    probes.push((
+                    probes.lock().unwrap().push((
                         path.file_name().unwrap().to_string_lossy().into_owned(),
                         max_bytes,
                     ));
@@ -4947,7 +5297,7 @@ mod tests {
 
             assert_eq!(plan.entries.len(), 3);
             assert_eq!(
-                probes,
+                probes.into_inner().unwrap(),
                 vec![(
                     "notes.txt".to_string(),
                     crate::domain::index::BINARY_SNIFF_BYTES
@@ -5107,12 +5457,12 @@ mod tests {
                 },
             ];
 
-            let mut probe_count = 0usize;
+            let probe_count = std::sync::atomic::AtomicUsize::new(0);
             let plan = scout_entries_with_io(
                 candidates,
                 |path| std::fs::metadata(path),
                 |_path, _max_bytes| {
-                    probe_count += 1;
+                    probe_count.fetch_add(1, Ordering::Relaxed);
                     Ok(Vec::new())
                 },
                 Vec::new(),
@@ -5121,7 +5471,7 @@ mod tests {
             .expect("opaque paths must remain catalogable");
 
             assert_eq!(plan.entries.len(), 2);
-            assert_eq!(probe_count, 0);
+            assert_eq!(probe_count.load(Ordering::Relaxed), 0);
             assert!(
                 plan.entries
                     .iter()
@@ -5164,12 +5514,12 @@ mod tests {
                 },
             ];
 
-            let mut probe_count = 0usize;
+            let probe_count = std::sync::atomic::AtomicUsize::new(0);
             let plan = scout_entries_with_io(
                 candidates,
                 |path| std::fs::metadata(path),
                 |_path, _max_bytes| {
-                    probe_count += 1;
+                    probe_count.fetch_add(1, Ordering::Relaxed);
                     Ok(Vec::new())
                 },
                 Vec::new(),
@@ -5177,7 +5527,7 @@ mod tests {
             )
             .expect("unsafe path metadata must remain catalogable by opaque ID");
 
-            assert_eq!(probe_count, 0);
+            assert_eq!(probe_count.load(Ordering::Relaxed), 0);
             assert_eq!(plan.entries.len(), 2);
             assert!(
                 plan.entries

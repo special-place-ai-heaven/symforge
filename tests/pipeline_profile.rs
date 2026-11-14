@@ -709,7 +709,7 @@ fn profile_pipeline() {
     println!("publication log lines mentioning a deferred bridge during B: {deferred}");
 
     // ── C: queries ─────────────────────────────────────────────────────────
-    println!("\n== C. queries on the loaded index (n=20 each; all serial loops, see report) ==");
+    println!("\n== C. queries on the loaded index (n=20 each) ==");
     let index = shared.read();
     let query = |label: &str, work: &dyn Fn() -> usize| {
         let mut samples = Vec::new();
@@ -1351,7 +1351,7 @@ fn scan_compare(
             .filter_map(|path| files.get(path))
             .map(|file| file.content.as_slice())
             .collect();
-        // Production case-insensitive literal: one `to_lowercase` per line.
+        // The former production case-insensitive literal: one `to_lowercase` per line.
         let lowercase_lane = |content: &&[u8]| {
             String::from_utf8_lossy(content)
                 .lines()

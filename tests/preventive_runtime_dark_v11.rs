@@ -1480,10 +1480,17 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // import is the `SymbolRecord` domain type. No index_lifecycle edge, no bridge.
 // A comment in `live_index/store.rs` names the partial update. Comment only, no
 // bridge. 320 files.
+// Parallel scout probe and searches: `discovery/mod.rs` and
+// `live_index/search.rs` map per-file work through a new ordered helper on the
+// existing indexing pool in `live_index/store.rs`. No index_lifecycle edge, no
+// bridge. 320 files.
+// Query pool: `live_index/store.rs` runs that ordered helper on its own
+// bounded rayon pool instead of the indexing pool, so an admission parse
+// cannot delay a search or scout. No index_lifecycle edge, no bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "9adcd38a1f62d389bd7058924942b912b343339c84eb454d815af7ede81a2750",
+    "5fb3f52ed876606388068a66eb5bfbde418a517e9a9bdb01b2f949edaf8d41df",
     320,
-    13093801,
+    13132015,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

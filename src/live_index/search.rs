@@ -1279,6 +1279,21 @@ pub fn search_text_with_options(
                 .expect("literal terms always build")
         });
 
+    // Allocation-free stand-in for the case-insensitive `to_lowercase` test
+    // below. On an ASCII line Unicode lowercasing IS ASCII lowercasing, so an
+    // ASCII-case-insensitive search for ASCII lowered terms is the same
+    // predicate; any non-ASCII line (or lowered term) keeps the original path.
+    let ascii_folded_terms = lowered_terms
+        .as_ref()
+        .filter(|terms| terms.iter().all(|term| term.is_ascii()))
+        .filter(|_| !crate::live_index::store::serial_oracle_active())
+        .map(|terms| {
+            aho_corasick::AhoCorasick::builder()
+                .ascii_case_insensitive(true)
+                .build(terms)
+                .expect("literal terms always build")
+        });
+
     let label = if normalized_terms.len() == 1 {
         format!("'{}'", normalized_terms[0])
     } else {
@@ -1323,6 +1338,8 @@ pub fn search_text_with_options(
         // Single-term path (or non-ASCII multi-term fallback)
         if case_sensitive {
             normalized_terms.iter().any(|term| line.contains(term))
+        } else if let Some(folded) = ascii_folded_terms.as_ref().filter(|_| line.is_ascii()) {
+            folded.is_match(line)
         } else {
             let lowered = line.to_lowercase();
             lowered_terms
@@ -1472,6 +1489,22 @@ pub fn search_structural(
     )
 }
 
+/// Candidate files parsed in parallel per round before the serial fold decides
+/// whether the total limit is reached. A round may parse up to this many files
+/// past the limit; they are discarded unread.
+const STRUCTURAL_SEARCH_ROUND: usize = 64;
+
+/// What the parallel half of structural search observed for one candidate.
+enum StructuralScan {
+    /// The file left the index between candidate selection and the scan.
+    Missing,
+    /// The pattern did not compile for this file's language.
+    NotCompiled,
+    /// The parse was cancelled at its deadline (or failed).
+    Unparsed,
+    Found(Vec<crate::parsing::ast_grep::StructuralMatch>),
+}
+
 fn search_structural_with_compiler(
     index: &LiveIndex,
     pattern: &str,
@@ -1491,12 +1524,6 @@ fn search_structural_with_compiler(
     let mut files: Vec<TextFileMatches> = Vec::new();
     let mut total_matches = 0usize;
     let mut suppressed_by_noise = 0usize;
-    // Cache key includes the TSX flavor because `.tsx` and `.ts` share the
-    // TypeScript LanguageId but compile against different tree-sitter grammars.
-    let mut compiled_patterns: HashMap<
-        (LanguageId, bool, String),
-        Result<crate::parsing::ast_grep::CompiledStructuralPattern, String>,
-    > = HashMap::new();
     // Track whether at least one candidate successfully compiled the
     // pattern. If every candidate errored, we must distinguish:
     //   * at least one candidate rejected the pattern as syntactically
@@ -1519,140 +1546,150 @@ fn search_structural_with_compiler(
         .collect();
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
+    // One compile per (language, TSX flavor) for the whole request. The key
+    // includes the flavor because `.tsx` and `.ts` share the TypeScript
+    // LanguageId but compile against different tree-sitter grammars.
+    let mut compiled_patterns: HashMap<
+        (LanguageId, bool),
+        Result<crate::parsing::ast_grep::CompiledStructuralPattern, String>,
+    > = HashMap::new();
     for (path, lang) in &candidates {
+        let is_tsx = LanguageId::is_tsx_path(path);
+        compiled_patterns
+            .entry((*lang, is_tsx))
+            .or_insert_with(|| compile_pattern(pattern, lang, is_tsx));
+    }
+
+    // Parse and match one round in parallel, then fold it serially in path
+    // order: the limit, the error buckets and the counters see exactly the
+    // sequence the one-file-at-a-time loop saw.
+    'rounds: for round in candidates.chunks(STRUCTURAL_SEARCH_ROUND) {
         if total_matches >= options.total_limit {
             break;
         }
+        let scans = crate::live_index::store::ordered_parallel_map(round, |(path, lang)| {
+            let Some(file) = index.get_file(path) else {
+                return StructuralScan::Missing;
+            };
+            let key = (*lang, LanguageId::is_tsx_path(path));
+            let Some(Ok(compiled_pattern)) = compiled_patterns.get(&key) else {
+                return StructuralScan::NotCompiled;
+            };
+            match crate::parsing::ast_grep::structural_search_with_compiled(
+                &String::from_utf8_lossy(&file.content),
+                compiled_pattern,
+            ) {
+                Ok(found) => StructuralScan::Found(found),
+                Err(_) => StructuralScan::Unparsed,
+            }
+        });
 
-        let file = match index.get_file(path) {
-            Some(f) => f,
-            None => continue,
-        };
+        for ((path, lang), scan) in round.iter().zip(scans) {
+            if total_matches >= options.total_limit {
+                break 'rounds;
+            }
+            let structural_matches = match scan {
+                StructuralScan::Missing => continue,
+                StructuralScan::NotCompiled => {
+                    let key = (*lang, LanguageId::is_tsx_path(path));
+                    if let Some(Err(e)) = compiled_patterns.get(&key) {
+                        // compile_structural_pattern returns two distinguishable
+                        // error shapes: "structural search not supported for …"
+                        // for config languages, and "invalid structural
+                        // pattern: …" for ast-grep Pattern::try_new failures.
+                        if e.starts_with("invalid structural pattern") {
+                            if first_syntax_error.is_none() {
+                                first_syntax_error = Some(e.clone());
+                            }
+                        } else if first_unsupported_error.is_none() {
+                            first_unsupported_error = Some(e.clone());
+                        }
+                    }
+                    continue;
+                }
+                StructuralScan::Unparsed => {
+                    // The file was not searched, so count it, never match it.
+                    any_parse_succeeded = true;
+                    unparsed_files += 1;
+                    continue;
+                }
+                StructuralScan::Found(found) => {
+                    any_parse_succeeded = true;
+                    found
+                }
+            };
 
-        let content_str = String::from_utf8_lossy(&file.content);
+            if structural_matches.is_empty() {
+                continue;
+            }
+            let Some(file) = index.get_file(path) else {
+                continue;
+            };
+            let content_str = String::from_utf8_lossy(&file.content);
 
-        let is_tsx = LanguageId::is_tsx_path(path);
-        let compiled = compiled_patterns
-            .entry((*lang, is_tsx, pattern.to_string()))
-            .or_insert_with(|| compile_pattern(pattern, lang, is_tsx));
-        let structural_matches = match compiled {
-            Ok(compiled_pattern) => {
-                any_parse_succeeded = true;
-                match crate::parsing::ast_grep::structural_search_with_compiled(
-                    &content_str,
-                    compiled_pattern,
-                ) {
-                    Ok(found) => found,
-                    Err(_) => {
-                        // Parse cancelled at the deadline (or failed): the
-                        // file was not searched, so count it, never match it.
-                        unparsed_files += 1;
+            // Pre-compute Rust test module line ranges for noise filtering.
+            let test_ranges: Vec<(u32, u32)> = if !options.noise_policy.include_tests
+                && *lang == crate::domain::index::LanguageId::Rust
+            {
+                compute_test_ranges(file)
+            } else {
+                Vec::new()
+            };
+
+            let remaining = options.total_limit.saturating_sub(total_matches);
+            let per_file_limit = options.max_per_file.min(remaining);
+
+            let mut matches: Vec<TextLineMatch> = Vec::new();
+            for sm in &structural_matches {
+                let line_idx = sm.start_line;
+
+                // Skip matches inside Rust #[cfg(test)] modules.
+                if !test_ranges.is_empty() {
+                    let line_num = line_idx as u32;
+                    if test_ranges
+                        .iter()
+                        .any(|&(start, end)| line_num >= start && line_num <= end)
+                    {
+                        suppressed_by_noise += 1;
                         continue;
                     }
                 }
-            }
-            Err(e) => {
-                // compile_structural_pattern returns two distinguishable error
-                // shapes: "structural search not supported for …" for
-                // config languages, and "invalid structural pattern: …"
-                // for ast-grep Pattern::try_new failures.
-                let e = e.clone();
-                if e.starts_with("invalid structural pattern") {
-                    if first_syntax_error.is_none() {
-                        first_syntax_error = Some(e);
-                    }
-                } else if first_unsupported_error.is_none() {
-                    first_unsupported_error = Some(e);
-                }
-                continue;
-            }
-        };
 
-        if structural_matches.is_empty() {
-            continue;
-        }
-
-        // Pre-compute Rust test module line ranges for noise filtering.
-        let test_ranges: Vec<(u32, u32)> = if !options.noise_policy.include_tests
-            && *lang == crate::domain::index::LanguageId::Rust
-        {
-            compute_test_ranges(file)
-        } else {
-            Vec::new()
-        };
-
-        let remaining = options.total_limit.saturating_sub(total_matches);
-        let per_file_limit = options.max_per_file.min(remaining);
-
-        let mut matches: Vec<TextLineMatch> = Vec::new();
-        for sm in &structural_matches {
-            let line_idx = sm.start_line;
-
-            // Skip matches inside Rust #[cfg(test)] modules.
-            if !test_ranges.is_empty() {
-                let line_num = line_idx as u32;
-                if test_ranges
-                    .iter()
-                    .any(|&(start, end)| line_num >= start && line_num <= end)
-                {
-                    suppressed_by_noise += 1;
-                    continue;
+                matches.push(TextLineMatch {
+                    line_number: line_idx + 1,
+                    line: structural_display_line(sm),
+                    enclosing_symbol: file
+                        .symbols
+                        .iter()
+                        .filter(|s| {
+                            s.line_range.0 <= (line_idx as u32)
+                                && s.line_range.1 >= (line_idx as u32)
+                        })
+                        .max_by_key(|s| s.depth)
+                        .map(|s| EnclosingMatchSymbol {
+                            name: s.name.clone(),
+                            kind: s.kind.to_string(),
+                            line_range: s.line_range,
+                            body: None,
+                        }),
+                });
+                if matches.len() >= per_file_limit {
+                    break;
                 }
             }
 
-            // Build display line: first line of matched text + captures summary.
-            let first_line = sm.text.lines().next().unwrap_or(&sm.text);
-            let display = if sm.captures.is_empty() {
-                first_line.to_string()
-            } else {
-                let caps: Vec<String> = sm
-                    .captures
-                    .iter()
-                    .map(|(name, val)| {
-                        let short = if val.len() > 40 {
-                            format!("{}...", &val[..37])
-                        } else {
-                            val.clone()
-                        };
-                        format!("${name}={short}")
-                    })
-                    .collect();
-                format!("{first_line}  // {}", caps.join(", "))
-            };
-
-            matches.push(TextLineMatch {
-                line_number: line_idx + 1,
-                line: display,
-                enclosing_symbol: file
-                    .symbols
-                    .iter()
-                    .filter(|s| {
-                        s.line_range.0 <= (line_idx as u32) && s.line_range.1 >= (line_idx as u32)
-                    })
-                    .max_by_key(|s| s.depth)
-                    .map(|s| EnclosingMatchSymbol {
-                        name: s.name.clone(),
-                        kind: s.kind.to_string(),
-                        line_range: s.line_range,
-                        body: None,
-                    }),
-            });
-            if matches.len() >= per_file_limit {
-                break;
+            if !matches.is_empty() {
+                let rendered_lines = options
+                    .context
+                    .map(|ctx| build_context_rendered_lines(&content_str, &matches, ctx));
+                total_matches += matches.len();
+                files.push(TextFileMatches {
+                    path: path.clone(),
+                    matches,
+                    rendered_lines,
+                    callers: None,
+                });
             }
-        }
-
-        if !matches.is_empty() {
-            let rendered_lines = options
-                .context
-                .map(|ctx| build_context_rendered_lines(&content_str, &matches, ctx));
-            total_matches += matches.len();
-            files.push(TextFileMatches {
-                path: path.clone(),
-                matches,
-                rendered_lines,
-                callers: None,
-            });
         }
     }
 
@@ -1691,6 +1728,27 @@ fn search_structural_with_compiler(
         options,
         &compiled_globs,
     ))
+}
+
+/// First line of the matched text plus a summary of its captures.
+fn structural_display_line(sm: &crate::parsing::ast_grep::StructuralMatch) -> String {
+    let first_line = sm.text.lines().next().unwrap_or(&sm.text);
+    if sm.captures.is_empty() {
+        return first_line.to_string();
+    }
+    let caps: Vec<String> = sm
+        .captures
+        .iter()
+        .map(|(name, val)| {
+            let short = if val.len() > 40 {
+                format!("{}...", &val[..37])
+            } else {
+                val.clone()
+            };
+            format!("${name}={short}")
+        })
+        .collect();
+    format!("{first_line}  // {}", caps.join(", "))
 }
 
 fn compile_text_glob_filters(
@@ -1828,13 +1886,13 @@ fn attach_text_match_context(
 fn collect_text_matches<F>(
     index: &LiveIndex,
     candidate_paths: Vec<String>,
-    mut is_match: F,
+    is_match: F,
     label: String,
     options: &TextSearchOptions,
     glob_filters: &CompiledTextGlobFilters,
 ) -> TextSearchResult
 where
-    F: FnMut(&str) -> bool,
+    F: Fn(&str) -> bool + Sync,
 {
     struct PathMatchBucket {
         path: String,
@@ -1843,15 +1901,11 @@ where
     }
 
     // Single scan per file: count every visible hit for overflow reporting while
-    // retaining only the bounded match lines needed for output/ranking.
-    let mut buckets: Vec<PathMatchBucket> = Vec::new();
-    let mut suppressed_by_noise: usize = 0;
-    let mut all_visible_matches: usize = 0;
-    for path in candidate_paths {
-        let file = match index.get_file(&path) {
-            Some(file) => file,
-            None => continue,
-        };
+    // retaining only the bounded match lines needed for output/ranking. Files
+    // scan independently on the query pool; the buckets are then totally
+    // ordered below (count, then unique path), so the scan order is invisible.
+    let scans = crate::live_index::store::ordered_parallel_map(&candidate_paths, |path| {
+        let file = index.get_file(path)?;
         let content_str = String::from_utf8_lossy(&file.content);
 
         // Pre-compute Rust test module line ranges for noise filtering.
@@ -1903,6 +1957,15 @@ where
                 });
             }
         }
+        Some((suppressed, visible_count, matches))
+    });
+    let mut buckets: Vec<PathMatchBucket> = Vec::new();
+    let mut suppressed_by_noise: usize = 0;
+    let mut all_visible_matches: usize = 0;
+    for (path, scan) in candidate_paths.into_iter().zip(scans) {
+        let Some((suppressed, visible_count, matches)) = scan else {
+            continue;
+        };
         suppressed_by_noise += suppressed;
         all_visible_matches += visible_count;
         if visible_count > 0 {
@@ -4150,5 +4213,383 @@ mod tests {
 
         assert_eq!(result.total_matches, 3);
         assert_eq!(compile_calls_by_language.get(&LanguageId::Rust), Some(&1));
+    }
+
+    /// The one-file-at-a-time structural search this module shipped before the
+    /// parallel rounds, kept verbatim as the equivalence oracle.
+    fn serial_structural_oracle(
+        index: &LiveIndex,
+        pattern: &str,
+        options: &TextSearchOptions,
+        mut compile_pattern: impl FnMut(
+            &str,
+            &LanguageId,
+            bool,
+        ) -> Result<
+            crate::parsing::ast_grep::CompiledStructuralPattern,
+            String,
+        >,
+    ) -> Result<TextSearchResult, TextSearchError> {
+        let compiled_globs = compile_text_glob_filters(options)?;
+        let targets_by_path = indexed_targets_by_path(index);
+
+        let mut files: Vec<TextFileMatches> = Vec::new();
+        let mut total_matches = 0usize;
+        let mut suppressed_by_noise = 0usize;
+        // Cache key includes the TSX flavor because `.tsx` and `.ts` share the
+        // TypeScript LanguageId but compile against different tree-sitter grammars.
+        let mut compiled_patterns: HashMap<
+            (LanguageId, bool, String),
+            Result<crate::parsing::ast_grep::CompiledStructuralPattern, String>,
+        > = HashMap::new();
+        // Track whether at least one candidate successfully compiled the
+        // pattern. If every candidate errored, we must distinguish:
+        //   * at least one candidate rejected the pattern as syntactically
+        //     invalid — propagate as InvalidStructuralPattern (pattern bug).
+        //   * every candidate was in a language ast-grep does not support —
+        //     propagate as UnsupportedStructuralLanguage (index/filter bug).
+        // Conflating the two was the original Unit 5 bug; split buckets fix it.
+        let mut any_parse_succeeded = false;
+        let mut unparsed_files = 0usize;
+        let mut first_syntax_error: Option<String> = None;
+        let mut first_unsupported_error: Option<String> = None;
+
+        // Collect candidate files filtered by options.
+        let mut candidates: Vec<(String, crate::domain::index::LanguageId)> = index
+            .all_files()
+            .filter(|(path, file)| {
+                file_matches_text_options(path, file, options, &compiled_globs, &targets_by_path)
+            })
+            .map(|(path, file)| (path.clone(), file.language))
+            .collect();
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (path, lang) in &candidates {
+            if total_matches >= options.total_limit {
+                break;
+            }
+
+            let file = match index.get_file(path) {
+                Some(f) => f,
+                None => continue,
+            };
+
+            let content_str = String::from_utf8_lossy(&file.content);
+
+            let is_tsx = LanguageId::is_tsx_path(path);
+            let compiled = compiled_patterns
+                .entry((*lang, is_tsx, pattern.to_string()))
+                .or_insert_with(|| compile_pattern(pattern, lang, is_tsx));
+            let structural_matches = match compiled {
+                Ok(compiled_pattern) => {
+                    any_parse_succeeded = true;
+                    match crate::parsing::ast_grep::structural_search_with_compiled(
+                        &content_str,
+                        compiled_pattern,
+                    ) {
+                        Ok(found) => found,
+                        Err(_) => {
+                            // Parse cancelled at the deadline (or failed): the
+                            // file was not searched, so count it, never match it.
+                            unparsed_files += 1;
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // compile_structural_pattern returns two distinguishable error
+                    // shapes: "structural search not supported for …" for
+                    // config languages, and "invalid structural pattern: …"
+                    // for ast-grep Pattern::try_new failures.
+                    let e = e.clone();
+                    if e.starts_with("invalid structural pattern") {
+                        if first_syntax_error.is_none() {
+                            first_syntax_error = Some(e);
+                        }
+                    } else if first_unsupported_error.is_none() {
+                        first_unsupported_error = Some(e);
+                    }
+                    continue;
+                }
+            };
+
+            if structural_matches.is_empty() {
+                continue;
+            }
+
+            // Pre-compute Rust test module line ranges for noise filtering.
+            let test_ranges: Vec<(u32, u32)> = if !options.noise_policy.include_tests
+                && *lang == crate::domain::index::LanguageId::Rust
+            {
+                compute_test_ranges(file)
+            } else {
+                Vec::new()
+            };
+
+            let remaining = options.total_limit.saturating_sub(total_matches);
+            let per_file_limit = options.max_per_file.min(remaining);
+
+            let mut matches: Vec<TextLineMatch> = Vec::new();
+            for sm in &structural_matches {
+                let line_idx = sm.start_line;
+
+                // Skip matches inside Rust #[cfg(test)] modules.
+                if !test_ranges.is_empty() {
+                    let line_num = line_idx as u32;
+                    if test_ranges
+                        .iter()
+                        .any(|&(start, end)| line_num >= start && line_num <= end)
+                    {
+                        suppressed_by_noise += 1;
+                        continue;
+                    }
+                }
+
+                // Build display line: first line of matched text + captures summary.
+                let first_line = sm.text.lines().next().unwrap_or(&sm.text);
+                let display = if sm.captures.is_empty() {
+                    first_line.to_string()
+                } else {
+                    let caps: Vec<String> = sm
+                        .captures
+                        .iter()
+                        .map(|(name, val)| {
+                            let short = if val.len() > 40 {
+                                format!("{}...", &val[..37])
+                            } else {
+                                val.clone()
+                            };
+                            format!("${name}={short}")
+                        })
+                        .collect();
+                    format!("{first_line}  // {}", caps.join(", "))
+                };
+
+                matches.push(TextLineMatch {
+                    line_number: line_idx + 1,
+                    line: display,
+                    enclosing_symbol: file
+                        .symbols
+                        .iter()
+                        .filter(|s| {
+                            s.line_range.0 <= (line_idx as u32)
+                                && s.line_range.1 >= (line_idx as u32)
+                        })
+                        .max_by_key(|s| s.depth)
+                        .map(|s| EnclosingMatchSymbol {
+                            name: s.name.clone(),
+                            kind: s.kind.to_string(),
+                            line_range: s.line_range,
+                            body: None,
+                        }),
+                });
+                if matches.len() >= per_file_limit {
+                    break;
+                }
+            }
+
+            if !matches.is_empty() {
+                let rendered_lines = options
+                    .context
+                    .map(|ctx| build_context_rendered_lines(&content_str, &matches, ctx));
+                total_matches += matches.len();
+                files.push(TextFileMatches {
+                    path: path.clone(),
+                    matches,
+                    rendered_lines,
+                    callers: None,
+                });
+            }
+        }
+
+        // If no candidate compiled the pattern, surface the right error kind.
+        // Syntax errors win over "unsupported language" because a syntax error
+        // means the USER has a bug in their pattern; the language-unsupported
+        // bucket only matters when every candidate was in a config language.
+        if !any_parse_succeeded {
+            if let Some(error) = first_syntax_error {
+                return Err(TextSearchError::InvalidStructuralPattern {
+                    pattern: pattern.to_string(),
+                    error,
+                });
+            }
+            if let Some(sample_error) = first_unsupported_error {
+                return Err(TextSearchError::UnsupportedStructuralLanguage {
+                    pattern: pattern.to_string(),
+                    sample_error,
+                });
+            }
+        }
+
+        Ok(with_excluded_knowledge_count(
+            TextSearchResult {
+                label: format!("structural '{pattern}'"),
+                total_matches,
+                files,
+                suppressed_by_noise,
+                overflow_count: 0,
+                excluded_knowledge_files: 0,
+                withheld_policy_files: 0,
+                withheld_size_files: 0,
+                unparsed_files,
+            },
+            index,
+            options,
+            &compiled_globs,
+        ))
+    }
+
+    /// A corpus large enough for several structural rounds and parallel text
+    /// scans: functions, `unwrap` calls, a Rust test module, CRLF lines, and
+    /// non-ASCII lines whose Unicode lowercasing differs from ASCII folding.
+    fn parallel_equivalence_corpus() -> LiveIndex {
+        let mut files = Vec::new();
+        for i in 0..150 {
+            let mut content = format!(
+                "fn f{i}() {{ let x = g().unwrap(); }}\r\nfn index_{i}() {{ h().unwrap(); }}\n"
+            );
+            if i % 3 == 0 {
+                content.push_str("// \u{212A}EY_VALUE\n// plain key_value\n// ÄBC İndex\n");
+            }
+            if i % 5 == 0 {
+                content.push_str("#[cfg(test)]\nmod tests {\n    fn t() { z().unwrap(); }\n}\n");
+            }
+            for line in 0..(i % 7) {
+                content.push_str(&format!("fn extra_{line}() {{ INDEX.unwrap(); }}\n"));
+            }
+            files.push(make_file(
+                &format!("src/f{i:03}.rs"),
+                &content,
+                vec![make_symbol(&format!("f{i}"), SymbolKind::Function, 0)],
+            ));
+        }
+        let mut json = make_file("data/config.json", "{\"index\": 1}\n", vec![]);
+        json.1.language = LanguageId::Json;
+        files.push(json);
+        make_index(files)
+    }
+
+    fn equivalence_option_variants() -> Vec<TextSearchOptions> {
+        let base = TextSearchOptions::default();
+        vec![
+            base.clone(),
+            TextSearchOptions {
+                total_limit: 3,
+                max_per_file: 2,
+                ..base.clone()
+            },
+            TextSearchOptions {
+                total_limit: 63,
+                max_per_file: 1,
+                ..base.clone()
+            },
+            TextSearchOptions {
+                total_limit: usize::MAX,
+                max_per_file: usize::MAX,
+                ..base.clone()
+            },
+            TextSearchOptions {
+                noise_policy: NoisePolicy {
+                    include_tests: true,
+                    ..base.noise_policy
+                },
+                context: Some(1),
+                ..base.clone()
+            },
+            TextSearchOptions {
+                ranked: true,
+                ..base.clone()
+            },
+        ]
+    }
+
+    #[test]
+    fn parallel_structural_search_matches_the_serial_oracle() {
+        let index = parallel_equivalence_corpus();
+        for pattern in ["$X.unwrap()", "fn $NAME($$$) { $$$ }", "fn (", "INDEX"] {
+            for options in equivalence_option_variants() {
+                let compile = crate::parsing::ast_grep::compile_structural_pattern;
+                let parallel = search_structural_with_compiler(&index, pattern, &options, compile);
+                let serial = serial_structural_oracle(&index, pattern, &options, compile);
+                assert_eq!(
+                    format!("{parallel:?}"),
+                    format!("{serial:?}"),
+                    "pattern {pattern:?}, limits {}/{}",
+                    options.total_limit,
+                    options.max_per_file
+                );
+            }
+        }
+        let unlimited = search_structural_with_compiler(
+            &index,
+            "$X.unwrap()",
+            &equivalence_option_variants()[3],
+            crate::parsing::ast_grep::compile_structural_pattern,
+        )
+        .expect("valid pattern");
+        assert!(unlimited.total_matches > 3 * STRUCTURAL_SEARCH_ROUND);
+    }
+
+    #[test]
+    fn parallel_text_search_matches_the_serial_oracle() {
+        let index = parallel_equivalence_corpus();
+        let terms = vec!["index".to_string(), "\u{212A}ey".to_string()];
+        // (query, terms, regex, case_sensitive, whole_word)
+        type Query<'a> = (
+            Option<&'a str>,
+            Option<&'a [String]>,
+            bool,
+            Option<bool>,
+            bool,
+        );
+        let queries: [Query<'_>; 9] = [
+            (Some("index"), None, false, None, false),
+            (Some("INDEX"), None, false, Some(true), false),
+            (Some("key"), None, false, None, false),
+            (Some("\u{212A}ey"), None, false, None, false),
+            (Some("äbc"), None, false, None, false),
+            (Some("i\u{307}ndex"), None, false, None, false),
+            (Some("index"), None, false, None, true),
+            (None, Some(terms.as_slice()), false, None, false),
+            (Some(r"fn\s+\w+_\d+"), None, true, None, false),
+        ];
+        for (query, terms, regex, case_sensitive, whole_word) in queries {
+            for options in equivalence_option_variants() {
+                let options = TextSearchOptions {
+                    case_sensitive,
+                    whole_word,
+                    ..options
+                };
+                let run = || search_text_with_options(&index, query, terms, regex, &options);
+                let serial = crate::live_index::store::with_serial_oracle(run);
+                let parallel = run();
+                assert_eq!(
+                    format!("{parallel:?}"),
+                    format!("{serial:?}"),
+                    "query {query:?}, limits {}/{}",
+                    options.total_limit,
+                    options.max_per_file
+                );
+            }
+        }
+        // The Unicode semantics the fast lane must keep: KELVIN SIGN lowercases
+        // to ASCII `k`, so in a candidate file `key_value` also matches a line
+        // that no ASCII fold would match.
+        let kelvin = search_text_with_options(
+            &index,
+            Some("key_value"),
+            None,
+            false,
+            &TextSearchOptions::default(),
+        )
+        .expect("literal search");
+        assert!(kelvin.total_matches > 0);
+        assert!(
+            kelvin
+                .files
+                .iter()
+                .flat_map(|file| &file.matches)
+                .any(|found| found.line.contains('\u{212A}'))
+        );
     }
 }
