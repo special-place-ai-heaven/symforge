@@ -9,7 +9,9 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use crate::domain::{FileDisposition, IndexTargets, LanguageId, SourceIdentity, SymbolKind};
+use crate::domain::{
+    FileDisposition, IndexTargets, LanguageId, SourceIdentity, SymbolKind, SymbolRecord,
+};
 
 use super::graph::SymbolId;
 use super::store::{IndexedFile, LiveIndex};
@@ -659,21 +661,7 @@ pub fn build_knowledge_bridge(
         ))
     });
 
-    let mut reverse_exact: BTreeMap<CodeAnchorId, Vec<u32>> = BTreeMap::new();
-    let mut ownership_selectors = Vec::new();
-    for (index, link) in forward.iter().enumerate() {
-        let index = u32::try_from(index).unwrap_or(u32::MAX);
-        match &link.resolution {
-            BridgeResolution::ResolvedExact(anchor) => {
-                reverse_exact
-                    .entry(anchor.id.clone())
-                    .or_default()
-                    .push(index);
-            }
-            BridgeResolution::ResolvedDeclaredSet { .. } => ownership_selectors.push(index),
-            BridgeResolution::Ambiguous { .. } | BridgeResolution::Missing => {}
-        }
-    }
+    let (reverse_exact, ownership_selectors) = forward_indices(&forward);
     let mut reverse_knowledge: BTreeMap<KnowledgeAnchorId, Vec<u32>> = BTreeMap::new();
     for (index, link) in knowledge_links.iter().enumerate() {
         if let KnowledgeLinkResolution::ResolvedExact(anchor) = &link.resolution {
@@ -706,7 +694,24 @@ mod test_seams {
     thread_local! {
         pub(super) static FULL_BRIDGE_BUILDS: Cell<u64> = const { Cell::new(0) };
         pub(super) static FORCE_CARRY: Cell<bool> = const { Cell::new(false) };
+        pub(super) static PARTIAL_BRIDGE_UPDATES: Cell<u64> = const { Cell::new(0) };
+        pub(super) static FORCE_PARTIAL: Cell<bool> = const { Cell::new(false) };
     }
+}
+
+/// Carries on this thread that recomputed at least one code anchor. Tests
+/// read it to tell a partial update from a plain carry.
+#[cfg(any(test, feature = "__test-internals"))]
+pub fn partial_bridge_updates() -> u64 {
+    test_seams::PARTIAL_BRIDGE_UPDATES.with(std::cell::Cell::get)
+}
+
+/// Negative control: while on, a carry on this thread skips the check that
+/// every referenced name is defined as often as before, so a test can show
+/// its equivalence check catches a wrong partial update.
+#[cfg(any(test, feature = "__test-internals"))]
+pub fn force_partial_bridge_update_for_test(on: bool) {
+    test_seams::FORCE_PARTIAL.with(|force| force.set(on));
 }
 
 /// Full [`build_knowledge_bridge`] runs on this thread. Tests read it to
@@ -770,13 +775,22 @@ pub(crate) fn code_only_changes<'a>(
 /// A build reads the source, the content generation, the limits, the Indexed
 /// targets in the manifest, the set of file paths, and each file's language,
 /// content, content hash and symbols; nothing else (not mtime, not
-/// references). So the bridge is unchanged, apart from the generation stamped
-/// in its anchors, when every changed file is code-only (see
-/// [`code_only_changes`]) and each such file either kept its content hash and
-/// symbols, or is a file no link resolves to and whose old and new symbols
-/// name nothing a knowledge file refers to. Symbol links to other files are
-/// untouched: their matches, counts and samples come only from files that
-/// define a referenced name.
+/// references). When every changed file is code-only (see
+/// [`code_only_changes`]), knowledge files, cards, candidates and the path set
+/// are those of `previous_live`, so path and ownership resolutions are too.
+/// A changed code file reaches the bridge only through the code anchors that
+/// point into it, and through how many times it defines each referenced name.
+///
+/// So when every changed file defines each referenced name as often as before
+/// (sections excluded, as in [`symbol_index`]) and kept the length of its
+/// content hash, every resolution variant, match count, sample count and
+/// budget decision is unchanged: anchor metadata weighs the path, name, kind
+/// and hash length, never lines. What can differ is the anchors into the
+/// changed files: their hash, lines, kind and start line. Those are recomputed
+/// from the new file ([`refresh_code_anchors`]) and the reverse index rebuilt.
+/// The anchors into one file for one name are adjacent in a sorted match list
+/// (`CodeAnchorId` orders by path first), so the kept samples take the same
+/// number from that file as before, in the new order.
 pub(crate) fn carry_knowledge_bridge(
     previous_live: &LiveIndex,
     previous: &KnowledgeBridge,
@@ -791,33 +805,25 @@ pub(crate) fn carry_knowledge_bridge(
         restamp_bridge(&mut bridge, content_generation);
         return Some(bridge);
     }
+    #[cfg(any(test, feature = "__test-internals"))]
+    let skip_count_check = test_seams::FORCE_PARTIAL.with(std::cell::Cell::get);
+    #[cfg(not(any(test, feature = "__test-internals")))]
+    let skip_count_check = false;
     let changed = code_only?;
-    let mut resolved_paths: Option<BTreeSet<&str>> = None;
+    let mut refreshed = BTreeSet::new();
     for &path in changed {
         let (old, new) = (&previous_live.files[path], &live.files[path]);
         if old.content_hash == new.content_hash && old.symbols == new.symbols {
             continue;
         }
-        let names_referenced =
-            old.symbols.iter().chain(&new.symbols).any(|symbol| {
-                symbol.kind != SymbolKind::Section && referenced.contains(&symbol.name)
-            });
-        if names_referenced {
+        if old.content_hash.len() != new.content_hash.len()
+            || (!skip_count_check
+                && referenced_name_counts(old, referenced)
+                    != referenced_name_counts(new, referenced))
+        {
             return None;
         }
-        let resolved = resolved_paths.get_or_insert_with(|| {
-            previous
-                .forward
-                .iter()
-                .filter_map(|link| match &link.resolution {
-                    BridgeResolution::ResolvedExact(anchor) => Some(code_anchor_path(anchor)),
-                    _ => None,
-                })
-                .collect()
-        });
-        if resolved.contains(path) {
-            return None;
-        }
+        refreshed.insert(path);
     }
     // ponytail: a deep copy, because every anchor stamps the content
     // generation, so a value equal to a fresh build cannot share the previous
@@ -825,8 +831,128 @@ pub(crate) fn carry_knowledge_bridge(
     // Upgrade path: stamp the generation at read time from the owning
     // `PublishedGeneration` and share the bridge by `Arc`.
     let mut bridge = previous.clone();
+    if !refreshed.is_empty() && refresh_code_anchors(&mut bridge, live, &refreshed) {
+        #[cfg(any(test, feature = "__test-internals"))]
+        test_seams::PARTIAL_BRIDGE_UPDATES.with(|updates| updates.set(updates.get() + 1));
+        (bridge.reverse_exact, bridge.ownership_selectors) = forward_indices(&bridge.forward);
+    }
     restamp_bridge(&mut bridge, content_generation);
     Some(bridge)
+}
+
+/// How many times `file` defines each referenced name, sections excluded.
+fn referenced_name_counts<'a>(
+    file: &'a IndexedFile,
+    referenced: &BTreeSet<String>,
+) -> BTreeMap<&'a str, usize> {
+    let mut counts = BTreeMap::new();
+    for symbol in &file.symbols {
+        if symbol.kind != SymbolKind::Section && referenced.contains(&symbol.name) {
+            *counts.entry(symbol.name.as_str()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Recompute, from `live`, every code anchor in `bridge.forward` that points
+/// into a `changed` file, keeping each anchor's position. Returns whether any
+/// anchor was recomputed. The generation is left for [`restamp_bridge`].
+fn refresh_code_anchors(
+    bridge: &mut KnowledgeBridge,
+    live: &LiveIndex,
+    changed: &BTreeSet<&str>,
+) -> bool {
+    let mut by_name: BTreeMap<(String, String), Vec<CodeAnchor>> = BTreeMap::new();
+    let mut fresh = |anchor: &CodeAnchor, name: &str| -> Vec<CodeAnchor> {
+        let path = code_anchor_path(anchor);
+        by_name
+            .entry((path.to_string(), name.to_string()))
+            .or_insert_with(|| {
+                file_symbol_anchors(
+                    &anchor.source,
+                    anchor.content_generation,
+                    path,
+                    &live.files[path],
+                    name,
+                )
+            })
+            .clone()
+    };
+    let mut any = false;
+    for link in &mut bridge.forward {
+        match &mut link.resolution {
+            BridgeResolution::ResolvedExact(anchor) => {
+                if !changed.contains(code_anchor_path(anchor)) {
+                    continue;
+                }
+                let replacement = match &anchor.id {
+                    CodeAnchorId::File { path } => Some(file_code_anchor(
+                        &anchor.source,
+                        anchor.content_generation,
+                        path,
+                        &live.files[path.as_str()],
+                    )),
+                    CodeAnchorId::Symbol { symbol, .. } => {
+                        match fresh(anchor, &symbol.name).as_slice() {
+                            [only] => Some(only.clone()),
+                            _ => None,
+                        }
+                    }
+                };
+                if let Some(replacement) = replacement {
+                    *anchor = replacement;
+                    any = true;
+                }
+            }
+            BridgeResolution::Ambiguous {
+                bounded_samples, ..
+            } => {
+                for path in changed {
+                    let positions: Vec<usize> = bounded_samples
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, anchor)| code_anchor_path(anchor) == *path)
+                        .map(|(index, _)| index)
+                        .collect();
+                    let Some(&first) = positions.first() else {
+                        continue;
+                    };
+                    let CodeAnchorId::Symbol { symbol, .. } = &bounded_samples[first].id else {
+                        continue;
+                    };
+                    let name = symbol.name.clone();
+                    let replacements = fresh(&bounded_samples[first], &name);
+                    for (index, replacement) in positions.into_iter().zip(replacements) {
+                        bounded_samples[index] = replacement;
+                        any = true;
+                    }
+                }
+            }
+            BridgeResolution::ResolvedDeclaredSet { .. } | BridgeResolution::Missing => {}
+        }
+    }
+    any
+}
+
+/// The reverse index of exact resolutions and the positions of ownership
+/// selectors, over a sorted forward list.
+fn forward_indices(forward: &[KnowledgeCodeLink]) -> (BTreeMap<CodeAnchorId, Vec<u32>>, Vec<u32>) {
+    let mut reverse_exact: BTreeMap<CodeAnchorId, Vec<u32>> = BTreeMap::new();
+    let mut ownership_selectors = Vec::new();
+    for (index, link) in forward.iter().enumerate() {
+        let index = u32::try_from(index).unwrap_or(u32::MAX);
+        match &link.resolution {
+            BridgeResolution::ResolvedExact(anchor) => {
+                reverse_exact
+                    .entry(anchor.id.clone())
+                    .or_default()
+                    .push(index);
+            }
+            BridgeResolution::ResolvedDeclaredSet { .. } => ownership_selectors.push(index),
+            BridgeResolution::Ambiguous { .. } | BridgeResolution::Missing => {}
+        }
+    }
+    (reverse_exact, ownership_selectors)
 }
 
 fn code_anchor_path(anchor: &CodeAnchor) -> &str {
@@ -1138,26 +1264,7 @@ fn symbol_index(
             if symbol.kind == SymbolKind::Section || !referenced_symbols.contains(&symbol.name) {
                 continue;
             }
-            let symbol_line_range = lines
-                .get_or_insert_with(|| NewlineIndex::new(&file.content))
-                .line_range(
-                    &file.content,
-                    symbol.byte_range.0 as usize..symbol.byte_range.1 as usize,
-                );
-            let anchor = CodeAnchor {
-                source: source.clone(),
-                content_generation,
-                id: CodeAnchorId::Symbol {
-                    symbol: SymbolId {
-                        path: path.clone(),
-                        name: symbol.name.clone(),
-                        kind: symbol.kind,
-                    },
-                    start_line: symbol_line_range.start,
-                },
-                content_hash: file.content_hash.clone(),
-                line_range: symbol_line_range,
-            };
+            let anchor = symbol_anchor(source, content_generation, path, file, symbol, &mut lines);
             by_name.entry(symbol.name.clone()).or_default().push(anchor);
         }
     }
@@ -1165,6 +1272,56 @@ fn symbol_index(
         anchors.sort_by(|left, right| left.id.cmp(&right.id));
     }
     by_name
+}
+
+/// The anchors [`symbol_index`] would list under `name` for this one file, in
+/// the same order.
+fn file_symbol_anchors(
+    source: &SourceIdentity,
+    content_generation: u64,
+    path: &str,
+    file: &IndexedFile,
+    name: &str,
+) -> Vec<CodeAnchor> {
+    let mut lines = None;
+    let mut anchors: Vec<CodeAnchor> = file
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind != SymbolKind::Section && symbol.name == name)
+        .map(|symbol| symbol_anchor(source, content_generation, path, file, symbol, &mut lines))
+        .collect();
+    anchors.sort_by(|left, right| left.id.cmp(&right.id));
+    anchors
+}
+
+fn symbol_anchor(
+    source: &SourceIdentity,
+    content_generation: u64,
+    path: &str,
+    file: &IndexedFile,
+    symbol: &SymbolRecord,
+    lines: &mut Option<NewlineIndex>,
+) -> CodeAnchor {
+    let symbol_line_range = lines
+        .get_or_insert_with(|| NewlineIndex::new(&file.content))
+        .line_range(
+            &file.content,
+            symbol.byte_range.0 as usize..symbol.byte_range.1 as usize,
+        );
+    CodeAnchor {
+        source: source.clone(),
+        content_generation,
+        id: CodeAnchorId::Symbol {
+            symbol: SymbolId {
+                path: path.to_string(),
+                name: symbol.name.clone(),
+                kind: symbol.kind,
+            },
+            start_line: symbol_line_range.start,
+        },
+        content_hash: file.content_hash.clone(),
+        line_range: symbol_line_range,
+    }
 }
 
 fn extract_candidates(path: &str, file: &IndexedFile, text: &str) -> Vec<BridgeCandidate> {

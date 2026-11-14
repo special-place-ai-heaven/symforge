@@ -1475,10 +1475,15 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Bounded structural parse: `ast_grep.rs` parses through `parsing::parse_within` and
 // `live_index/search.rs` counts cancelled files; index_lifecycle files only copy the
 // new count and render it. No new edge, no bridge. 320 files.
+// Issue #876 partial update: `live_index/knowledge_bridge.rs` and
+// `live_index/store.rs` update the carried bridge in place; the only new
+// import is the `SymbolRecord` domain type. No index_lifecycle edge, no bridge.
+// A comment in `live_index/store.rs` names the partial update. Comment only, no
+// bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "474126899f2801f070bce51df7e72670c1e546ea3d40e1dd90ce61006af36c83",
+    "9adcd38a1f62d389bd7058924942b912b343339c84eb454d815af7ede81a2750",
     320,
-    13086832,
+    13093801,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

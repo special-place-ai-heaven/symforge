@@ -2216,7 +2216,10 @@ fn build_published_authority(
 /// is whether [`code_only_changes`] held between the two indices. Then, with the
 /// source, source version, code signals and secret policy unchanged, no policy
 /// file, and every changed file code-only, every input but the generation is
-/// the same.
+/// the same. A carried bridge may hold recomputed code anchors
+/// ([`carry_knowledge_bridge`]); a build reads a code anchor only for its id,
+/// to match `relevant_code_changes`, which [`AuthorityTemporalIndex`] leaves
+/// empty, so those anchors do not reach the authority.
 fn carried_authority(
     previous: &PublishedGeneration,
     code_only: bool,
@@ -5595,25 +5598,31 @@ impl SharedIndexHandle {
         // belt-and-braces, since a content-preserving publish should not move
         // the source either.
         //
-        // A content publish whose change cannot reach knowledge (an edit to a
-        // code file no document points at, or a hash-skip that only moved an
-        // mtime) carries the previous bridge with its anchors restamped to
-        // the new content generation: `carry_knowledge_bridge` proves the
+        // A content publish that only edits code files, each defining every
+        // referenced name as often as before, carries the previous bridge
+        // with its anchors restamped to the new content generation. A changed
+        // code file holding any bridge anchor, as a link's exact resolution or
+        // as a kept sample of an ambiguous selector, also has those anchors
+        // recomputed (the partial update). `carry_knowledge_bridge` proves the
         // result equals a full build, which costs ~1.2 GB of allocation and
         // ~1.8 s on this repository (issue #876).
-        // One comparison against the replaced generation serves both carries.
-        let code_only = code_only_changes(&previous.live, &live);
+        // One comparison against the replaced generation serves both carries,
+        // and only a carry reads it: a deferred or re-bound publication skips it.
+        let same_source = source.is_some() && previous.source == source;
+        let code_only = (deferred_owner.is_none() && same_source)
+            .then(|| code_only_changes(&previous.live, &live))
+            .flatten();
         let mut bridge_carried = false;
         let bridge = if deferred_owner.is_some() {
             Arc::new(KnowledgeBridge::loading())
         } else {
             match source.as_deref() {
-                Some(source) if !content_changed && previous.source.as_deref() == Some(source) => {
+                Some(_) if !content_changed && same_source => {
                     bridge_carried = true;
                     Arc::clone(&previous.bridge)
                 }
                 Some(source) => {
-                    let carried = (previous.source.as_deref() == Some(source))
+                    let carried = same_source
                         .then(|| {
                             carry_knowledge_bridge(
                                 &previous.live,
