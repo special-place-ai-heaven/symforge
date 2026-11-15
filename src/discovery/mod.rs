@@ -490,13 +490,19 @@ pub(crate) fn path_is_root_build_output(root: &Path, relative_path: &str) -> boo
 /// VCS/runtime internals are outside source scope even when ignore rules
 /// explicitly re-include them. Other repository-owned hidden paths remain
 /// discoverable and flow through normal ignore/admission policy.
+///
+/// The curation engine's transient files (`.symforge-curation-*`: the root
+/// durability probe, policy and recovery temps) are runtime internals too.
+/// They appear in the repository root mid-apply; observing one republished
+/// the source and staled the very review that apply was guarding on.
 pub(crate) fn path_is_hard_scope_excluded(relative_path: &Path) -> bool {
     relative_path.components().any(|component| {
         let std::path::Component::Normal(name) = component else {
             return false;
         };
         name.to_str().is_some_and(|name| {
-            matches!(crate::paths::fold_case(name).as_str(), ".git" | ".symforge")
+            let name = crate::paths::fold_case(name);
+            matches!(name.as_str(), ".git" | ".symforge") || name.starts_with(".symforge-curation-")
         })
     })
 }
@@ -3653,6 +3659,47 @@ mod tests {
                 ".\u{17F}ymforge/index.bin"
             )));
             assert!(path_is_hard_scope_excluded(Path::new(".GIT/config")));
+        }
+
+        /// The embedded observer fingerprints this scout plan. A curation apply's
+        /// root durability probe and policy temp must not change it, or the observer
+        /// republishes mid-apply and the engine refuses its own review as stale.
+        #[test]
+        fn curation_engine_temps_leave_the_scout_plan_unchanged() {
+            let tmp = TempDir::new().unwrap();
+            create_file(
+                tmp.path(),
+                "src/lib.rs",
+                "pub fn exact() -> bool { true }\n",
+            );
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let scout = || {
+                format!(
+                    "{:?}",
+                    scout_repository_with_exclusions_cancellable(
+                        tmp.path(),
+                        &SourceExclusions::default(),
+                        &cancel,
+                    )
+                    .unwrap()
+                )
+            };
+            let before = scout();
+            create_file(
+                tmp.path(),
+                ".symforge-curation-probe-destination-xtA6BG",
+                "before",
+            );
+            create_file(
+                tmp.path(),
+                ".symforge-curation-probe-replacement-Q1",
+                "after",
+            );
+            create_file(tmp.path(), ".symforge-curation-policy-Z9", "[policy]\n");
+            assert_eq!(scout(), before);
+            assert!(!path_is_hard_scope_excluded(Path::new(
+                ".symforge-knowledge.toml"
+            )));
         }
 
         #[test]
