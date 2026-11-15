@@ -1193,10 +1193,27 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Issue #876 allocator: `guidance/health.rs` gains a private allocator line for the
 // Memory section (jemalloc mallctl reads behind server + Linux glibc). Private
 // helpers, no bridge. Same 91 files.
+// Structural rewrite: `index_lifecycle/embed_batch.rs` adds inherent
+// `preview_structural_rewrite` / `apply_structural_rewrite` on the embedded
+// handle, calling outward into `edit_safety::structural_rewrite` and the
+// existing staged-batch kernel; `guidance/request_refusal.rs` lists the new
+// `rewrite` argument. Same 91 files, no bridge.
+// Rewrite review fixes: `embed_batch.rs` reserves the replay key before
+// planning and records a scope-wide post-image (new private
+// `scope_manifest_for_paths`, a `StagedAnswer` flag, an outward
+// `edit_safety::paths_in_scope` call); `embed_wire_edit.rs` dispatches the
+// new wire variants to the existing inherent methods. Same 91 files, no bridge.
+// Rewrite review fixes 2: `guidance/read_context.rs` gains two pure refusal
+// formatters (`project_wide_mutation_refused_unverified`, moved from
+// `protocol/format.rs`, and `structural_rewrite_refused_unverified`, an
+// outward `edit_safety::withheld_in_scope` call); `embed_batch.rs` calls the
+// latter in its rewrite plan and replay scope. Same 91 files, no bridge.
+// Merge of main (#876 allocator) into the rewrite branch: tuple recomputed over
+// both sides; no source line beyond either side. Same 91 files, no bridge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "2698c5807018967133d340c2f2e587ed8b59f115555745a60b06a1c4ab2f4e03",
+    "1adc47361bd1bfeadb4f47f89dda0d04d378c1aa59f8ac17f161f697841a8cbe",
     91,
-    2504990,
+    2516034,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1506,10 +1523,28 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Issue #876 allocator: the private health allocator line above; `main.rs` adds a
 // Linux glibc `#[global_allocator]` static; `daemon.rs` rewords a comment. No
 // index_lifecycle edge, no bridge. 320 files.
+// Structural rewrite: new `edit_safety/structural_rewrite.rs` (no
+// index_lifecycle edge; the language filter is parsed by each lane) plans an
+// ast-grep rewrite that `protocol/edit_tools.rs` (roster file, one new
+// `guidance::filters` call) and the embed handle stage through the existing
+// batch pipeline; `parsing` gains the rewrite and an error-node count. No
+// trait, registration or re-export bridge into the dark directory. 321 files.
+// Rewrite review fixes: `protocol/edit_tools.rs` refuses on in-scope withheld
+// files and begins replay before planning (calls into `edit_safety` only);
+// `embed/parity/edit/wire.rs` gains rewrite variants; the embed lane changes
+// are listed on the excluded pin. No new bridge. 321 files.
+// Rewrite review fixes 2: the withheld-since-restore refusal text moves from
+// `protocol/format.rs` into `guidance/read_context.rs` (a pure formatter,
+// re-delegated) beside a shared structural-rewrite refusal both lanes call;
+// `edit_safety/structural_rewrite.rs` (no index_lifecycle edge) counts
+// admission-withheld catalog rows in scope; `protocol/edit_tools.rs` runs the
+// existing reconcile sweep before planning. No new bridge. 321 files.
+// Merge of main (#876 allocator) into the rewrite branch: tuple recomputed over
+// both sides; no source line beyond either side. No new bridge. 321 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "9eb3d257f77e9efc583e05c5cd2b573921e39cca34210403bd7beb17516491bd",
-    320,
-    13158616,
+    "09d6b11b42af01792e8b2438ca2ee34ed8bd96f91ca993e5e0d5ce57c775d8c5",
+    321,
+    13207805,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

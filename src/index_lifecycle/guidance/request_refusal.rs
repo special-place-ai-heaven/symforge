@@ -821,6 +821,7 @@ pub(crate) static TOOL_ARGUMENTS: &[(&str, &[&str])] = &[
             "edits",
             "idempotency_key",
             "project",
+            "rewrite",
             "working_directory",
         ],
     ),
@@ -1447,7 +1448,6 @@ fn tool_required(tool: &str) -> &'static [&'static str] {
 pub(crate) static TOOL_REQUIRED: &[(&str, &[&str])] = &[
     ("analyze_file_impact", &["path"]),
     ("ask", &["query"]),
-    ("batch_edit", &["edits"]),
     ("batch_insert", &["content", "position", "targets"]),
     ("batch_rename", &["path", "name", "new_name"]),
     (

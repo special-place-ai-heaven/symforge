@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use symforge::embed::parity::edit::{
     BatchEditAction, BatchEditRequest, BatchInsertRequest, BatchRenameRequest, DeleteRequest,
-    EditApplyAuthority, EditGuard, EditTarget, EditWithinRequest, InsertPosition, InsertRequest,
-    ReplaceRequest,
+    EditApplyAuthority, EditError, EditErrorKind, EditGuard, EditTarget, EditWithinRequest,
+    InsertPosition, InsertRequest, ReplaceRequest, StructuralRewriteRequest,
 };
 use symforge::embed::{
     EmbeddedSourceHandle, EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase,
@@ -176,6 +176,27 @@ fn run_case(
                     .unwrap()
                     .body
                     .render()
+            }
+        }
+        "batch_edit" if input.get("rewrite").is_some() => {
+            let request: StructuralRewriteRequest =
+                serde_json::from_value(input["rewrite"].clone()).expect("rewrite request");
+            let answer = if dry_run {
+                handle
+                    .preview_structural_rewrite(&request)
+                    .map(|preview| preview.body)
+            } else {
+                handle
+                    .apply_structural_rewrite(&request, authority, key)
+                    .map(|applied| applied.body)
+            };
+            match answer {
+                Ok(body) => body.render(),
+                // A refusal carries the text MCP prints for it.
+                Err(EditError::Edit(EditErrorKind::StructuralRewriteRefused { message })) => {
+                    message
+                }
+                Err(other) => panic!("unexpected rewrite refusal {other:?}"),
             }
         }
         "batch_edit" => {

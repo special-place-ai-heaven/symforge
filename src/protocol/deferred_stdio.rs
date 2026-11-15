@@ -1114,6 +1114,38 @@ mod tests {
         assert!(text.contains("tools_allowed_unknown: bogus"), "{text}");
     }
 
+    /// `batch_edit`'s structural mode is no separate tool: an allow-list
+    /// without `batch_edit` refuses a `rewrite` call like any batch edit, and
+    /// one listing it lets the call through to the handler.
+    #[tokio::test]
+    async fn structural_rewrite_is_callable_only_where_batch_edit_is_allowed() {
+        use crate::protocol::surface_probe::SurfaceEnvVarGuard;
+        let rewrite = json!({
+            "rewrite": {"pattern": "old($A)", "template": "new($A)"},
+            "dry_run": true
+        });
+        for (allowed, refused) in [("status, get_symbol", true), ("status, batch_edit", false)] {
+            let _tools = SurfaceEnvVarGuard::set("SYMFORGE_TOOLS", Some(allowed));
+            let _surface = SurfaceEnvVarGuard::set("SYMFORGE_SURFACE", None);
+            let (front, startup) = DeferredStdioServer::new(Path::new("/work/repo"));
+            startup.send_replace(StdioStartup::Ready(Arc::new(real_server())));
+            let mut client = connect(front);
+            client.initialize().await;
+            let reply = client
+                .call_with(2, "batch_edit", rewrite.clone(), None)
+                .await;
+            let message = reply["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(
+                message.contains("'batch_edit'") && message.contains("SYMFORGE_TOOLS"),
+                refused,
+                "{allowed}: {reply}"
+            );
+            if !refused {
+                assert!(reply.get("result").is_some(), "{reply}");
+            }
+        }
+    }
+
     /// The readiness probe calls `status` through the gated `call_tool`. With
     /// `status` off the allow-list the probe is refused, yet a loading index is
     /// still answered with the loading notice, not a wrong result.

@@ -647,3 +647,48 @@ async fn status_and_health_name_the_served_repositories() {
     assert!(!is_error, "{health}");
     assert!(health.contains("Watcher:"), "{health}");
 }
+
+/// `batch_edit` structural mode routes by `project` like every edit: the
+/// rewrite lands in the selected repository only.
+#[tokio::test(flavor = "multi_thread")]
+async fn structural_rewrite_routes_by_project() {
+    let a = fixture_repo("alpha.rs", "alpha_only_fn");
+    let b = fixture_repo("beta.rs", "beta_only_fn");
+    let served = start(args(vec![spec("a", a.path()), spec("b", b.path())], false)).await;
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let (text, _) = call(
+            &served.url,
+            "search_symbols",
+            serde_json::json!({"query": "beta_only_fn", "project": "b"}),
+        )
+        .await;
+        if text.contains("beta.rs") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "b never indexed: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let (text, is_error) = call(
+        &served.url,
+        "batch_edit",
+        serde_json::json!({
+            "project": "b",
+            "rewrite": {"pattern": "pub fn $N() {}", "template": "pub fn $N() { () }"}
+        }),
+    )
+    .await;
+    assert!(!is_error, "{text}");
+    assert_eq!(
+        std::fs::read_to_string(b.path().join("beta.rs")).unwrap(),
+        "pub fn beta_only_fn() { () }\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(a.path().join("alpha.rs")).unwrap(),
+        "pub fn alpha_only_fn() {}\n",
+        "the other repository is untouched"
+    );
+}

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     BatchEditApplied, BatchEditPreview, BatchRenamePreview, EditGuard, EditTarget,
     EditWithinPreview, InsertPosition, ReplaceApplied, ReplacePreview, StructuralApplied,
-    StructuralPreview,
+    StructuralPreview, StructuralRewriteRequest,
 };
 use crate::lifecycle_identity::PublicationIdentity;
 
@@ -105,6 +105,36 @@ pub struct WireBatchRenamePlan {
     pub uncertain_sites: usize,
 }
 
+/// MCP `batch_edit`'s `rewrite` object, refusing unknown keys as every wire
+/// fact does.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireStructuralRewrite {
+    pub pattern: String,
+    pub template: String,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub glob: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+impl From<&WireStructuralRewrite> for StructuralRewriteRequest {
+    fn from(wire: &WireStructuralRewrite) -> Self {
+        Self {
+            pattern: wire.pattern.clone(),
+            template: wire.template.clone(),
+            language: wire.language.clone(),
+            path_prefix: wire.path_prefix.clone(),
+            glob: wire.glob.clone(),
+            limit: wire.limit,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WireEditRequest {
@@ -161,6 +191,12 @@ pub enum WireEditRequest {
     ApplyBatchEdit {
         actions: Vec<WireBatchEditAction>,
     },
+    PreviewStructuralRewrite {
+        rewrite: WireStructuralRewrite,
+    },
+    ApplyStructuralRewrite {
+        rewrite: WireStructuralRewrite,
+    },
     PreviewBatchInsert {
         targets: Vec<WireEditGuard>,
         position: InsertPosition,
@@ -189,6 +225,7 @@ impl WireEditRequest {
             | Self::ApplyDelete { .. }
             | Self::ApplyEditWithin { .. }
             | Self::ApplyBatchEdit { .. }
+            | Self::ApplyStructuralRewrite { .. }
             | Self::ApplyBatchInsert { .. }
             | Self::ApplyBatchRename { .. } => true,
             Self::Plan { .. }
@@ -198,6 +235,7 @@ impl WireEditRequest {
             | Self::PreviewDelete { .. }
             | Self::PreviewEditWithin { .. }
             | Self::PreviewBatchEdit { .. }
+            | Self::PreviewStructuralRewrite { .. }
             | Self::PreviewBatchInsert { .. }
             | Self::PreviewBatchRename { .. } => false,
         }

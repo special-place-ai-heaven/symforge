@@ -508,21 +508,21 @@ pub struct BatchEditInput {
     /// Local/embedded servers refuse non-matching selectors.
     #[serde(default)]
     pub project: Option<String>,
-    /// List of individual edits to apply atomically.
-    #[serde(deserialize_with = "super::tools::lenient_vec_required")]
+    /// Symbol-addressed edits, applied atomically.
+    #[serde(default, deserialize_with = "super::tools::lenient_vec_required")]
     #[schemars(with = "Vec<SingleEdit>")]
     pub edits: Vec<SingleEdit>,
-    /// When true, validate and plan all edits but skip disk writes and index mutation.
-    /// Returns per-edit preview lines prefixed with `[DRY RUN]`.
+    /// Instead of edits: rewrite ast-grep `pattern` matches ($X, $$$X) as `template`, up to `limit` (100).
+    #[serde(default)]
+    pub rewrite: Option<crate::edit_safety::structural_rewrite::StructuralRewrite>,
+    /// Plan everything, write nothing; lines start `[DRY RUN]`.
     #[serde(default, deserialize_with = "super::tools::lenient_bool")]
     pub dry_run: Option<bool>,
     /// Optional replay guard for committed mutations. Dry runs do not reserve or replay.
     #[serde(default)]
     pub idempotency_key: Option<String>,
-    /// Caller's working directory (absolute path). Applies to all edits in the
-    /// batch unless a per-edit override is set. Consumed by the
-    /// `worktree-awareness` feature hook to redirect writes into the matching
-    /// git worktree.
+    /// Caller's absolute working directory; writes go to its git worktree. A
+    /// per-edit value overrides it.
     #[serde(default)]
     pub working_directory: Option<String>,
 }
@@ -538,11 +538,9 @@ pub struct SingleEdit {
     /// Line number to disambiguate.
     #[serde(default, deserialize_with = "super::tools::lenient_u32")]
     pub symbol_line: Option<u32>,
-    /// The edit operation to perform.
+    /// Edit operation.
     pub operation: EditOperation,
-    /// Per-edit caller working directory (absolute path). Overrides any
-    /// `working_directory` set on the enclosing `BatchEditInput`. Consumed by
-    /// the `worktree-awareness` feature hook.
+    /// Per-edit override of the batch `working_directory`.
     #[serde(default)]
     pub working_directory: Option<String>,
 }
@@ -745,7 +743,7 @@ impl<'de> serde::Deserialize<'de> for SingleEdit {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum EditOperation {
-    /// Replace the entire symbol definition.
+    /// Replace the whole symbol.
     #[serde(rename = "replace")]
     Replace { new_body: String },
     /// Insert code before the symbol.
@@ -983,17 +981,6 @@ pub(crate) fn execute_batch_edit(
     tests::run_before_batch_edit_stage_hook();
 
     // Phase 3: Stage all edits per file in memory first.
-    struct StagedFile {
-        path: String,
-        abs_path: PathBuf,
-        original: Vec<u8>,
-        new_content: Vec<u8>,
-        language: LanguageId,
-        summaries: Vec<String>,
-        working_directory: Option<PathBuf>,
-        resolved_target: crate::worktree::ResolvedTarget,
-    }
-
     let mut staged: Vec<StagedFile> = Vec::with_capacity(by_file.len());
 
     // Stage (and so report) files in path order, as `execute_batch_insert`
@@ -1128,10 +1115,6 @@ pub(crate) fn execute_batch_edit(
             }
         }
 
-        let indexed_abs_path = match safe_repo_path(repo_root, path) {
-            Ok(p) => p,
-            Err(e) => return Err(format!("Path containment error for '{path}': {e}")),
-        };
         // Per-edit override wins over the top-level batch value; first non-None
         // per file decides (mixing per-edit values across the same file is
         // undefined and accepted only because order is deterministic).
@@ -1140,34 +1123,132 @@ pub(crate) fn execute_batch_edit(
             .find_map(|&ri| edits[resolved[ri].operation].working_directory.as_deref())
             .map(PathBuf::from)
             .or_else(|| top_level_working_directory.map(PathBuf::from));
-        let hook_ctx = super::edit_hooks::EditContext {
-            relative_path: path,
-            indexed_absolute_path: &indexed_abs_path,
+        staged.push(stage_batch_file(
             repo_root,
             project_state_dir,
-            working_directory: per_file_working_directory.as_deref(),
-        };
-        let resolved_target = match super::edit_hooks::resolve(&hook_ctx) {
-            Ok(r) => r,
-            Err(e) => return Err(format!("Path resolution error for '{path}': {e}")),
-        };
-        // Review finding 5 (post-v7.19.0): fail closed instead of clobbering
-        // a diverged rerouted target — this batch's splices were resolved
-        // against the index snapshot, not the worktree file.
-        let original = guard_batch_reroute_divergence(&resolved_target, &file.content, path)?;
-        let abs_path = resolved_target.target_path.clone();
-        staged.push(StagedFile {
-            path: path.clone(),
-            abs_path,
-            original,
-            new_content: content,
+            path,
+            &file.content,
+            content,
             language,
-            summaries: file_summaries,
-            working_directory: per_file_working_directory,
-            resolved_target,
-        });
+            file_summaries,
+            per_file_working_directory,
+        )?);
     }
 
+    commit_batch_files(index, repo_root, project_state_dir, staged, dry_run)
+}
+
+/// One file of a batch, staged in memory: its routed target, the bytes it is
+/// verified against, its postimage, and the summaries it reports.
+struct StagedFile {
+    path: String,
+    abs_path: PathBuf,
+    original: Vec<u8>,
+    new_content: Vec<u8>,
+    language: LanguageId,
+    summaries: Vec<String>,
+    working_directory: Option<PathBuf>,
+    resolved_target: crate::worktree::ResolvedTarget,
+}
+
+/// Confine `path`, route it through the edit hooks, and stage `new_content`
+/// against the indexed bytes it was planned from.
+#[allow(clippy::too_many_arguments)]
+fn stage_batch_file(
+    repo_root: &Path,
+    project_state_dir: Option<&crate::domain::ProjectStateDir>,
+    path: &str,
+    indexed_content: &[u8],
+    new_content: Vec<u8>,
+    language: LanguageId,
+    summaries: Vec<String>,
+    working_directory: Option<PathBuf>,
+) -> Result<StagedFile, String> {
+    let indexed_abs_path = match safe_repo_path(repo_root, path) {
+        Ok(p) => p,
+        Err(e) => return Err(format!("Path containment error for '{path}': {e}")),
+    };
+    let hook_ctx = super::edit_hooks::EditContext {
+        relative_path: path,
+        indexed_absolute_path: &indexed_abs_path,
+        repo_root,
+        project_state_dir,
+        working_directory: working_directory.as_deref(),
+    };
+    let resolved_target = match super::edit_hooks::resolve(&hook_ctx) {
+        Ok(r) => r,
+        Err(e) => return Err(format!("Path resolution error for '{path}': {e}")),
+    };
+    // Review finding 5 (post-v7.19.0): fail closed instead of clobbering
+    // a diverged rerouted target — this batch's splices were resolved
+    // against the index snapshot, not the worktree file.
+    let original = guard_batch_reroute_divergence(&resolved_target, indexed_content, path)?;
+    let abs_path = resolved_target.target_path.clone();
+    Ok(StagedFile {
+        path: path.to_string(),
+        abs_path,
+        original,
+        new_content,
+        language,
+        summaries,
+        working_directory,
+        resolved_target,
+    })
+}
+
+/// `batch_edit` structural mode: stage every file of `plan` exactly as a
+/// symbol-addressed batch stages its files, after checking that the index
+/// still holds the bytes the plan was computed from, then commit (or, for a
+/// dry run, report) through the same kernel.
+pub(crate) fn execute_structural_rewrite(
+    index: &SharedIndex,
+    repo_root: &Path,
+    project_state_dir: Option<&crate::domain::ProjectStateDir>,
+    plan: &crate::edit_safety::structural_rewrite::RewritePlan,
+    dry_run: bool,
+    working_directory: Option<&Path>,
+) -> Result<(Vec<String>, Vec<std::path::PathBuf>), String> {
+    crate::worktree::refuse_network_working_directories(std::iter::once(working_directory))
+        .map_err(|error| error.to_string())?;
+    let summaries = plan.summaries(false);
+    let mut staged = Vec::with_capacity(plan.files.len());
+    for (file, summary) in plan.files.iter().zip(summaries) {
+        {
+            let guard = index.read();
+            let current = guard
+                .get_file(&file.path)
+                .ok_or_else(|| format!("File disappeared: {}", file.path))?;
+            if current.content != file.original {
+                return Err(format!(
+                    "Error: file `{}` changed after the rewrite was planned; retry with fresh source. No files were modified.",
+                    file.path
+                ));
+            }
+        }
+        staged.push(stage_batch_file(
+            repo_root,
+            project_state_dir,
+            &file.path,
+            &file.original,
+            file.replacement.clone(),
+            file.language,
+            vec![summary],
+            working_directory.map(PathBuf::from),
+        )?);
+    }
+    commit_batch_files(index, repo_root, project_state_dir, staged, dry_run)
+}
+
+/// Phases 4 and 5 of every batch: a dry run reports the staged summaries;
+/// a real run commits all postimages through the shared staged kernel, then
+/// reindexes every file and runs the after-commit hooks.
+fn commit_batch_files(
+    index: &SharedIndex,
+    repo_root: &Path,
+    project_state_dir: Option<&crate::domain::ProjectStateDir>,
+    staged: Vec<StagedFile>,
+    dry_run: bool,
+) -> Result<(Vec<String>, Vec<std::path::PathBuf>), String> {
     if dry_run {
         let mut summaries = Vec::new();
         for staged_file in &staged {

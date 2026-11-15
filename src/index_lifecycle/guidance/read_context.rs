@@ -1330,6 +1330,35 @@ pub fn withheld_not_searched_note(
     ))
 }
 
+/// A project-wide mutation cannot see references inside withheld files, so
+/// it refuses rather than leave them half-renamed.
+pub fn project_wide_mutation_refused_unverified(
+    tool: &str,
+    unverified: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    let (count, listed) = withheld_listing(unverified, None, 10)?;
+    Some(format!(
+        "{tool} refused: {count} files are withheld as unverified since restore, and a \
+         project-wide change cannot see what they contain: {listed}. A successful re-read \
+         releases each one; run index_folder to rebuild the project from source, then retry."
+    ))
+}
+
+/// The `batch_edit` structural-mode refusal both lanes print when the
+/// request's scope holds a file withheld as unverified since restore.
+pub fn structural_rewrite_refused_unverified(
+    index: &crate::live_index::LiveIndex,
+    request: &crate::edit_safety::structural_rewrite::StructuralRewrite,
+    language: Option<crate::domain::LanguageId>,
+) -> Result<(), String> {
+    let withheld =
+        crate::edit_safety::structural_rewrite::withheld_in_scope(index, request, language)?;
+    match project_wide_mutation_refused_unverified("batch_edit rewrite", &withheld) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

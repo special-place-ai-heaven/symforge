@@ -894,7 +894,9 @@ mod tests {
         }
         // A missing required field is not an unknown key.
         assert!(matches!(
-            decode_strict::<BatchEditInput>(serde_json::json!({ "dry_run": true })),
+            decode_strict::<crate::protocol::edit::BatchRenameInput>(
+                serde_json::json!({ "dry_run": true })
+            ),
             Err(StrictError::Decode(_))
         ));
     }
