@@ -1210,10 +1210,13 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // latter in its rewrite plan and replay scope. Same 91 files, no bridge.
 // Merge of main (#876 allocator) into the rewrite branch: tuple recomputed over
 // both sides; no source line beyond either side. Same 91 files, no bridge.
+// Replay child diagnostics: `index_lifecycle/embed_knowledge.rs` test module only
+// captures the re-spawned child's output for its failure message. cfg(test); no
+// new edge, no bridge. Same 91 files.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "1adc47361bd1bfeadb4f47f89dda0d04d378c1aa59f8ac17f161f697841a8cbe",
+    "a90f11da532bc2df6899d3d607936131cbe6831b642fb1ca982890b225d2c1ad",
     91,
-    2516034,
+    2516356,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1541,10 +1544,12 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // existing reconcile sweep before planning. No new bridge. 321 files.
 // Merge of main (#876 allocator) into the rewrite branch: tuple recomputed over
 // both sides; no source line beyond either side. No new bridge. 321 files.
+// Replay child diagnostics: test-only change in `index_lifecycle/embed_knowledge.rs`
+// (child output in an assertion message). No new edge, no bridge. 321 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "09d6b11b42af01792e8b2438ca2ee34ed8bd96f91ca993e5e0d5ce57c775d8c5",
+    "5a03f11f1659869185c50baa1b0596c536b26444e7bd4e98eb784e7951763a7e",
     321,
-    13207805,
+    13208127,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

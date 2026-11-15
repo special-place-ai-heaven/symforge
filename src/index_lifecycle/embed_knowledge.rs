@@ -276,6 +276,15 @@ mod tests {
     use std::sync::{Arc, atomic::AtomicBool};
     use std::time::{Duration, Instant};
 
+    fn child_report(out: &std::process::Output) -> String {
+        format!(
+            "status={:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
     #[test]
     fn curation_completed_replay_survives_process_restart() {
         let Ok(child_root) = std::env::var("SYMFORGE_KNOWLEDGE_REPLAY_CHILD_ROOT") else {
@@ -308,13 +317,16 @@ mod tests {
             let wire_path = wire.path().join("curation-request.json");
             let child = crate::process_util::hidden_command(std::env::current_exe().unwrap())
                 .arg("curation_completed_replay_survives_process_restart")
+                .arg("--nocapture")
                 .env("SYMFORGE_KNOWLEDGE_REPLAY_CHILD_ROOT", root)
                 .env("SYMFORGE_KNOWLEDGE_REPLAY_REQUEST", &wire_path)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
+                .output()
                 .expect("child test process");
-            assert!(child.success(), "child failed to complete curation");
+            assert!(
+                child.status.success(),
+                "child failed to complete curation: {}",
+                child_report(&child)
+            );
             let request: WireKnowledgeRequest =
                 serde_json::from_slice(&fs::read(&wire_path).unwrap())
                     .expect("strict serialized curation request");
@@ -485,13 +497,16 @@ mod tests {
         let wire_path = outer.path().join("curation-request.json");
         let child = crate::process_util::hidden_command(std::env::current_exe().unwrap())
             .arg("curation_completed_replay_survives_process_restart")
+            .arg("--nocapture")
             .env("SYMFORGE_KNOWLEDGE_REPLAY_CHILD_ROOT", &root)
             .env("SYMFORGE_KNOWLEDGE_REPLAY_REQUEST", &wire_path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .output()
             .unwrap();
-        assert!(child.success(), "initial process did not complete curation");
+        assert!(
+            child.status.success(),
+            "initial process did not complete curation: {}",
+            child_report(&child)
+        );
         let request: WireKnowledgeRequest =
             serde_json::from_slice(&fs::read(&wire_path).unwrap()).unwrap();
         let displaced = outer.path().join("original-source");
