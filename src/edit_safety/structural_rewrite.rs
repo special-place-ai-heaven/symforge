@@ -155,7 +155,6 @@ pub fn plan_structural_rewrite(
         Some(limit) => limit as usize,
     };
     let scope = Scope::new(request, language)?;
-    refuse_withheld_since_restore(index, &scope)?;
     let withheld = scope.admission_withheld(index);
     let mut candidates: Vec<(&String, &crate::live_index::store::IndexedFile)> = index
         .all_files()
@@ -318,7 +317,6 @@ pub fn paths_in_scope(
     language: Option<LanguageId>,
 ) -> Result<Vec<String>, String> {
     let scope = Scope::new(request, language)?;
-    refuse_withheld_since_restore(index, &scope)?;
     let mut paths: Vec<String> = index
         .all_files()
         .filter(|(path, file)| scope.contains(path, Some(file.language)))
@@ -328,32 +326,21 @@ pub fn paths_in_scope(
     Ok(paths)
 }
 
-/// Refuse when `request` would have searched a file the snapshot verify
-/// withheld since restore: it has no trustworthy indexed bytes, so the planner
-/// cannot see its matches. Both lanes print this text; the MCP lane also runs
-/// it before its replay guard.
-pub fn refuse_withheld_in_scope(
+/// The withheld-since-restore files `request` would have searched, with why.
+/// A withheld file has no trustworthy indexed bytes, so the planner cannot
+/// see its matches; both lanes refuse rather than skip it silently.
+pub fn withheld_in_scope(
     index: &LiveIndex,
     request: &StructuralRewrite,
     language: Option<LanguageId>,
-) -> Result<(), String> {
-    refuse_withheld_since_restore(index, &Scope::new(request, language)?)
-}
-
-fn refuse_withheld_since_restore(index: &LiveIndex, scope: &Scope) -> Result<(), String> {
-    let withheld: std::collections::BTreeMap<String, String> = index
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let scope = Scope::new(request, language)?;
+    Ok(index
         .withheld_since_restore()
         .iter()
         .filter(|(path, _)| scope.contains(path, LanguageId::from_path(path)))
         .map(|(path, why)| (path.clone(), why.clone()))
-        .collect();
-    match crate::index_lifecycle::guidance::read_context::project_wide_mutation_refused_unverified(
-        "batch_edit rewrite",
-        &withheld,
-    ) {
-        Some(refusal) => Err(refusal),
-        None => Ok(()),
-    }
+        .collect())
 }
 
 /// The scope a `path_prefix` names. Absolute and parent-relative prefixes are

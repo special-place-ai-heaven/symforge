@@ -2204,7 +2204,7 @@ impl SymForgeServer {
         {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
-            if let Err(refusal) = crate::edit_safety::structural_rewrite::refuse_withheld_in_scope(
+            if let Err(refusal) = crate::index_lifecycle::guidance::read_context::structural_rewrite_refused_unverified(
                 &guard, rewrite, language,
             ) {
                 return refusal;

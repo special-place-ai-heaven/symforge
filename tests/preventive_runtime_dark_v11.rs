@@ -1200,10 +1200,15 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // `scope_manifest_for_paths`, a `StagedAnswer` flag, an outward
 // `edit_safety::paths_in_scope` call); `embed_wire_edit.rs` dispatches the
 // new wire variants to the existing inherent methods. Same 91 files, no bridge.
+// Rewrite review fixes 2: `guidance/read_context.rs` gains two pure refusal
+// formatters (`project_wide_mutation_refused_unverified`, moved from
+// `protocol/format.rs`, and `structural_rewrite_refused_unverified`, an
+// outward `edit_safety::withheld_in_scope` call); `embed_batch.rs` calls the
+// latter in its rewrite plan and replay scope. Same 91 files, no bridge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "b89d60ad2ee06aaaef3ab99e538a4a2e3852dbbb4d0784fe5813b61960a0a886",
+    "40f4e9832344620a6b1db2bbff08006a4d5bd731f03a80c2b372122f39689c38",
     91,
-    2511070,
+    2512677,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1522,14 +1527,14 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // are listed on the excluded pin. No new bridge. 321 files.
 // Rewrite review fixes 2: the withheld-since-restore refusal text moves from
 // `protocol/format.rs` into `guidance/read_context.rs` (a pure formatter,
-// re-delegated) so `edit_safety/structural_rewrite.rs` can refuse inside the
-// shared planner for both lanes; the planner counts admission-withheld
-// catalog rows; `protocol/edit_tools.rs` runs the existing reconcile sweep
-// before planning. No new bridge. 321 files.
+// re-delegated) beside a shared structural-rewrite refusal both lanes call;
+// `edit_safety/structural_rewrite.rs` (no index_lifecycle edge) counts
+// admission-withheld catalog rows in scope; `protocol/edit_tools.rs` runs the
+// existing reconcile sweep before planning. No new bridge. 321 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "c4cc8fd42d26ca710d0c037b1d3efa65b8e30f9a86026a95abb96d8f280eb57c",
+    "534e33f941213b27d265109bbeddc986f8cc6ab23a778ea474b93d4d1dc51396",
     321,
-    13203311,
+    13203752,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

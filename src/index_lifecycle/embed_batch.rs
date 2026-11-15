@@ -1699,8 +1699,11 @@ fn plan_rewrite(
         .map_err(|error| EditErrorKind::StructuralRewriteRefused {
             message: refusal(error),
         })?;
-    plan_structural_rewrite(&snapshot.generation.live, request, language)
-        .map_err(|message| EditErrorKind::StructuralRewriteRefused { message })
+    let refused = |message| EditErrorKind::StructuralRewriteRefused { message };
+    let live = &snapshot.generation.live;
+    super::guidance::read_context::structural_rewrite_refused_unverified(live, request, language)
+        .map_err(refused)?;
+    plan_structural_rewrite(live, request, language).map_err(refused)
 }
 
 /// Every indexed file the request's scope names, in path order.
@@ -1711,7 +1714,10 @@ fn rewrite_scope(
     let refused = |message| EditErrorKind::StructuralRewriteRefused { message };
     let language = super::guidance::filters::parse_language_filter(request.language.as_deref())
         .map_err(|error| refused(refusal(error)))?;
-    paths_in_scope(&snapshot.generation.live, request, language).map_err(refused)
+    let live = &snapshot.generation.live;
+    super::guidance::read_context::structural_rewrite_refused_unverified(live, request, language)
+        .map_err(refused)?;
+    paths_in_scope(live, request, language).map_err(refused)
 }
 
 /// Stage every planned file against the bytes it was planned from, admitted

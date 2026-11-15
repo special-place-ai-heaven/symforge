@@ -1344,6 +1344,21 @@ pub fn project_wide_mutation_refused_unverified(
     ))
 }
 
+/// The `batch_edit` structural-mode refusal both lanes print when the
+/// request's scope holds a file withheld as unverified since restore.
+pub fn structural_rewrite_refused_unverified(
+    index: &crate::live_index::LiveIndex,
+    request: &crate::edit_safety::structural_rewrite::StructuralRewrite,
+    language: Option<crate::domain::LanguageId>,
+) -> Result<(), String> {
+    let withheld =
+        crate::edit_safety::structural_rewrite::withheld_in_scope(index, request, language)?;
+    match project_wide_mutation_refused_unverified("batch_edit rewrite", &withheld) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
