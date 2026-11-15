@@ -2200,9 +2200,78 @@ fn format_memory_health(generation: &crate::live_index::store::PublishedGenerati
         Err(reason) => format!("process_resident_bytes: not measured ({reason})"),
     };
     format!(
-        "── Memory ──\n{resident}\nproject {}",
-        index_memory_counts(generation.memory_counts())
+        "── Memory ──\n{resident}\nproject {}\n{}",
+        index_memory_counts(generation.memory_counts()),
+        allocator_line()
     )
+}
+
+/// The allocator serving this process, observed rather than assumed: the
+/// shipped binary installs jemalloc on Linux glibc, and a probe allocation
+/// through the global allocator must move jemalloc's per-thread allocated
+/// counter before this line names it. An embedder or test binary that links
+/// jemalloc without installing it fails the probe and is reported unidentified.
+fn allocator_line() -> String {
+    #[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))]
+    if let Some(line) = jemalloc_line() {
+        return line;
+    }
+    "allocator: not identified (only jemalloc is probed)".to_string()
+}
+
+#[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))]
+#[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))]
+fn jemalloc_line() -> Option<String> {
+    const PROBE: usize = 64 * 1024;
+    let before: u64 = jemalloc_read(c"thread.allocated")?;
+    let probe = std::hint::black_box(vec![0u8; PROBE]);
+    let after: u64 = jemalloc_read(c"thread.allocated")?;
+    drop(probe);
+    if after.saturating_sub(before) < PROBE as u64 {
+        return None;
+    }
+    let version = jemalloc_version().unwrap_or_else(|| "unread".to_string());
+    let background = jemalloc_read::<bool>(c"background_thread")
+        .map_or_else(|| "unread".to_string(), |on| on.to_string());
+    Some(format!(
+        "allocator=jemalloc version={version} background_thread={background}"
+    ))
+}
+
+/// Read one fixed-size jemalloc control value. Callers pass the C type the
+/// name documents: `u64` for `thread.allocated`, `bool` for
+/// `background_thread`, a C string pointer for `version`.
+#[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))]
+#[allow(unsafe_code)]
+fn jemalloc_read<T: Copy>(name: &std::ffi::CStr) -> Option<T> {
+    let mut value = std::mem::MaybeUninit::<T>::uninit();
+    let mut len = std::mem::size_of::<T>();
+    // SAFETY: `name` is NUL-terminated; `value` is writable for `len` bytes and
+    // mallctl writes at most that many; a null `newp` with length 0 writes nothing.
+    let status = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // SAFETY: success with the full size reported means every byte was written
+    // with a value of the documented type.
+    (status == 0 && len == std::mem::size_of::<T>()).then(|| unsafe { value.assume_init() })
+}
+
+#[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))]
+#[allow(unsafe_code)]
+fn jemalloc_version() -> Option<String> {
+    let pointer: *const std::ffi::c_char = jemalloc_read(c"version")?;
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: jemalloc's `version` is a static NUL-terminated string.
+    let version = unsafe { std::ffi::CStr::from_ptr(pointer) };
+    Some(version.to_string_lossy().into_owned())
 }
 
 /// This process's resident memory in bytes: Linux `VmRSS` from
@@ -2393,6 +2462,14 @@ mod memory_section_tests {
         assert_eq!(
             lines[2],
             "project files=0 content_bytes=0 references=0 trigram_entries=0"
+        );
+        // This test binary keeps the system allocator, so the jemalloc probe
+        // must not fire even where jemalloc is linked (the server build on
+        // Linux glibc): the line reports what serves the process, not what
+        // was compiled in.
+        assert_eq!(
+            lines[3],
+            "allocator: not identified (only jemalloc is probed)"
         );
     }
 }

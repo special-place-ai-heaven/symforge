@@ -1190,6 +1190,9 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Bounded structural parse: the embed text-search wire carries `unparsed_files` and
 // the shared search renderer names files whose parse was cancelled. Field copies and
 // a pure render helper. Same 91 files, no bridge.
+// Issue #876 allocator: `guidance/health.rs` gains a private allocator line for the
+// Memory section (jemalloc mallctl reads behind server + Linux glibc). Private
+// helpers, no bridge. Same 91 files.
 // Structural rewrite: `index_lifecycle/embed_batch.rs` adds inherent
 // `preview_structural_rewrite` / `apply_structural_rewrite` on the embedded
 // handle, calling outward into `edit_safety::structural_rewrite` and the
@@ -1205,10 +1208,12 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // `protocol/format.rs`, and `structural_rewrite_refused_unverified`, an
 // outward `edit_safety::withheld_in_scope` call); `embed_batch.rs` calls the
 // latter in its rewrite plan and replay scope. Same 91 files, no bridge.
+// Merge of main (#876 allocator) into the rewrite branch: tuple recomputed over
+// both sides; no source line beyond either side. Same 91 files, no bridge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "40f4e9832344620a6b1db2bbff08006a4d5bd731f03a80c2b372122f39689c38",
+    "1adc47361bd1bfeadb4f47f89dda0d04d378c1aa59f8ac17f161f697841a8cbe",
     91,
-    2512677,
+    2516034,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1515,6 +1520,9 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // `FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE` switch to one root so a watcher
 // another test left running cannot take it; its test gains a bystander
 // watcher. cfg(test) only; no index_lifecycle edge, no bridge. 320 files.
+// Issue #876 allocator: the private health allocator line above; `main.rs` adds a
+// Linux glibc `#[global_allocator]` static; `daemon.rs` rewords a comment. No
+// index_lifecycle edge, no bridge. 320 files.
 // Structural rewrite: new `edit_safety/structural_rewrite.rs` (no
 // index_lifecycle edge; the language filter is parsed by each lane) plans an
 // ast-grep rewrite that `protocol/edit_tools.rs` (roster file, one new
@@ -1531,10 +1539,12 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // `edit_safety/structural_rewrite.rs` (no index_lifecycle edge) counts
 // admission-withheld catalog rows in scope; `protocol/edit_tools.rs` runs the
 // existing reconcile sweep before planning. No new bridge. 321 files.
+// Merge of main (#876 allocator) into the rewrite branch: tuple recomputed over
+// both sides; no source line beyond either side. No new bridge. 321 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "534e33f941213b27d265109bbeddc986f8cc6ab23a778ea474b93d4d1dc51396",
+    "09d6b11b42af01792e8b2438ca2ee34ed8bd96f91ca993e5e0d5ce57c775d8c5",
     321,
-    13203752,
+    13207805,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
