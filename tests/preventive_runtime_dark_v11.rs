@@ -1190,10 +1190,13 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Bounded structural parse: the embed text-search wire carries `unparsed_files` and
 // the shared search renderer names files whose parse was cancelled. Field copies and
 // a pure render helper. Same 91 files, no bridge.
+// Issue #876 allocator: `guidance/health.rs` gains a private allocator line for the
+// Memory section (jemalloc mallctl reads behind server + Linux glibc). Private
+// helpers, no bridge. Same 91 files.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "02226b2999ab85ff43e1039e08a696a8a470a949e59d37aab8303eb64766331b",
+    "2698c5807018967133d340c2f2e587ed8b59f115555745a60b06a1c4ab2f4e03",
     91,
-    2501633,
+    2504990,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1500,10 +1503,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // `FORCE_WATCHER_SESSION_EXIT_AFTER_ACTIVE` switch to one root so a watcher
 // another test left running cannot take it; its test gains a bystander
 // watcher. cfg(test) only; no index_lifecycle edge, no bridge. 320 files.
+// Issue #876 allocator: the private health allocator line above; `main.rs` adds a
+// Linux glibc `#[global_allocator]` static; `daemon.rs` rewords a comment. No
+// index_lifecycle edge, no bridge. 320 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "68c7a32e85082c1ebe8f56efa9dfea084a68f7fd7c7b31afa60bb25b7555851a",
+    "9eb3d257f77e9efc583e05c5cd2b573921e39cca34210403bd7beb17516491bd",
     320,
-    13154563,
+    13158616,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

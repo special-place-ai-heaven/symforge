@@ -560,7 +560,10 @@ impl SessionRecord {
 /// resident memory stayed far above the live heap, and `malloc_trim(0)`
 /// returned most of the difference in about a tenth of a second. Unloads are
 /// rare, so that cost is paid rarely. Other allocators (musl, Windows, macOS)
-/// get nothing here.
+/// get nothing here. The binary's Rust heap is jemalloc on this target, but
+/// the bundled C libraries still allocate through glibc, and the trim still
+/// returned most of that after an unload under jemalloc
+/// (docs/solutions/allocator-comparison-876.md), so it stays.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[allow(unsafe_code)]
 fn release_freed_heap() {
