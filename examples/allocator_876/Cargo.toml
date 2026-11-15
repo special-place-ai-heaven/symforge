@@ -1,0 +1,39 @@
+[package]
+name = "allocator-876"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone on purpose: its own workspace and lockfile, so the measured
+# allocators never enter symforge's dependency graph, `cargo deny` or a
+# shipped binary. Run instructions: docs/solutions/allocator-comparison-876.md.
+[workspace]
+
+[features]
+mimalloc = ["dep:mimalloc-safe"]
+jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies]
+symforge = { path = "../..", features = ["__test-internals"] }
+tempfile = "3"
+mimalloc-safe = { version = "0.1.70", features = ["v3"], optional = true }
+libc = "0.2"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.7", features = ["background_threads"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+# Same patches as the root manifest, so the measured code is the shipped code.
+[patch.crates-io]
+tree-sitter-scss = { path = "../../vendor/tree-sitter-scss" }
+rmcp = { path = "../../vendor/rmcp" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -3,6 +3,14 @@
 //! surface this file used to consume; all dispatch logic lives behind
 //! `symforge::server_api::run`.
 
+// Issue #876: on Linux glibc, jemalloc with background purge returns freed
+// index generations to the OS; glibc kept them resident. Measured, see
+// docs/solutions/allocator-comparison-876.md. Other targets keep the system
+// allocator. Only the binary chooses: the library never installs one.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() -> std::process::ExitCode {
     match symforge::server_api::run(std::env::args_os().collect()) {
         Ok(symforge::server_api::ServerExit::Success) => std::process::ExitCode::SUCCESS,
