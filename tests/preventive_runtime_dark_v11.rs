@@ -1213,10 +1213,13 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Replay child diagnostics: `index_lifecycle/embed_knowledge.rs` test module only
 // captures the re-spawned child's output for its failure message. cfg(test); no
 // new edge, no bridge. Same 91 files.
+// Curation race: `index_lifecycle/embed_knowledge.rs` maps the engine's stale
+// review refusals to StalePublication via a file-local fn. No new edge, no
+// bridge. Same 91 files.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "a90f11da532bc2df6899d3d607936131cbe6831b642fb1ca982890b225d2c1ad",
+    "51291faf9f45ff9268767b237e5e3e31546e893f9f0d10137814514b24151c44",
     91,
-    2516356,
+    2517520,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1546,10 +1549,13 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // both sides; no source line beyond either side. No new bridge. 321 files.
 // Replay child diagnostics: test-only change in `index_lifecycle/embed_knowledge.rs`
 // (child output in an assertion message). No new edge, no bridge. 321 files.
+// Curation race: `discovery/mod.rs` hard-scope excludes `.symforge-curation-*`
+// engine temps; `index_lifecycle/embed_knowledge.rs` maps stale review refusals
+// to StalePublication. No new edge, no bridge. 321 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "5a03f11f1659869185c50baa1b0596c536b26444e7bd4e98eb784e7951763a7e",
+    "2f67e2558b9164e54f681352f12053f71e3205ddc28afa5de2f3c22397ce7622",
     321,
-    13208127,
+    13211220,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

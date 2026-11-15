@@ -31,6 +31,19 @@ fn checked_curation_receipt(
     Ok(rendered)
 }
 
+/// The engine's review guards (`prepare_mutation`) reject before any policy
+/// write and record the key as failed, so the outcome is known: nothing
+/// landed and the caller must capture a fresh review. Not `Uncertain`.
+fn is_stale_review_refusal(rendered: &str) -> bool {
+    [
+        "Error: stale_review_hash;",
+        "Error: stale_manifest_digest;",
+        "Error: stale_policy_digest;",
+    ]
+    .iter()
+    .any(|prefix| rendered.starts_with(prefix))
+}
+
 impl EmbeddedSourceHandle {
     pub fn preview_wire_knowledge(
         &self,
@@ -221,6 +234,8 @@ impl EmbeddedSourceHandle {
         if !rendered.starts_with("status=applied\n") {
             return Err(if rendered.starts_with("status=unavailable\n") {
                 KnowledgeCurationError::DurableStateUnavailable
+            } else if is_stale_review_refusal(&rendered) {
+                KnowledgeCurationError::StalePublication
             } else {
                 KnowledgeCurationError::Uncertain
             });
@@ -676,6 +691,16 @@ mod tests {
         ));
         assert!(!root.join(".symforge-knowledge.toml").exists());
         request.if_serving_publication_identity = current_serving_identity;
+        // A review the engine refuses as stale writes nothing, so the outcome
+        // is known and must not be reported as Uncertain.
+        let mut stale_review = request.clone();
+        stale_review.input.if_source_review_hash = "0".repeat(64);
+        stale_review.input.idempotency_key = Some("fixture-curation-stale-review".to_string());
+        assert!(matches!(
+            handle.curate_knowledge(&stale_review, Some(&authority)),
+            Err(KnowledgeCurationError::StalePublication)
+        ));
+        assert!(!root.join(".symforge-knowledge.toml").exists());
         let applied = handle
             .curate_knowledge(&request, Some(&authority))
             .expect("apply");
