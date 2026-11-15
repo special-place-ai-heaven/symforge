@@ -147,6 +147,9 @@ impl EmbeddedSourceHandle {
             WireEditRequest::PreviewBatchEdit { actions } => self
                 .preview_batch_edit(&bound_actions(actions, root, publication))
                 .map(WireEditReply::BatchEditPreview),
+            WireEditRequest::PreviewStructuralRewrite { rewrite } => self
+                .preview_structural_rewrite(&rewrite.into())
+                .map(WireEditReply::BatchEditPreview),
             WireEditRequest::PreviewBatchInsert {
                 targets,
                 position,
@@ -246,6 +249,9 @@ impl EmbeddedSourceHandle {
                     authority,
                     operation_key,
                 )
+                .map(WireEditReply::BatchEditApplied),
+            WireEditRequest::ApplyStructuralRewrite { rewrite } => self
+                .apply_structural_rewrite(&rewrite.into(), authority, operation_key)
                 .map(WireEditReply::BatchEditApplied),
             WireEditRequest::ApplyBatchInsert {
                 targets,

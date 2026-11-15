@@ -19952,6 +19952,28 @@ mod tests {
                 && rename.contains("index_folder"),
             "a project-wide rename must refuse while files are withheld: {rename}"
         );
+
+        let rewrite = server
+            .batch_edit(input(serde_json::json!({
+                "rewrite": {"pattern": "foo()", "template": "bar()"}, "dry_run": true
+            })))
+            .await;
+        assert!(
+            rewrite.starts_with("batch_edit rewrite refused: 1 files are withheld as unverified")
+                && rewrite.contains("src/held.rs")
+                && rewrite.contains("index_folder"),
+            "a project-wide rewrite must refuse while files are withheld: {rewrite}"
+        );
+        let elsewhere = server
+            .batch_edit(input(serde_json::json!({
+                "rewrite": {"pattern": "foo()", "template": "bar()", "path_prefix": "web"},
+                "dry_run": true
+            })))
+            .await;
+        assert!(
+            !elsewhere.contains("withheld"),
+            "a rewrite scoped away from the withheld file is not refused for it: {elsewhere}"
+        );
     }
 
     /// A withheld sensitive path keeps its path-rule refusal, and free text in
@@ -23201,6 +23223,36 @@ mod tests {
                 .await,
         );
 
+        assert_eq!(second, first);
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), written_once);
+    }
+
+    /// A converging rewrite matches nothing once applied, so the replay
+    /// record must be read before the re-plan, or a retried key would answer
+    /// "matched nothing" for files it changed.
+    #[tokio::test]
+    async fn test_batch_edit_structural_rewrite_replays_after_the_tree_converges() {
+        let source = b"fn alpha() {\n    old_call(1);\n}\n";
+        let (_dir, server, file_path) = setup_edit_test(source);
+        let request = serde_json::json!({
+            "rewrite": {"pattern": "old_call($A)", "template": "new_call($A)"},
+            "idempotency_key": "structural-rewrite-replay",
+        });
+
+        let first = serialized_tool_result(
+            server
+                .batch_edit_tool(Parameters(batch_edit_input_from_json(request.clone())))
+                .await,
+        );
+        assert_tool_result_edit_status(&first, "success", OutcomeClass::Found);
+        let written_once = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(written_once, "fn alpha() {\n    new_call(1);\n}\n");
+
+        let second = serialized_tool_result(
+            server
+                .batch_edit_tool(Parameters(batch_edit_input_from_json(request)))
+                .await,
+        );
         assert_eq!(second, first);
         assert_eq!(std::fs::read_to_string(&file_path).unwrap(), written_once);
     }

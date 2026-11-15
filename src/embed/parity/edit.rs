@@ -282,6 +282,81 @@ mod process_replay_tests {
         )
         .expect("save serialized request");
     }
+
+    /// The wire carries `batch_edit`'s structural mode, and a completed key
+    /// replays after the rewrite converged (its re-plan matches nothing).
+    #[test]
+    fn wire_structural_rewrite_replays_after_the_tree_converges() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        git2::Repository::init(repository.path()).expect("initialize repository");
+        fs::create_dir_all(repository.path().join("src")).unwrap();
+        fs::write(
+            repository.path().join("src/lib.rs"),
+            b"pub fn run() { old_call(1); }\n",
+        )
+        .unwrap();
+        fs::write(
+            repository.path().join("src/other.rs"),
+            b"pub fn idle() {}\n",
+        )
+        .unwrap();
+        let unknown = serde_json::from_value::<WireEditRequest>(serde_json::json!({
+            "kind": "apply_structural_rewrite",
+            "rewrite": {"pattern": "old_call($A)", "template": "new_call($A)", "dry_run": true},
+        }));
+        assert!(unknown.is_err(), "an unknown rewrite key must be refused");
+        let request: WireEditRequest = serde_json::from_value(serde_json::json!({
+            "kind": "apply_structural_rewrite",
+            "rewrite": {"pattern": "old_call($A)", "template": "new_call($A)"},
+        }))
+        .expect("strict wire rewrite request");
+
+        let runtime = ProcessIndexRuntime::acquire().expect("process runtime");
+        let handle = runtime
+            .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+                repository.path().to_path_buf(),
+            ))
+            .expect("open source");
+        wait_current(&handle);
+        let preview: WireEditRequest = serde_json::from_value(serde_json::json!({
+            "kind": "preview_structural_rewrite",
+            "rewrite": {"pattern": "old_call($A)", "template": "new_call($A)"},
+        }))
+        .expect("strict wire preview request");
+        let previewed = handle.preview_wire_edit(&preview).expect("wire preview");
+        assert!(
+            matches!(&previewed, WireEditReply::BatchEditPreview(result) if result.files.len() == 1)
+        );
+
+        let authority = authority(repository.path());
+        let applied = handle
+            .apply_wire_edit(&request, &authority, "structural-rewrite-op")
+            .expect("wire apply");
+        assert!(matches!(applied, WireEditReply::BatchEditApplied(result) if !result.replayed));
+        let written = b"pub fn run() { new_call(1); }\n";
+        assert_eq!(
+            fs::read(repository.path().join("src/lib.rs")).unwrap(),
+            written
+        );
+        wait_current(&handle);
+        let replayed = handle
+            .apply_wire_edit(&request, &authority, "structural-rewrite-op")
+            .expect("completed rewrite replays");
+        assert!(matches!(replayed, WireEditReply::BatchEditApplied(result) if result.replayed));
+        assert_eq!(
+            fs::read(repository.path().join("src/lib.rs")).unwrap(),
+            written
+        );
+        let fresh = handle.apply_wire_edit(&request, &authority, "structural-rewrite-new-op");
+        assert!(
+            matches!(
+                &fresh,
+                Err(EditError::Edit(EditErrorKind::StructuralRewriteRefused { message }))
+                    if message.contains("matched nothing")
+            ),
+            "a new key re-plans the converged tree"
+        );
+    }
 }
 
 /// One insertion applied at every guarded anchor as a single staged operation.

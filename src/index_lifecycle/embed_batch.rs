@@ -19,7 +19,9 @@ use crate::edit_safety::structural::{
     insert_after_position, insert_before_position, prepare_replace, replacement_splice_range,
     select_edit_within_body, splice_footprints_overlap,
 };
-use crate::edit_safety::structural_rewrite::{RewritePlan, plan_structural_rewrite, refusal};
+use crate::edit_safety::structural_rewrite::{
+    RewritePlan, paths_in_scope, plan_structural_rewrite, refusal,
+};
 use crate::embed::parity::edit::{
     BatchEditAction, BatchEditApplied, BatchEditPreview, BatchEditRequest, BatchFilePreview,
     BatchInsertRequest, BatchRenamePlan, BatchRenamePreview, BatchRenameRequest,
@@ -590,6 +592,30 @@ fn manifest_entries(
 
 type PathManifest = (Vec<u8>, Vec<(String, String)>);
 
+/// The post-image of every file a structural rewrite's scope names, written
+/// or not, in path order; an absent file records as `absent`. A rewrite
+/// converges (a replay's re-plan matches nothing), so its replay cannot learn
+/// the changed files from a plan: the scope, fixed by the request, stands in.
+/// Unlocked: writes are atomic renames, so a racing writer only turns a
+/// replay into a conflict.
+// ponytail: reads every in-scope file once per keyed apply and replay; store
+// the written paths in the replay record if large scopes make that hot.
+fn scope_manifest_for_paths(
+    paths: &[String],
+    authority: &super::activation::ProjectSourceAuthority,
+) -> Result<PathManifest, EditErrorKind> {
+    let mut entries = Vec::with_capacity(paths.len());
+    for path in paths {
+        let digest =
+            crate::idempotency::post_image_digest_beneath(authority, std::path::Path::new(path))
+                .ok_or(EditErrorKind::ReplayConflict)?
+                .unwrap_or_else(|| "absent".to_string());
+        entries.push((path.clone(), digest));
+    }
+    let manifest = serde_json::to_vec(&entries).map_err(|_| EditErrorKind::ReplayUnavailable)?;
+    Ok((manifest, entries))
+}
+
 fn current_manifest_for_paths(
     root: &std::path::Path,
     paths: &[String],
@@ -852,6 +878,7 @@ impl EmbeddedSourceHandle {
             StagedAnswer {
                 tool: "batch_rename",
                 tee: false,
+                scope_manifest: false,
                 stage: Box::new(|snapshot| {
                     let (staged, plan) = stage_rename(snapshot, request)?;
                     let sites = plan.by_file.values().map(Vec::len).sum::<usize>();
@@ -987,6 +1014,7 @@ impl EmbeddedSourceHandle {
                 // MCP's `batch_edit` writes through `atomic_write_file` and
                 // reports each tee; `batch_insert` and `batch_rename` discard it.
                 tee: matches!(tool, BatchTool::Edit),
+                scope_manifest: false,
                 stage: Box::new(move |snapshot| {
                     Ok((
                         stage_batch(snapshot, request)?,
@@ -1006,7 +1034,12 @@ impl EmbeddedSourceHandle {
         replay_paths: Vec<String>,
         answer: StagedAnswer<'_>,
     ) -> Result<BatchEditApplied, EditError> {
-        let StagedAnswer { tool, tee, stage } = answer;
+        let StagedAnswer {
+            tool,
+            tee,
+            scope_manifest,
+            stage,
+        } = answer;
         if authority.root != snapshot.root || authority.cancel.load(Ordering::Acquire) {
             return Err(EditError::Edit(EditErrorKind::WriteAuthorityRefused));
         }
@@ -1036,9 +1069,13 @@ impl EmbeddedSourceHandle {
                 {
                     return Err(EditError::Edit(EditErrorKind::ReplayConflict));
                 }
-                let (current, files) =
+                let (current, files) = if scope_manifest {
+                    scope_manifest_for_paths(&replay_paths, &snapshot.authority)
+                        .map_err(|_| EditError::Edit(EditErrorKind::ReplayConflict))?
+                } else {
                     current_manifest_for_paths(&snapshot.root, &replay_paths, &snapshot.authority)
-                        .map_err(EditError::Edit)?;
+                        .map_err(EditError::Edit)?
+                };
                 if !record.matches_post_image(&current) {
                     return Err(EditError::Edit(EditErrorKind::ReplayConflict));
                 }
@@ -1095,7 +1132,13 @@ impl EmbeddedSourceHandle {
                         let _ = replay.mark_uncertain(&lease);
                         return Err(EditError::Edit(EditErrorKind::WriteUncertain));
                     }
-                    let post = manifest(&staged, &snapshot.authority).map_err(|_| {
+                    let post = if scope_manifest {
+                        scope_manifest_for_paths(&replay_paths, &snapshot.authority)
+                            .map(|(bytes, _)| bytes)
+                    } else {
+                        manifest(&staged, &snapshot.authority)
+                    }
+                    .map_err(|_| {
                         let _ = replay.mark_uncertain(&lease);
                         EditError::Edit(EditErrorKind::WriteUncertain)
                     })?;
@@ -1189,6 +1232,9 @@ impl EmbeddedSourceHandle {
 struct StagedAnswer<'a> {
     tool: &'static str,
     tee: bool,
+    /// Record and replay the post-image of every `replay_paths` entry rather
+    /// than of the staged files (structural rewrite).
+    scope_manifest: bool,
     #[allow(clippy::type_complexity)]
     stage: Box<
         dyn FnOnce(
@@ -1657,6 +1703,17 @@ fn plan_rewrite(
         .map_err(|message| EditErrorKind::StructuralRewriteRefused { message })
 }
 
+/// Every indexed file the request's scope names, in path order.
+fn rewrite_scope(
+    snapshot: &EmbeddedQuerySnapshot,
+    request: &StructuralRewriteRequest,
+) -> Result<Vec<String>, EditErrorKind> {
+    let refused = |message| EditErrorKind::StructuralRewriteRefused { message };
+    let language = super::guidance::filters::parse_language_filter(request.language.as_deref())
+        .map_err(|error| refused(refusal(error)))?;
+    paths_in_scope(&snapshot.generation.live, request, language).map_err(refused)
+}
+
 /// Stage every planned file against the bytes it was planned from, admitted
 /// before and after as a rename's files are.
 fn stage_rewrite(
@@ -1771,8 +1828,9 @@ impl EmbeddedSourceHandle {
     }
 
     /// MCP `batch_edit` structural mode, applied through the staged batch
-    /// kernel under one replay key. Like MCP, the rewrite is planned before
-    /// the replay record is consulted.
+    /// kernel under one replay key. The replay record is consulted before the
+    /// rewrite is planned, so a completed key replays after the tree has
+    /// converged; its post-image covers the request's whole scope.
     pub fn apply_structural_rewrite(
         &self,
         request: &StructuralRewriteRequest,
@@ -1781,8 +1839,7 @@ impl EmbeddedSourceHandle {
     ) -> Result<BatchEditApplied, EditError> {
         let snapshot = self.capture_query_snapshot(b"apply-structural-rewrite")?;
         answer::enforce_trust(&snapshot)?;
-        let plan = plan_rewrite(&snapshot, request).map_err(EditError::Edit)?;
-        let replay_paths = plan.files.iter().map(|file| file.path.clone()).collect();
+        let replay_paths = rewrite_scope(&snapshot, request).map_err(EditError::Edit)?;
         let fingerprint = RequestFingerprint::for_json(
             "embed_structural_rewrite_v1",
             &serde_json::json!({"scope": authority.scope, "rewrite": request}),
@@ -1797,6 +1854,7 @@ impl EmbeddedSourceHandle {
             StagedAnswer {
                 tool: "batch_edit",
                 tee: true,
+                scope_manifest: true,
                 stage: Box::new(move |snapshot| {
                     let plan = plan_rewrite(snapshot, request)?;
                     Ok((

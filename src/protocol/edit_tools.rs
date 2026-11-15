@@ -2176,49 +2176,48 @@ impl SymForgeServer {
         }
     }
 
-    /// `batch_edit` structural mode. The plan is computed once from the index;
-    /// its files then take the symbol-addressed batch's path: read gate,
-    /// freshen and confinement, project-config trust, replay guard, staging
-    /// through the edit hooks, and the shared commit kernel.
+    /// `batch_edit` structural mode. Like `batch_rename`, the withheld-file
+    /// refusal and the replay guard run before the plan, so a retried key
+    /// replays its stored answer instead of re-planning a converged tree. The
+    /// plan is computed once from the index; its files then take the
+    /// symbol-addressed batch's path: read gate, freshen and confinement,
+    /// staging through the edit hooks, and the shared commit kernel.
     fn batch_structural_rewrite(
         &self,
         input: &edit::BatchEditInput,
         rewrite: &crate::edit_safety::structural_rewrite::StructuralRewrite,
     ) -> String {
-        let plan = {
-            let guard = self.index.data_plane().read();
-            loading_guard!(guard);
-            let language = match crate::index_lifecycle::guidance::filters::parse_language_filter(
-                rewrite.language.as_deref(),
-            ) {
-                Ok(language) => language,
-                Err(error) => return crate::edit_safety::structural_rewrite::refusal(error),
-            };
-            let plan = match crate::edit_safety::structural_rewrite::plan_structural_rewrite(
-                &guard, rewrite, language,
-            ) {
-                Ok(plan) => plan,
-                Err(refusal) => return refusal,
-            };
-            if let Some(notice) = plan
-                .files
-                .iter()
-                .find_map(|file| crate::protocol::read_gate::unverified_notice(&guard, &file.path))
-            {
-                return notice;
-            }
-            plan
-        };
-        let paths: Vec<String> = plan.files.iter().map(|file| file.path.clone()).collect();
-        let (repo_root, source_authority) = match prepare_batch_paths_for_edit(self, &paths) {
-            Ok(prepared) => prepared,
-            Err(e) => return e,
+        let Some(repo_root) = self.capture_repo_root() else {
+            return "Error: no repository root configured.".to_string();
         };
         let project_state = self.capture_project_state_dir();
         let project_config_trust_suffix = match project_config_trust_response_suffix(&repo_root) {
             Ok(suffix) => suffix,
             Err(message) => return message,
         };
+        let language = match crate::index_lifecycle::guidance::filters::parse_language_filter(
+            rewrite.language.as_deref(),
+        ) {
+            Ok(language) => language,
+            Err(error) => return crate::edit_safety::structural_rewrite::refusal(error),
+        };
+        {
+            let guard = self.index.data_plane().read();
+            loading_guard!(guard);
+            let withheld = match crate::edit_safety::structural_rewrite::withheld_in_scope(
+                rewrite,
+                language,
+                guard.withheld_since_restore(),
+            ) {
+                Ok(withheld) => withheld,
+                Err(refusal) => return refusal,
+            };
+            if let Some(refusal) =
+                format::project_wide_mutation_refused_unverified("batch_edit rewrite", &withheld)
+            {
+                return refusal;
+            }
+        }
         let dry_run = input.dry_run.unwrap_or(false);
         let idempotency = match begin_mutation_replay(
             self,
@@ -2229,6 +2228,37 @@ impl SymForgeServer {
         ) {
             Ok(idempotency) => idempotency,
             Err(output) => return output,
+        };
+        let plan = {
+            let guard = self.index.data_plane().read();
+            if !matches!(guard.index_state(), IndexState::Ready) {
+                return fail_and_return_bound_mutation_replay(
+                    &idempotency,
+                    "Error: the index stopped being ready before the rewrite was planned; retry. No files were modified."
+                        .to_string(),
+                );
+            }
+            let plan = match crate::edit_safety::structural_rewrite::plan_structural_rewrite(
+                &guard, rewrite, language,
+            ) {
+                Ok(plan) => plan,
+                Err(refusal) => {
+                    return fail_and_return_bound_mutation_replay(&idempotency, refusal);
+                }
+            };
+            if let Some(notice) = plan
+                .files
+                .iter()
+                .find_map(|file| crate::protocol::read_gate::unverified_notice(&guard, &file.path))
+            {
+                return fail_and_return_bound_mutation_replay(&idempotency, notice);
+            }
+            plan
+        };
+        let paths: Vec<String> = plan.files.iter().map(|file| file.path.clone()).collect();
+        let source_authority = match prepare_batch_paths_for_edit(self, &paths) {
+            Ok((_, authority)) => authority,
+            Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         match edit::execute_structural_rewrite(
             self.index.data_plane(),

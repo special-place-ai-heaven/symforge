@@ -1195,10 +1195,15 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // handle, calling outward into `edit_safety::structural_rewrite` and the
 // existing staged-batch kernel; `guidance/request_refusal.rs` lists the new
 // `rewrite` argument. Same 91 files, no bridge.
+// Rewrite review fixes: `embed_batch.rs` reserves the replay key before
+// planning and records a scope-wide post-image (new private
+// `scope_manifest_for_paths`, a `StagedAnswer` flag, an outward
+// `edit_safety::paths_in_scope` call); `embed_wire_edit.rs` dispatches the
+// new wire variants to the existing inherent methods. Same 91 files, no bridge.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "794f7ec312d26741515dc254c6e75678c3f8e1be8b16f7737502ba97d2baf641",
+    "b89d60ad2ee06aaaef3ab99e538a4a2e3852dbbb4d0784fe5813b61960a0a886",
     91,
-    2508067,
+    2511070,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1511,10 +1516,14 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // `guidance::filters` call) and the embed handle stage through the existing
 // batch pipeline; `parsing` gains the rewrite and an error-node count. No
 // trait, registration or re-export bridge into the dark directory. 321 files.
+// Rewrite review fixes: `protocol/edit_tools.rs` refuses on in-scope withheld
+// files and begins replay before planning (calls into `edit_safety` only);
+// `embed/parity/edit/wire.rs` gains rewrite variants; the embed lane changes
+// are listed on the excluded pin. No new bridge. 321 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "bf3308dac64657d065a97c451b74785e9ff56742408e00d15b7d271ca8f10eec",
+    "3bb6ccb24e5853fd9a36f0883d6d08139ad61f083586bb0dc43913c591772fa0",
     321,
-    13186047,
+    13199313,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

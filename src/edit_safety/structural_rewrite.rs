@@ -120,37 +120,10 @@ pub fn plan_structural_rewrite(
         }
         Some(limit) => limit as usize,
     };
-    let prefix = scope_prefix(request.path_prefix.as_deref())?;
-    let glob = match request.glob.as_deref().filter(|glob| !glob.is_empty()) {
-        None => None,
-        Some(glob) => Some(
-            globset::GlobBuilder::new(glob)
-                .literal_separator(true)
-                .build()
-                .map_err(|error| refusal(format_args!("invalid `glob` '{glob}': {error}")))?
-                .compile_matcher(),
-        ),
-    };
-    if let Some(language) = language
-        && crate::parsing::ast_grep::SgLang::from_language_id(&language, false).is_none()
-    {
-        return Err(refusal(format_args!(
-            "{} has no structural grammar",
-            language.name()
-        )));
-    }
-
+    let scope = Scope::new(request, language)?;
     let mut candidates: Vec<(&String, &crate::live_index::store::IndexedFile)> = index
         .all_files()
-        .filter(|(path, file)| {
-            prefix.matches(path)
-                && glob
-                    .as_ref()
-                    .is_none_or(|glob| glob.is_match(path.as_str()))
-                && language.is_none_or(|language| file.language == language)
-                && crate::parsing::ast_grep::SgLang::from_language_id(&file.language, false)
-                    .is_some()
-        })
+        .filter(|(path, file)| scope.contains(path, Some(file.language)))
         .collect();
     candidates.sort_by(|left, right| left.0.cmp(right.0));
 
@@ -215,6 +188,89 @@ pub fn plan_structural_rewrite(
     }
     refuse_syntax_regressions(&files)?;
     Ok(RewritePlan { files })
+}
+
+/// The files a request may touch: `path_prefix`, `glob` and `language`, and
+/// only languages with a structural grammar.
+struct Scope {
+    prefix: crate::live_index::search::PathScope,
+    glob: Option<globset::GlobMatcher>,
+    language: Option<LanguageId>,
+}
+
+impl Scope {
+    fn new(request: &StructuralRewrite, language: Option<LanguageId>) -> Result<Self, String> {
+        let prefix = scope_prefix(request.path_prefix.as_deref())?;
+        let glob = match request.glob.as_deref().filter(|glob| !glob.is_empty()) {
+            None => None,
+            Some(glob) => Some(
+                globset::GlobBuilder::new(glob)
+                    .literal_separator(true)
+                    .build()
+                    .map_err(|error| refusal(format_args!("invalid `glob` '{glob}': {error}")))?
+                    .compile_matcher(),
+            ),
+        };
+        if let Some(language) = language
+            && crate::parsing::ast_grep::SgLang::from_language_id(&language, false).is_none()
+        {
+            return Err(refusal(format_args!(
+                "{} has no structural grammar",
+                language.name()
+            )));
+        }
+        Ok(Self {
+            prefix,
+            glob,
+            language,
+        })
+    }
+
+    /// `file_language` is `None` when the path maps to no known language.
+    fn contains(&self, path: &str, file_language: Option<LanguageId>) -> bool {
+        let Some(file_language) = file_language else {
+            return false;
+        };
+        self.prefix.matches(path)
+            && self.glob.as_ref().is_none_or(|glob| glob.is_match(path))
+            && self
+                .language
+                .is_none_or(|language| file_language == language)
+            && crate::parsing::ast_grep::SgLang::from_language_id(&file_language, false).is_some()
+    }
+}
+
+/// Every indexed file `request` would search, in path order: the embed
+/// lane's replay scope.
+pub fn paths_in_scope(
+    index: &LiveIndex,
+    request: &StructuralRewrite,
+    language: Option<LanguageId>,
+) -> Result<Vec<String>, String> {
+    let scope = Scope::new(request, language)?;
+    let mut paths: Vec<String> = index
+        .all_files()
+        .filter(|(path, file)| scope.contains(path, Some(file.language)))
+        .map(|(path, _)| path.clone())
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
+/// The withheld-since-restore files `request` would have searched, with why.
+/// A withheld file has no trustworthy indexed bytes, so the planner cannot
+/// see its matches; the MCP lane refuses rather than skip it silently.
+pub fn withheld_in_scope(
+    request: &StructuralRewrite,
+    language: Option<LanguageId>,
+    withheld: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let scope = Scope::new(request, language)?;
+    Ok(withheld
+        .iter()
+        .filter(|(path, _)| scope.contains(path, LanguageId::from_path(path)))
+        .map(|(path, why)| (path.clone(), why.clone()))
+        .collect())
 }
 
 /// The scope a `path_prefix` names. Absolute and parent-relative prefixes are
