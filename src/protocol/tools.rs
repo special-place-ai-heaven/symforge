@@ -19964,6 +19964,24 @@ mod tests {
                 && rewrite.contains("index_folder"),
             "a project-wide rewrite must refuse while files are withheld: {rewrite}"
         );
+        {
+            // The embed lane plans and scopes its replay through these two;
+            // each must refuse with the MCP lane's exact text.
+            use crate::edit_safety::structural_rewrite as sr;
+            let request: sr::StructuralRewrite = serde_json::from_value(
+                serde_json::json!({"pattern": "foo()", "template": "bar()"}),
+            )
+            .expect("rewrite");
+            let guard = server.index.data_plane().read();
+            assert_eq!(
+                sr::plan_structural_rewrite(&guard, &request, None).expect_err("plan refuses"),
+                rewrite
+            );
+            assert_eq!(
+                sr::paths_in_scope(&guard, &request, None).expect_err("scope refuses"),
+                rewrite
+            );
+        }
         let elsewhere = server
             .batch_edit(input(serde_json::json!({
                 "rewrite": {"pattern": "foo()", "template": "bar()", "path_prefix": "web"},

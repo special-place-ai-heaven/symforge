@@ -52,6 +52,39 @@ pub struct RewrittenFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RewritePlan {
     pub files: Vec<RewrittenFile>,
+    /// In-scope files admission withheld, so the plan never searched them.
+    pub withheld: AdmissionWithheld,
+}
+
+/// In-scope catalog files admission kept out of the index: by policy
+/// (sensitive path or content) and by size.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdmissionWithheld {
+    pub policy: usize,
+    pub size: usize,
+}
+
+impl AdmissionWithheld {
+    /// `""`, or the clause both lanes append naming what was not searched.
+    fn suffix(self) -> String {
+        let mut parts = Vec::new();
+        if self.policy > 0 {
+            parts.push(format!(
+                "{} in-scope file(s) withheld by admission policy",
+                self.policy
+            ));
+        }
+        if self.size > 0 {
+            parts.push(format!(
+                "{} in-scope file(s) over the size threshold",
+                self.size
+            ));
+        }
+        if parts.is_empty() {
+            return String::new();
+        }
+        format!("; not searched: {}", parts.join(" and "))
+    }
 }
 
 impl RewritePlan {
@@ -83,9 +116,10 @@ impl RewritePlan {
     /// The evidence line both lanes print.
     pub fn evidence(&self) -> String {
         format!(
-            "{} structural match(es) across {} file(s)",
+            "{} structural match(es) across {} file(s){}",
             self.sites(),
-            self.files.len()
+            self.files.len(),
+            self.withheld.suffix()
         )
     }
 }
@@ -121,6 +155,8 @@ pub fn plan_structural_rewrite(
         Some(limit) => limit as usize,
     };
     let scope = Scope::new(request, language)?;
+    refuse_withheld_since_restore(index, &scope)?;
+    let withheld = scope.admission_withheld(index);
     let mut candidates: Vec<(&String, &crate::live_index::store::IndexedFile)> = index
         .all_files()
         .filter(|(path, file)| scope.contains(path, Some(file.language)))
@@ -178,16 +214,20 @@ pub fn plan_structural_rewrite(
     if searched == 0 {
         return Err(refusal(match first_compile_error {
             Some(error) => error,
-            None => "no indexed source file with a structural grammar is in scope".to_string(),
+            None => format!(
+                "no indexed source file with a structural grammar is in scope{}",
+                withheld.suffix()
+            ),
         }));
     }
     if files.is_empty() {
         return Err(refusal(format_args!(
-            "the pattern matched nothing in {searched} file(s) in scope"
+            "the pattern matched nothing in {searched} file(s) in scope{}",
+            withheld.suffix()
         )));
     }
     refuse_syntax_regressions(&files)?;
-    Ok(RewritePlan { files })
+    Ok(RewritePlan { files, withheld })
 }
 
 /// The files a request may touch: `path_prefix`, `glob` and `language`, and
@@ -238,6 +278,36 @@ impl Scope {
                 .is_none_or(|language| file_language == language)
             && crate::parsing::ast_grep::SgLang::from_language_id(&file_language, false).is_some()
     }
+
+    /// The catalog files in scope that admission withheld by policy or size:
+    /// the same dispositions `search_text` discloses.
+    fn admission_withheld(&self, index: &LiveIndex) -> AdmissionWithheld {
+        use crate::domain::{FileDisposition, HardSkipReason, MetadataOnlyReason};
+        let mut withheld = AdmissionWithheld::default();
+        for entry in &index.manifest_entries {
+            let Some(path) = entry.path.normalized_utf8.as_deref() else {
+                continue;
+            };
+            if !self.contains(path, LanguageId::from_path(path)) {
+                continue;
+            }
+            match &entry.disposition {
+                FileDisposition::MetadataOnly {
+                    reason:
+                        MetadataOnlyReason::SensitivePath { .. }
+                        | MetadataOnlyReason::SensitiveContent { .. },
+                } => withheld.policy += 1,
+                FileDisposition::MetadataOnly {
+                    reason: MetadataOnlyReason::OversizedData,
+                }
+                | FileDisposition::HardSkip {
+                    reason: HardSkipReason::PerFileCeiling,
+                } => withheld.size += 1,
+                _ => {}
+            }
+        }
+        withheld
+    }
 }
 
 /// Every indexed file `request` would search, in path order: the embed
@@ -248,6 +318,7 @@ pub fn paths_in_scope(
     language: Option<LanguageId>,
 ) -> Result<Vec<String>, String> {
     let scope = Scope::new(request, language)?;
+    refuse_withheld_since_restore(index, &scope)?;
     let mut paths: Vec<String> = index
         .all_files()
         .filter(|(path, file)| scope.contains(path, Some(file.language)))
@@ -257,20 +328,32 @@ pub fn paths_in_scope(
     Ok(paths)
 }
 
-/// The withheld-since-restore files `request` would have searched, with why.
-/// A withheld file has no trustworthy indexed bytes, so the planner cannot
-/// see its matches; the MCP lane refuses rather than skip it silently.
-pub fn withheld_in_scope(
+/// Refuse when `request` would have searched a file the snapshot verify
+/// withheld since restore: it has no trustworthy indexed bytes, so the planner
+/// cannot see its matches. Both lanes print this text; the MCP lane also runs
+/// it before its replay guard.
+pub fn refuse_withheld_in_scope(
+    index: &LiveIndex,
     request: &StructuralRewrite,
     language: Option<LanguageId>,
-    withheld: &std::collections::BTreeMap<String, String>,
-) -> Result<std::collections::BTreeMap<String, String>, String> {
-    let scope = Scope::new(request, language)?;
-    Ok(withheld
+) -> Result<(), String> {
+    refuse_withheld_since_restore(index, &Scope::new(request, language)?)
+}
+
+fn refuse_withheld_since_restore(index: &LiveIndex, scope: &Scope) -> Result<(), String> {
+    let withheld: std::collections::BTreeMap<String, String> = index
+        .withheld_since_restore()
         .iter()
         .filter(|(path, _)| scope.contains(path, LanguageId::from_path(path)))
         .map(|(path, why)| (path.clone(), why.clone()))
-        .collect())
+        .collect();
+    match crate::index_lifecycle::guidance::read_context::project_wide_mutation_refused_unverified(
+        "batch_edit rewrite",
+        &withheld,
+    ) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
 }
 
 /// The scope a `path_prefix` names. Absolute and parent-relative prefixes are

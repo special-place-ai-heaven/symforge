@@ -415,10 +415,6 @@ pub use crate::index_lifecycle::guidance::read_admission_format::content_withhel
 /// is not reported absent, because it is not.
 pub use crate::index_lifecycle::guidance::read_admission_format::unverified_since_restore;
 
-/// Paths the snapshot verify withheld inside `scope`, bounded for display:
-/// the count, up to `limit` paths, and how many more there are.
-use crate::index_lifecycle::guidance::read_context::withheld_listing;
-
 /// Appended to a project-wide answer when the snapshot verify withheld files
 /// inside its scope: those files were not searched, so the answer may be
 /// missing hits from them.
@@ -434,12 +430,9 @@ pub fn project_wide_mutation_refused_unverified(
     tool: &str,
     unverified: &std::collections::BTreeMap<String, String>,
 ) -> Option<String> {
-    let (count, listed) = withheld_listing(unverified, None, 10)?;
-    Some(format!(
-        "{tool} refused: {count} files are withheld as unverified since restore, and a \
-         project-wide change cannot see what they contain: {listed}. A successful re-read \
-         releases each one; run index_folder to rebuild the project from source, then retry."
-    ))
+    crate::index_lifecycle::guidance::read_context::project_wide_mutation_refused_unverified(
+        tool, unverified,
+    )
 }
 
 /// Honest "not indexed" response for a path that EXISTS but was deliberately

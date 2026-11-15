@@ -1520,10 +1520,16 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // files and begins replay before planning (calls into `edit_safety` only);
 // `embed/parity/edit/wire.rs` gains rewrite variants; the embed lane changes
 // are listed on the excluded pin. No new bridge. 321 files.
+// Rewrite review fixes 2: the withheld-since-restore refusal text moves from
+// `protocol/format.rs` into `guidance/read_context.rs` (a pure formatter,
+// re-delegated) so `edit_safety/structural_rewrite.rs` can refuse inside the
+// shared planner for both lanes; the planner counts admission-withheld
+// catalog rows; `protocol/edit_tools.rs` runs the existing reconcile sweep
+// before planning. No new bridge. 321 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "3bb6ccb24e5853fd9a36f0883d6d08139ad61f083586bb0dc43913c591772fa0",
+    "c4cc8fd42d26ca710d0c037b1d3efa65b8e30f9a86026a95abb96d8f280eb57c",
     321,
-    13199313,
+    13203311,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

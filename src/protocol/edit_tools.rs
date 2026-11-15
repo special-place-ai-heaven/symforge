@@ -2177,7 +2177,7 @@ impl SymForgeServer {
     }
 
     /// `batch_edit` structural mode. Like `batch_rename`, the withheld-file
-    /// refusal and the replay guard run before the plan, so a retried key
+    /// refusal, the disk reconcile and the replay guard run before the plan, so a retried key
     /// replays its stored answer instead of re-planning a converged tree. The
     /// plan is computed once from the index; its files then take the
     /// symbol-addressed batch's path: read gate, freshen and confinement,
@@ -2204,20 +2204,15 @@ impl SymForgeServer {
         {
             let guard = self.index.data_plane().read();
             loading_guard!(guard);
-            let withheld = match crate::edit_safety::structural_rewrite::withheld_in_scope(
-                rewrite,
-                language,
-                guard.withheld_since_restore(),
+            if let Err(refusal) = crate::edit_safety::structural_rewrite::refuse_withheld_in_scope(
+                &guard, rewrite, language,
             ) {
-                Ok(withheld) => withheld,
-                Err(refusal) => return refusal,
-            };
-            if let Some(refusal) =
-                format::project_wide_mutation_refused_unverified("batch_edit rewrite", &withheld)
-            {
                 return refusal;
             }
         }
+        // The plan reads the index, so sweep the disk first: a file written
+        // outside symforge and not yet published would otherwise be skipped.
+        let reconciled = prepare_project_wide_rename(self, &repo_root);
         let dry_run = input.dry_run.unwrap_or(false);
         let idempotency = match begin_mutation_replay(
             self,
@@ -2257,6 +2252,7 @@ impl SymForgeServer {
         };
         let paths: Vec<String> = plan.files.iter().map(|file| file.path.clone()).collect();
         let source_authority = match prepare_batch_paths_for_edit(self, &paths) {
+            Ok((_, edit_format::EditSourceAuthority::CurrentIndex)) => reconciled,
             Ok((_, authority)) => authority,
             Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };

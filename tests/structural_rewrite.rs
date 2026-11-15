@@ -255,3 +255,65 @@ async fn nested_matches_are_refused_as_overlapping() {
         "pub fn run() {\n    old_call(old_call(1));\n}\n"
     );
 }
+
+#[tokio::test]
+async fn a_file_written_outside_symforge_is_reconciled_before_the_plan() {
+    let repo = fixture_repo();
+    let root = repo.path();
+    let server = server_for(root);
+    // Written after the index loaded, with no watcher to publish it.
+    std::fs::write(
+        root.join("src/new_client.rs"),
+        "pub fn client() {\n    old_call(7);\n}\n",
+    )
+    .expect("new file");
+
+    let (dry, dry_error) = call(
+        &server,
+        json!({ "rewrite": rewrite("old_call($A)", "new_call($A)"), "dry_run": true }),
+    )
+    .await;
+    assert!(!dry_error, "{dry}");
+    assert!(
+        dry.contains("5 structural match(es) across 4 file(s)")
+            && dry.contains("src/new_client.rs")
+            && dry.contains("Source authority: disk-refreshed"),
+        "the reconcile sweep must cover the unpublished file: {dry}"
+    );
+}
+
+#[tokio::test]
+async fn in_scope_files_withheld_by_admission_are_named_not_silently_skipped() {
+    let repo = fixture_repo();
+    let root = repo.path();
+    std::fs::write(
+        root.join("src/creds.rs"),
+        "pub fn creds() {\n    let password = \"S3cretValue9xAb\";\n    old_call(password);\n}\n",
+    )
+    .expect("withheld file");
+    let server = server_for(root);
+
+    let (dry, dry_error) = call(
+        &server,
+        json!({ "rewrite": rewrite("old_call($A)", "new_call($A)"), "dry_run": true }),
+    )
+    .await;
+    assert!(!dry_error, "{dry}");
+    assert!(
+        dry.contains(
+            "4 structural match(es) across 3 file(s); not searched: 1 in-scope file(s) withheld by admission policy"
+        ),
+        "{dry}"
+    );
+    assert!(!dry.contains("S3cretValue9xAb"), "{dry}");
+
+    let (elsewhere, _) = call(
+        &server,
+        json!({
+            "rewrite": { "pattern": "old_call($A)", "template": "new_call($A)", "path_prefix": "web" },
+            "dry_run": true
+        }),
+    )
+    .await;
+    assert!(!elsewhere.contains("not searched"), "{elsewhere}");
+}
