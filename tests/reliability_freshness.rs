@@ -23,8 +23,8 @@ const LOST_OBSERVATIONS: &str =
 /// affected file.
 const BLANKET_CAVEATS: [&str; 2] = ["UNVERIFIED against disk", "index may be stale"];
 
-/// Holds `path` so that reading it fails until the guard is dropped:
-/// an exclusive share mode on Windows, mode 000 elsewhere.
+/// Holds `path` (a file or a directory) so that reading it fails until the
+/// guard is dropped: an exclusive share mode on Windows, mode 000 elsewhere.
 struct ReadBlock {
     #[cfg(windows)]
     _handle: std::fs::File,
@@ -38,11 +38,15 @@ impl ReadBlock {
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
+            /// `FILE_FLAG_BACKUP_SEMANTICS`: lets the open name a directory.
+            const BACKUP_SEMANTICS: u32 = 0x0200_0000;
             let handle = std::fs::OpenOptions::new()
                 .read(true)
                 .share_mode(0)
+                .custom_flags(BACKUP_SEMANTICS)
                 .open(path)
                 .expect("open with exclusive share mode");
+            assert!(!readable(path), "the exclusive open blocks reads");
             Some(Self { _handle: handle })
         }
         #[cfg(not(windows))]
@@ -50,7 +54,7 @@ impl ReadBlock {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000))
                 .expect("chmod 000");
-            if std::fs::read(path).is_ok() {
+            if readable(path) {
                 // Root reads through mode 000; the scenario cannot be built here.
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).ok();
                 return None;
@@ -59,6 +63,15 @@ impl ReadBlock {
                 path: path.to_path_buf(),
             })
         }
+    }
+}
+
+/// Whether `path` reads: a file's bytes, a directory's entries.
+fn readable(path: &Path) -> bool {
+    if path.is_dir() {
+        std::fs::read_dir(path).is_ok()
+    } else {
+        std::fs::read(path).is_ok()
     }
 }
 
@@ -890,47 +903,427 @@ mod lane_parity {
         }
     }
 
-    /// Why the lane tests park the observer: unparked, the embedded source
-    /// sees a read block on its next poll (its scout cannot probe the file),
-    /// leaves Current for as long as the block holds, and refuses a strict
-    /// query `SourceUnavailable` / `OnEvent` meanwhile. A query issued right
-    /// after the block raced that poll (the CI flake of PR #914).
+    // Why the lane tests park the observer: unparked, the embedded source
+    // sees a read block on its next poll (its scout cannot probe the file)
+    // and reloads; a strict query issued while it refreshes is refused
+    // `SourceUnavailable` / `OnEvent`. A query issued right after the block
+    // raced that poll (the CI flake of PR #914). The reload ends serving
+    // (`an_unreadable_file_costs_one_reload_and_the_source_keeps_serving`),
+    // so the race is one refresh long, not the block's whole span, but it is
+    // still a race: the parity tests keep the hold.
+
+    /// Waits for the observer's next full reload after `reloads`, then for
+    /// the source to leave it: Current at a version past `version`, or Blocked.
+    fn settle(
+        handle: &EmbeddedSourceHandle,
+        reloads: u64,
+        version: u64,
+    ) -> symforge::embed::SourceRuntimeView {
+        let until = Instant::now() + Duration::from_secs(30);
+        while handle.observer_counts_for_test().1 <= reloads {
+            assert!(Instant::now() < until, "the observer never reloaded");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        loop {
+            let since = handle.change_version();
+            let view = handle.runtime_view();
+            if (view.phase == SourceRuntimePhase::Current && view.source_version > version)
+                || view.phase == SourceRuntimePhase::Blocked
+            {
+                return view;
+            }
+            let remaining = until.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "the reload never settled: {view:?}");
+            handle.wait_for_change(since, remaining).unwrap();
+        }
+    }
+
+    /// The full reloads the observer runs over its next `polls` polls.
+    fn reloads_over_polls(handle: &EmbeddedSourceHandle, polls: u64) -> u64 {
+        let (start_polls, start_reloads) = handle.observer_counts_for_test();
+        let until = Instant::now() + Duration::from_secs(60);
+        while handle.observer_counts_for_test().0 < start_polls + polls {
+            assert!(Instant::now() < until, "the observer stopped polling");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        handle.observer_counts_for_test().1 - start_reloads
+    }
+
+    fn text_search(
+        handle: &EmbeddedSourceHandle,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, symforge::embed::parity::QueryRefusal> {
+        let request = QueryRequest::TextSearch(serde_json::from_value(args.clone()).unwrap());
+        let claim = handle.query_with_policy(
+            &request,
+            QueryLimits::default(),
+            QueryPolicy::default(),
+            None,
+            None,
+        )?;
+        match claim.value() {
+            QueryOutput::TextSearch(found) => Ok(serde_json::to_value(found).unwrap()),
+            other => panic!("unexpected output: {other:?}"),
+        }
+    }
+
+    fn caveat_lines(text: &str) -> Vec<String> {
+        text.lines()
+            .filter(|line| line.starts_with(NOT_CONFIRMED) || line.starts_with("Files created"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A path held unreadable for a test that must not skip: the platform's
+    /// [`ReadBlock`] where it blocks the read, otherwise (unix as root, which
+    /// reads through mode 000) the library's forced-unreadable seam, which
+    /// fails the same probes, reads and directory listings.
+    struct Unreadable {
+        _os: Option<ReadBlock>,
+        _forced: Option<symforge::discovery::ForcedAccessForTest>,
+    }
+
+    impl Unreadable {
+        fn os_or_forced(path: &Path) -> Self {
+            match ReadBlock::hold(path) {
+                Some(block) => Self {
+                    _os: Some(block),
+                    _forced: None,
+                },
+                None => {
+                    eprintln!(
+                        "note: this platform reads through mode 000 (root); {} is forced unreadable instead",
+                        path.display()
+                    );
+                    Self::forced(path)
+                }
+            }
+        }
+
+        fn forced(path: &Path) -> Self {
+            Self {
+                _os: None,
+                _forced: Some(symforge::discovery::force_unreadable_for_test(path)),
+            }
+        }
+    }
+
+    /// FR-018 on the embed lane: a tracked file the source cannot read costs
+    /// one reload, after which the source serves again. An answer that does
+    /// not use the file is unchanged; one that does still cites it, with
+    /// MCP's caveat; the observer stays quiet while the block holds; and once
+    /// the file reads again, one reload clears the caveat.
+    #[tokio::test]
+    async fn an_unreadable_file_costs_one_reload_and_the_source_keeps_serving() {
+        unreadable_file_serves(Unreadable::os_or_forced).await;
+    }
+
+    /// The same through the forced seam on every platform, so the seam that
+    /// stands in for the block on a root runner is itself proven here.
+    #[tokio::test]
+    async fn a_forced_unreadable_file_costs_one_reload_and_the_source_keeps_serving() {
+        unreadable_file_serves(Unreadable::forced).await;
+    }
+
+    async fn unreadable_file_serves(block: fn(&Path) -> Unreadable) {
+        const FILE: &str = "src/user.rs";
+        let not_using = json!({ "query": "run_parent", "path_prefix": "src/parent" });
+        let using = json!({ "query": "target_fn" });
+        let dir = fixture_copy();
+        let runtime = ProcessIndexRuntime::acquire().unwrap();
+        let handle = open(&runtime, dir.path());
+        let not_using_before = text_search(&handle, &not_using).unwrap();
+        let using_before = text_search(&handle, &using).unwrap();
+        assert!(
+            using_before["rows"].to_string().contains(FILE),
+            "control: the answer cites {FILE}:\n{using_before}"
+        );
+        let (_, reloads) = handle.observer_counts_for_test();
+        let version = handle.runtime_view().source_version;
+        let held = block(&dir.path().join(FILE));
+
+        let blocked = settle(&handle, reloads, version);
+        assert_eq!(
+            blocked.phase,
+            SourceRuntimePhase::Current,
+            "the source serves while {FILE} is unreadable"
+        );
+        assert_eq!(
+            reloads_over_polls(&handle, 3),
+            0,
+            "the observer is quiet while the file stays unreadable"
+        );
+        assert_eq!(handle.observer_counts_for_test().1, reloads + 1);
+        assert_eq!(
+            text_search(&handle, &not_using).unwrap(),
+            not_using_before,
+            "an answer that does not use {FILE} is unchanged"
+        );
+        let using_blocked = text_search(&handle, &using).unwrap();
+        assert!(
+            using_blocked["rows"].to_string().contains(FILE),
+            "the reload kept {FILE}'s last record:\n{using_blocked}"
+        );
+        let embed_caveats = caveat_lines(
+            using_blocked["freshness_notes"]
+                .as_str()
+                .unwrap_or_default(),
+        );
+
+        let (_, reloads) = handle.observer_counts_for_test();
+        drop(held);
+        let readable = settle(&handle, reloads, blocked.source_version);
+        assert_eq!(readable.phase, SourceRuntimePhase::Current);
+        assert_eq!(reloads_over_polls(&handle, 3), 0, "one reload, then quiet");
+        assert_eq!(handle.observer_counts_for_test().1, reloads + 1);
+        assert_eq!(
+            text_search(&handle, &using).unwrap(),
+            using_before,
+            "readable again, the answer is what it was, caveat gone"
+        );
+
+        // MCP over its own copy, the block landing after its load.
+        let mcp_dir = fixture_copy();
+        let mcp = mcp_answer_under_block(mcp_dir.path(), FILE, block, using).await;
+        assert!(
+            embed_caveats
+                .iter()
+                .any(|line| line.starts_with(&format!("{NOT_CONFIRMED}: {FILE} ("))),
+            "the answer that uses {FILE} names it:\n{using_blocked}"
+        );
+        assert_eq!(
+            caveat_lines(&mcp),
+            embed_caveats,
+            "the lanes print the same caveat\nMCP:\n{mcp}\nembed:\n{using_blocked}"
+        );
+    }
+
+    /// MCP's answer to `search_text` over `root` with `file` blocked after the
+    /// load. This lane runs no watcher (`server_from_shared` starts none), so
+    /// a chmod's inotify event has nothing to race; that the answer comes
+    /// from the generation loaded before the block is checked, not assumed.
+    async fn mcp_answer_under_block(
+        root: &Path,
+        file: &str,
+        block: fn(&Path) -> Unreadable,
+        args: serde_json::Value,
+    ) -> String {
+        let shared = LiveIndex::load(root).unwrap();
+        let server = server_from_shared(root, shared.clone());
+        let loaded = shared.published_generation().publication_generation;
+        let held = block(&root.join(file));
+        let mcp = call(&server, "search_text", args).await;
+        drop(held);
+        assert_eq!(
+            shared.published_generation().publication_generation,
+            loaded,
+            "the MCP answer is over the generation loaded before the block"
+        );
+        mcp
+    }
+
+    /// The other side of FR-018: an unreadable directory can hide files the
+    /// index has never seen (FR-017), so the source still blocks and refuses
+    /// a strict query, without reloading the tree on every poll, and one
+    /// reload recovers it once the directory lists again.
     #[test]
-    fn an_unparked_observer_sees_a_read_block_and_refuses_strict_queries() {
+    fn an_unreadable_directory_still_blocks_the_source() {
+        unreadable_directory_blocks(Unreadable::os_or_forced);
+    }
+
+    /// The same through the forced seam on every platform.
+    #[test]
+    fn a_forced_unreadable_directory_still_blocks_the_source() {
+        unreadable_directory_blocks(Unreadable::forced);
+    }
+
+    fn unreadable_directory_blocks(block: fn(&Path) -> Unreadable) {
         use symforge::embed::RetryAdvice;
         use symforge::embed::parity::QueryRefusalKind;
         let dir = fixture_copy();
         let runtime = ProcessIndexRuntime::acquire().unwrap();
         let handle = open(&runtime, dir.path());
-        let Some(block) = ReadBlock::hold(&dir.path().join("src/user.rs")) else {
-            eprintln!("skipped: this platform reads through the block (root)");
-            return;
-        };
-        let until = Instant::now() + Duration::from_secs(20);
-        loop {
-            let since = handle.change_version();
-            if handle.runtime_view().phase != SourceRuntimePhase::Current {
-                break;
-            }
-            let remaining = until.saturating_duration_since(Instant::now());
-            assert!(!remaining.is_zero(), "the observer never saw the block");
-            handle.wait_for_change(since, remaining).unwrap();
-        }
-        let request = QueryRequest::TextSearch(
-            serde_json::from_value(json!({ "query": "target_fn" })).unwrap(),
-        );
-        let refusal = handle
-            .query_with_policy(
-                &request,
-                QueryLimits::default(),
-                QueryPolicy::default(),
-                None,
-                None,
-            )
-            .expect_err("a strict query while the observer republishes the block");
-        drop(block);
+        let (_, reloads) = handle.observer_counts_for_test();
+        let version = handle.runtime_view().source_version;
+        let held = block(&dir.path().join("src/other"));
+        let view = settle(&handle, reloads, version);
+        assert_eq!(view.phase, SourceRuntimePhase::Blocked);
+        let refusal = text_search(&handle, &json!({ "query": "target_fn" }))
+            .expect_err("a strict query while observations are lost");
         assert_eq!(refusal.kind(), QueryRefusalKind::SourceUnavailable);
         assert_eq!(refusal.retry(), RetryAdvice::OnEvent);
+        assert_eq!(
+            reloads_over_polls(&handle, 3),
+            0,
+            "blocked, the observer waits for the disk to change instead of reloading every poll"
+        );
+
+        let (_, reloads) = handle.observer_counts_for_test();
+        let version = handle.runtime_view().source_version;
+        drop(held);
+        let readable = settle(&handle, reloads, version);
+        assert_eq!(
+            readable.phase,
+            SourceRuntimePhase::Current,
+            "the directory lists again: the changed fingerprint recovers the source"
+        );
+        assert_eq!(reloads_over_polls(&handle, 3), 0, "one reload, then quiet");
+        assert_eq!(handle.observer_counts_for_test().1, reloads + 1);
+    }
+
+    /// A block that clears while the reload that saw it is still running:
+    /// the reload ends Blocked, yet a scout taken after it already lists the
+    /// directory, so no later poll differs from that scout. The observer
+    /// compares later polls with what the reload itself saw, so the next
+    /// poll reloads and the source serves again.
+    #[test]
+    fn a_block_that_clears_during_its_own_reload_is_still_seen_to_clear() {
+        let dir = fixture_copy();
+        let runtime = ProcessIndexRuntime::acquire().unwrap();
+        let handle = open(&runtime, dir.path());
+        let parked = handle.hold_observer_for_test();
+        let (_, reloads) = handle.observer_counts_for_test();
+        let version = handle.runtime_view().source_version;
+        let held = symforge::discovery::force_unreadable_for_test(&dir.path().join("src/other"));
+        handle.before_next_baseline_for_test(move || drop(held));
+        drop(parked);
+
+        // Reload one sees the block and ends Blocked; reload two is the retry.
+        let view = settle(&handle, reloads + 1, version);
+        assert_eq!(
+            view.phase,
+            SourceRuntimePhase::Current,
+            "the block cleared before the reload's baseline was taken, and the source recovered"
+        );
+        assert!(text_search(&handle, &json!({ "query": "target_fn" })).is_ok());
+        assert_eq!(reloads_over_polls(&handle, 3), 0, "two reloads, then quiet");
+        assert_eq!(handle.observer_counts_for_test().1, reloads + 2);
+    }
+
+    /// A file that changed while the reload read it keeps its last record,
+    /// and the scout after the reload already stamps the new bytes, so the
+    /// fingerprint never moves again. The observer re-reads it once per poll
+    /// while it reads unstable and stops once it reads stable, serving the
+    /// new bytes.
+    #[test]
+    fn a_file_that_changed_while_read_is_read_again_until_it_reads_stable() {
+        const FILE: &str = "src/user.rs";
+        let marker = json!({ "query": "reread_marker_036" });
+        let dir = fixture_copy();
+        let runtime = ProcessIndexRuntime::acquire().unwrap();
+        let handle = open(&runtime, dir.path());
+        assert_eq!(
+            text_search(&handle, &marker).unwrap()["total_matches"],
+            0,
+            "control: the marker is not in the tree yet"
+        );
+        let (_, reloads) = handle.observer_counts_for_test();
+        let version = handle.runtime_view().source_version;
+        let path = dir.path().join(FILE);
+        let unstable = symforge::discovery::force_unstable_read_for_test(&path);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("\npub fn reread_marker_036() {}\n");
+        std::fs::write(&path, text).unwrap();
+        let view = settle(&handle, reloads, version);
+        assert_eq!(view.phase, SourceRuntimePhase::Current);
+        // One re-read per poll; the window's edges may each split one poll.
+        let polls = 4;
+        let rereads = reloads_over_polls(&handle, polls);
+        assert!(
+            (polls - 1..=polls + 1).contains(&rereads),
+            "one re-read per poll while the file reads unstable: {rereads} over {polls}"
+        );
+
+        // Quiet before any query: an answer's freshen re-reads a changed file
+        // too, so the observer's own re-read is proven by the counters first.
+        drop(unstable);
+        let until = Instant::now() + Duration::from_secs(30);
+        while reloads_over_polls(&handle, 2) != 0 {
+            assert!(
+                Instant::now() < until,
+                "the observer never read the file stable"
+            );
+        }
+        let found = text_search(&handle, &marker).unwrap();
+        assert_ne!(
+            found["total_matches"], 0,
+            "read stable, the source serves the new bytes:\n{found}"
+        );
+    }
+
+    /// Every indexed file removed in place latches `ReconciliationPending`
+    /// (the store's physical-replacement heuristic) over a clean scout. The
+    /// root anchor still verifies, and the reload observed the whole present
+    /// tree, so nothing was lost: the source serves the tree as it now is.
+    /// The latch must not switch off keeping an unreadable file's record: a
+    /// file of the refilled tree that becomes unreadable is still cited, with
+    /// MCP's caveat.
+    #[tokio::test]
+    async fn a_tree_emptied_in_place_is_served_as_it_now_is() {
+        const ADDED: &str = "added.rs";
+        const ADDED_TEXT: &str = "pub fn target_fn() {}\n";
+        let dir = fixture_copy();
+        let runtime = ProcessIndexRuntime::acquire().unwrap();
+        let handle = open(&runtime, dir.path());
+        let (_, reloads) = handle.observer_counts_for_test();
+        let version = handle.runtime_view().source_version;
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            let dot = path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with('.'));
+            if path.is_dir() && dot {
+                continue; // state the source keeps beside the tree
+            }
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+        let emptied = settle(&handle, reloads, version);
+        assert_eq!(emptied.phase, SourceRuntimePhase::Current);
+        let found = text_search(&handle, &json!({ "query": "target_fn" })).unwrap();
+        assert_eq!(found["total_matches"], 0, "{found}");
+
+        let (_, reloads) = handle.observer_counts_for_test();
+        std::fs::write(dir.path().join(ADDED), ADDED_TEXT).unwrap();
+        let refilled = settle(&handle, reloads, emptied.source_version);
+        assert_eq!(refilled.phase, SourceRuntimePhase::Current);
+        let found = text_search(&handle, &json!({ "query": "target_fn" })).unwrap();
+        assert!(found["rows"].to_string().contains(ADDED), "{found}");
+
+        let (_, reloads) = handle.observer_counts_for_test();
+        let held = Unreadable::os_or_forced(&dir.path().join(ADDED));
+        let blocked = settle(&handle, reloads, refilled.source_version);
+        assert_eq!(blocked.phase, SourceRuntimePhase::Current);
+        let found = text_search(&handle, &json!({ "query": "target_fn" })).unwrap();
+        drop(held);
+        assert!(
+            found["rows"].to_string().contains(ADDED),
+            "the latched reload kept {ADDED}'s last record:\n{found}"
+        );
+        let embed_caveats = caveat_lines(found["freshness_notes"].as_str().unwrap_or_default());
+        assert!(
+            embed_caveats
+                .iter()
+                .any(|line| line.starts_with(&format!("{NOT_CONFIRMED}: {ADDED} ("))),
+            "the answer names the unreadable file:\n{found}"
+        );
+        let mcp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(mcp_dir.path().join(ADDED), ADDED_TEXT).unwrap();
+        let mcp = mcp_answer_under_block(
+            mcp_dir.path(),
+            ADDED,
+            Unreadable::os_or_forced,
+            json!({ "query": "target_fn" }),
+        )
+        .await;
+        assert_eq!(
+            caveat_lines(&mcp),
+            embed_caveats,
+            "the lanes print the same caveat\nMCP:\n{mcp}\nembed:\n{found}"
+        );
     }
 }
 

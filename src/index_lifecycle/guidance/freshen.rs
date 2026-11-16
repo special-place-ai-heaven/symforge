@@ -230,14 +230,37 @@ impl AnswerCheck {
 }
 
 /// True when the index may have missed file events, so files it has never
-/// seen may exist (FR-017). An unreadable or unstable record is about a file
-/// the index knows and is no lost observation (FR-018): a degraded scout counts
-/// only when one of its issues names no scouted entry (an unreadable
-/// directory, a traversal stop), because only then can a file be unseen.
+/// seen may exist (FR-017), judged over one consistent publication.
 fn observations_lost(shared: &SharedIndex) -> bool {
+    observed_publication(shared).is_none()
+}
+
+/// The published generation, unless its publication may have missed file
+/// events. The embedded source serves only such a publication (FR-018), and
+/// MCP prints the FR-017 line when there is none, so the two lanes cannot
+/// disagree about what was lost. The freshness and the scout plan come from
+/// the one generation that published them, so the pair is consistent without
+/// the writer lock.
+pub(crate) fn observed_publication(
+    shared: &SharedIndex,
+) -> Option<std::sync::Arc<crate::live_index::store::PublishedGeneration>> {
+    let published = shared.published_generation();
+    (!observations_lost_in(&published.freshness, published.scout_plan.as_deref()))
+        .then_some(published)
+}
+
+/// Whether `freshness`, published with the scout `plan`, may have missed file
+/// events. An unreadable or unstable record is about a file the index knows
+/// and is no lost observation (FR-018): a degraded scout counts only when one
+/// of its issues names no scouted entry (an unreadable directory, a traversal
+/// stop), because only then can a file be unseen.
+fn observations_lost_in(
+    freshness: &crate::domain::FreshnessStatus,
+    plan: Option<&crate::discovery::ScoutPlan>,
+) -> bool {
     use crate::domain::{FreshnessReason, FreshnessStatus, ScoutIssueKind};
     let unseen_by_scout = || {
-        shared.scout_plan().is_none_or(|plan| {
+        plan.is_none_or(|plan| {
             let scouted: std::collections::HashSet<&str> = plan
                 .entries
                 .iter()
@@ -252,7 +275,7 @@ fn observations_lost(shared: &SharedIndex) -> bool {
             })
         })
     };
-    match shared.freshness_status().as_ref() {
+    match freshness {
         FreshnessStatus::Current => false,
         FreshnessStatus::Verifying => true,
         FreshnessStatus::Degraded { reason_codes, .. } => {
@@ -819,6 +842,213 @@ pub(crate) struct TargetedFreshen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-017 / FR-018: what counts as a lost observation. The embedded
+    /// source serves only a publication for which this is false, so every
+    /// reason that can hide an unseen file must stay on the lost side.
+    #[test]
+    fn only_a_possibly_unseen_file_is_a_lost_observation() {
+        use crate::discovery::ScoutPlan;
+        use crate::domain::{
+            CoverageStatus, FreshnessReason as R, FreshnessStatus, ScoutIssue, ScoutIssueKind,
+        };
+        let plan = |issues: Vec<ScoutIssue>| ScoutPlan {
+            coverage: CoverageStatus::Degraded,
+            entries: Vec::new(),
+            issues,
+            usage: Default::default(),
+        };
+        let issue = |path_id: Option<&str>, kind| ScoutIssue {
+            path_id: path_id.map(str::to_owned),
+            safe_path: None,
+            kind,
+            safe_message: String::new(),
+        };
+        let degraded = |reason| FreshnessStatus::Degraded {
+            last_valid_content_generation: 0,
+            reason_codes: vec![reason],
+        };
+        let clean = plan(Vec::new());
+        let unseen_directory = plan(vec![issue(
+            Some("src/hidden"),
+            ScoutIssueKind::DirectoryEntryUnreadable {
+                kind: crate::domain::AccessErrorKind::PermissionDenied,
+            },
+        )]);
+        let circuit_breaker = plan(vec![issue(None, ScoutIssueKind::TraversalCircuitBreaker)]);
+        // A real scouted entry, so an issue can name a file the scout saw.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("known.rs"), "fn known() {}\n").unwrap();
+        let scouted = crate::discovery::scout_repository(dir.path()).unwrap();
+        let known_id = scouted.entries[0].path.public_id.clone();
+        let with_known = |issues: Vec<ScoutIssue>| ScoutPlan {
+            entries: scouted.entries.clone(),
+            ..plan(issues)
+        };
+        let known_unreadable = with_known(vec![issue(
+            Some(&known_id),
+            ScoutIssueKind::DirectoryEntryUnreadable {
+                kind: crate::domain::AccessErrorKind::PermissionDenied,
+            },
+        )]);
+        let known_and_unseen = with_known(vec![
+            issue(
+                Some(&known_id),
+                ScoutIssueKind::DirectoryEntryUnreadable {
+                    kind: crate::domain::AccessErrorKind::PermissionDenied,
+                },
+            ),
+            issue(
+                Some("src/hidden"),
+                ScoutIssueKind::DirectoryEntryUnreadable {
+                    kind: crate::domain::AccessErrorKind::PermissionDenied,
+                },
+            ),
+        ]);
+        let known_circuit_breaker = with_known(vec![issue(
+            Some(&known_id),
+            ScoutIssueKind::TraversalCircuitBreaker,
+        )]);
+        let both = |first, second| FreshnessStatus::Degraded {
+            last_valid_content_generation: 0,
+            reason_codes: vec![first, second],
+        };
+        for (freshness, plan, lost) in [
+            // FR-018: the only issue names a file the scout saw, so no file
+            // can be unseen and the publication serves.
+            (
+                degraded(R::ReconciliationPending),
+                Some(&known_unreadable),
+                false,
+            ),
+            // ...but no other reason is excused by that plan.
+            (FreshnessStatus::Verifying, Some(&known_unreadable), true),
+            (
+                degraded(R::WatcherUnavailable),
+                Some(&known_unreadable),
+                true,
+            ),
+            (
+                degraded(R::SnapshotVerificationFailed),
+                Some(&known_unreadable),
+                true,
+            ),
+            (
+                degraded(R::CatalogEntryCapacityExceeded),
+                Some(&known_unreadable),
+                true,
+            ),
+            (
+                degraded(R::CatalogMetadataCapacityExceeded),
+                Some(&known_unreadable),
+                true,
+            ),
+            (
+                both(R::ReconciliationPending, R::WatcherUnavailable),
+                Some(&known_unreadable),
+                true,
+            ),
+            // One issue naming no scouted entry is enough to lose.
+            (
+                degraded(R::ReconciliationPending),
+                Some(&known_and_unseen),
+                true,
+            ),
+            // A traversal stop loses even when it names a scouted entry.
+            (
+                degraded(R::ReconciliationPending),
+                Some(&known_circuit_breaker),
+                true,
+            ),
+            (FreshnessStatus::Current, None, false),
+            (FreshnessStatus::Verifying, Some(&clean), true),
+            (degraded(R::WatcherUnavailable), Some(&clean), true),
+            (degraded(R::SnapshotVerificationFailed), Some(&clean), true),
+            (
+                degraded(R::CatalogEntryCapacityExceeded),
+                Some(&clean),
+                true,
+            ),
+            (
+                degraded(R::CatalogMetadataCapacityExceeded),
+                Some(&clean),
+                true,
+            ),
+            (degraded(R::ReconciliationPending), None, true),
+            (
+                degraded(R::ReconciliationPending),
+                Some(&unseen_directory),
+                true,
+            ),
+            (
+                degraded(R::ReconciliationPending),
+                Some(&circuit_breaker),
+                true,
+            ),
+            (degraded(R::ReconciliationPending), Some(&clean), false),
+            (degraded(R::ObservationFailed), Some(&clean), false),
+            (degraded(R::DerivedPublicationPending), Some(&clean), false),
+        ] {
+            assert_eq!(
+                observations_lost_in(&freshness, plan),
+                lost,
+                "{freshness:?} over {plan:?}"
+            );
+        }
+    }
+
+    /// The embedded gates judge the publication while they hold their state
+    /// mutex, so the judgment must not wait on the writer lock a reload holds
+    /// while it rebuilds, and it must pair the published generation with the
+    /// plan published with it, not the plan the reload already stored for its
+    /// own coming publication.
+    #[cfg(feature = "server")]
+    #[test]
+    fn judging_a_publication_takes_no_writer_lock() {
+        use std::sync::{Arc, Mutex, mpsc};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let shared = crate::live_index::LiveIndex::load(dir.path()).unwrap();
+        let before = shared.published_generation();
+        let seen = Arc::new(Mutex::new(None));
+        let _guard = {
+            let shared = shared.clone();
+            let seen = Arc::clone(&seen);
+            crate::live_index::store::install_reload_mid_commit_hook(move || {
+                let (sender, receiver) = mpsc::channel();
+                let reader = shared.clone();
+                std::thread::spawn(move || {
+                    let _ = sender.send(observed_publication(&reader));
+                });
+                *seen.lock().unwrap() =
+                    Some(receiver.recv_timeout(std::time::Duration::from_secs(5)));
+            })
+        };
+        shared.reload(dir.path()).unwrap();
+        let observed = seen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("control: the reload reached its commit point")
+            .expect("the judgment returns while a reload holds the writer lock")
+            .expect("the published generation lost no observation");
+        assert_eq!(
+            observed.publication_generation,
+            before.publication_generation
+        );
+        let (Some(observed_plan), Some(before_plan)) = (&observed.scout_plan, &before.scout_plan)
+        else {
+            panic!("both generations carry their scout plan");
+        };
+        assert!(
+            Arc::ptr_eq(observed_plan, before_plan),
+            "judged with the plan its own generation published"
+        );
+        assert!(
+            !Arc::ptr_eq(before_plan, &shared.scout_plan().unwrap()),
+            "control: the reload stored a new plan"
+        );
+    }
 
     /// Review M6: at most five unconfirmed files are named, then a count.
     #[test]

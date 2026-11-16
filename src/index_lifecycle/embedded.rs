@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar};
 use std::time::Duration;
 
 use super::registry::ProjectKey;
-use crate::domain::{FreshnessStatus, RootBinding, StatePlacement};
+use crate::domain::{RootBinding, StatePlacement};
 
 const EMBED_OBSERVER_POLL: Duration = Duration::from_millis(200);
 const REFRESHING_VISIBILITY_WINDOW: Duration = Duration::from_millis(25);
@@ -151,6 +151,16 @@ fn take_panic_after_start_for_test(key: &ProjectKey) -> bool {
     } else {
         false
     }
+}
+
+/// What the observer compares between polls: a digest of what a scout of the
+/// tree recorded. `coverage` is left out. A scout derives it from the entries
+/// and issues digested here, and a reload also marks its stored plan Degraded
+/// for a parse failure, which no fresh scout of the same disk would show.
+fn plan_fingerprint(plan: &crate::discovery::ScoutPlan) -> String {
+    crate::hash::digest_hex(
+        format!("{:?}{:?}{:?}", plan.entries, plan.issues, plan.usage).as_bytes(),
+    )
 }
 
 /// Parks one source's observer poll; see `hold_observer_for_test`.
@@ -533,6 +543,15 @@ struct EmbeddedBinding {
     /// the lock while it observes and republishes. See `hold_observer_for_test`.
     #[cfg(feature = "__test-internals")]
     observer_held: std::sync::Mutex<bool>,
+    /// Observer disk polls and full tree reloads; see `observer_counts_for_test`.
+    #[cfg(feature = "__test-internals")]
+    observer_polls: AtomicU64,
+    #[cfg(feature = "__test-internals")]
+    observer_reloads: AtomicU64,
+    /// Runs once, before the next baseline fingerprint is taken; see
+    /// `before_next_baseline_for_test`.
+    #[cfg(feature = "__test-internals")]
+    before_baseline: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Original selected state child. Parked between operations so an idle source
@@ -661,6 +680,12 @@ impl EmbeddedBinding {
             progress: crate::live_index::store::ReloadProgressSink::new(),
             #[cfg(feature = "__test-internals")]
             observer_held: std::sync::Mutex::new(false),
+            #[cfg(feature = "__test-internals")]
+            observer_polls: AtomicU64::new(0),
+            #[cfg(feature = "__test-internals")]
+            observer_reloads: AtomicU64::new(0),
+            #[cfg(feature = "__test-internals")]
+            before_baseline: std::sync::Mutex::new(None),
         })
     }
 
@@ -686,6 +711,10 @@ impl EmbeddedBinding {
             .expect("embedded restored seed mutex")
             .take();
         #[cfg(feature = "embed")]
+        let first_is_reload = restored.is_none();
+        #[cfg(not(feature = "embed"))]
+        let first_is_reload = true;
+        #[cfg(feature = "embed")]
         let mut observed_fingerprint = if let Some(mtimes) = restored {
             crate::live_index::persist::background_verify_bound(
                 self.runtime.data_plane(),
@@ -700,6 +729,16 @@ impl EmbeddedBinding {
         };
         #[cfg(not(feature = "embed"))]
         let mut observed_fingerprint = self.reload_and_publish();
+        // A reload that ended Blocked (an unreadable directory: observations
+        // lost) is repeated only once the disk or a refresh request gives it
+        // something new to observe. A Blocked phase that no reload produced
+        // (a restored snapshot still verifying, a failed freshen) is retried
+        // on the next poll, as before.
+        let mut blocked_by_reload = first_is_reload && self.phase_is_blocked();
+        // A file that changed while the reload read it keeps its last record,
+        // and the fresh scout's stamp is already the baseline, so no later
+        // poll would see it change: re-read it on the next poll instead.
+        let mut reread_unstable = self.published_unstable_read();
         self.complete_pending_reset();
         loop {
             let mut control = self.control.lock().expect("embedded control mutex");
@@ -736,9 +775,10 @@ impl EmbeddedBinding {
                 (None, Some(_)) | (Some(_), None) => true,
                 (None, None) => false,
             };
-            let blocked = self.state.lock().expect("embedded state mutex").phase
-                == super::public_api::SourceRuntimePhase::Blocked;
-            if explicit_refresh || disk_changed || blocked {
+            let retry_block = self.phase_is_blocked() && !blocked_by_reload;
+            // Re-checked: an answer's freshen may have re-read the file since.
+            let reread = reread_unstable && self.published_unstable_read();
+            if explicit_refresh || disk_changed || retry_block || reread {
                 self.set_phase(super::public_api::SourceRuntimePhase::Refreshing);
                 if self.wait_refresh_visibility_or_stop() {
                     break;
@@ -747,10 +787,15 @@ impl EmbeddedBinding {
                 if self.shutdown_started.load(Ordering::Acquire) {
                     break;
                 }
+                blocked_by_reload = self.phase_is_blocked();
+                reread_unstable = self.published_unstable_read();
                 self.complete_pending_reset();
             } else {
                 observed_fingerprint = next_fingerprint;
+                reread_unstable = false;
             }
+            #[cfg(feature = "__test-internals")]
+            self.observer_polls.fetch_add(1, Ordering::AcqRel);
         }
         self.set_phase(super::public_api::SourceRuntimePhase::Stopped);
         #[cfg(feature = "embed")]
@@ -774,6 +819,27 @@ impl EmbeddedBinding {
             drop(control);
             self.runtime.data_plane().mark_index_folder_reset();
         }
+    }
+
+    fn phase_is_blocked(&self) -> bool {
+        self.state.lock().expect("embedded state mutex").phase
+            == super::public_api::SourceRuntimePhase::Blocked
+    }
+
+    /// Whether the published index holds a file whose read saw it change.
+    fn published_unstable_read(&self) -> bool {
+        self.runtime
+            .data_plane()
+            .published_generation()
+            .live
+            .manifest_entries
+            .iter()
+            .any(|entry| {
+                matches!(
+                    entry.disposition,
+                    crate::domain::FileDisposition::UnstableDuringRead
+                )
+            })
     }
 
     fn wait_refresh_visibility_or_stop(&self) -> bool {
@@ -802,6 +868,8 @@ impl EmbeddedBinding {
             &self.root,
             &self.state_placement,
         );
+        #[cfg(feature = "__test-internals")]
+        self.observer_reloads.fetch_add(1, Ordering::AcqRel);
         let result = self.runtime.data_plane().refresh_bound_tree_cancellable(
             &self.root,
             self.state_placement.directory().cloned(),
@@ -944,10 +1012,13 @@ impl EmbeddedBinding {
     #[cfg(feature = "embed")]
     fn publish_freshened(&self) {
         let mut state = self.state.lock().expect("embedded state mutex");
-        let published = self.runtime.data_plane().published_generation();
+        let Some(published) =
+            super::guidance::freshen::observed_publication(self.runtime.data_plane())
+        else {
+            return;
+        };
         if self.shutdown_started.load(Ordering::Acquire)
             || state.phase != super::public_api::SourceRuntimePhase::Current
-            || !matches!(published.freshness.as_ref(), FreshnessStatus::Current)
         {
             return;
         }
@@ -970,6 +1041,15 @@ impl EmbeddedBinding {
             return None;
         }
 
+        #[cfg(feature = "__test-internals")]
+        if let Some(hook) = self
+            .before_baseline
+            .lock()
+            .expect("before baseline mutex")
+            .take()
+        {
+            hook();
+        }
         let Some(fingerprint) = self.observe_fingerprint() else {
             if self.shutdown_started.load(Ordering::Acquire) {
                 return None;
@@ -986,12 +1066,26 @@ impl EmbeddedBinding {
         if self.shutdown_started.load(Ordering::Acquire) {
             return None;
         }
-        let published = self.runtime.data_plane().published_generation();
-        if !matches!(published.freshness.as_ref(), FreshnessStatus::Current) {
+        // Spec 036 FR-018: a degraded publication that lost no observation
+        // (a known file the scout could not read) serves; answers that use
+        // that file name it.
+        let Some(published) =
+            super::guidance::freshen::observed_publication(self.runtime.data_plane())
+        else {
             drop(state);
             self.set_blocked();
-            return Some(fingerprint);
-        }
+            // A blocked source is reloaded only when the disk differs from
+            // this baseline, so the baseline is what the reload itself saw:
+            // the fingerprint above was taken after it, and a block that
+            // cleared in between would otherwise never be seen to clear.
+            let reloaded = self.runtime.data_plane().published_generation();
+            return Some(
+                reloaded
+                    .scout_plan
+                    .as_deref()
+                    .map_or(fingerprint, plan_fingerprint),
+            );
+        };
         state.source_version = state.source_version.saturating_add(1).max(1);
         state.current_publication_identity = Some(format!(
             "embed-publication-{}-{}",
@@ -1031,7 +1125,7 @@ impl EmbeddedBinding {
         }
         #[cfg(feature = "embed")]
         self.authority.verify_physical_root_anchor().ok()?;
-        Some(crate::hash::digest_hex(format!("{plan:?}").as_bytes()))
+        Some(plan_fingerprint(&plan))
     }
 
     #[cfg(feature = "embed")]
@@ -1098,7 +1192,7 @@ impl EmbeddedBinding {
             generation.publication_generation,
         );
         if state.current_publication_identity.as_deref() != Some(&publication_identity)
-            || !matches!(generation.freshness.as_ref(), FreshnessStatus::Current)
+            || !serves(index, &generation)
             || authority.current_publication() != Some(authority_publication)
         {
             return Err(refuse(
@@ -1351,6 +1445,18 @@ struct CurrentEmbedClaim {
     binding_identity: String,
     publication_identity: String,
     source_version: u64,
+}
+
+/// The query gates' freshness check: `generation` is still the published
+/// one and lost no observation (`freshen::observed_publication`).
+#[cfg(feature = "embed")]
+fn serves(
+    index: &crate::live_index::store::SharedIndex,
+    generation: &crate::live_index::store::PublishedGeneration,
+) -> bool {
+    super::guidance::freshen::observed_publication(index).is_some_and(|observed| {
+        observed.publication_generation == generation.publication_generation
+    })
 }
 
 fn normalized_path_prefix(prefix: Option<&str>) -> Option<String> {
@@ -2432,7 +2538,7 @@ impl EmbeddedSourceHandle {
             generation.publication_generation
         );
         if state.current_publication_identity.as_deref() != Some(&publication_identity)
-            || !matches!(generation.freshness.as_ref(), FreshnessStatus::Current)
+            || !serves(index, &generation)
             || authority.current_publication() != Some(authority_publication)
             || self.closed.load(Ordering::Acquire)
         {
@@ -3192,6 +3298,32 @@ impl EmbeddedSourceHandle {
         }
     }
 
+    /// Run `hook` once, the next time the observer is about to take the
+    /// fingerprint it compares later polls with (after a reload, or after a
+    /// snapshot restore), so a test can change the disk in exactly that gap.
+    /// The hook must not call this or `hold_observer_for_test`.
+    #[cfg(feature = "__test-internals")]
+    pub fn before_next_baseline_for_test(&self, hook: impl FnOnce() + Send + 'static) {
+        if let Some(binding) = &self.binding {
+            *binding
+                .before_baseline
+                .lock()
+                .expect("before baseline mutex") = Some(Box::new(hook));
+        }
+    }
+
+    /// The observer's disk polls and full tree reloads so far, so a test can
+    /// wait on the observer instead of on time. `(0, 0)` for an unbound handle.
+    #[cfg(feature = "__test-internals")]
+    pub fn observer_counts_for_test(&self) -> (u64, u64) {
+        self.binding.as_ref().map_or((0, 0), |binding| {
+            (
+                binding.observer_polls.load(Ordering::Acquire),
+                binding.observer_reloads.load(Ordering::Acquire),
+            )
+        })
+    }
+
     /// Signal reload cancel without joining the worker. Close still joins.
     #[cfg(feature = "__test-internals")]
     pub fn cancel_reload_for_test(&self) {
@@ -3445,6 +3577,7 @@ impl Drop for EmbeddedSourceHandle {
 #[cfg(all(test, feature = "embed"))]
 mod refresh_lifecycle_tests {
     use super::*;
+    use crate::domain::FreshnessStatus;
     use crate::embed::parity::{QueryLimits, QueryRefusalKind, QueryRequest};
     use crate::embed::{EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase};
 
@@ -3904,6 +4037,33 @@ mod refresh_lifecycle_tests {
         assert_eq!(
             std::fs::read_to_string(root.path().join("caller.rs")).unwrap(),
             "fn c() { loaded(); }\n"
+        );
+    }
+
+    /// A reload marks its stored plan Degraded for a parse failure; a fresh
+    /// scout of the same disk does not. The two must still compare equal, or
+    /// a blocked source would reload on every poll.
+    #[test]
+    fn the_observer_fingerprint_ignores_coverage_and_sees_an_issue() {
+        use crate::discovery::ScoutPlan;
+        use crate::domain::{CoverageStatus, ManifestResourceUsage};
+        let plan = |coverage, catalog_entries| ScoutPlan {
+            coverage,
+            entries: Vec::new(),
+            issues: Vec::new(),
+            usage: ManifestResourceUsage {
+                catalog_entries,
+                catalog_metadata_bytes: 0,
+                admitted_content_bytes: 0,
+            },
+        };
+        assert_eq!(
+            super::plan_fingerprint(&plan(CoverageStatus::Complete, 1)),
+            super::plan_fingerprint(&plan(CoverageStatus::Degraded, 1))
+        );
+        assert_ne!(
+            super::plan_fingerprint(&plan(CoverageStatus::Complete, 1)),
+            super::plan_fingerprint(&plan(CoverageStatus::Complete, 2))
         );
     }
 }

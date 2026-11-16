@@ -670,6 +670,13 @@ pub(crate) fn retry_transient<T>(
     path: Option<&Path>,
     mut op: impl FnMut() -> Result<T, AccessFailure>,
 ) -> Result<T, OsCause> {
+    #[cfg(feature = "__test-internals")]
+    if let Some((super::ForcedAccess::Unreadable | super::ForcedAccess::UnreadableDirectory, _)) =
+        path.and_then(super::forced_access)
+    {
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        return Err(classify(&denied, None, path));
+    }
     let mut backoff = Duration::from_millis(10);
     loop {
         let failure = match op() {

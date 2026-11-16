@@ -1125,6 +1125,7 @@ mod tests {
             source: generation.source.clone(),
             source_version: Some(Arc::new(source_version)),
             freshness: Arc::clone(&generation.freshness),
+            scout_plan: generation.scout_plan.clone(),
             manifest: generation.manifest.clone(),
             code_signals: Arc::clone(&generation.code_signals),
             bridge: Arc::clone(&generation.bridge),

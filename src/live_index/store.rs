@@ -937,6 +937,12 @@ fn stable_read_with_budget(
     budget: &RetryBudget,
 ) -> StableReadOutcome {
     use crate::discovery::os_response::retry_transient;
+    #[cfg(feature = "__test-internals")]
+    if let Some((crate::discovery::ForcedAccess::UnstableRead, true)) =
+        crate::discovery::forced_access(path)
+    {
+        return StableReadOutcome::UnstableDuringRead;
+    }
     let Ok(max_bytes) = usize::try_from(scout_stamp.size) else {
         return StableReadOutcome::HardSkip {
             reason: HardSkipReason::PerFileCeiling,
@@ -1710,6 +1716,10 @@ pub struct PublishedGeneration {
     pub source: Option<Arc<SourceIdentity>>,
     pub source_version: Option<Arc<SourceVersion>>,
     pub freshness: Arc<FreshnessStatus>,
+    /// The scout plan published with `freshness`. A reader judging what this
+    /// publication may have missed (`freshen::observed_publication`) pairs the
+    /// two from one generation, without the writer lock.
+    pub scout_plan: Option<Arc<discovery::ScoutPlan>>,
     pub manifest: Option<Arc<RepositoryManifest>>,
     pub code_signals: Arc<CodeSignalsSnapshot>,
     pub bridge: Arc<KnowledgeBridge>,
@@ -2610,6 +2620,40 @@ fn merge_post_watermark_live_admissions(
     Ok(())
 }
 
+/// The embedded worker's whole-tree refresh keeps a file it could not read at
+/// its last indexed record, as the watcher's terminal-disposition publication
+/// does (`retains_last_valid_content`): the manifest entry still says the file
+/// is unreadable, and an answer that cites the record is compared with the
+/// disk, which names the file (spec 036 FR-018). Dropping the record would
+/// silently take the file's rows out of every answer.
+fn retain_unreadable_records(current: &LiveIndex, candidate: &mut LiveIndex) -> anyhow::Result<()> {
+    let unreadable: Vec<String> = candidate
+        .manifest_entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.disposition,
+                FileDisposition::Unreadable { .. } | FileDisposition::UnstableDuringRead
+            )
+        })
+        .filter_map(|entry| entry.path.normalized_utf8.clone())
+        .filter(|path| !candidate.files.contains_key(path))
+        .collect();
+    for path in unreadable {
+        let Some(file) = current.files.get(&path) else {
+            continue;
+        };
+        let file = (**file).clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            candidate.update_file_with_manifest(path.clone(), file, false);
+        }));
+        if result.is_err() {
+            anyhow::bail!("reload refused: failed to keep the last record of unreadable '{path}'");
+        }
+    }
+    Ok(())
+}
+
 /// Whether every indexed source path from `watermark` is absent on disk under
 /// `root`. Witnesses delete+recreate (path-vanish→new) without consulting mtime.
 fn indexed_tree_absent_from_disk(watermark: &LiveIndex, root: &Path) -> bool {
@@ -2770,6 +2814,7 @@ impl SharedIndexHandle {
             source: source.clone(),
             source_version,
             freshness: Arc::new(freshness_status.clone()),
+            scout_plan: scout_plan.clone(),
             manifest,
             code_signals,
             bridge,
@@ -2980,6 +3025,7 @@ impl SharedIndexHandle {
             source: Some(source),
             source_version: Some(source_version),
             freshness: Arc::new(freshness),
+            scout_plan: None,
             manifest,
             code_signals,
             bridge,
@@ -3841,6 +3887,7 @@ impl SharedIndexHandle {
             source: previous.source.clone(),
             source_version: previous.source_version.clone(),
             freshness: Arc::clone(&previous.freshness),
+            scout_plan: previous.scout_plan.clone(),
             manifest: previous.manifest.clone(),
             code_signals: Arc::clone(&previous.code_signals),
             bridge: prepared.bridge,
@@ -3907,6 +3954,7 @@ impl SharedIndexHandle {
             source: previous.source.clone(),
             source_version: previous.source_version.clone(),
             freshness: Arc::clone(&previous.freshness),
+            scout_plan: previous.scout_plan.clone(),
             manifest: previous.manifest.clone(),
             code_signals: Arc::clone(&previous.code_signals),
             bridge: Arc::clone(&previous.bridge),
@@ -3952,6 +4000,7 @@ impl SharedIndexHandle {
             source: previous.source.clone(),
             source_version: previous.source_version.clone(),
             freshness: Arc::clone(&previous.freshness),
+            scout_plan: previous.scout_plan.clone(),
             manifest: previous.manifest.clone(),
             code_signals: Arc::clone(&previous.code_signals),
             bridge: prepared.bridge,
@@ -4016,6 +4065,7 @@ impl SharedIndexHandle {
             source: previous.source.clone(),
             source_version: previous.source_version.clone(),
             freshness: Arc::clone(&previous.freshness),
+            scout_plan: previous.scout_plan.clone(),
             manifest: previous.manifest.clone(),
             code_signals: Arc::clone(&previous.code_signals),
             bridge: Arc::new(KnowledgeBridge {
@@ -4048,6 +4098,7 @@ impl SharedIndexHandle {
             source: previous.source.clone(),
             source_version: previous.source_version.clone(),
             freshness: Arc::clone(&previous.freshness),
+            scout_plan: previous.scout_plan.clone(),
             manifest: previous.manifest.clone(),
             code_signals: Arc::clone(&previous.code_signals),
             bridge: Arc::new(KnowledgeBridge::loading()),
@@ -4300,6 +4351,15 @@ impl SharedIndexHandle {
         check_reload_cancelled(cancel)?;
         let current_live = self.live.load_full();
         merge_post_watermark_live_admissions(&watermark_live, &current_live, &mut live)?;
+        // Not gated on the replacement latch: the latch keeps freshness off
+        // Current for the life of the handle, and a candidate manifest that
+        // lists a path as unreadable has itself just observed that file on
+        // disk. Dropping its record would take the file's rows out of every
+        // answer with no caveat; kept, an answer that cites it is compared
+        // with the disk, which names it (FR-018).
+        if matches!(retention, PreUpdateRetention::RecordChangedFiles) {
+            retain_unreadable_records(&current_live, &mut live)?;
+        }
         self.source_exclusions.store(Arc::new(source_exclusions));
         self.scout_plan.store(Some(scout_plan));
         // A latched observer gap outlives a reload. This rebuild proves present
@@ -4344,8 +4404,11 @@ impl SharedIndexHandle {
         // Path-keyed pre-update snapshots belong to the previous project
         // generation. Clear them under the same writer lock as the retarget so
         // a late impact request cannot consume a replacement project's state.
+        // Only a replacement THIS reload observed retires the baselines. The
+        // latch outlives it to keep freshness honest; on a later reload of
+        // the tree now present the baselines describe that tree.
         let baselines = match retention {
-            PreUpdateRetention::RecordChangedFiles if !physical_replacement => {
+            PreUpdateRetention::RecordChangedFiles if !observed_replacement => {
                 Some(changed_file_baselines(&current_live, &live))
             }
             _ => {
@@ -5734,6 +5797,7 @@ impl SharedIndexHandle {
             source: source.clone(),
             source_version,
             freshness,
+            scout_plan,
             manifest,
             code_signals,
             bridge,
@@ -10622,6 +10686,51 @@ mod tests {
             shared.freshness_status().as_ref(),
             &FreshnessStatus::Current,
             "subsequent clean reload on unchanged physical root must stay Current"
+        );
+    }
+
+    /// The replacement latch keeps freshness off Current after every indexed
+    /// file vanished, but it must not also retire the `analyze_file_impact`
+    /// baselines of every later refresh: the tree those refreshes read is the
+    /// one now present, and its changed files keep their prior image.
+    #[test]
+    fn a_vanished_tree_retires_impact_baselines_only_for_the_reload_that_saw_it() {
+        let project = TempDir::new().unwrap();
+        write_file(project.path(), "src/lib.rs", "pub fn first() {}\n");
+        let shared = LiveIndex::load(project.path()).unwrap();
+        let cancel = AtomicBool::new(false);
+        let refresh = || {
+            shared
+                .refresh_bound_tree_cancellable(
+                    project.path(),
+                    None,
+                    discovery::SourceExclusions::default(),
+                    &cancel,
+                )
+                .expect("refresh")
+        };
+        std::fs::remove_file(project.path().join("src/lib.rs")).unwrap();
+        refresh();
+        assert!(
+            matches!(
+                shared.freshness_status().as_ref(),
+                FreshnessStatus::Degraded { .. }
+            ),
+            "control: the vanished tree latched the replacement"
+        );
+        write_file(project.path(), "src/lib.rs", "pub fn second() {}\n");
+        refresh();
+        write_file(project.path(), "src/lib.rs", "pub fn third() {}\n");
+        refresh();
+        let baseline = shared
+            .take_pre_update_snapshot("src/lib.rs")
+            .expect("the changed file keeps its prior image");
+        assert!(
+            baseline
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "second"),
+            "the baseline is the tree the refresh replaced"
         );
     }
 
