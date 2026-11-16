@@ -1219,6 +1219,12 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
 // Curation race: `index_lifecycle/embed_knowledge.rs` maps the engine's stale
 // review refusals to StalePublication via a file-local fn. No new edge, no
 // bridge. Same 91 files.
+// Observer park: `index_lifecycle/embedded.rs` gains the `__test-internals`
+// `hold_observer_for_test` seam (a flag the observer loop checks). No new
+// edge, no bridge. Same 91 files.
+// Stale review check: `index_lifecycle/embed_knowledge.rs` test module only moves
+// the stale-review assertion after the apply. cfg(test); no new edge, no
+// bridge. Same 91 files.
 // History: review notes for the retired `FULL_SOURCE_PIN_V1` tuple.
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
 // again after the derived-stage hold grew a reached-wait so CR-1 G17 can
@@ -1550,6 +1556,10 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
 // Curation race: `discovery/mod.rs` hard-scope excludes `.symforge-curation-*`
 // engine temps; `index_lifecycle/embed_knowledge.rs` maps stale review refusals
 // to StalePublication. No new edge, no bridge. 321 files.
+// Observer park: `index_lifecycle/embedded.rs` `__test-internals` seam
+// `hold_observer_for_test`. No new edge, no bridge. 321 files.
+// Stale review check: test-only change in `index_lifecycle/embed_knowledge.rs`.
+// No new edge, no bridge. 321 files.
 // From the per-file manifest on, the manifest diff plus PR review are the
 // record of each baseline refresh; no per-change note is added to this file.
 // One blank-separated pin line per file lets PRs on different files merge cleanly.
