@@ -1868,8 +1868,13 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 // doctests), the serial `--lib --bins --tests` gate moved to the scheduled run,
 // and every new cargo-mentioning line is an env assignment, a cache key, a
 // download, or that archive; census 91/53/2.
+// Refreshed 2026-11-16 to shorten the PR critical path: the Linux archive and
+// its partitions became one `cargo nextest run --no-run` build plus one
+// `cargo nextest run` in the same job, and windows-native became a matrix whose
+// test shards add only nextest's `--partition` selector. Three cargo lines out,
+// three in, none a doctest lane; census still 91/53/2.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "3f4a18c2a554b992:48758"),
+    ("ci.yml", "7d2d7a2847253397:46866"),
     ("release.yml", "b174946ff2c434bb:115022"),
 ];
 
@@ -2089,17 +2094,17 @@ const CARGO_LINES: &[(&str, usize)] = &[
     // Windows-native job. No test harness: nextest never builds or runs
     // doctests, and the fmt/clippy gates cannot reach the doctest lane.
     ("run: cargo check --no-default-features --features embed", 1),
-    ("run: cargo nextest run --no-fail-fast", 1),
-    // Linux test split. `cargo nextest archive` builds the same
-    // `--lib --bins --tests` selection as the serial gate and nextest never
-    // builds or runs doctests; the partitions run that archive with the
-    // standalone nextest binary, which builds nothing.
+    // Sharded on hosted runners; `--partition` only selects which tests run.
     (
-        "cargo nextest archive --lib --bins --tests --archive-file \"$RUNNER_TEMP/nextest-archive.tar.zst\"",
+        "run: cargo nextest run --no-fail-fast --partition \"slice:$env:SLICE\"",
         1,
     ),
+    // Linux suite. Builds then runs the same `--lib --bins --tests`
+    // selection as the serial gate in one job; nextest never builds or runs
+    // doctests, and `--no-run` only builds.
+    ("cargo nextest run --lib --bins --tests --no-run", 1),
     (
-        "run: cargo-nextest nextest run --archive-file \"$RUNNER_TEMP/nextest-archive.tar.zst\" --extract-to \"$GITHUB_WORKSPACE\" --partition \"slice:$PARTITION/4\" --no-fail-fast",
+        "run: cargo nextest run --lib --bins --tests --no-fail-fast",
         1,
     ),
 ];
