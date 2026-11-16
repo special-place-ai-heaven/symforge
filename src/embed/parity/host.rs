@@ -944,7 +944,8 @@ impl HostRefusal {
                 // MCP prints exactly this text for the same refusal.
                 let message = match &kind {
                     Kind::ProjectConfigTrustEnforced { message }
-                    | Kind::StructuralRewriteRefused { message } => Some(message.clone()),
+                    | Kind::StructuralRewriteRefused { message }
+                    | Kind::ProjectWideMutationRefused { message } => Some(message.clone()),
                     _ => None,
                 };
                 let (host_kind, name) = match kind {

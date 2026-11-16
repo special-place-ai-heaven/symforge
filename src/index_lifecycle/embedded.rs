@@ -3779,4 +3779,90 @@ mod refresh_lifecycle_tests {
             super::super::public_api::RetryAdvice::Never
         );
     }
+
+    /// The embed lane refuses `batch_rename` while files are withheld since a
+    /// snapshot restore, with MCP's exact text, before planning or writing
+    /// (preview and apply alike). The withheld set is installed on the live
+    /// data plane the handle publishes from; no fixture can make the verify
+    /// withhold a real file, because its failure seam is `cfg(test)`-only.
+    #[test]
+    fn server_and_embed_batch_rename_refuses_while_files_are_withheld_since_restore() {
+        use crate::embed::parity::edit::{
+            BatchRenameRequest, EditApplyAuthority, EditError, EditErrorKind, EditTarget,
+        };
+        use crate::live_index::store::{SnapshotVerifyReport, SnapshotVerifyState};
+
+        let (root, _runtime, handle) = open_current();
+        std::fs::write(root.path().join("caller.rs"), "fn c() { loaded(); }\n").unwrap();
+        let after = handle.runtime_view().source_version;
+        handle.request_refresh().unwrap();
+        wait_current(&handle, after);
+        let withheld = std::collections::BTreeMap::from([(
+            "src/held.rs".to_owned(),
+            "it could not be read".to_owned(),
+        )]);
+        {
+            let binding = handle.binding.as_ref().unwrap();
+            let mut live = binding.runtime.data_plane().write();
+            live.snapshot_verify_state = SnapshotVerifyState::Completed(
+                SnapshotVerifyReport::from_mismatched_paths(vec!["src/held.rs".to_owned()])
+                    .with_unverified(withheld.clone()),
+            );
+        }
+        // The write republished the data plane; bind the source's identity to it.
+        handle.binding.as_ref().unwrap().publish_freshened();
+        let plan = handle
+            .plan_batch_rename(
+                &EditTarget {
+                    path: "lib.rs".to_owned(),
+                    name: "loaded".to_owned(),
+                    kind: None,
+                    symbol_line: None,
+                },
+                false,
+            )
+            .expect("a plan carries no withheld check; apply and preview do");
+        let request = BatchRenameRequest {
+            plan,
+            new_name: "renamed".to_owned(),
+        };
+        let expected =
+            super::super::guidance::read_context::project_wide_mutation_refused_unverified(
+                "batch_rename",
+                &withheld,
+            )
+            .expect("a withheld file refuses");
+        assert!(expected.starts_with("batch_rename refused: 1 files are withheld"));
+
+        let authority = EditApplyAuthority::for_source_root(
+            root.path().to_path_buf(),
+            "withheld-rename".to_owned(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let message_of = |error: EditError| match error {
+            EditError::Edit(EditErrorKind::ProjectWideMutationRefused { message }) => message,
+            other => panic!("expected the withheld refusal, got {other:?}"),
+        };
+        assert_eq!(
+            message_of(handle.preview_batch_rename(&request).unwrap_err()),
+            expected
+        );
+        assert_eq!(
+            message_of(
+                handle
+                    .apply_batch_rename(&request, &authority, "withheld-rename-1")
+                    .unwrap_err()
+            ),
+            expected
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("lib.rs")).unwrap(),
+            "pub fn loaded() {}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("caller.rs")).unwrap(),
+            "fn c() { loaded(); }\n"
+        );
+    }
 }
