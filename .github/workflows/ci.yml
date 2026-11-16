@@ -16,7 +16,7 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
-  # One nextest version for the archive build, every partition, and Windows.
+  # One nextest version for the Linux suite and every Windows shard.
   NEXTEST_VERSION: "0.9.151"
 
 permissions:
@@ -249,17 +249,20 @@ jobs:
             !${{ runner.temp }}/zccache/**/logs
           key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
 
-  # Builds every test binary once and hands them to the `test` partitions as a
-  # nextest archive (https://nexte.st/docs/ci-features/archiving/). The test
-  # binaries embed absolute source and binary paths at compile time, so each
-  # partition must check out at this job's path; `workspace` lets it check.
+  # Builds every test binary and runs the whole suite in the same job, one
+  # process per test (nextest, .config/nextest.toml: 8 test threads, one
+  # reported retry). Until 2026-11 the binaries went to four partition jobs as
+  # a ~2 GB nextest archive: one upload plus four downloads cost ~10 min of the
+  # critical path, more than the 7.5 min of compile and test they served, and
+  # the partitions shared the same host's cores anyway. The serial
+  # `--test-threads=1` gate the constitution names runs in `serial-suite`.
+  # The job id stays `test-build` so its zccache key is unchanged.
   test-build:
+    name: test
     needs: plan
     if: needs.plan.outputs.code_changed != 'false'
     runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
-    timeout-minutes: 30
-    outputs:
-      workspace: ${{ steps.archive.outputs.workspace }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -294,32 +297,20 @@ jobs:
 
       # The same `--lib --bins --tests` selection as the serial suite: the
       # criterion bench target (harness = false) has its own job.
-      - name: Build and archive the test binaries
-        id: archive
+      - name: Build the test binaries
+        id: build
         run: |
-          cargo nextest archive --lib --bins --tests --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
-          echo "workspace=$GITHUB_WORKSPACE" >> "$GITHUB_OUTPUT"
-          {
-            echo "- test build workspace: \`$GITHUB_WORKSPACE\`"
-            echo "- target/debug: $(du -sh target/debug | cut -f1), archive: $(du -sh "$RUNNER_TEMP/nextest-archive.tar.zst" | cut -f1)"
-          } >> "$GITHUB_STEP_SUMMARY"
+          cargo nextest run --lib --bins --tests --no-run
+          echo "- target/debug: $(du -sh target/debug | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload the test archive
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: nextest-archive
-          path: ${{ runner.temp }}/nextest-archive.tar.zst
-          retention-days: 1
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Set up Node for the Slice 0 oracle
+      # The Slice 0 oracle and the tests that spawn node both use it.
+      - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
-      # Slice 0's product is positive controls that MUST fail, so the test
-      # partitions cannot check them: they run the default suite, where every
+      # Slice 0's product is positive controls that MUST fail, so the suite
+      # step below cannot check them: it runs the default suite, where every
       # control is `#[ignore]`d precisely so a deliberate RED does not turn main
       # red. This runs them, reusing the test build above, and preserves the
       # outcome as the contract's bounded CI-SLICE0 artifact -- one deterministic
@@ -340,6 +331,21 @@ jobs:
           path: target/ci/lifecycle-v11/slice-0-oracle-contract.json
           if-no-files-found: error
 
+      # The suite runs whenever the build did, even when the oracle above went
+      # red, so one failure never hides the other.
+      # stel_golden_replay needs gitignored phase0 corpora; without this step the
+      # integration tests skip vacuously and CI misses regressions operators see
+      # after cloning per tests/fixtures/phase0-corpus/README.md.
+      - name: Clone phase0 golden-replay corpora
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: bash execution/clone_phase0_corpora.sh
+
+      - name: Run tests (process-per-test)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          SYMFORGE_HOME: ${{ runner.temp }}/symforge-test-home
+        run: cargo nextest run --lib --bins --tests --no-fail-fast
+
       - name: zccache stats and stop
         if: ${{ always() }}
         run: |
@@ -356,74 +362,6 @@ jobs:
             !${{ runner.temp }}/zccache/**/*.lock
             !${{ runner.temp }}/zccache/**/logs
           key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
-
-  # Runs the archived suite in four slices, one process per test (nextest,
-  # .config/nextest.toml: 8 test threads, one reported retry). Needs only a
-  # checkout, git, node and nextest: no Rust toolchain, no build. The serial
-  # `--test-threads=1` gate the constitution names runs in `serial-suite`.
-  test:
-    name: test (${{ matrix.partition }}/4)
-    needs: [plan, test-build]
-    if: needs.plan.outputs.code_changed != 'false'
-    runs-on: ${{ fromJSON(needs.plan.outputs.linux) }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        partition: [1, 2, 3, 4]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Check runner prerequisites
-        run: bash execution/ci_prepare.sh git curl tar jq > /dev/null
-
-      - name: Check the checkout path and isolate the test home
-        env:
-          BUILD_WORKSPACE: ${{ needs.test-build.outputs.workspace }}
-        run: |
-          if [ "$BUILD_WORKSPACE" != "$GITHUB_WORKSPACE" ]; then
-            echo "::error::The test binaries were built in $BUILD_WORKSPACE and embed that path at compile time, but this runner checked out to $GITHUB_WORKSPACE. Give the self-hosted runners one work directory, or set the repository variable CI_RUNNERS=hosted."
-            exit 1
-          fi
-          echo "SYMFORGE_HOME=$RUNNER_TEMP/symforge-test-home" >> "$GITHUB_ENV"
-
-      # One test spawns `rustc` to compile a probe file
-      # (src/edit_safety/structural.rs, rust_insert_before_keeps_disabled_code_disabled),
-      # so the slices need the pinned compiler, minimal profile, no build.
-      - name: Install rustc only (rust-toolchain.toml channel)
-        run: |
-          # Prints the installed version itself; GITHUB_PATH puts rustc on
-          # PATH from the next step on, so it is not called here.
-          bash execution/ensure_rustup.sh --minimal
-
-      - name: Set up Node for tests that spawn node
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: '22'
-
-      # stel_golden_replay needs gitignored phase0 corpora; without this step the
-      # integration tests skip vacuously and CI misses regressions operators see
-      # after cloning per tests/fixtures/phase0-corpus/README.md.
-      - name: Clone phase0 golden-replay corpora
-        run: bash execution/clone_phase0_corpora.sh
-
-      - name: Install nextest (prebuilt)
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
-        with:
-          tool: nextest@${{ env.NEXTEST_VERSION }}
-
-      - name: Download the test archive
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: nextest-archive
-          path: ${{ runner.temp }}
-
-      # --extract-to puts target/ back where the build job had it, inside the
-      # checkout, so the compile-time paths resolve.
-      - name: Run tests (process-per-test, one slice)
-        env:
-          PARTITION: ${{ matrix.partition }}
-        run: cargo-nextest nextest run --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" --extract-to "$GITHUB_WORKSPACE" --partition "slice:$PARTITION/4" --no-fail-fast
 
   bench:
     needs: plan
@@ -667,7 +605,7 @@ jobs:
           grep -q '^test result: ok\. 2 passed; 0 failed;' "$RUNNER_TEMP/server-embed-parity.log"
 
       # The integration tests gated on `embed` compile only with it on, and no
-      # other job runs them; the rest already run in the `test` partitions.
+      # other job runs them; the rest already run in the `test-build` suite.
       # `__test-internals` is required by the files gated on both features.
       # tests/ci_embed_selection.rs fails when an embed-gated file is not selected.
       - name: Run server and embed integration tests
@@ -773,7 +711,7 @@ jobs:
           key: zccache-1.15.6-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
 
   # The constitution (principle IV) names the serial suite as a gate. Pull
-  # requests and pushes run the same tests through nextest partitions; this
+  # requests and pushes run the same tests through nextest; this
   # runs them the old way, one test thread per binary, every day and on demand.
   serial-suite:
     needs: plan
@@ -876,13 +814,20 @@ jobs:
   # files, test home, the checkout) stays inside the runner's work directory
   # and the last step deletes it, even on failure or cancellation. On
   # GitHub-hosted Windows the VM is discarded, so only the test home moves.
-  # One machine cannot run test partitions in parallel, so the suite is not
-  # split here.
+  # Hosted runners are separate machines, so there the work is sharded: `lint`
+  # (fmt, clippy, embed check, parity tests) and three nextest slices, each
+  # compiling its own test build. One workstation cannot run shards in
+  # parallel, so there one `all` shard runs every step in the original order.
   windows-native:
+    name: windows-native (${{ matrix.shard }})
     needs: plan
     if: needs.plan.outputs.code_changed != 'false'
     runs-on: ${{ fromJSON(needs.plan.outputs.windows) }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(contains(needs.plan.outputs.windows, 'self-hosted') && '["all"]' || '["lint", "1/3", "2/3", "3/3"]') }}
     defaults:
       run:
         # PowerShell, not bash: on the workstation a bare `bash` resolves to
@@ -960,25 +905,34 @@ jobs:
           $bin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       - name: Check Rust formatting
+        if: matrix.shard == 'lint' || matrix.shard == 'all'
         run: cargo fmt --check
 
-      # stel_golden_replay needs gitignored phase0 corpora (see the test job).
+      # stel_golden_replay needs gitignored phase0 corpora (see the test-build job).
       - name: Clone phase0 golden-replay corpora
+        if: matrix.shard != 'lint'
         run: ./execution/clone_phase0_corpora.ps1
 
       - name: Run clippy
+        if: matrix.shard == 'lint' || matrix.shard == 'all'
         run: cargo clippy --all-targets -- -D warnings
 
       # The build Fathom compiles as a path dependency. It failed with four
       # errors on every toolchain before the stable GetFileInformationByHandle
       # physical-root anchor; this step keeps it permanently green.
       - name: Check the embed engine build
+        if: matrix.shard == 'lint' || matrix.shard == 'all'
         run: cargo check --no-default-features --features embed
 
+      # nextest's `slice:1/1` is the whole suite.
       - name: Run Rust tests (process-per-test)
-        run: cargo nextest run --no-fail-fast
+        if: matrix.shard != 'lint'
+        env:
+          SLICE: ${{ matrix.shard == 'all' && '1/1' || matrix.shard }}
+        run: cargo nextest run --no-fail-fast --partition "slice:$env:SLICE"
 
       - name: Run server and embed parity tests
+        if: matrix.shard == 'lint' || matrix.shard == 'all'
         # --no-tests=fail makes a stale or misconfigured test filter fail CI.
         run: cargo nextest run --features embed,__test-internals --lib --no-tests=fail -E 'test(server_and_embed_)'
 
@@ -1051,7 +1005,6 @@ jobs:
       - release-version
       - lint
       - test-build
-      - test
       - bench
       - release-build
       - embed-build

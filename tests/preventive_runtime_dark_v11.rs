@@ -13,7 +13,8 @@
 //! moved file cannot make the claim vacuously true. Rust name resolution is
 //! not reconstructed here. Instead, the reviewed baseline establishes that the two excluded
 //! implementation surfaces contain no pre-existing outward dispatch bridge;
-//! an exact source-set seal below makes any later trait, inherent-method,
+//! an exact per-file source seal below (one SHA-256 per `src/` file in
+//! `tests/darkness_baseline/full_source.pins`) makes any later trait, inherent-method,
 //! registration, or re-export bridge inside those surfaces fail, while the
 //! lexical sweeps keep direct outside callers diagnostic. This is reviewed
 //! baseline preservation, not a general compiler call-graph oracle.
@@ -151,12 +152,14 @@
 //! split invocation carrying a concat argument, which no single line of
 //! this scan can see — and any future spelling not enumerated here. The
 //! splice tripwire is therefore not the load-bearing mechanism by itself.
-//! Darkness is held by the reviewed whole-`src` seal. The narrower
-//! excluded-source seal and outside caller sweeps remain diagnostic tripwires:
+//! Darkness is held by the reviewed whole-`src` seal: every in-tree `src/`
+//! file's path-bound SHA-256 in `tests/darkness_baseline/full_source.pins`.
+//! The narrower excluded-source seal (the dark-side lines of that manifest)
+//! and outside caller sweeps remain diagnostic tripwires:
 //! none of the three is a compiler-semantic call graph by itself.
 
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::Metadata;
@@ -1110,7 +1113,7 @@ const EXCLUDED_RUNTIME_SOURCE_PATHS: &[&str] = &[
     "index_lifecycle/verification.rs",
     "server_api.rs",
 ];
-const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-source-set-v1\0";
+// History: review notes for the retired `EXCLUDED_RUNTIME_SOURCE_PIN_V1` tuple.
 // Baseline refreshed 2026-09-16 after re-reviewing the complete src diff:
 // process-wide embed factory, cooperative close, index_census,
 // index_progress, and search_knowledge on the handle. Same 20 excluded
@@ -1216,18 +1219,13 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Curation race: `index_lifecycle/embed_knowledge.rs` maps the engine's stale
 // review refusals to StalePublication via a file-local fn. No new edge, no
 // bridge. Same 91 files.
-// Rename withheld refusal: `index_lifecycle/embed_batch.rs` refuses preview and
-// apply of `batch_rename` through the existing `guidance::read_context`
-// formatter (the file already calls that module); `embed/parity/edit.rs` gains
-// the `ProjectWideMutationRefused` variant and `embed/parity/host.rs` passes its
-// text through; `embedded.rs` only a cfg(test) test. No new edge, no bridge.
-// Same 91 files.
-const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "c379541363d4af7bc48a03e851b8219c3f54192c44186188a56e25c7ee0d8c0d",
-    91,
-    2521979,
-);
-const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
+// Observer park: `index_lifecycle/embedded.rs` gains the `__test-internals`
+// `hold_observer_for_test` seam (a flag the observer loop checks). No new
+// edge, no bridge. Same 91 files.
+// Stale review check: `index_lifecycle/embed_knowledge.rs` test module only moves
+// the stale-review assertion after the apply. cfg(test); no new edge, no
+// bridge. Same 91 files.
+// History: review notes for the retired `FULL_SOURCE_PIN_V1` tuple.
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
 // again after the derived-stage hold grew a reached-wait so CR-1 G17 can
 // observe the pause, then for the deferred stdio front, which added
@@ -1558,15 +1556,19 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Curation race: `discovery/mod.rs` hard-scope excludes `.symforge-curation-*`
 // engine temps; `index_lifecycle/embed_knowledge.rs` maps stale review refusals
 // to StalePublication. No new edge, no bridge. 321 files.
-// Rename withheld refusal: embed `batch_rename` preview/apply call the existing
-// `read_context::project_wide_mutation_refused_unverified` formatter; a new
-// `EditErrorKind` variant is passed through `host.rs`. No new index_lifecycle
-// bridge edge. 321 files.
-const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "484a66c671d7a7e918e78a1593269bc598b78795967a1452d41b05ea5a550261",
-    321,
-    13215985,
-);
+// Observer park: `index_lifecycle/embedded.rs` `__test-internals` seam
+// `hold_observer_for_test`. No new edge, no bridge. 321 files.
+// Stale review check: test-only change in `index_lifecycle/embed_knowledge.rs`.
+// No new edge, no bridge. 321 files.
+// From the per-file manifest on, the manifest diff plus PR review are the
+// record of each baseline refresh; no per-change note is added to this file.
+// One blank-separated pin line per file lets PRs on different files merge cleanly.
+const SOURCE_PINS_MANIFEST: &str = "tests/darkness_baseline/full_source.pins";
+const SOURCE_FILE_PIN_DOMAIN_V1: &[u8] = b"symforge-source-file-pin-v1\0";
+const BLESS_SOURCE_PINS_ENV: &str = "SYMFORGE_BLESS_SOURCE_PINS";
+const REFRESH_SOURCE_PINS_COMMAND: &str = "SYMFORGE_BLESS_SOURCE_PINS=1 cargo test \
+     --test preventive_runtime_dark_v11 full_source_set_matches_reviewed_darkness_baseline \
+     -- --nocapture";
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(bytes.len());
@@ -1610,23 +1612,138 @@ fn normalized_source_records(src: &Path, files: Vec<PathBuf>) -> Vec<(String, Ve
     records
 }
 
-fn source_set_fingerprint(domain: &[u8], records: &[(String, Vec<u8>)]) -> (String, usize, usize) {
+/// One file's pin: SHA-256 over the domain, a record count of one, then the
+/// length-prefixed normalized path and content -- the same framing the retired
+/// whole-set digest used, so a pin binds its path and a rename or a content
+/// swap between two files changes both lines.
+fn source_file_pin(path: &str, content: &[u8]) -> String {
     let mut hash = Sha256::new();
-    hash.update(domain);
-    hash.update((records.len() as u64).to_le_bytes());
-    let mut normalized_bytes = 0usize;
-    for (path, content) in records {
-        hash.update((path.len() as u64).to_le_bytes());
-        hash.update(path.as_bytes());
-        hash.update((content.len() as u64).to_le_bytes());
-        hash.update(content);
-        normalized_bytes += content.len();
-    }
+    hash.update(SOURCE_FILE_PIN_DOMAIN_V1);
+    hash.update(1u64.to_le_bytes());
+    hash.update((path.len() as u64).to_le_bytes());
+    hash.update(path.as_bytes());
+    hash.update((content.len() as u64).to_le_bytes());
+    hash.update(content);
     let mut digest = String::with_capacity(64);
     for byte in hash.finalize() {
         write!(&mut digest, "{byte:02x}").expect("write SHA-256 hex");
     }
-    (digest, records.len(), normalized_bytes)
+    digest
+}
+
+fn observed_source_pins(records: &[(String, Vec<u8>)]) -> BTreeMap<String, String> {
+    records
+        .iter()
+        .map(|(path, content)| {
+            assert!(
+                !path.contains(['\n', '\r']),
+                "source path cannot be pinned on one manifest line: {path:?}"
+            );
+            (path.clone(), source_file_pin(path, content))
+        })
+        .collect()
+}
+
+fn source_pins_manifest_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(SOURCE_PINS_MANIFEST)
+}
+
+/// Parse `<sha256-hex>  <path>` lines; blank separator lines are skipped. CRLF
+/// is normalized first, so a checkout that still produced CRLF compares the
+/// same; any other malformed line fails.
+fn parse_source_pins(bytes: &[u8]) -> BTreeMap<String, String> {
+    let text = String::from_utf8(crlf_to_lf(bytes))
+        .unwrap_or_else(|error| panic!("{SOURCE_PINS_MANIFEST} is not UTF-8: {error}"));
+    let mut pins = BTreeMap::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let parsed = line
+            .get(..64)
+            .zip(line.get(64..).and_then(|rest| rest.strip_prefix("  ")))
+            .filter(|(hash, path)| {
+                !path.is_empty() && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            });
+        let Some((hash, path)) = parsed else {
+            panic!(
+                "{SOURCE_PINS_MANIFEST}:{}: malformed pin line {line:?}",
+                index + 1
+            );
+        };
+        assert!(
+            pins.insert(path.to_owned(), hash.to_owned()).is_none(),
+            "{SOURCE_PINS_MANIFEST}:{}: duplicate pin for {path}",
+            index + 1
+        );
+    }
+    pins
+}
+
+fn read_source_pins_manifest(allow_missing: bool) -> BTreeMap<String, String> {
+    let path = source_pins_manifest_path();
+    let bytes = if allow_missing {
+        match optional_observation(std::fs::read(&path), "read source pin manifest", &path) {
+            Some(bytes) => bytes,
+            None => return BTreeMap::new(),
+        }
+    } else {
+        required_observation(std::fs::read(&path), "read source pin manifest", &path)
+    };
+    require_regular_non_link(&path);
+    parse_source_pins(&bytes)
+}
+
+/// Pin lines are separated by a blank line. Git conflicts when two branches
+/// change ADJACENT lines, and neighbouring paths (one directory) are common;
+/// the unchanged separator between entries lets those merges stay clean.
+fn render_source_pins(pins: &BTreeMap<String, String>) -> String {
+    let lines: Vec<String> = pins
+        .iter()
+        .map(|(path, hash)| format!("{hash}  {path}\n"))
+        .collect();
+    lines.join("\n")
+}
+
+/// Every added, removed, and changed path, sorted, each dark-side entry marked.
+fn source_pin_drift(
+    observed: &BTreeMap<String, String>,
+    baseline: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let paths: BTreeSet<&String> = observed.keys().chain(baseline.keys()).collect();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let change = match (observed.get(path), baseline.get(path)) {
+                (Some(now), Some(then)) if now == then => return None,
+                (Some(_), Some(_)) => "changed",
+                (Some(_), None) => "added",
+                (None, _) => "removed",
+            };
+            let dark = if EXCLUDED_RUNTIME_SOURCE_PATHS.contains(&path.as_str()) {
+                " [dark-side: excluded runtime source; needs the outward-bridge review]"
+            } else {
+                ""
+            };
+            Some(format!("{change}: src/{path}{dark}"))
+        })
+        .collect()
+}
+
+/// Bless mode is local only: CI must never approve its own baseline.
+fn bless_source_pins_requested() -> bool {
+    if std::env::var_os(BLESS_SOURCE_PINS_ENV).is_none() {
+        return false;
+    }
+    for ci in ["CI", "GITHUB_ACTIONS"] {
+        assert!(
+            std::env::var_os(ci).is_none(),
+            "refusing to bless {SOURCE_PINS_MANIFEST}: {ci} is set, and CI must never \
+             approve its own source baseline. Refresh locally and commit the reviewed \
+             manifest diff"
+        );
+    }
+    true
 }
 
 #[test]
@@ -1647,14 +1764,26 @@ fn excluded_runtime_source_set_matches_reviewed_baseline() {
          before updating both the path set and its reviewed semantic baseline"
     );
 
-    let (digest, file_count, normalized_bytes) =
-        source_set_fingerprint(EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1, &records);
-    assert_eq!(
-        (digest.as_str(), file_count, normalized_bytes),
-        EXCLUDED_RUNTIME_SOURCE_PIN_V1,
-        "an excluded runtime source changed. Direct callers may still be absent while a \
-         trait, inherent-method, registration, or re-export bridge creates a semantic edge; \
-         review the complete excluded-source diff before updating this pin"
+    if bless_source_pins_requested() {
+        // The whole-src test owns the rewrite and reports dark-side entries.
+        return;
+    }
+    let baseline = read_source_pins_manifest(false);
+    let drift: Vec<String> = records
+        .iter()
+        .filter_map(|(path, content)| match baseline.get(path) {
+            Some(pin) if *pin == source_file_pin(path, content) => None,
+            Some(_) => Some(format!("changed: src/{path}")),
+            None => Some(format!("unpinned: src/{path}")),
+        })
+        .collect();
+    assert!(
+        drift.is_empty(),
+        "an excluded runtime source changed against {SOURCE_PINS_MANIFEST}:\n  {}\n\
+         Direct callers may still be absent while a trait, inherent-method, registration, \
+         or re-export bridge creates a semantic edge; review the complete excluded-source \
+         diff before refreshing with: {REFRESH_SOURCE_PINS_COMMAND}",
+        drift.join("\n  ")
     );
 }
 
@@ -1663,7 +1792,12 @@ fn excluded_runtime_source_set_matches_reviewed_baseline() {
 /// semantic drift; this broader change detector also catches zero-token
 /// aliases, macro bridges, and arbitrary Cargo target files outside the dark
 /// implementation set. Updating it requires re-reviewing the complete `src/`
-/// diff. Generated `OUT_DIR`, proc-macro, dependency, and external-consumer
+/// diff; the manifest diff names every file it covers. Every in-tree file,
+/// extensionless ones included, has one path-bound SHA-256 line in
+/// `tests/darkness_baseline/full_source.pins`, so any addition, removal,
+/// rename, or byte change fails until the manifest is refreshed in the same
+/// PR (`SYMFORGE_BLESS_SOURCE_PINS=1`, refused under `CI`/`GITHUB_ACTIONS`).
+/// Generated `OUT_DIR`, proc-macro, dependency, and external-consumer
 /// source remain outside this in-repository claim.
 #[test]
 fn full_source_set_matches_reviewed_darkness_baseline() {
@@ -1676,14 +1810,42 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
     let mut files = Vec::new();
     source_files_under(&src, &mut files);
     let records = normalized_source_records(&src, files);
-    let (digest, file_count, normalized_bytes) =
-        source_set_fingerprint(FULL_SOURCE_DOMAIN_V1, &records);
-    assert_eq!(
-        (digest.as_str(), file_count, normalized_bytes),
-        FULL_SOURCE_PIN_V1,
-        "an in-tree source candidate changed. Re-review the complete src diff for a new direct, \
-         aliased, macro-generated, trait, inherent-method, registration, or re-export bridge \
-         before updating this pin"
+    let observed = observed_source_pins(&records);
+    let blessing = bless_source_pins_requested();
+    let baseline = read_source_pins_manifest(blessing);
+    let drift = source_pin_drift(&observed, &baseline);
+    if blessing {
+        let path = source_pins_manifest_path();
+        if let Some(parent) = path.parent() {
+            required_observation(
+                std::fs::create_dir_all(parent),
+                "create manifest dir",
+                parent,
+            );
+        }
+        required_observation(
+            std::fs::write(&path, render_source_pins(&observed)),
+            "bless source pin manifest",
+            &path,
+        );
+        println!(
+            "blessed {} source pins into {SOURCE_PINS_MANIFEST}; {} change(s):",
+            observed.len(),
+            drift.len()
+        );
+        for line in &drift {
+            println!("  {line}");
+        }
+        return;
+    }
+    assert!(
+        drift.is_empty(),
+        "{} in-tree source candidate(s) differ from {SOURCE_PINS_MANIFEST}:\n  {}\n\
+         Re-review the complete src diff for a new direct, aliased, macro-generated, trait, \
+         inherent-method, registration, or re-export bridge (a dark-side entry also needs the \
+         excluded-source bridge review), then refresh with: {REFRESH_SOURCE_PINS_COMMAND}",
+        drift.len(),
+        drift.join("\n  ")
     );
 }
 
@@ -1706,8 +1868,13 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 // doctests), the serial `--lib --bins --tests` gate moved to the scheduled run,
 // and every new cargo-mentioning line is an env assignment, a cache key, a
 // download, or that archive; census 91/53/2.
+// Refreshed 2026-11-16 to shorten the PR critical path: the Linux archive and
+// its partitions became one `cargo nextest run --no-run` build plus one
+// `cargo nextest run` in the same job, and windows-native became a matrix whose
+// test shards add only nextest's `--partition` selector. Three cargo lines out,
+// three in, none a doctest lane; census still 91/53/2.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "3f4a18c2a554b992:48758"),
+    ("ci.yml", "7d2d7a2847253397:46866"),
     ("release.yml", "b174946ff2c434bb:115022"),
 ];
 
@@ -1927,17 +2094,17 @@ const CARGO_LINES: &[(&str, usize)] = &[
     // Windows-native job. No test harness: nextest never builds or runs
     // doctests, and the fmt/clippy gates cannot reach the doctest lane.
     ("run: cargo check --no-default-features --features embed", 1),
-    ("run: cargo nextest run --no-fail-fast", 1),
-    // Linux test split. `cargo nextest archive` builds the same
-    // `--lib --bins --tests` selection as the serial gate and nextest never
-    // builds or runs doctests; the partitions run that archive with the
-    // standalone nextest binary, which builds nothing.
+    // Sharded on hosted runners; `--partition` only selects which tests run.
     (
-        "cargo nextest archive --lib --bins --tests --archive-file \"$RUNNER_TEMP/nextest-archive.tar.zst\"",
+        "run: cargo nextest run --no-fail-fast --partition \"slice:$env:SLICE\"",
         1,
     ),
+    // Linux suite. Builds then runs the same `--lib --bins --tests`
+    // selection as the serial gate in one job; nextest never builds or runs
+    // doctests, and `--no-run` only builds.
+    ("cargo nextest run --lib --bins --tests --no-run", 1),
     (
-        "run: cargo-nextest nextest run --archive-file \"$RUNNER_TEMP/nextest-archive.tar.zst\" --extract-to \"$GITHUB_WORKSPACE\" --partition \"slice:$PARTITION/4\" --no-fail-fast",
+        "run: cargo nextest run --lib --bins --tests --no-fail-fast",
         1,
     ),
 ];
