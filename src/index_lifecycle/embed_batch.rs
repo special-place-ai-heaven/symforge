@@ -793,6 +793,7 @@ impl EmbeddedSourceHandle {
     ) -> Result<BatchRenamePreview, EditError> {
         let snapshot = self.capture_query_snapshot(b"preview-batch-rename")?;
         answer::enforce_trust(&snapshot)?;
+        refuse_rename_while_withheld(&snapshot).map_err(EditError::Edit)?;
         let (staged, plan) = stage_rename(&snapshot, request).map_err(EditError::Edit)?;
         let mut rendered = crate::edit_safety::rename::render_rename_preview(
             &snapshot.generation.live,
@@ -865,6 +866,7 @@ impl EmbeddedSourceHandle {
     ) -> Result<BatchEditApplied, EditError> {
         let snapshot = self.capture_query_snapshot(b"apply-batch-rename")?;
         answer::enforce_trust(&snapshot)?;
+        refuse_rename_while_withheld(&snapshot).map_err(EditError::Edit)?;
         if request.plan.guard.root != snapshot.root || request.plan.affected_paths.is_empty() {
             return Err(EditError::Edit(EditErrorKind::InvalidPath));
         }
@@ -1687,6 +1689,20 @@ fn batch_insert_as_edits(request: &BatchInsertRequest) -> Result<BatchEditReques
             })
             .collect(),
     })
+}
+
+/// MCP's `batch_rename` refuses up front, dry runs included, while any file is
+/// withheld as unverified since a snapshot restore: its references cannot be
+/// seen. Same function, same text. `plan_batch_rename` stays a read-only
+/// plan; the refusal gates every path that can write or preview a write.
+fn refuse_rename_while_withheld(snapshot: &EmbeddedQuerySnapshot) -> Result<(), EditErrorKind> {
+    match super::guidance::read_context::project_wide_mutation_refused_unverified(
+        "batch_rename",
+        snapshot.generation.live.withheld_since_restore(),
+    ) {
+        Some(message) => Err(EditErrorKind::ProjectWideMutationRefused { message }),
+        None => Ok(()),
+    }
 }
 
 /// MCP's `batch_edit` structural-mode plan over this snapshot: the same
