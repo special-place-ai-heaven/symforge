@@ -38,29 +38,35 @@ retries = 1
 # contention — reproduced: hook_subprocess_integration alone at default
 # parallelism fails its 10s deadlines, at `-j 2` the same 18 tests pass in
 # 1.9s — so these run with the whole machine to themselves.
+#
+# `num-test-threads`, not `num-cpus`: this profile's pool is 8, so on a
+# four-core runner `num-cpus` reserves half of it and four other tests still
+# run beside the budgeted one. That is how two of these tests failed both
+# attempts on four-core runners on 2026-11-16 (CI runs 43937599200 and
+# 43947628456) while passing everywhere with more cores.
 
 [[profile.default.overrides]]
 filter = "binary(hook_subprocess_integration)"
-threads-required = "num-cpus"
+threads-required = "num-test-threads"
 
 [[profile.default.overrides]]
 filter = "binary(sidecar_integration)"
-threads-required = "num-cpus"
+threads-required = "num-test-threads"
 
 [[profile.default.overrides]]
 filter = "binary(api_keys_store)"
-threads-required = "num-cpus"
+threads-required = "num-test-threads"
 
 [[profile.default.overrides]]
 filter = "binary(hook_enrichment_integration)"
-threads-required = "num-cpus"
+threads-required = "num-test-threads"
 
 # hook_root_guard serves loopback HTTP per test (same 10054 class as
 # hook_enrichment_integration: two different tests of this binary have
 # flaked under full parallelism, both green serialized).
 [[profile.default.overrides]]
 filter = "binary(hook_root_guard)"
-threads-required = "num-cpus"
+threads-required = "num-test-threads"
 
 # ArcSwap writer-progress stress (tests/live_index_integration.rs). On
 # windows-native the writer can finish zero update_file swaps inside the
@@ -68,14 +74,20 @@ threads-required = "num-cpus"
 # zero: suite contention plus eight spinning readers, not a torn snapshot.
 # Class TIMING, issue #752. See docs/ci/known-flakes.md.
 #
-# The binary overrides above use threads-required = "num-cpus". That fills
-# this profile's test-threads = 8 pool only when the host has at least 8
-# logical CPUs. windows-native has fewer, so num-cpus would leave other
-# tests running. num-test-threads reserves every slot, which is nextest's
+# num-test-threads reserves every slot, which is nextest's
 # machine-exclusive value. Profile retries stay at 1; both attempts already
 # failed, and a higher global retry count is not the fix.
 [[profile.default.overrides]]
 filter = "binary(live_index_integration) and test(=test_arcswap_concurrent_reads_under_writer_pressure)"
+threads-required = "num-test-threads"
+
+# LIDX-05 load budget (tests/live_index_integration.rs): a 70-file load must
+# finish inside 500 ms of wall clock. Beside seven other test processes on a
+# four-core runner it took 507 ms on both attempts (CI run 43947628456,
+# windows-native 1/3). Class TIMING: the budget is unchanged, the test gets
+# the machine to itself.
+[[profile.default.overrides]]
+filter = "binary(live_index_integration) and test(/^test_load_perf_/)"
 threads-required = "num-test-threads"
 
 # src/cli/hook.rs fixture tests give an in-process loopback server 50 ms to
