@@ -153,10 +153,14 @@ fn take_panic_after_start_for_test(key: &ProjectKey) -> bool {
     }
 }
 
-/// What the observer compares between polls: a digest of everything a scout
-/// of the tree recorded.
+/// What the observer compares between polls: a digest of what a scout of the
+/// tree recorded. `coverage` is left out. A scout derives it from the entries
+/// and issues digested here, and a reload also marks its stored plan Degraded
+/// for a parse failure, which no fresh scout of the same disk would show.
 fn plan_fingerprint(plan: &crate::discovery::ScoutPlan) -> String {
-    crate::hash::digest_hex(format!("{plan:?}").as_bytes())
+    crate::hash::digest_hex(
+        format!("{:?}{:?}{:?}", plan.entries, plan.issues, plan.usage).as_bytes(),
+    )
 }
 
 /// Parks one source's observer poll; see `hold_observer_for_test`.
@@ -544,8 +548,8 @@ struct EmbeddedBinding {
     observer_polls: AtomicU64,
     #[cfg(feature = "__test-internals")]
     observer_reloads: AtomicU64,
-    /// Runs once, after the next reload has read the tree and before its
-    /// baseline fingerprint is taken; see `before_next_baseline_for_test`.
+    /// Runs once, before the next baseline fingerprint is taken; see
+    /// `before_next_baseline_for_test`.
     #[cfg(feature = "__test-internals")]
     before_baseline: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -3294,9 +3298,10 @@ impl EmbeddedSourceHandle {
         }
     }
 
-    /// Run `hook` once, after the next reload has read the tree and before
-    /// the observer takes the fingerprint it compares later polls with, so a
-    /// test can change the disk in exactly that gap.
+    /// Run `hook` once, the next time the observer is about to take the
+    /// fingerprint it compares later polls with (after a reload, or after a
+    /// snapshot restore), so a test can change the disk in exactly that gap.
+    /// The hook must not call this or `hold_observer_for_test`.
     #[cfg(feature = "__test-internals")]
     pub fn before_next_baseline_for_test(&self, hook: impl FnOnce() + Send + 'static) {
         if let Some(binding) = &self.binding {
@@ -4032,6 +4037,33 @@ mod refresh_lifecycle_tests {
         assert_eq!(
             std::fs::read_to_string(root.path().join("caller.rs")).unwrap(),
             "fn c() { loaded(); }\n"
+        );
+    }
+
+    /// A reload marks its stored plan Degraded for a parse failure; a fresh
+    /// scout of the same disk does not. The two must still compare equal, or
+    /// a blocked source would reload on every poll.
+    #[test]
+    fn the_observer_fingerprint_ignores_coverage_and_sees_an_issue() {
+        use crate::discovery::ScoutPlan;
+        use crate::domain::{CoverageStatus, ManifestResourceUsage};
+        let plan = |coverage, catalog_entries| ScoutPlan {
+            coverage,
+            entries: Vec::new(),
+            issues: Vec::new(),
+            usage: ManifestResourceUsage {
+                catalog_entries,
+                catalog_metadata_bytes: 0,
+                admitted_content_bytes: 0,
+            },
+        };
+        assert_eq!(
+            super::plan_fingerprint(&plan(CoverageStatus::Complete, 1)),
+            super::plan_fingerprint(&plan(CoverageStatus::Degraded, 1))
+        );
+        assert_ne!(
+            super::plan_fingerprint(&plan(CoverageStatus::Complete, 1)),
+            super::plan_fingerprint(&plan(CoverageStatus::Complete, 2))
         );
     }
 }
