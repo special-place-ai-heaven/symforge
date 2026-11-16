@@ -153,6 +153,12 @@ fn take_panic_after_start_for_test(key: &ProjectKey) -> bool {
     }
 }
 
+/// What the observer compares between polls: a digest of everything a scout
+/// of the tree recorded.
+fn plan_fingerprint(plan: &crate::discovery::ScoutPlan) -> String {
+    crate::hash::digest_hex(format!("{plan:?}").as_bytes())
+}
+
 /// Parks one source's observer poll; see `hold_observer_for_test`.
 #[cfg(feature = "__test-internals")]
 pub struct ObserverHoldForTest {
@@ -538,6 +544,10 @@ struct EmbeddedBinding {
     observer_polls: AtomicU64,
     #[cfg(feature = "__test-internals")]
     observer_reloads: AtomicU64,
+    /// Runs once, after the next reload has read the tree and before its
+    /// baseline fingerprint is taken; see `before_next_baseline_for_test`.
+    #[cfg(feature = "__test-internals")]
+    before_baseline: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Original selected state child. Parked between operations so an idle source
@@ -670,6 +680,8 @@ impl EmbeddedBinding {
             observer_polls: AtomicU64::new(0),
             #[cfg(feature = "__test-internals")]
             observer_reloads: AtomicU64::new(0),
+            #[cfg(feature = "__test-internals")]
+            before_baseline: std::sync::Mutex::new(None),
         })
     }
 
@@ -1025,6 +1037,15 @@ impl EmbeddedBinding {
             return None;
         }
 
+        #[cfg(feature = "__test-internals")]
+        if let Some(hook) = self
+            .before_baseline
+            .lock()
+            .expect("before baseline mutex")
+            .take()
+        {
+            hook();
+        }
         let Some(fingerprint) = self.observe_fingerprint() else {
             if self.shutdown_started.load(Ordering::Acquire) {
                 return None;
@@ -1049,7 +1070,17 @@ impl EmbeddedBinding {
         else {
             drop(state);
             self.set_blocked();
-            return Some(fingerprint);
+            // A blocked source is reloaded only when the disk differs from
+            // this baseline, so the baseline is what the reload itself saw:
+            // the fingerprint above was taken after it, and a block that
+            // cleared in between would otherwise never be seen to clear.
+            let reloaded = self.runtime.data_plane().published_generation();
+            return Some(
+                reloaded
+                    .scout_plan
+                    .as_deref()
+                    .map_or(fingerprint, plan_fingerprint),
+            );
         };
         state.source_version = state.source_version.saturating_add(1).max(1);
         state.current_publication_identity = Some(format!(
@@ -1090,7 +1121,7 @@ impl EmbeddedBinding {
         }
         #[cfg(feature = "embed")]
         self.authority.verify_physical_root_anchor().ok()?;
-        Some(crate::hash::digest_hex(format!("{plan:?}").as_bytes()))
+        Some(plan_fingerprint(&plan))
     }
 
     #[cfg(feature = "embed")]
@@ -3260,6 +3291,19 @@ impl EmbeddedSourceHandle {
         }
         ObserverHoldForTest {
             binding: self.binding.as_ref().map(Arc::downgrade),
+        }
+    }
+
+    /// Run `hook` once, after the next reload has read the tree and before
+    /// the observer takes the fingerprint it compares later polls with, so a
+    /// test can change the disk in exactly that gap.
+    #[cfg(feature = "__test-internals")]
+    pub fn before_next_baseline_for_test(&self, hook: impl FnOnce() + Send + 'static) {
+        if let Some(binding) = &self.binding {
+            *binding
+                .before_baseline
+                .lock()
+                .expect("before baseline mutex") = Some(Box::new(hook));
         }
     }
 

@@ -1171,6 +1171,35 @@ mod lane_parity {
         assert_eq!(handle.observer_counts_for_test().1, reloads + 1);
     }
 
+    /// A block that clears while the reload that saw it is still running:
+    /// the reload ends Blocked, yet a scout taken after it already lists the
+    /// directory, so no later poll differs from that scout. The observer
+    /// compares later polls with what the reload itself saw, so the next
+    /// poll reloads and the source serves again.
+    #[test]
+    fn a_block_that_clears_during_its_own_reload_is_still_seen_to_clear() {
+        let dir = fixture_copy();
+        let runtime = ProcessIndexRuntime::acquire().unwrap();
+        let handle = open(&runtime, dir.path());
+        let parked = handle.hold_observer_for_test();
+        let (_, reloads) = handle.observer_counts_for_test();
+        let version = handle.runtime_view().source_version;
+        let held = symforge::discovery::force_unreadable_for_test(&dir.path().join("src/other"));
+        handle.before_next_baseline_for_test(move || drop(held));
+        drop(parked);
+
+        // Reload one sees the block and ends Blocked; reload two is the retry.
+        let view = settle(&handle, reloads + 1, version);
+        assert_eq!(
+            view.phase,
+            SourceRuntimePhase::Current,
+            "the block cleared before the reload's baseline was taken, and the source recovered"
+        );
+        assert!(text_search(&handle, &json!({ "query": "target_fn" })).is_ok());
+        assert_eq!(reloads_over_polls(&handle, 3), 0, "two reloads, then quiet");
+        assert_eq!(handle.observer_counts_for_test().1, reloads + 2);
+    }
+
     /// A file that changed while the reload read it keeps its last record,
     /// and the scout after the reload already stamps the new bytes, so the
     /// fingerprint never moves again. The observer re-reads it once per poll
