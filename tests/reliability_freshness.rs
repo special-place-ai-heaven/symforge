@@ -621,7 +621,7 @@ async fn inspect_match_sees_an_outside_edit_of_its_file() {
 /// Item 6: the same request down both lanes prints the same envelope and
 /// caveat lines, in each of three states: every cited file confirmed, one
 /// cited file that cannot be compared, and no comparison run (a git mode).
-#[cfg(feature = "embed")]
+#[cfg(all(feature = "embed", feature = "__test-internals"))]
 mod lane_parity {
     use super::*;
     use reliability_support::{call_with_meta, committed_fixture_copy};
@@ -726,6 +726,12 @@ mod lane_parity {
         let server = server_for(mcp_dir.path());
         // Both lanes hold a fresh index with no content stamp; the block, if
         // any, lands after both loaded, so each must read the file to check it.
+        // The embedded observer would see the block on its next poll (its
+        // scout cannot probe the file) and republish: a strict query is
+        // refused while it refreshes, and the degraded scout leaves the source
+        // Blocked. Park it, so the embed lane answers from the publication it
+        // loaded, as the MCP lane (no watcher here) does.
+        let _observer = handle.hold_observer_for_test();
         let held = block.map(|path| {
             (
                 ReadBlock::hold(&mcp_dir.path().join(path)),
@@ -827,7 +833,9 @@ mod lane_parity {
             let handle = open(&runtime, embed_dir.path());
             // The embed lane answers before the MCP server exists (see the
             // round-2 report: a later embed source refuses otherwise); each
-            // block lands after its lane loaded.
+            // block lands after its lane loaded, with the embed observer
+            // parked (see `both_lanes`).
+            let _observer = handle.hold_observer_for_test();
             let embed_held = block.map(|path| ReadBlock::hold(&embed_dir.path().join(path)));
             if matches!(embed_held, Some(None)) {
                 eprintln!("skipped: this platform reads through the block (root)");
@@ -880,6 +888,49 @@ mod lane_parity {
                 );
             }
         }
+    }
+
+    /// Why the lane tests park the observer: unparked, the embedded source
+    /// sees a read block on its next poll (its scout cannot probe the file),
+    /// leaves Current for as long as the block holds, and refuses a strict
+    /// query `SourceUnavailable` / `OnEvent` meanwhile. A query issued right
+    /// after the block raced that poll (the CI flake of PR #914).
+    #[test]
+    fn an_unparked_observer_sees_a_read_block_and_refuses_strict_queries() {
+        use symforge::embed::RetryAdvice;
+        use symforge::embed::parity::QueryRefusalKind;
+        let dir = fixture_copy();
+        let runtime = ProcessIndexRuntime::acquire().unwrap();
+        let handle = open(&runtime, dir.path());
+        let Some(block) = ReadBlock::hold(&dir.path().join("src/user.rs")) else {
+            eprintln!("skipped: this platform reads through the block (root)");
+            return;
+        };
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            let since = handle.change_version();
+            if handle.runtime_view().phase != SourceRuntimePhase::Current {
+                break;
+            }
+            let remaining = until.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "the observer never saw the block");
+            handle.wait_for_change(since, remaining).unwrap();
+        }
+        let request = QueryRequest::TextSearch(
+            serde_json::from_value(json!({ "query": "target_fn" })).unwrap(),
+        );
+        let refusal = handle
+            .query_with_policy(
+                &request,
+                QueryLimits::default(),
+                QueryPolicy::default(),
+                None,
+                None,
+            )
+            .expect_err("a strict query while the observer republishes the block");
+        drop(block);
+        assert_eq!(refusal.kind(), QueryRefusalKind::SourceUnavailable);
+        assert_eq!(refusal.retry(), RetryAdvice::OnEvent);
     }
 }
 
@@ -964,7 +1015,7 @@ async fn cited_paths_with_spaces_and_unicode_are_checked_on_mcp() {
 }
 
 /// The same scenario on the embed lane's native text search.
-#[cfg(feature = "embed")]
+#[cfg(all(feature = "embed", feature = "__test-internals"))]
 #[test]
 fn cited_paths_with_spaces_and_unicode_are_checked_on_embed() {
     use symforge::embed::parity::{QueryLimits, QueryPolicy, QueryRequest};
@@ -997,6 +1048,10 @@ fn cited_paths_with_spaces_and_unicode_are_checked_on_embed() {
             .unwrap();
         serde_json::to_string(claim.value()).unwrap()
     };
+    // The edit lands behind the index's back: with the observer parked, the
+    // next answer sees it through its own check, not through a republish (a
+    // strict query is refused while the observer refreshes).
+    let _observer = handle.hold_observer_for_test();
     let mut stale = Vec::new();
     for (path, query) in [
         (SPACED, json!({ "query": "spaced_line_036", "limit": 1 })),

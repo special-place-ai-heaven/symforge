@@ -1216,10 +1216,16 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Curation race: `index_lifecycle/embed_knowledge.rs` maps the engine's stale
 // review refusals to StalePublication via a file-local fn. No new edge, no
 // bridge. Same 91 files.
+// Observer park: `index_lifecycle/embedded.rs` gains the `__test-internals`
+// `hold_observer_for_test` seam (a flag the observer loop checks). No new
+// edge, no bridge. Same 91 files.
+// Stale review check: `index_lifecycle/embed_knowledge.rs` test module only moves
+// the stale-review assertion after the apply. cfg(test); no new edge, no
+// bridge. Same 91 files.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "51291faf9f45ff9268767b237e5e3e31546e893f9f0d10137814514b24151c44",
+    "6cbcba759009c3dce0bbb5327a2118b5dc05773af2b7379e5fb0694a84839ca3",
     91,
-    2517520,
+    2520349,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1552,10 +1558,14 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Curation race: `discovery/mod.rs` hard-scope excludes `.symforge-curation-*`
 // engine temps; `index_lifecycle/embed_knowledge.rs` maps stale review refusals
 // to StalePublication. No new edge, no bridge. 321 files.
+// Observer park: `index_lifecycle/embedded.rs` `__test-internals` seam
+// `hold_observer_for_test`. No new edge, no bridge. 321 files.
+// Stale review check: test-only change in `index_lifecycle/embed_knowledge.rs`.
+// No new edge, no bridge. 321 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "2f67e2558b9164e54f681352f12053f71e3205ddc28afa5de2f3c22397ce7622",
+    "7f46e285a502393a3411c973dd05b06f288584b49a60cf46a0df63e615373b42",
     321,
-    13211220,
+    13214049,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

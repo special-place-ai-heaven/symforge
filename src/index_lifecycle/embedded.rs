@@ -153,6 +153,21 @@ fn take_panic_after_start_for_test(key: &ProjectKey) -> bool {
     }
 }
 
+/// Parks one source's observer poll; see `hold_observer_for_test`.
+#[cfg(feature = "__test-internals")]
+pub struct ObserverHoldForTest {
+    binding: Option<std::sync::Weak<EmbeddedBinding>>,
+}
+
+#[cfg(feature = "__test-internals")]
+impl Drop for ObserverHoldForTest {
+    fn drop(&mut self) {
+        if let Some(binding) = self.binding.as_ref().and_then(std::sync::Weak::upgrade) {
+            *binding.observer_held.lock().expect("observer hold mutex") = false;
+        }
+    }
+}
+
 #[cfg(feature = "__test-internals")]
 struct JoinEnteredState {
     entered: std::sync::Mutex<bool>,
@@ -514,6 +529,10 @@ struct EmbeddedBinding {
     worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     shutdown_started: AtomicBool,
     progress: Arc<crate::live_index::store::ReloadProgressSink>,
+    /// `true` while a test parks the observer's disk poll; an iteration holds
+    /// the lock while it observes and republishes. See `hold_observer_for_test`.
+    #[cfg(feature = "__test-internals")]
+    observer_held: std::sync::Mutex<bool>,
 }
 
 /// Original selected state child. Parked between operations so an idle source
@@ -640,6 +659,8 @@ impl EmbeddedBinding {
             worker: std::sync::Mutex::new(None),
             shutdown_started: AtomicBool::new(false),
             progress: crate::live_index::store::ReloadProgressSink::new(),
+            #[cfg(feature = "__test-internals")]
+            observer_held: std::sync::Mutex::new(false),
         })
     }
 
@@ -700,6 +721,12 @@ impl EmbeddedBinding {
                 self.prune_graph_leases(&mut state);
             }
 
+            #[cfg(feature = "__test-internals")]
+            let observer_held = self.observer_held.lock().expect("observer hold mutex");
+            #[cfg(feature = "__test-internals")]
+            if *observer_held && !explicit_refresh {
+                continue;
+            }
             let next_fingerprint = self.observe_fingerprint();
             if self.shutdown_started.load(Ordering::Acquire) {
                 break;
@@ -3148,6 +3175,20 @@ impl EmbeddedSourceHandle {
     pub fn revoke_admission_for_test(&self) {
         if let Some(binding) = &self.binding {
             binding.runtime.revoke_admission_for_test();
+        }
+    }
+
+    /// Park this source's disk poll until the returned hold drops: the
+    /// observer neither scouts the tree nor republishes what changed on disk
+    /// (an explicit refresh still runs). Taking the hold waits out a poll in
+    /// flight, so no change made after this returns is observed while held.
+    #[cfg(feature = "__test-internals")]
+    pub fn hold_observer_for_test(&self) -> ObserverHoldForTest {
+        if let Some(binding) = &self.binding {
+            *binding.observer_held.lock().expect("observer hold mutex") = true;
+        }
+        ObserverHoldForTest {
+            binding: self.binding.as_ref().map(Arc::downgrade),
         }
     }
 
