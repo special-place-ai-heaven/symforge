@@ -2533,6 +2533,7 @@ mod tests {
                 source: source_bound.then(|| Arc::clone(base.source.as_ref().unwrap())),
                 source_version: base.source_version.clone(),
                 freshness: Arc::clone(&base.freshness),
+                scout_plan: base.scout_plan.clone(),
                 manifest: base.manifest.clone(),
                 code_signals: Arc::clone(&base.code_signals),
                 bridge: Arc::clone(&base.bridge),

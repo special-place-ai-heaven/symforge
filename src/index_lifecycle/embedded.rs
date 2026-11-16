@@ -695,6 +695,10 @@ impl EmbeddedBinding {
             .expect("embedded restored seed mutex")
             .take();
         #[cfg(feature = "embed")]
+        let first_is_reload = restored.is_none();
+        #[cfg(not(feature = "embed"))]
+        let first_is_reload = true;
+        #[cfg(feature = "embed")]
         let mut observed_fingerprint = if let Some(mtimes) = restored {
             crate::live_index::persist::background_verify_bound(
                 self.runtime.data_plane(),
@@ -709,6 +713,16 @@ impl EmbeddedBinding {
         };
         #[cfg(not(feature = "embed"))]
         let mut observed_fingerprint = self.reload_and_publish();
+        // A reload that ended Blocked (an unreadable directory: observations
+        // lost) is repeated only once the disk or a refresh request gives it
+        // something new to observe. A Blocked phase that no reload produced
+        // (a restored snapshot still verifying, a failed freshen) is retried
+        // on the next poll, as before.
+        let mut blocked_by_reload = first_is_reload && self.phase_is_blocked();
+        // A file that changed while the reload read it keeps its last record,
+        // and the fresh scout's stamp is already the baseline, so no later
+        // poll would see it change: re-read it on the next poll instead.
+        let mut reread_unstable = self.published_unstable_read();
         self.complete_pending_reset();
         loop {
             let mut control = self.control.lock().expect("embedded control mutex");
@@ -745,9 +759,10 @@ impl EmbeddedBinding {
                 (None, Some(_)) | (Some(_), None) => true,
                 (None, None) => false,
             };
-            let blocked = self.state.lock().expect("embedded state mutex").phase
-                == super::public_api::SourceRuntimePhase::Blocked;
-            if explicit_refresh || disk_changed || blocked {
+            let retry_block = self.phase_is_blocked() && !blocked_by_reload;
+            // Re-checked: an answer's freshen may have re-read the file since.
+            let reread = reread_unstable && self.published_unstable_read();
+            if explicit_refresh || disk_changed || retry_block || reread {
                 self.set_phase(super::public_api::SourceRuntimePhase::Refreshing);
                 if self.wait_refresh_visibility_or_stop() {
                     break;
@@ -756,9 +771,12 @@ impl EmbeddedBinding {
                 if self.shutdown_started.load(Ordering::Acquire) {
                     break;
                 }
+                blocked_by_reload = self.phase_is_blocked();
+                reread_unstable = self.published_unstable_read();
                 self.complete_pending_reset();
             } else {
                 observed_fingerprint = next_fingerprint;
+                reread_unstable = false;
             }
             #[cfg(feature = "__test-internals")]
             self.observer_polls.fetch_add(1, Ordering::AcqRel);
@@ -785,6 +803,27 @@ impl EmbeddedBinding {
             drop(control);
             self.runtime.data_plane().mark_index_folder_reset();
         }
+    }
+
+    fn phase_is_blocked(&self) -> bool {
+        self.state.lock().expect("embedded state mutex").phase
+            == super::public_api::SourceRuntimePhase::Blocked
+    }
+
+    /// Whether the published index holds a file whose read saw it change.
+    fn published_unstable_read(&self) -> bool {
+        self.runtime
+            .data_plane()
+            .published_generation()
+            .live
+            .manifest_entries
+            .iter()
+            .any(|entry| {
+                matches!(
+                    entry.disposition,
+                    crate::domain::FileDisposition::UnstableDuringRead
+                )
+            })
     }
 
     fn wait_refresh_visibility_or_stop(&self) -> bool {

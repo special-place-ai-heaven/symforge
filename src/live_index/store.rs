@@ -937,6 +937,12 @@ fn stable_read_with_budget(
     budget: &RetryBudget,
 ) -> StableReadOutcome {
     use crate::discovery::os_response::retry_transient;
+    #[cfg(feature = "__test-internals")]
+    if let Some((crate::discovery::ForcedAccess::UnstableRead, true)) =
+        crate::discovery::forced_access(path)
+    {
+        return StableReadOutcome::UnstableDuringRead;
+    }
     let Ok(max_bytes) = usize::try_from(scout_stamp.size) else {
         return StableReadOutcome::HardSkip {
             reason: HardSkipReason::PerFileCeiling,
@@ -1710,6 +1716,10 @@ pub struct PublishedGeneration {
     pub source: Option<Arc<SourceIdentity>>,
     pub source_version: Option<Arc<SourceVersion>>,
     pub freshness: Arc<FreshnessStatus>,
+    /// The scout plan published with `freshness`. A reader judging what this
+    /// publication may have missed (`freshen::observed_publication`) pairs the
+    /// two from one generation, without the writer lock.
+    pub scout_plan: Option<Arc<discovery::ScoutPlan>>,
     pub manifest: Option<Arc<RepositoryManifest>>,
     pub code_signals: Arc<CodeSignalsSnapshot>,
     pub bridge: Arc<KnowledgeBridge>,
@@ -2804,6 +2814,7 @@ impl SharedIndexHandle {
             source: source.clone(),
             source_version,
             freshness: Arc::new(freshness_status.clone()),
+            scout_plan: scout_plan.clone(),
             manifest,
             code_signals,
             bridge,
@@ -3014,6 +3025,7 @@ impl SharedIndexHandle {
             source: Some(source),
             source_version: Some(source_version),
             freshness: Arc::new(freshness),
+            scout_plan: None,
             manifest,
             code_signals,
             bridge,
@@ -3252,16 +3264,6 @@ impl SharedIndexHandle {
     #[must_use]
     pub fn scout_plan(&self) -> Option<Arc<discovery::ScoutPlan>> {
         self.scout_plan.load_full()
-    }
-
-    /// The published generation with the scout plan published alongside it.
-    /// Every writer stores the plan and publishes under the writer lock, so
-    /// reading both under it pairs them.
-    pub(crate) fn published_generation_with_scout_plan(
-        &self,
-    ) -> (Arc<PublishedGeneration>, Option<Arc<discovery::ScoutPlan>>) {
-        let _wg = self.write_mutex.lock();
-        (self.published_generation(), self.scout_plan())
     }
 
     #[must_use]
@@ -3885,6 +3887,7 @@ impl SharedIndexHandle {
             source: previous.source.clone(),
             source_version: previous.source_version.clone(),
             freshness: Arc::clone(&previous.freshness),
+            scout_plan: previous.scout_plan.clone(),
             manifest: previous.manifest.clone(),
             code_signals: Arc::clone(&previous.code_signals),
             bridge: prepared.bridge,
@@ -3951,6 +3954,7 @@ impl SharedIndexHandle {
             source: previous.source.clone(),
             source_version: previous.source_version.clone(),
             freshness: Arc::clone(&previous.freshness),
+            scout_plan: previous.scout_plan.clone(),
             manifest: previous.manifest.clone(),
             code_signals: Arc::clone(&previous.code_signals),
             bridge: Arc::clone(&previous.bridge),
@@ -3996,6 +4000,7 @@ impl SharedIndexHandle {
             source: previous.source.clone(),
             source_version: previous.source_version.clone(),
             freshness: Arc::clone(&previous.freshness),
+            scout_plan: previous.scout_plan.clone(),
             manifest: previous.manifest.clone(),
             code_signals: Arc::clone(&previous.code_signals),
             bridge: prepared.bridge,
@@ -4060,6 +4065,7 @@ impl SharedIndexHandle {
             source: previous.source.clone(),
             source_version: previous.source_version.clone(),
             freshness: Arc::clone(&previous.freshness),
+            scout_plan: previous.scout_plan.clone(),
             manifest: previous.manifest.clone(),
             code_signals: Arc::clone(&previous.code_signals),
             bridge: Arc::new(KnowledgeBridge {
@@ -4092,6 +4098,7 @@ impl SharedIndexHandle {
             source: previous.source.clone(),
             source_version: previous.source_version.clone(),
             freshness: Arc::clone(&previous.freshness),
+            scout_plan: previous.scout_plan.clone(),
             manifest: previous.manifest.clone(),
             code_signals: Arc::clone(&previous.code_signals),
             bridge: Arc::new(KnowledgeBridge::loading()),
@@ -4344,7 +4351,13 @@ impl SharedIndexHandle {
         check_reload_cancelled(cancel)?;
         let current_live = self.live.load_full();
         merge_post_watermark_live_admissions(&watermark_live, &current_live, &mut live)?;
-        if matches!(retention, PreUpdateRetention::RecordChangedFiles) && !physical_replacement {
+        // Not gated on the replacement latch: the latch keeps freshness off
+        // Current for the life of the handle, and a candidate manifest that
+        // lists a path as unreadable has itself just observed that file on
+        // disk. Dropping its record would take the file's rows out of every
+        // answer with no caveat; kept, an answer that cites it is compared
+        // with the disk, which names it (FR-018).
+        if matches!(retention, PreUpdateRetention::RecordChangedFiles) {
             retain_unreadable_records(&current_live, &mut live)?;
         }
         self.source_exclusions.store(Arc::new(source_exclusions));
@@ -4391,8 +4404,11 @@ impl SharedIndexHandle {
         // Path-keyed pre-update snapshots belong to the previous project
         // generation. Clear them under the same writer lock as the retarget so
         // a late impact request cannot consume a replacement project's state.
+        // Only a replacement THIS reload observed retires the baselines. The
+        // latch outlives it to keep freshness honest; on a later reload of
+        // the tree now present the baselines describe that tree.
         let baselines = match retention {
-            PreUpdateRetention::RecordChangedFiles if !physical_replacement => {
+            PreUpdateRetention::RecordChangedFiles if !observed_replacement => {
                 Some(changed_file_baselines(&current_live, &live))
             }
             _ => {
@@ -5781,6 +5797,7 @@ impl SharedIndexHandle {
             source: source.clone(),
             source_version,
             freshness,
+            scout_plan,
             manifest,
             code_signals,
             bridge,
@@ -10669,6 +10686,51 @@ mod tests {
             shared.freshness_status().as_ref(),
             &FreshnessStatus::Current,
             "subsequent clean reload on unchanged physical root must stay Current"
+        );
+    }
+
+    /// The replacement latch keeps freshness off Current after every indexed
+    /// file vanished, but it must not also retire the `analyze_file_impact`
+    /// baselines of every later refresh: the tree those refreshes read is the
+    /// one now present, and its changed files keep their prior image.
+    #[test]
+    fn a_vanished_tree_retires_impact_baselines_only_for_the_reload_that_saw_it() {
+        let project = TempDir::new().unwrap();
+        write_file(project.path(), "src/lib.rs", "pub fn first() {}\n");
+        let shared = LiveIndex::load(project.path()).unwrap();
+        let cancel = AtomicBool::new(false);
+        let refresh = || {
+            shared
+                .refresh_bound_tree_cancellable(
+                    project.path(),
+                    None,
+                    discovery::SourceExclusions::default(),
+                    &cancel,
+                )
+                .expect("refresh")
+        };
+        std::fs::remove_file(project.path().join("src/lib.rs")).unwrap();
+        refresh();
+        assert!(
+            matches!(
+                shared.freshness_status().as_ref(),
+                FreshnessStatus::Degraded { .. }
+            ),
+            "control: the vanished tree latched the replacement"
+        );
+        write_file(project.path(), "src/lib.rs", "pub fn second() {}\n");
+        refresh();
+        write_file(project.path(), "src/lib.rs", "pub fn third() {}\n");
+        refresh();
+        let baseline = shared
+            .take_pre_update_snapshot("src/lib.rs")
+            .expect("the changed file keeps its prior image");
+        assert!(
+            baseline
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "second"),
+            "the baseline is the tree the refresh replaced"
         );
     }
 

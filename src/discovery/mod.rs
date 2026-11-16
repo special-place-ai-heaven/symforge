@@ -123,6 +123,98 @@ fn pause_scout_after_files_for_test(root: &Path, cancel: Option<&AtomicBool>) {
 #[cfg(not(feature = "__test-internals"))]
 fn pause_scout_after_files_for_test(_root: &Path, _cancel: Option<&AtomicBool>) {}
 
+/// How a path forced by [`force_unreadable_for_test`] or
+/// [`force_unstable_read_for_test`] fails.
+#[cfg(feature = "__test-internals")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForcedAccess {
+    /// Every probe and read of the file, or of anything under the
+    /// directory, fails as permission denied.
+    Unreadable,
+    /// The directory cannot be listed: the walk records it as unreadable
+    /// and yields nothing under it.
+    UnreadableDirectory,
+    /// Every stable read of the file sees it change between its passes.
+    UnstableRead,
+}
+
+#[cfg(feature = "__test-internals")]
+static FORCED_ACCESS: std::sync::Mutex<Vec<(PathBuf, ForcedAccess)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Fails every probe and read of `path` (a file or a directory) in this
+/// process until the guard drops, as the platform does for a file another
+/// process holds exclusively or a mode-000 path: for a test that must build
+/// that state where the platform reads through it (unix as root).
+#[cfg(feature = "__test-internals")]
+pub fn force_unreadable_for_test(path: &Path) -> ForcedAccessForTest {
+    if path.is_dir() {
+        ForcedAccessForTest::install(path, ForcedAccess::UnreadableDirectory)
+    } else {
+        ForcedAccessForTest::install(path, ForcedAccess::Unreadable)
+    }
+}
+
+/// Makes every stable read of the file at `path` see it change while it is
+/// read, until the guard drops.
+#[cfg(feature = "__test-internals")]
+pub fn force_unstable_read_for_test(path: &Path) -> ForcedAccessForTest {
+    ForcedAccessForTest::install(path, ForcedAccess::UnstableRead)
+}
+
+#[cfg(feature = "__test-internals")]
+pub struct ForcedAccessForTest {
+    path: PathBuf,
+}
+
+#[cfg(feature = "__test-internals")]
+impl ForcedAccessForTest {
+    fn install(path: &Path, access: ForcedAccess) -> Self {
+        let path = std::fs::canonicalize(path).expect("a forced path exists");
+        let mut forced = FORCED_ACCESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            forced.iter().all(|(held, _)| held != &path),
+            "a path is forced at most once"
+        );
+        forced.push((path.clone(), access));
+        Self { path }
+    }
+}
+
+#[cfg(feature = "__test-internals")]
+impl Drop for ForcedAccessForTest {
+    fn drop(&mut self) {
+        FORCED_ACCESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(held, _)| held != &self.path);
+    }
+}
+
+/// The forced failure that applies to `path`, and whether `path` is the
+/// forced path itself rather than something under a forced directory.
+#[cfg(feature = "__test-internals")]
+pub(crate) fn forced_access(path: &Path) -> Option<(ForcedAccess, bool)> {
+    let forced = FORCED_ACCESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if forced.is_empty() {
+        return None;
+    }
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    forced.iter().find_map(|(held, access)| {
+        if *held == path {
+            Some((*access, true))
+        } else if *access == ForcedAccess::UnreadableDirectory && path.starts_with(held) {
+            Some((ForcedAccess::Unreadable, false))
+        } else {
+            None
+        }
+    })
+}
+
 use crate::domain::{
     AccessErrorKind, AccessStage, CatalogPath, CoverageStatus, FileClassification, FileStamp,
     FreshnessReason, HardSkipReason, IndexTargets, LanguageId, ManifestResourceUsage,
@@ -951,6 +1043,19 @@ fn discover_all_files_with_exclusions_and_issues_cancellable(
         let Ok(path) = std::fs::canonicalize(entry.path()) else {
             continue;
         };
+        #[cfg(feature = "__test-internals")]
+        match forced_access(&path) {
+            Some((ForcedAccess::UnreadableDirectory, _)) => {
+                issues.push(walk_issue_for_error(
+                    &root,
+                    Some(&path),
+                    Some(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                ));
+                continue;
+            }
+            Some((ForcedAccess::Unreadable, false)) => continue,
+            _ => {}
+        }
 
         if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             continue;

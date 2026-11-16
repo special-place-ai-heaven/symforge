@@ -1228,10 +1228,17 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // `index_lifecycle/guidance/freshen.rs` reads the generation and scout plan
 // through a new `SharedIndex` method (an existing guidance -> store edge). No
 // new edge, no bridge. Same 91 files.
+// Unreadable file serves, review follow-up: `embedded.rs`'s observer stops
+// re-running a reload that ended Blocked and re-reads an unstable file (reads
+// the published generation's manifest entries, an existing edge);
+// `freshen.rs` judges the publication from the generation's own scout plan
+// instead of the writer lock, plus cfg(test) tests over the store's existing
+// reload hook; `knowledge_model.rs` copies the new generation field. No new
+// edge, no bridge. Same 91 files.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "ac0d59ec8529ab3a5b86716b52d2e7d7872ae9188ad42626b54f8f4b0a92831e",
+    "17b297556435d0c932e50e8f9d75b308709c8db15b5780de085ad99580aea56b",
     91,
-    2525811,
+    2533191,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1572,10 +1579,16 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // `live_index/store.rs` adds `published_generation_with_scout_plan` and keeps an
 // unreadable file's last record on the embedded refresh (file-local fn). No new
 // edge, no bridge. 321 files.
+// Unreadable file serves, review follow-up: `PublishedGeneration` carries its
+// scout plan (every construction site copies it) and the writer-locked pair
+// read is gone; the embedded refresh keeps an unreadable record and impact
+// baselines past the replacement latch; `discovery` gains the
+// `__test-internals` forced-access seam, consulted by `os_response`'s retry
+// and the store's stable read. No new edge, no bridge. 321 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "4de1f06bbbced06bd561dc43d578c6cef76c5ea34243ecbf73786985d58f0cf7",
+    "2363ecad2bbeb8bb1b6ca2e9b97aadec4f12ba19dd496fdc11e96e224e9a0fba",
     321,
-    13221589,
+    13236209,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
