@@ -1222,10 +1222,16 @@ const EXCLUDED_RUNTIME_SOURCE_DOMAIN_V1: &[u8] = b"symforge-excluded-runtime-sou
 // Stale review check: `index_lifecycle/embed_knowledge.rs` test module only moves
 // the stale-review assertion after the apply. cfg(test); no new edge, no
 // bridge. Same 91 files.
+// Unreadable file serves: `index_lifecycle/embedded.rs` gates on
+// `freshen::observed_publication` (an existing embedded -> guidance edge) and
+// gains the `__test-internals` `observer_counts_for_test` seam;
+// `index_lifecycle/guidance/freshen.rs` reads the generation and scout plan
+// through a new `SharedIndex` method (an existing guidance -> store edge). No
+// new edge, no bridge. Same 91 files.
 const EXCLUDED_RUNTIME_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "6cbcba759009c3dce0bbb5327a2118b5dc05773af2b7379e5fb0694a84839ca3",
+    "ac0d59ec8529ab3a5b86716b52d2e7d7872ae9188ad42626b54f8f4b0a92831e",
     91,
-    2520349,
+    2525811,
 );
 const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // Baseline refreshed 2026-09-16 with the excluded-source pin above, then
@@ -1562,10 +1568,14 @@ const FULL_SOURCE_DOMAIN_V1: &[u8] = b"symforge-full-source-set-v1\0";
 // `hold_observer_for_test`. No new edge, no bridge. 321 files.
 // Stale review check: test-only change in `index_lifecycle/embed_knowledge.rs`.
 // No new edge, no bridge. 321 files.
+// Unreadable file serves: the embedded gates share `freshen::observed_publication`;
+// `live_index/store.rs` adds `published_generation_with_scout_plan` and keeps an
+// unreadable file's last record on the embedded refresh (file-local fn). No new
+// edge, no bridge. 321 files.
 const FULL_SOURCE_PIN_V1: (&str, usize, usize) = (
-    "7f46e285a502393a3411c973dd05b06f288584b49a60cf46a0df63e615373b42",
+    "4de1f06bbbced06bd561dc43d578c6cef76c5ea34243ecbf73786985d58f0cf7",
     321,
-    13214049,
+    13221589,
 );
 
 fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {

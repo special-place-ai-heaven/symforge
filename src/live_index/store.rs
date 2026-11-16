@@ -2610,6 +2610,40 @@ fn merge_post_watermark_live_admissions(
     Ok(())
 }
 
+/// The embedded worker's whole-tree refresh keeps a file it could not read at
+/// its last indexed record, as the watcher's terminal-disposition publication
+/// does (`retains_last_valid_content`): the manifest entry still says the file
+/// is unreadable, and an answer that cites the record is compared with the
+/// disk, which names the file (spec 036 FR-018). Dropping the record would
+/// silently take the file's rows out of every answer.
+fn retain_unreadable_records(current: &LiveIndex, candidate: &mut LiveIndex) -> anyhow::Result<()> {
+    let unreadable: Vec<String> = candidate
+        .manifest_entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.disposition,
+                FileDisposition::Unreadable { .. } | FileDisposition::UnstableDuringRead
+            )
+        })
+        .filter_map(|entry| entry.path.normalized_utf8.clone())
+        .filter(|path| !candidate.files.contains_key(path))
+        .collect();
+    for path in unreadable {
+        let Some(file) = current.files.get(&path) else {
+            continue;
+        };
+        let file = (**file).clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            candidate.update_file_with_manifest(path.clone(), file, false);
+        }));
+        if result.is_err() {
+            anyhow::bail!("reload refused: failed to keep the last record of unreadable '{path}'");
+        }
+    }
+    Ok(())
+}
+
 /// Whether every indexed source path from `watermark` is absent on disk under
 /// `root`. Witnesses delete+recreate (path-vanish→new) without consulting mtime.
 fn indexed_tree_absent_from_disk(watermark: &LiveIndex, root: &Path) -> bool {
@@ -3218,6 +3252,16 @@ impl SharedIndexHandle {
     #[must_use]
     pub fn scout_plan(&self) -> Option<Arc<discovery::ScoutPlan>> {
         self.scout_plan.load_full()
+    }
+
+    /// The published generation with the scout plan published alongside it.
+    /// Every writer stores the plan and publishes under the writer lock, so
+    /// reading both under it pairs them.
+    pub(crate) fn published_generation_with_scout_plan(
+        &self,
+    ) -> (Arc<PublishedGeneration>, Option<Arc<discovery::ScoutPlan>>) {
+        let _wg = self.write_mutex.lock();
+        (self.published_generation(), self.scout_plan())
     }
 
     #[must_use]
@@ -4300,6 +4344,9 @@ impl SharedIndexHandle {
         check_reload_cancelled(cancel)?;
         let current_live = self.live.load_full();
         merge_post_watermark_live_admissions(&watermark_live, &current_live, &mut live)?;
+        if matches!(retention, PreUpdateRetention::RecordChangedFiles) && !physical_replacement {
+            retain_unreadable_records(&current_live, &mut live)?;
+        }
         self.source_exclusions.store(Arc::new(source_exclusions));
         self.scout_plan.store(Some(scout_plan));
         // A latched observer gap outlives a reload. This rebuild proves present

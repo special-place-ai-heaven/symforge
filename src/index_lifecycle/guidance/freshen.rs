@@ -230,14 +230,36 @@ impl AnswerCheck {
 }
 
 /// True when the index may have missed file events, so files it has never
-/// seen may exist (FR-017). An unreadable or unstable record is about a file
-/// the index knows and is no lost observation (FR-018): a degraded scout counts
-/// only when one of its issues names no scouted entry (an unreadable
-/// directory, a traversal stop), because only then can a file be unseen.
+/// seen may exist (FR-017), judged over one consistent publication.
 fn observations_lost(shared: &SharedIndex) -> bool {
+    observed_publication(shared).is_none()
+}
+
+/// The published generation, unless its publication may have missed file
+/// events. The embedded source serves only such a publication (FR-018), and
+/// MCP prints the FR-017 line when there is none, so the two lanes cannot
+/// disagree about what was lost. The generation and the scout plan are read
+/// together under the writer lock: two separate loads could pair one
+/// publication with the next one's plan.
+pub(crate) fn observed_publication(
+    shared: &SharedIndex,
+) -> Option<std::sync::Arc<crate::live_index::store::PublishedGeneration>> {
+    let (published, plan) = shared.published_generation_with_scout_plan();
+    (!observations_lost_in(&published.freshness, plan.as_deref())).then_some(published)
+}
+
+/// Whether `freshness`, published with the scout `plan`, may have missed file
+/// events. An unreadable or unstable record is about a file the index knows
+/// and is no lost observation (FR-018): a degraded scout counts only when one
+/// of its issues names no scouted entry (an unreadable directory, a traversal
+/// stop), because only then can a file be unseen.
+fn observations_lost_in(
+    freshness: &crate::domain::FreshnessStatus,
+    plan: Option<&crate::discovery::ScoutPlan>,
+) -> bool {
     use crate::domain::{FreshnessReason, FreshnessStatus, ScoutIssueKind};
     let unseen_by_scout = || {
-        shared.scout_plan().is_none_or(|plan| {
+        plan.is_none_or(|plan| {
             let scouted: std::collections::HashSet<&str> = plan
                 .entries
                 .iter()
@@ -252,7 +274,7 @@ fn observations_lost(shared: &SharedIndex) -> bool {
             })
         })
     };
-    match shared.freshness_status().as_ref() {
+    match freshness {
         FreshnessStatus::Current => false,
         FreshnessStatus::Verifying => true,
         FreshnessStatus::Degraded { reason_codes, .. } => {
@@ -819,6 +841,77 @@ pub(crate) struct TargetedFreshen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-017 / FR-018: what counts as a lost observation. The embedded
+    /// source serves only a publication for which this is false, so every
+    /// reason that can hide an unseen file must stay on the lost side.
+    #[test]
+    fn only_a_possibly_unseen_file_is_a_lost_observation() {
+        use crate::discovery::ScoutPlan;
+        use crate::domain::{
+            CoverageStatus, FreshnessReason as R, FreshnessStatus, ScoutIssue, ScoutIssueKind,
+        };
+        let plan = |issues: Vec<ScoutIssue>| ScoutPlan {
+            coverage: CoverageStatus::Degraded,
+            entries: Vec::new(),
+            issues,
+            usage: Default::default(),
+        };
+        let issue = |path_id: Option<&str>, kind| ScoutIssue {
+            path_id: path_id.map(str::to_owned),
+            safe_path: None,
+            kind,
+            safe_message: String::new(),
+        };
+        let degraded = |reason| FreshnessStatus::Degraded {
+            last_valid_content_generation: 0,
+            reason_codes: vec![reason],
+        };
+        let clean = plan(Vec::new());
+        let unseen_directory = plan(vec![issue(
+            Some("src/hidden"),
+            ScoutIssueKind::DirectoryEntryUnreadable {
+                kind: crate::domain::AccessErrorKind::PermissionDenied,
+            },
+        )]);
+        let circuit_breaker = plan(vec![issue(None, ScoutIssueKind::TraversalCircuitBreaker)]);
+        for (freshness, plan, lost) in [
+            (FreshnessStatus::Current, None, false),
+            (FreshnessStatus::Verifying, Some(&clean), true),
+            (degraded(R::WatcherUnavailable), Some(&clean), true),
+            (degraded(R::SnapshotVerificationFailed), Some(&clean), true),
+            (
+                degraded(R::CatalogEntryCapacityExceeded),
+                Some(&clean),
+                true,
+            ),
+            (
+                degraded(R::CatalogMetadataCapacityExceeded),
+                Some(&clean),
+                true,
+            ),
+            (degraded(R::ReconciliationPending), None, true),
+            (
+                degraded(R::ReconciliationPending),
+                Some(&unseen_directory),
+                true,
+            ),
+            (
+                degraded(R::ReconciliationPending),
+                Some(&circuit_breaker),
+                true,
+            ),
+            (degraded(R::ReconciliationPending), Some(&clean), false),
+            (degraded(R::ObservationFailed), Some(&clean), false),
+            (degraded(R::DerivedPublicationPending), Some(&clean), false),
+        ] {
+            assert_eq!(
+                observations_lost_in(&freshness, plan),
+                lost,
+                "{freshness:?} over {plan:?}"
+            );
+        }
+    }
 
     /// Review M6: at most five unconfirmed files are named, then a count.
     #[test]

@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar};
 use std::time::Duration;
 
 use super::registry::ProjectKey;
-use crate::domain::{FreshnessStatus, RootBinding, StatePlacement};
+use crate::domain::{RootBinding, StatePlacement};
 
 const EMBED_OBSERVER_POLL: Duration = Duration::from_millis(200);
 const REFRESHING_VISIBILITY_WINDOW: Duration = Duration::from_millis(25);
@@ -533,6 +533,11 @@ struct EmbeddedBinding {
     /// the lock while it observes and republishes. See `hold_observer_for_test`.
     #[cfg(feature = "__test-internals")]
     observer_held: std::sync::Mutex<bool>,
+    /// Observer disk polls and full tree reloads; see `observer_counts_for_test`.
+    #[cfg(feature = "__test-internals")]
+    observer_polls: AtomicU64,
+    #[cfg(feature = "__test-internals")]
+    observer_reloads: AtomicU64,
 }
 
 /// Original selected state child. Parked between operations so an idle source
@@ -661,6 +666,10 @@ impl EmbeddedBinding {
             progress: crate::live_index::store::ReloadProgressSink::new(),
             #[cfg(feature = "__test-internals")]
             observer_held: std::sync::Mutex::new(false),
+            #[cfg(feature = "__test-internals")]
+            observer_polls: AtomicU64::new(0),
+            #[cfg(feature = "__test-internals")]
+            observer_reloads: AtomicU64::new(0),
         })
     }
 
@@ -751,6 +760,8 @@ impl EmbeddedBinding {
             } else {
                 observed_fingerprint = next_fingerprint;
             }
+            #[cfg(feature = "__test-internals")]
+            self.observer_polls.fetch_add(1, Ordering::AcqRel);
         }
         self.set_phase(super::public_api::SourceRuntimePhase::Stopped);
         #[cfg(feature = "embed")]
@@ -802,6 +813,8 @@ impl EmbeddedBinding {
             &self.root,
             &self.state_placement,
         );
+        #[cfg(feature = "__test-internals")]
+        self.observer_reloads.fetch_add(1, Ordering::AcqRel);
         let result = self.runtime.data_plane().refresh_bound_tree_cancellable(
             &self.root,
             self.state_placement.directory().cloned(),
@@ -944,10 +957,13 @@ impl EmbeddedBinding {
     #[cfg(feature = "embed")]
     fn publish_freshened(&self) {
         let mut state = self.state.lock().expect("embedded state mutex");
-        let published = self.runtime.data_plane().published_generation();
+        let Some(published) =
+            super::guidance::freshen::observed_publication(self.runtime.data_plane())
+        else {
+            return;
+        };
         if self.shutdown_started.load(Ordering::Acquire)
             || state.phase != super::public_api::SourceRuntimePhase::Current
-            || !matches!(published.freshness.as_ref(), FreshnessStatus::Current)
         {
             return;
         }
@@ -986,12 +1002,16 @@ impl EmbeddedBinding {
         if self.shutdown_started.load(Ordering::Acquire) {
             return None;
         }
-        let published = self.runtime.data_plane().published_generation();
-        if !matches!(published.freshness.as_ref(), FreshnessStatus::Current) {
+        // Spec 036 FR-018: a degraded publication that lost no observation
+        // (a known file the scout could not read) serves; answers that use
+        // that file name it.
+        let Some(published) =
+            super::guidance::freshen::observed_publication(self.runtime.data_plane())
+        else {
             drop(state);
             self.set_blocked();
             return Some(fingerprint);
-        }
+        };
         state.source_version = state.source_version.saturating_add(1).max(1);
         state.current_publication_identity = Some(format!(
             "embed-publication-{}-{}",
@@ -1098,7 +1118,7 @@ impl EmbeddedBinding {
             generation.publication_generation,
         );
         if state.current_publication_identity.as_deref() != Some(&publication_identity)
-            || !matches!(generation.freshness.as_ref(), FreshnessStatus::Current)
+            || !serves(index, &generation)
             || authority.current_publication() != Some(authority_publication)
         {
             return Err(refuse(
@@ -1351,6 +1371,18 @@ struct CurrentEmbedClaim {
     binding_identity: String,
     publication_identity: String,
     source_version: u64,
+}
+
+/// The query gates' freshness check: `generation` is still the published
+/// one and lost no observation (`freshen::observed_publication`).
+#[cfg(feature = "embed")]
+fn serves(
+    index: &crate::live_index::store::SharedIndex,
+    generation: &crate::live_index::store::PublishedGeneration,
+) -> bool {
+    super::guidance::freshen::observed_publication(index).is_some_and(|observed| {
+        observed.publication_generation == generation.publication_generation
+    })
 }
 
 fn normalized_path_prefix(prefix: Option<&str>) -> Option<String> {
@@ -2432,7 +2464,7 @@ impl EmbeddedSourceHandle {
             generation.publication_generation
         );
         if state.current_publication_identity.as_deref() != Some(&publication_identity)
-            || !matches!(generation.freshness.as_ref(), FreshnessStatus::Current)
+            || !serves(index, &generation)
             || authority.current_publication() != Some(authority_publication)
             || self.closed.load(Ordering::Acquire)
         {
@@ -3192,6 +3224,18 @@ impl EmbeddedSourceHandle {
         }
     }
 
+    /// The observer's disk polls and full tree reloads so far, so a test can
+    /// wait on the observer instead of on time. `(0, 0)` for an unbound handle.
+    #[cfg(feature = "__test-internals")]
+    pub fn observer_counts_for_test(&self) -> (u64, u64) {
+        self.binding.as_ref().map_or((0, 0), |binding| {
+            (
+                binding.observer_polls.load(Ordering::Acquire),
+                binding.observer_reloads.load(Ordering::Acquire),
+            )
+        })
+    }
+
     /// Signal reload cancel without joining the worker. Close still joins.
     #[cfg(feature = "__test-internals")]
     pub fn cancel_reload_for_test(&self) {
@@ -3445,6 +3489,7 @@ impl Drop for EmbeddedSourceHandle {
 #[cfg(all(test, feature = "embed"))]
 mod refresh_lifecycle_tests {
     use super::*;
+    use crate::domain::FreshnessStatus;
     use crate::embed::parity::{QueryLimits, QueryRefusalKind, QueryRequest};
     use crate::embed::{EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase};
 
