@@ -86,7 +86,7 @@ b84068dab2528679296497ebc7d24850a8ff2e726893787a1b242ca9bea8c9a4  embed/parity/a
 
 15c1affa41f4af638344275aec83b066a09f20d73b85199a36f660630a3ed214  embed/parity/detect_impact.rs
 
-c61f2b6710ed559937f3fb72e507a1333ccf216c19664774598452a1abf9dc1c  embed/parity/edit.rs
+665f9f3827505f4ce65f8daa6b686fb5532d791bcbb5bacd064673e1179f194d  embed/parity/edit.rs
 
 e7173513f20cc58949f948d00f2ae945755c9f40df3b3178d97d691a5f53fbc8  embed/parity/edit/wire.rs
 
@@ -96,7 +96,7 @@ aec191c3ffa30398a52a6dcc8893cb0e96ec77509be798566464962dc8313290  embed/parity/f
 
 0b9fca4d011d5952469ca24096e5c421ca2a83f0041186d353fa8edfcfc44f97  embed/parity/guidance.rs
 
-c9a6f1cf3ef1456ec172aabec1637413b5f8c0d209ea827a25424b5c269d1ddf  embed/parity/host.rs
+9271eaa040f9a025868cffc79056efb63b0e18584e69edbc48c3b7a595fff426  embed/parity/host.rs
 
 1df1f981de0625c51ee3b520b6f8e2ead085de4e55b1ce4a81dc179904752c0d  embed/parity/host/request_check.rs
 
@@ -150,7 +150,7 @@ f7ffe6a7c4907820e1b900cfede6afd938ce082c06611565e350fde8021ff096  index_lifecycl
 
 a19b16f421e6894394b83d58a0236a13aedd38ca78f9d9f195506b7d96e0fbf6  index_lifecycle/embed_ask.rs
 
-22d45065a82ee091cdaddadd4ddebfd41024a7042bcc5964f43eaa82e19668a9  index_lifecycle/embed_batch.rs
+af7cfce24d4514f4921d0ee046750a24e45be40354cad5f8245999cdf028e436  index_lifecycle/embed_batch.rs
 
 605d69ae81ab6301aa66f9760e660f620d92d280913f59893b4b4e76ccc5b013  index_lifecycle/embed_changes.rs
 
@@ -212,7 +212,7 @@ f205fdc0cb89cc5c2ceeb733f627888f2ac5199ad4d3a7d7d16964b97f47274a  index_lifecycl
 
 e297089d270bd9554751753f1541620b9c0fd644d77f91d33c21e31a2e8c99f6  index_lifecycle/embed_wire_edit.rs
 
-c71f313717b434b268c854c0a3991c004b3bd4f86134722217ba6058e49cf41f  index_lifecycle/embedded.rs
+4a8372b9a00e2fafb7dd9546bc860a4bd3681f4763c6947bc3b3998b338c4902  index_lifecycle/embedded.rs
 
 cd27b0897f0c4ac19d239063998ea175cd994864d8b110a2ea913143c493427c  index_lifecycle/guidance/argument_values.rs
 

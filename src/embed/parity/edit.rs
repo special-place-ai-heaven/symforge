@@ -695,6 +695,12 @@ pub enum EditErrorKind {
     StructuralRewriteRefused {
         message: String,
     },
+    /// A project-wide mutation (`batch_rename`) refused because files are
+    /// withheld as unverified since a snapshot restore. Carries MCP's exact
+    /// refusal text.
+    ProjectWideMutationRefused {
+        message: String,
+    },
 }
 
 #[derive(Debug)]
