@@ -691,21 +691,43 @@ mod tests {
         ));
         assert!(!root.join(".symforge-knowledge.toml").exists());
         request.if_serving_publication_identity = current_serving_identity;
-        // A review the engine refuses as stale writes nothing, so the outcome
-        // is known and must not be reported as Uncertain.
-        let mut stale_review = request.clone();
-        stale_review.input.if_source_review_hash = "0".repeat(64);
-        stale_review.input.idempotency_key = Some("fixture-curation-stale-review".to_string());
-        assert!(matches!(
-            handle.curate_knowledge(&stale_review, Some(&authority)),
-            Err(KnowledgeCurationError::StalePublication)
-        ));
-        assert!(!root.join(".symforge-knowledge.toml").exists());
+        let source_version_before_apply = handle.runtime_view().source_version;
         let applied = handle
             .curate_knowledge(&request, Some(&authority))
             .expect("apply");
         assert_eq!(applied.status, KnowledgeCurationStatus::Applied);
         assert!(applied.refresh_ticket_identity.is_some());
         assert!(root.join(".symforge-knowledge.toml").exists());
+        // The apply queued a republish; wait for it so the identity captured
+        // next is the one the engine will see, and only the review is stale.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let view = handle.runtime_view();
+            if view.phase == SourceRuntimePhase::Current
+                && view.source_version > source_version_before_apply
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "republish did not complete");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let policy_before = fs::read(root.join(".symforge-knowledge.toml")).expect("policy");
+        // A review the engine refuses as stale writes nothing, so the outcome
+        // is known and must not be reported as Uncertain.
+        let mut stale_review = request.clone();
+        stale_review.if_serving_publication_identity = handle
+            .capture_query_snapshot(b"curation-stale-review")
+            .expect("fresh snapshot")
+            .serving_publication_identity;
+        stale_review.input.if_source_review_hash = "0".repeat(64);
+        stale_review.input.idempotency_key = Some("fixture-curation-stale-review".to_string());
+        assert!(matches!(
+            handle.curate_knowledge(&stale_review, Some(&authority)),
+            Err(KnowledgeCurationError::StalePublication)
+        ));
+        assert_eq!(
+            fs::read(root.join(".symforge-knowledge.toml")).expect("policy"),
+            policy_before
+        );
     }
 }
