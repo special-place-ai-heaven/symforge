@@ -3786,7 +3786,7 @@ mod refresh_lifecycle_tests {
     /// data plane the handle publishes from; no fixture can make the verify
     /// withhold a real file, because its failure seam is `cfg(test)`-only.
     #[test]
-    fn server_and_embed_batch_rename_refuses_while_files_are_withheld_since_restore() {
+    fn embed_batch_rename_refuses_while_files_are_withheld_since_restore() {
         use crate::embed::parity::edit::{
             BatchRenameRequest, EditApplyAuthority, EditError, EditErrorKind, EditTarget,
         };
