@@ -526,8 +526,9 @@ pub(crate) trait UpdateOps {
     /// still identify it while its binary is in place. Returns a summary line.
     fn stop_daemon(&mut self) -> anyhow::Result<String>;
     /// Install `specs` into the staging prefix with `program` (npm). The live
-    /// install is not touched. Returns `true` on success.
-    fn stage_install(&mut self, program: &str, specs: &[String]) -> anyhow::Result<bool>;
+    /// install is not touched. A failed or timed-out install carries the tail
+    /// of npm's output.
+    fn stage_install(&mut self, program: &str, specs: &[String]) -> anyhow::Result<StageOutcome>;
     /// `--version` of the staged binary.
     fn staged_version(&mut self) -> InstalledProbe;
     /// Rename the staged packages' files over the live ones, keeping a copy of
@@ -671,7 +672,7 @@ impl UpdateOps for RealUpdateOps {
         })
     }
 
-    fn stage_install(&mut self, program: &str, specs: &[String]) -> anyhow::Result<bool> {
+    fn stage_install(&mut self, program: &str, specs: &[String]) -> anyhow::Result<StageOutcome> {
         // A leftover from an interrupted run would be overlaid onto the live
         // install along with the fresh files, so start from an empty staging dir.
         match std::fs::remove_dir_all(&self.staging) {
@@ -686,17 +687,11 @@ impl UpdateOps for RealUpdateOps {
         let args = staging_install_args(&self.staging, specs);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         // Bounded wait: spawn + poll `try_wait` against a deadline and kill the
-        // child on timeout, returning Ok(false) so the caller bails instead of
+        // child on timeout, returning `Failed` so the caller bails instead of
         // hanging.
-        let mut child = crate::process_util::hidden_command(program)
-            .args(&args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("failed to start `{}`", invocation_text(program, &args)))?;
-        wait_or_kill(
-            &mut child,
+        run_staged_install(
+            program,
+            &args,
             Instant::now() + NPM_INSTALL_TIMEOUT,
             NPM_INSTALL_POLL,
         )
@@ -1005,6 +1000,92 @@ fn verify_initialize_at(binary: &Path, cwd: &Path, timeout: Duration) -> anyhow:
 fn is_initialize_result(line: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(line)
         .is_ok_and(|message| message["id"] == 1 && message["result"]["protocolVersion"].is_string())
+}
+
+/// How many trailing lines of npm's output a failed staging install reports.
+const NPM_OUTPUT_TAIL_LINES: usize = 20;
+/// How long to wait for the output readers after the child is done. A
+/// grandchild (`node.exe` under a killed `cmd.exe`) can hold the pipes open.
+const NPM_READER_GRACE: Duration = Duration::from_secs(2);
+
+/// Result of the staging install.
+pub(crate) enum StageOutcome {
+    Installed,
+    /// Non-zero exit or timeout; `output_tail` is npm's last output lines.
+    Failed {
+        output_tail: String,
+    },
+}
+
+type OutputTail = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
+
+/// Relay `source` line by line (raw bytes) to `sink` while keeping the last
+/// [`NPM_OUTPUT_TAIL_LINES`] lines. Drains until EOF so the child never blocks
+/// on a full pipe.
+fn relay_lines(mut source: impl BufRead, mut sink: impl Write, tail: &OutputTail) {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match source.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let _ = sink.write_all(&line).and_then(|()| sink.flush());
+        let text = String::from_utf8_lossy(&line).trim_end().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
+        if tail.len() == NPM_OUTPUT_TAIL_LINES {
+            tail.pop_front();
+        }
+        tail.push_back(text);
+    }
+}
+
+/// Spawn `program`, relay its stdout/stderr live, and wait under `deadline`.
+/// Output goes through pipes because a hidden-console child's inherited console
+/// handles are replaced on Windows, which silently dropped npm's errors.
+fn run_staged_install(
+    program: &str,
+    args: &[&str],
+    deadline: Instant,
+    poll: Duration,
+) -> anyhow::Result<StageOutcome> {
+    let mut child = crate::process_util::hidden_command(program)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start `{}`", invocation_text(program, args)))?;
+    let tail = OutputTail::default();
+    let mut readers = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        let tail = tail.clone();
+        readers.push(std::thread::spawn(move || {
+            relay_lines(std::io::BufReader::new(out), std::io::stdout(), &tail)
+        }));
+    }
+    if let Some(err) = child.stderr.take() {
+        let tail = tail.clone();
+        readers.push(std::thread::spawn(move || {
+            relay_lines(std::io::BufReader::new(err), std::io::stderr(), &tail)
+        }));
+    }
+    let succeeded = wait_or_kill(&mut child, deadline, poll);
+    // Bounded wait: unfinished readers are detached rather than joined.
+    let grace_end = Instant::now() + NPM_READER_GRACE;
+    while Instant::now() < grace_end && !readers.iter().all(|r| r.is_finished()) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if succeeded? {
+        return Ok(StageOutcome::Installed);
+    }
+    let tail = tail.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(StageOutcome::Failed {
+        output_tail: tail.iter().cloned().collect::<Vec<_>>().join("\n"),
+    })
 }
 
 /// A child process we can poll for completion and force-kill. The seam exists so
@@ -1499,12 +1580,24 @@ fn update_steps(
             "symforge update: installing {} into a staging directory; running sessions are not touched.",
             specs.join(" ")
         );
-        if !ops.stage_install(program, &specs)? {
+        if let StageOutcome::Failed { output_tail } = ops.stage_install(program, &specs)? {
+            let npm_said = if output_tail.trim().is_empty() {
+                "\nNo npm output was captured.".to_string()
+            } else {
+                let indented: Vec<String> = output_tail.lines().map(|l| format!("  {l}")).collect();
+                format!("\nnpm said:\n{}", indented.join("\n"))
+            };
+            let hint = if output_tail.contains("E404") || output_tail.contains("ETARGET") {
+                "\nnpm reported a package or version the registry did not serve. If the \
+                 release is new it may still be processing; retry in a few minutes."
+            } else {
+                ""
+            };
             bail!(
                 "symforge update failed: the staging install (`{program} install ... {}`) exited \
                  unsuccessfully or timed out. The live install was NOT touched and running sessions \
                  are unaffected. Retry, or install from a plain shell:\n  {plain_cmd}\n\
-                 (The version registry was already pruned.)",
+                 (The version registry was already pruned.){npm_said}{hint}",
                 specs.join(" ")
             );
         }
@@ -1806,6 +1899,7 @@ mod tests {
         /// Successive `live_version` answers: before the swap, then after.
         live: Vec<InstalledProbe>,
         stage_result: bool,
+        stage_output: String,
         staged: InstalledProbe,
         stop: Result<String, String>,
         installed: InstalledProbe,
@@ -1831,6 +1925,7 @@ mod tests {
                     InstalledProbe::Version("7.15.4".to_string()),
                 ],
                 stage_result: true,
+                stage_output: String::new(),
                 staged: InstalledProbe::Version("7.15.4".to_string()),
                 stop: Ok("stopped the daemon (pid 7)".to_string()),
                 installed: InstalledProbe::Version("7.15.4".to_string()),
@@ -1875,10 +1970,20 @@ mod tests {
             self.events.push("stop-daemon".into());
             self.stop.clone().map_err(|e| anyhow::anyhow!(e))
         }
-        fn stage_install(&mut self, program: &str, specs: &[String]) -> anyhow::Result<bool> {
+        fn stage_install(
+            &mut self,
+            program: &str,
+            specs: &[String],
+        ) -> anyhow::Result<StageOutcome> {
             self.events
                 .push(format!("stage {program} {}", specs.join(" ")));
-            Ok(self.stage_result)
+            Ok(if self.stage_result {
+                StageOutcome::Installed
+            } else {
+                StageOutcome::Failed {
+                    output_tail: self.stage_output.clone(),
+                }
+            })
         }
         fn staged_version(&mut self) -> InstalledProbe {
             self.staged.clone()
@@ -2306,6 +2411,95 @@ mod tests {
         assert!(!ops.events.iter().any(|e| e.starts_with("daemon")));
         assert!(!ops.events.iter().any(|e| e.starts_with("reregister")));
         assert_eq!(ops.reconciled_with, None);
+    }
+
+    fn failed_stage_message(output: &str) -> String {
+        let mut ops = FakeOps {
+            stage_result: false,
+            stage_output: output.to_string(),
+            ..Default::default()
+        };
+        orchestrate_update("windows", "x86_64", &mut ops)
+            .expect_err("a failed staging install is reported")
+            .to_string()
+    }
+
+    const RETRY_SENTENCE: &str = "retry in a few minutes";
+
+    #[test]
+    fn a_failed_stage_shows_npm_404_and_the_retry_hint() {
+        let msg = failed_stage_message(
+            "npm error code E404\n\
+             npm error 404 Not Found - GET https://registry.npmjs.org/symforge-windows-x64/-/symforge-windows-x64-7.15.4.tgz",
+        );
+        assert!(msg.contains("npm said:"), "{msg}");
+        assert!(msg.contains("npm error code E404"), "{msg}");
+        assert!(
+            msg.contains("404 Not Found - GET https://registry.npmjs.org/symforge-windows-x64/-/"),
+            "{msg}"
+        );
+        assert!(msg.contains(RETRY_SENTENCE), "{msg}");
+        assert!(msg.contains("NOT touched"), "{msg}");
+    }
+
+    #[test]
+    fn a_failed_stage_with_another_error_shows_it_without_the_retry_hint() {
+        let msg = failed_stage_message("npm error code EACCES");
+        assert!(msg.contains("npm error code EACCES"), "{msg}");
+        assert!(!msg.contains(RETRY_SENTENCE), "{msg}");
+    }
+
+    #[test]
+    fn a_failed_stage_with_no_output_says_npm_printed_nothing() {
+        let msg = failed_stage_message("");
+        assert!(msg.contains("No npm output was captured"), "{msg}");
+        assert!(!msg.contains("npm said:"), "{msg}");
+        assert!(!msg.contains(RETRY_SENTENCE), "{msg}");
+    }
+
+    #[test]
+    fn run_staged_install_captures_stderr_of_a_failing_child() {
+        #[cfg(windows)]
+        let (program, args) = ("cmd", ["/C", "echo marker 1>&2 & exit /b 3"]);
+        #[cfg(not(windows))]
+        let (program, args) = ("sh", ["-c", "echo marker >&2; exit 3"]);
+        let outcome = run_staged_install(
+            program,
+            &args,
+            Instant::now() + Duration::from_secs(30),
+            Duration::from_millis(10),
+        )
+        .expect("the child spawns");
+        match outcome {
+            StageOutcome::Failed { output_tail } => {
+                assert!(output_tail.contains("marker"), "{output_tail:?}")
+            }
+            StageOutcome::Installed => panic!("a non-zero exit must be Failed"),
+        }
+    }
+
+    #[test]
+    fn run_staged_install_does_not_wait_on_a_grandchild_holding_the_pipes() {
+        // The child exits at once; its background grandchild keeps the output
+        // pipes open for ~20 s. Joining the readers would block that long.
+        #[cfg(windows)]
+        let (program, args) = ("cmd", ["/C", "start /b ping -n 20 127.0.0.1 & exit /b 1"]);
+        #[cfg(not(windows))]
+        let (program, args) = ("sh", ["-c", "sleep 20 & exit 1"]);
+        let started = Instant::now();
+        let outcome = run_staged_install(
+            program,
+            &args,
+            Instant::now() + Duration::from_secs(30),
+            Duration::from_millis(10),
+        )
+        .expect("the child spawns");
+        assert!(matches!(outcome, StageOutcome::Failed { .. }));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "returned after {:?}; the readers must be detached, not joined",
+            started.elapsed()
+        );
     }
 
     #[test]
