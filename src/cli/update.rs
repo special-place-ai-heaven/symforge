@@ -1582,14 +1582,14 @@ fn update_steps(
         );
         if let StageOutcome::Failed { output_tail } = ops.stage_install(program, &specs)? {
             let npm_said = if output_tail.trim().is_empty() {
-                "\nnpm printed nothing.".to_string()
+                "\nNo npm output was captured.".to_string()
             } else {
                 let indented: Vec<String> = output_tail.lines().map(|l| format!("  {l}")).collect();
                 format!("\nnpm said:\n{}", indented.join("\n"))
             };
             let hint = if output_tail.contains("E404") || output_tail.contains("ETARGET") {
-                "\nThe registry does not serve that version yet; the release may still be \
-                 processing, so retry in a few minutes."
+                "\nnpm reported a package or version the registry did not serve. If the \
+                 release is new it may still be processing; retry in a few minutes."
             } else {
                 ""
             };
@@ -2452,7 +2452,7 @@ mod tests {
     #[test]
     fn a_failed_stage_with_no_output_says_npm_printed_nothing() {
         let msg = failed_stage_message("");
-        assert!(msg.contains("npm printed nothing"), "{msg}");
+        assert!(msg.contains("No npm output was captured"), "{msg}");
         assert!(!msg.contains("npm said:"), "{msg}");
         assert!(!msg.contains(RETRY_SENTENCE), "{msg}");
     }
@@ -2476,6 +2476,30 @@ mod tests {
             }
             StageOutcome::Installed => panic!("a non-zero exit must be Failed"),
         }
+    }
+
+    #[test]
+    fn run_staged_install_does_not_wait_on_a_grandchild_holding_the_pipes() {
+        // The child exits at once; its background grandchild keeps the output
+        // pipes open for ~20 s. Joining the readers would block that long.
+        #[cfg(windows)]
+        let (program, args) = ("cmd", ["/C", "start /b ping -n 20 127.0.0.1 & exit /b 1"]);
+        #[cfg(not(windows))]
+        let (program, args) = ("sh", ["-c", "sleep 20 & exit 1"]);
+        let started = Instant::now();
+        let outcome = run_staged_install(
+            program,
+            &args,
+            Instant::now() + Duration::from_secs(30),
+            Duration::from_millis(10),
+        )
+        .expect("the child spawns");
+        assert!(matches!(outcome, StageOutcome::Failed { .. }));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "returned after {:?}; the readers must be detached, not joined",
+            started.elapsed()
+        );
     }
 
     #[test]
