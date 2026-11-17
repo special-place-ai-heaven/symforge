@@ -336,32 +336,59 @@ fn remove_orphan_durable_bin_at(control_state_dir: &crate::domain::ControlStateD
     lines
 }
 
-/// What the harness scan found: every registry target's state, plus whether a
-/// Grok config exists (Grok is registrable by `init` but not covered by the
-/// harness registry).
+/// What the harness scan found: every registry target's state, plus whether
+/// the Grok and Oh My Pi configs (registrable by `init` but not covered by the
+/// harness registry) already carry a SymForge entry.
 #[derive(Debug, Clone)]
 pub(crate) struct HarnessScan {
     statuses: Vec<HarnessStatus>,
-    grok_config_present: bool,
-    /// `~/.omp/agent/mcp.json` exists. OMP is registrable by `init` but is not
-    /// in the HTTP harness registry, same as Grok.
-    omp_config_present: bool,
-    /// Harnesses whose registered command already runs the live binary.
-    already_current: Vec<HarnessId>,
+    /// `~/.grok/config.toml` parses and already has a SymForge entry.
+    grok_registered: bool,
+    /// `~/.omp/agent/mcp.json` parses and already has a SymForge entry.
+    omp_registered: bool,
     /// Harnesses attached over HTTP: no binary path to repoint.
     http_attached: Vec<HarnessId>,
 }
 
-/// Decide which harnesses `update` re-registers. Only a harness that ALREADY
+/// One client `update` re-registers: the `init --client` value and the name
+/// shown to the user. Grok and Oh My Pi are not in the harness registry, so
+/// this is not a [`HarnessId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Target {
+    slug: &'static str,
+    name: &'static str,
+}
+
+impl Target {
+    const GROK: Self = Self {
+        slug: "grok",
+        name: "Grok",
+    };
+    const OMP: Self = Self {
+        slug: "omp",
+        name: "Oh My Pi",
+    };
+}
+
+impl From<HarnessId> for Target {
+    fn from(id: HarnessId) -> Self {
+        Self {
+            slug: id.slug(),
+            name: id.display_name(),
+        }
+    }
+}
+
+/// Decide which clients `update` re-registers. Only a client that ALREADY
 /// carries a `symforge` entry is touched, so update never creates config for a
-/// client the user does not run. Kilo Code is excluded: its config is
-/// project-local, and update never writes project-local files. A harness
-/// attached over HTTP has no binary path to repoint. After a real swap every
-/// other present harness is re-registered, since the new release may change
-/// hooks, allow lists, env defaults, or guidance (each writer skips an
-/// unchanged file); without one, a harness that already runs the live binary
-/// is left alone. Returns the targets plus the lines to print.
-fn plan_reregistration(scan: &HarnessScan, swapped: bool) -> (Vec<HarnessId>, Vec<String>) {
+/// client the user does not run. Every such client is re-registered on every
+/// run, not only after a swap: a command that already runs the live binary
+/// says nothing about its hooks, allow lists, env defaults, or guidance (each
+/// writer skips a file that is already correct). Kilo Code is excluded: its
+/// config is project-local, and update never writes project-local files. A
+/// harness attached over HTTP has no binary path to repoint. Returns the
+/// targets plus the lines to print.
+fn plan_reregistration(scan: &HarnessScan) -> (Vec<Target>, Vec<String>) {
     let mut targets = Vec::new();
     let mut skipped = Vec::new();
     for status in &scan.statuses {
@@ -375,14 +402,6 @@ fn plan_reregistration(scan: &HarnessScan, swapped: bool) -> (Vec<HarnessId>, Ve
                 ));
             }
             HarnessState::PresentCurrent | HarnessState::PresentStale(_)
-                if !swapped && scan.already_current.contains(&status.id) =>
-            {
-                skipped.push(format!(
-                    "unchanged: {} (it already runs the updated binary)",
-                    status.id.display_name()
-                ));
-            }
-            HarnessState::PresentCurrent | HarnessState::PresentStale(_)
                 if scan.http_attached.contains(&status.id) =>
             {
                 skipped.push(format!(
@@ -391,7 +410,7 @@ fn plan_reregistration(scan: &HarnessScan, swapped: bool) -> (Vec<HarnessId>, Ve
                 ));
             }
             HarnessState::PresentCurrent | HarnessState::PresentStale(_) => {
-                targets.push(status.id);
+                targets.push(status.id.into());
             }
             // The parse error text is deliberately not echoed: a TOML error
             // quotes the offending line, which can carry a bearer token.
@@ -403,17 +422,11 @@ fn plan_reregistration(scan: &HarnessScan, swapped: bool) -> (Vec<HarnessId>, Ve
             HarnessState::NotInstalled | HarnessState::Absent => {}
         }
     }
-    if scan.grok_config_present {
-        skipped.push(
-            "skipped: Grok (the harness scan does not cover it; run `symforge init --client grok` if Grok uses SymForge)"
-                .to_string(),
-        );
+    if scan.grok_registered {
+        targets.push(Target::GROK);
     }
-    if scan.omp_config_present {
-        skipped.push(
-            "skipped: Oh My Pi (the harness scan does not cover it; run `symforge init --client omp` if OMP uses SymForge)"
-                .to_string(),
-        );
+    if scan.omp_registered {
+        targets.push(Target::OMP);
     }
     (targets, skipped)
 }
@@ -550,9 +563,9 @@ pub(crate) trait UpdateOps {
     fn prune_registry(&mut self) -> Vec<String>;
     /// Scan the known harness configs.
     fn harness_scan(&mut self) -> HarnessScan;
-    /// Re-register one harness onto the freshly-installed binary by spawning
+    /// Re-register one client onto the freshly-installed binary by spawning
     /// the NEW binary's `init`.
-    fn reregister(&mut self, harness: HarnessId) -> anyhow::Result<()>;
+    fn reregister(&mut self, target: Target) -> anyhow::Result<()>;
     /// Remove the retired durable-install leftovers ONLY when `reregistered` is
     /// true (otherwise clients still point at the orphan and deleting it would
     /// break them). Registry pruning is handled separately by [`UpdateOps::prune_registry`].
@@ -620,28 +633,6 @@ impl RealUpdateOps {
             journal: Vec::new(),
             mismatch: None,
         }
-    }
-
-    /// Whether a registered `command` already runs the live binary: the same
-    /// file, or (the Windows Claude Desktop wrapper) a script that invokes it
-    /// by absolute path.
-    fn runs_live_binary(&self, command: &str) -> bool {
-        let command = Path::new(command);
-        if crate::path_shadow::same_file(command, &self.live_binary) {
-            return true;
-        }
-        let is_script = command
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"));
-        is_script
-            && std::fs::read_to_string(command).is_ok_and(|script| {
-                let binary = self.live_binary.display().to_string();
-                if cfg!(windows) {
-                    script.to_lowercase().contains(&binary.to_lowercase())
-                } else {
-                    script.contains(&binary)
-                }
-            })
     }
 }
 
@@ -818,57 +809,45 @@ impl UpdateOps for RealUpdateOps {
         // The working dir only feeds the project-local Kilo Code target, which
         // `plan_reregistration` never re-registers; home keeps the caller's cwd
         // out of it. Presence comes from the scan (the desired attach entry is a
-        // placeholder); what each entry runs comes from its `command`.
+        // placeholder); an entry without a `command` is attached over HTTP.
         let registry = HarnessRegistry::known_with(&self.home, &self.home);
         let statuses = registry.scan(&AttachEntry::new("", None));
-        let mut already_current = Vec::new();
-        let mut http_attached = Vec::new();
-        for status in &statuses {
-            if !matches!(
-                status.state,
-                HarnessState::PresentCurrent | HarnessState::PresentStale(_)
-            ) {
-                continue;
-            }
-            match crate::cli::harness::registered_command(status) {
-                // Command identity is not enough. A native command beside a
-                // wrapper's leftover args still fails the MCP handshake, so
-                // update re-inits that harness.
-                Some(command)
-                    if self.runs_live_binary(&command)
-                        && crate::cli::harness::registered_stdio_args(status).is_some_and(
-                            |args| {
-                                !crate::cli::init::stdio_launch_args_need_rewrite(&args, &command)
-                            },
-                        ) =>
-                {
-                    already_current.push(status.id);
-                }
-                Some(_) => {}
-                None => http_attached.push(status.id),
-            }
-        }
+        let http_attached = statuses
+            .iter()
+            .filter(|status| {
+                matches!(
+                    status.state,
+                    HarnessState::PresentCurrent | HarnessState::PresentStale(_)
+                ) && crate::cli::harness::registered_command(status).is_none()
+            })
+            .map(|status| status.id)
+            .collect();
+        // An unreadable or unparsable config reads as "no entry": it is neither
+        // written nor described.
+        let has_entry = |path: PathBuf, present: fn(&str) -> bool| {
+            crate::cli::init::read_config_text(&path).is_ok_and(|text| present(&text))
+        };
         HarnessScan {
             statuses,
-            grok_config_present: self.home.join(".grok").join("config.toml").exists(),
-            omp_config_present: self
-                .home
-                .join(".omp")
-                .join("agent")
-                .join("mcp.json")
-                .exists(),
-            already_current,
+            grok_registered: has_entry(
+                self.home.join(".grok").join("config.toml"),
+                crate::cli::init::toml_has_symforge,
+            ),
+            omp_registered: has_entry(
+                self.home.join(".omp").join("agent").join("mcp.json"),
+                crate::cli::init::json_has_symforge,
+            ),
             http_attached,
         }
     }
 
-    fn reregister(&mut self, harness: HarnessId) -> anyhow::Result<()> {
+    fn reregister(&mut self, target: Target) -> anyhow::Result<()> {
         // The NEW binary writes the registration (this process is still the old
         // one). It runs from the home directory with no workspace override, so
         // no project-local file is written and the caller's cwd is never
         // captured as a workspace root.
         let status = crate::process_util::hidden_command(&self.live_binary)
-            .args(["init", "--client", harness.slug()])
+            .args(["init", "--client", target.slug])
             .current_dir(&self.home)
             .env_remove(crate::discovery::WORKSPACE_ROOT_ENV)
             .stdin(Stdio::null())
@@ -879,13 +858,13 @@ impl UpdateOps for RealUpdateOps {
                 format!(
                     "starting `{} init --client {}`",
                     self.live_binary.display(),
-                    harness.slug()
+                    target.slug
                 )
             })?;
         anyhow::ensure!(
             status.success(),
             "`symforge init --client {}` exited with {status}",
-            harness.slug()
+            target.slug
         );
         Ok(())
     }
@@ -1750,17 +1729,17 @@ fn update_steps(
     // Re-point the harnesses that already use SymForge. Only after every one of
     // them succeeded are the retired durable-install artifacts cleared —
     // deleting the orphan while a client still references it would break it.
-    let (targets, skipped) = plan_reregistration(&ops.harness_scan(), swapped);
+    let (targets, skipped) = plan_reregistration(&ops.harness_scan());
     summary.notes.extend(skipped);
     let mut all_reregistered = true;
-    for harness in targets {
-        match ops.reregister(harness) {
-            Ok(()) => summary.reregistered.push(harness.display_name()),
+    for target in targets {
+        match ops.reregister(target) {
+            Ok(()) => summary.reregistered.push(target.name),
             Err(error) => {
                 all_reregistered = false;
                 summary.notes.push(format!(
                     "skipped: re-registering {}: {error:#}",
-                    harness.display_name()
+                    target.name
                 ));
             }
         }
@@ -1909,7 +1888,9 @@ mod tests {
         daemon: Result<InstalledDaemon, String>,
         initialize: Result<(), String>,
         scan: Vec<(HarnessId, HarnessState)>,
-        reregister_fails: Vec<HarnessId>,
+        reregister_fails: Vec<&'static str>,
+        grok_registered: bool,
+        omp_registered: bool,
         reconciled_with: Option<bool>,
         shadow: Option<crate::path_shadow::ShadowReport>,
         mismatch: Option<PrefixMismatch>,
@@ -1942,6 +1923,8 @@ mod tests {
                     (HarnessId::Cursor, HarnessState::NotInstalled),
                 ],
                 reregister_fails: Vec::new(),
+                grok_registered: false,
+                omp_registered: false,
                 reconciled_with: None,
                 shadow: None,
                 mismatch: None,
@@ -2013,11 +1996,14 @@ mod tests {
             Vec::new()
         }
         fn harness_scan(&mut self) -> HarnessScan {
-            scan_of(&self.scan)
+            let mut scan = scan_of(&self.scan);
+            scan.grok_registered = self.grok_registered;
+            scan.omp_registered = self.omp_registered;
+            scan
         }
-        fn reregister(&mut self, harness: HarnessId) -> anyhow::Result<()> {
-            self.events.push(format!("reregister {}", harness.slug()));
-            if self.reregister_fails.contains(&harness) {
+        fn reregister(&mut self, target: Target) -> anyhow::Result<()> {
+            self.events.push(format!("reregister {}", target.slug));
+            if self.reregister_fails.contains(&target.slug) {
                 bail!("init exited with 1");
             }
             Ok(())
@@ -2062,9 +2048,8 @@ mod tests {
                     state: state.clone(),
                 })
                 .collect(),
-            grok_config_present: false,
-            omp_config_present: false,
-            already_current: Vec::new(),
+            grok_registered: false,
+            omp_registered: false,
             http_attached: Vec::new(),
         }
     }
@@ -2584,7 +2569,7 @@ mod tests {
     #[test]
     fn orchestrate_update_does_not_remove_orphan_when_reregistration_fails() {
         let mut ops = FakeOps {
-            reregister_fails: vec![HarnessId::ClaudeCode],
+            reregister_fails: vec!["claude"],
             ..Default::default()
         };
         orchestrate_update("linux", "x86_64", &mut ops).expect("update should still succeed");
@@ -2879,35 +2864,30 @@ mod tests {
         assert!(!ops.happened("swap") && !ops.happened("stop-daemon"));
     }
 
+    fn names(targets: &[Target]) -> Vec<&'static str> {
+        targets.iter().map(|target| target.slug).collect()
+    }
+
     #[test]
-    fn plan_reregistration_leaves_current_and_http_attached_harnesses_alone() {
+    fn plan_reregistration_skips_http_attached_harnesses() {
         let mut scan = scan_of(&[
             (HarnessId::ClaudeCode, HarnessState::PresentCurrent),
-            (HarnessId::Codex, HarnessState::PresentCurrent),
             (
                 HarnessId::Cursor,
                 HarnessState::PresentStale(crate::cli::harness::StaleFields::Url),
             ),
         ]);
-        scan.already_current = vec![HarnessId::ClaudeCode];
         scan.http_attached = vec![HarnessId::Cursor];
 
-        let (targets, notes) = plan_reregistration(&scan, false);
+        let (targets, notes) = plan_reregistration(&scan);
 
-        assert_eq!(targets, vec![HarnessId::Codex]);
+        assert_eq!(names(&targets), vec!["claude"]);
         let text = notes.join("\n");
-        assert!(text.contains("unchanged: Claude Code"), "{text}");
         assert!(text.contains("Cursor (it attaches over HTTP"), "{text}");
-
-        // After a real swap the binary path is the same file, so "already
-        // current" says nothing about hooks, allow lists, env, or guidance the
-        // new release changed: every stdio harness is re-registered.
-        let (targets, _) = plan_reregistration(&scan, true);
-        assert_eq!(targets, vec![HarnessId::ClaudeCode, HarnessId::Codex]);
     }
 
     #[test]
-    fn plan_reregistration_touches_only_harnesses_that_already_use_symforge() {
+    fn plan_reregistration_touches_only_clients_that_already_use_symforge() {
         let mut scan = scan_of(&[
             (HarnessId::ClaudeCode, HarnessState::PresentCurrent),
             (
@@ -2922,12 +2902,14 @@ mod tests {
             ),
             (HarnessId::KiloCode, HarnessState::PresentCurrent),
         ]);
-        scan.grok_config_present = true;
-        scan.omp_config_present = true;
+        scan.grok_registered = true;
+        scan.omp_registered = true;
 
-        let (targets, skipped) = plan_reregistration(&scan, true);
+        let (targets, skipped) = plan_reregistration(&scan);
 
-        assert_eq!(targets, vec![HarnessId::ClaudeCode, HarnessId::Codex]);
+        assert_eq!(names(&targets), vec!["claude", "codex", "grok", "omp"]);
+        assert_eq!(targets[2].name, "Grok");
+        assert_eq!(targets[3].name, "Oh My Pi");
         let text = skipped.join("\n");
         assert!(
             text.contains("Claude Desktop") && text.contains("does not parse"),
@@ -2941,15 +2923,46 @@ mod tests {
             text.contains("Kilo Code") && text.contains("project-local"),
             "{text}"
         );
-        assert!(text.contains("Grok"), "{text}");
         assert!(
-            text.contains("Oh My Pi") && text.contains("--client omp"),
+            !text.contains("Gemini")
+                && !text.contains("Cursor")
+                && !text.contains("Grok")
+                && !text.contains("Oh My Pi"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn plan_reregistration_without_a_grok_or_omp_entry_is_silent() {
+        let (targets, notes) = plan_reregistration(&scan_of(&[]));
         assert!(
-            !text.contains("Gemini") && !text.contains("Cursor"),
-            "{text}"
+            targets.is_empty() && notes.is_empty(),
+            "{targets:?} {notes:?}"
         );
+    }
+
+    #[test]
+    fn orchestrate_update_reregisters_grok_and_omp_and_reports_their_failure() {
+        let mut ops = FakeOps {
+            reregister_fails: vec!["omp"],
+            grok_registered: true,
+            omp_registered: true,
+            ..Default::default()
+        };
+        let mut summary = UpdateSummary::default();
+        update_steps("linux", "x86_64", &mut ops, &mut summary).expect("update succeeds");
+        assert!(ops.happened("reregister grok") && ops.happened("reregister omp"));
+        assert!(summary.reregistered.contains(&"Grok"));
+        assert!(!summary.reregistered.contains(&"Oh My Pi"));
+        assert!(
+            summary
+                .notes
+                .iter()
+                .any(|note| note.contains("re-registering Oh My Pi")),
+            "{:?}",
+            summary.notes
+        );
+        assert_eq!(ops.reconciled_with, Some(false));
     }
 
     #[test]
@@ -3534,41 +3547,7 @@ mod tests {
     }
 
     #[test]
-    fn harness_scan_leaves_a_harness_that_already_runs_the_live_binary_alone() {
-        let (prefix, modules) = fake_install();
-        write_file(&installed_binary(&modules.join(TEST_PACKAGE)), "old-binary");
-        let home = tempfile::tempdir().unwrap();
-        let mut ops = RealUpdateOps::new(
-            std::env::consts::OS,
-            TEST_PACKAGE,
-            prefix.path().to_path_buf(),
-            home.path().to_path_buf(),
-        );
-        let entry = |server: serde_json::Value| {
-            serde_json::json!({ "mcpServers": { "symforge": server } }).to_string()
-        };
-        write_file(
-            &home.path().join(".claude.json"),
-            &entry(serde_json::json!({ "command": ops.live_binary.display().to_string() })),
-        );
-        write_file(
-            &home.path().join(".cursor").join("mcp.json"),
-            &entry(serde_json::json!({ "command": "/elsewhere/symforge" })),
-        );
-        write_file(
-            &home.path().join(".gemini").join("settings.json"),
-            &entry(serde_json::json!({ "url": "http://127.0.0.1:8787/mcp" })),
-        );
-
-        let scan = ops.harness_scan();
-
-        assert_eq!(scan.already_current, vec![HarnessId::ClaudeCode]);
-        assert_eq!(scan.http_attached, vec![HarnessId::Gemini]);
-        assert_eq!(plan_reregistration(&scan, false).0, vec![HarnessId::Cursor]);
-    }
-
-    #[test]
-    fn harness_scan_reregisters_when_the_live_command_still_has_wrapper_args() {
+    fn harness_scan_reregisters_every_stdio_harness_even_when_it_runs_the_live_binary() {
         let (prefix, modules) = fake_install();
         write_file(&installed_binary(&modules.join(TEST_PACKAGE)), "old-binary");
         let home = tempfile::tempdir().unwrap();
@@ -3579,17 +3558,20 @@ mod tests {
             home.path().to_path_buf(),
         );
         let live = ops.live_binary.display().to_string();
+        let entry = |server: serde_json::Value| {
+            serde_json::json!({ "mcpServers": { "symforge": server } }).to_string()
+        };
+        write_file(
+            &home.path().join(".claude.json"),
+            &entry(serde_json::json!({ "command": &live })),
+        );
         write_file(
             &home.path().join(".cursor").join("mcp.json"),
-            &serde_json::json!({
-                "mcpServers": {
-                    "symforge": {
-                        "command": &live,
-                        "args": [r"C:\fixture\program files\old\symforge.exe"]
-                    }
-                }
-            })
-            .to_string(),
+            &entry(serde_json::json!({ "command": "/elsewhere/symforge" })),
+        );
+        write_file(
+            &home.path().join(".gemini").join("settings.json"),
+            &entry(serde_json::json!({ "url": "http://127.0.0.1:8787/mcp" })),
         );
         write_file(
             &home.path().join(".codex").join("config.toml"),
@@ -3597,20 +3579,49 @@ mod tests {
         );
 
         let scan = ops.harness_scan();
-        let (targets, _) = plan_reregistration(&scan, false);
-        assert!(
-            targets.contains(&HarnessId::Cursor),
-            "stale wrapper args must be re-registered: {targets:?}"
+
+        assert_eq!(scan.http_attached, vec![HarnessId::Gemini]);
+        let (targets, _) = plan_reregistration(&scan);
+        assert_eq!(names(&targets), vec!["claude", "codex", "cursor"]);
+    }
+
+    #[test]
+    fn harness_scan_finds_grok_and_omp_only_when_they_hold_a_symforge_entry() {
+        let (prefix, _modules) = fake_install();
+        let home = tempfile::tempdir().unwrap();
+        let mut ops = RealUpdateOps::new(
+            std::env::consts::OS,
+            TEST_PACKAGE,
+            prefix.path().to_path_buf(),
+            home.path().to_path_buf(),
         );
-        assert!(
-            !targets.contains(&HarnessId::Codex),
-            "a live command with empty args stays unchanged: {targets:?}"
+        let omp = home.path().join(".omp").join("agent").join("mcp.json");
+        let grok = home.path().join(".grok").join("config.toml");
+
+        let scan = ops.harness_scan();
+        assert!(!scan.grok_registered && !scan.omp_registered, "no files");
+
+        write_file(&grok, "[mcp_servers.other]\ncommand = \"x\"\n");
+        write_file(&omp, "{\"mcpServers\": {\"other\": {}}}");
+        let scan = ops.harness_scan();
+        assert!(!scan.grok_registered && !scan.omp_registered, "no entry");
+
+        write_file(&grok, "[mcp_servers.symforge]\ncommand = \"x\"\n");
+        write_file(
+            &omp,
+            "{\"mcpServers\": {\"symforge\": {\"command\": \"x\"}}}",
         );
-        assert!(
-            home.path()
-                .join(".cursor")
-                .join("mcp.json")
-                .starts_with(home.path())
+        let scan = ops.harness_scan();
+        assert!(scan.grok_registered && scan.omp_registered, "entry present");
+
+        write_file(&grok, "[mcp_servers.symforge\nbad = LEAKMARKER");
+        write_file(&omp, "{ not json LEAKMARKER");
+        let scan = ops.harness_scan();
+        assert!(!scan.grok_registered && !scan.omp_registered, "unparsable");
+        assert_eq!(
+            std::fs::read_to_string(&grok).unwrap(),
+            "[mcp_servers.symforge\nbad = LEAKMARKER",
+            "an unparsable config is never written"
         );
     }
 

@@ -1047,16 +1047,6 @@ fn reconcile_native_stdio_args(
     )
 }
 
-/// Whether `symforge update` must re-run init for this entry. A command that
-/// already names the live binary is not enough: wrapper args left beside it
-/// still launch the wrong process.
-pub(crate) fn stdio_launch_args_need_rewrite(existing: &[String], native_command: &str) -> bool {
-    match reconcile_native_stdio_args(existing, native_command) {
-        Ok(next) => next != existing,
-        Err(_) => true,
-    }
-}
-
 fn json_launch_is_remote(entry: &serde_json::Map<String, Value>) -> bool {
     // Remote type names are the ones the harness docs actually use. A local
     // stdio entry (`stdio`, `local`, or no type) is not remote.
@@ -1166,7 +1156,7 @@ fn refresh_toml_stdio_launch(
     Ok(())
 }
 
-fn toml_has_symforge(text: &str) -> bool {
+pub(crate) fn toml_has_symforge(text: &str) -> bool {
     text.parse::<DocumentMut>().ok().is_some_and(|doc| {
         doc.get("mcp_servers")
             .and_then(Item::as_table_like)
@@ -1174,7 +1164,7 @@ fn toml_has_symforge(text: &str) -> bool {
     })
 }
 
-fn json_has_symforge(text: &str) -> bool {
+pub(crate) fn json_has_symforge(text: &str) -> bool {
     serde_json::from_str::<Value>(text)
         .ok()
         .is_some_and(|value| {

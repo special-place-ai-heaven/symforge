@@ -389,50 +389,6 @@ pub fn registered_command(status: &HarnessStatus) -> Option<String> {
     }
 }
 
-/// The `args` of the SymForge stdio entry.
-///
-/// `Some([])` when the entry exists and `args` is absent. `None` when the
-/// config cannot be read, the entry is absent, or `args` is not a string array.
-pub fn registered_stdio_args(status: &HarnessStatus) -> Option<Vec<String>> {
-    let text = read_config_text(&status.config_path).ok()?;
-    match status.format {
-        HarnessFormat::Json => {
-            let value: Value = serde_json::from_str(&text).ok()?;
-            let entry = value.get("mcpServers")?.get(SYMFORGE_SERVER_NAME)?;
-            match entry.get("args") {
-                None | Some(Value::Null) => Some(Vec::new()),
-                Some(Value::Array(values)) => {
-                    let mut args = Vec::with_capacity(values.len());
-                    for value in values {
-                        args.push(value.as_str()?.to_string());
-                    }
-                    Some(args)
-                }
-                Some(_) => None,
-            }
-        }
-        HarnessFormat::Toml => {
-            let doc = text.parse::<DocumentMut>().ok()?;
-            let entry = doc
-                .get("mcp_servers")?
-                .as_table()?
-                .get(SYMFORGE_SERVER_NAME)?
-                .as_table()?;
-            match entry.get("args") {
-                None => Some(Vec::new()),
-                Some(item) => {
-                    let array = item.as_array()?;
-                    let mut args = Vec::with_capacity(array.len());
-                    for value in array.iter() {
-                        args.push(value.as_str()?.to_string());
-                    }
-                    Some(args)
-                }
-            }
-        }
-    }
-}
-
 fn strip_bearer(header: &str) -> Option<&str> {
     header
         .strip_prefix("Bearer ")
