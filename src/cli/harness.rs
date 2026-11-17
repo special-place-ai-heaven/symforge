@@ -380,9 +380,9 @@ pub fn registered_command(status: &HarnessStatus) -> Option<String> {
             .parse::<DocumentMut>()
             .ok()?
             .get("mcp_servers")?
-            .as_table()?
+            .as_table_like()?
             .get(SYMFORGE_SERVER_NAME)?
-            .as_table()?
+            .as_table_like()?
             .get("command")?
             .as_str()
             .map(str::to_string),
@@ -633,6 +633,27 @@ mod tests {
             config_path: path,
             format: HarnessFormat::Json,
         }
+    }
+
+    #[test]
+    fn registered_command_reads_an_inline_table_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[mcp_servers]\nsymforge = { command = \"/opt/symforge\" }\n",
+        )
+        .unwrap();
+        let status = HarnessStatus {
+            id: HarnessId::Codex,
+            config_path: path,
+            format: HarnessFormat::Toml,
+            state: HarnessState::PresentCurrent,
+        };
+        assert_eq!(
+            registered_command(&status).as_deref(),
+            Some("/opt/symforge")
+        );
     }
 
     #[test]

@@ -38,6 +38,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use crate::cli::harness::{AttachEntry, HarnessId, HarnessRegistry, HarnessState, HarnessStatus};
+use crate::cli::init::EntryKind;
 use crate::daemon::InstalledDaemon;
 use crate::domain::ControlStateDir;
 
@@ -342,10 +343,11 @@ fn remove_orphan_durable_bin_at(control_state_dir: &crate::domain::ControlStateD
 #[derive(Debug, Clone)]
 pub(crate) struct HarnessScan {
     statuses: Vec<HarnessStatus>,
-    /// `~/.grok/config.toml` parses and already has a SymForge entry.
-    grok_registered: bool,
-    /// `~/.omp/agent/mcp.json` parses and already has a SymForge entry.
-    omp_registered: bool,
+    /// What `~/.grok/config.toml` holds for SymForge (`Absent` when it is
+    /// missing, unreadable, or does not parse).
+    grok_entry: EntryKind,
+    /// What `~/.omp/agent/mcp.json` holds for SymForge, same rule.
+    omp_entry: EntryKind,
     /// Harnesses attached over HTTP: no binary path to repoint.
     http_attached: Vec<HarnessId>,
 }
@@ -422,11 +424,18 @@ fn plan_reregistration(scan: &HarnessScan) -> (Vec<Target>, Vec<String>) {
             HarnessState::NotInstalled | HarnessState::Absent => {}
         }
     }
-    if scan.grok_registered {
-        targets.push(Target::GROK);
-    }
-    if scan.omp_registered {
-        targets.push(Target::OMP);
+    for (entry, target) in [
+        (scan.grok_entry, Target::GROK),
+        (scan.omp_entry, Target::OMP),
+    ] {
+        match entry {
+            EntryKind::Stdio => targets.push(target),
+            EntryKind::Remote => skipped.push(format!(
+                "skipped: {} (it attaches over HTTP; there is no binary path to repoint)",
+                target.name
+            )),
+            EntryKind::Absent => {}
+        }
     }
     (targets, skipped)
 }
@@ -824,18 +833,18 @@ impl UpdateOps for RealUpdateOps {
             .collect();
         // An unreadable or unparsable config reads as "no entry": it is neither
         // written nor described.
-        let has_entry = |path: PathBuf, present: fn(&str) -> bool| {
-            crate::cli::init::read_config_text(&path).is_ok_and(|text| present(&text))
+        let entry_of = |path: PathBuf, kind: fn(&str) -> EntryKind| {
+            crate::cli::init::read_config_text(&path).map_or(EntryKind::Absent, |text| kind(&text))
         };
         HarnessScan {
             statuses,
-            grok_registered: has_entry(
+            grok_entry: entry_of(
                 self.home.join(".grok").join("config.toml"),
-                crate::cli::init::toml_has_symforge,
+                crate::cli::init::toml_symforge_entry,
             ),
-            omp_registered: has_entry(
+            omp_entry: entry_of(
                 self.home.join(".omp").join("agent").join("mcp.json"),
-                crate::cli::init::json_has_symforge,
+                crate::cli::init::json_symforge_entry,
             ),
             http_attached,
         }
@@ -1889,8 +1898,8 @@ mod tests {
         initialize: Result<(), String>,
         scan: Vec<(HarnessId, HarnessState)>,
         reregister_fails: Vec<&'static str>,
-        grok_registered: bool,
-        omp_registered: bool,
+        grok_entry: EntryKind,
+        omp_entry: EntryKind,
         reconciled_with: Option<bool>,
         shadow: Option<crate::path_shadow::ShadowReport>,
         mismatch: Option<PrefixMismatch>,
@@ -1923,8 +1932,8 @@ mod tests {
                     (HarnessId::Cursor, HarnessState::NotInstalled),
                 ],
                 reregister_fails: Vec::new(),
-                grok_registered: false,
-                omp_registered: false,
+                grok_entry: EntryKind::Absent,
+                omp_entry: EntryKind::Absent,
                 reconciled_with: None,
                 shadow: None,
                 mismatch: None,
@@ -1997,8 +2006,8 @@ mod tests {
         }
         fn harness_scan(&mut self) -> HarnessScan {
             let mut scan = scan_of(&self.scan);
-            scan.grok_registered = self.grok_registered;
-            scan.omp_registered = self.omp_registered;
+            scan.grok_entry = self.grok_entry;
+            scan.omp_entry = self.omp_entry;
             scan
         }
         fn reregister(&mut self, target: Target) -> anyhow::Result<()> {
@@ -2048,8 +2057,8 @@ mod tests {
                     state: state.clone(),
                 })
                 .collect(),
-            grok_registered: false,
-            omp_registered: false,
+            grok_entry: EntryKind::Absent,
+            omp_entry: EntryKind::Absent,
             http_attached: Vec::new(),
         }
     }
@@ -2902,8 +2911,8 @@ mod tests {
             ),
             (HarnessId::KiloCode, HarnessState::PresentCurrent),
         ]);
-        scan.grok_registered = true;
-        scan.omp_registered = true;
+        scan.grok_entry = EntryKind::Stdio;
+        scan.omp_entry = EntryKind::Stdio;
 
         let (targets, skipped) = plan_reregistration(&scan);
 
@@ -2933,6 +2942,18 @@ mod tests {
     }
 
     #[test]
+    fn plan_reregistration_skips_remote_grok_and_omp_entries_with_a_note() {
+        let mut scan = scan_of(&[]);
+        scan.grok_entry = EntryKind::Remote;
+        scan.omp_entry = EntryKind::Remote;
+        let (targets, notes) = plan_reregistration(&scan);
+        assert!(targets.is_empty(), "{targets:?}");
+        let text = notes.join("\n");
+        assert!(text.contains("Grok (it attaches over HTTP"), "{text}");
+        assert!(text.contains("Oh My Pi (it attaches over HTTP"), "{text}");
+    }
+
+    #[test]
     fn plan_reregistration_without_a_grok_or_omp_entry_is_silent() {
         let (targets, notes) = plan_reregistration(&scan_of(&[]));
         assert!(
@@ -2945,8 +2966,8 @@ mod tests {
     fn orchestrate_update_reregisters_grok_and_omp_and_reports_their_failure() {
         let mut ops = FakeOps {
             reregister_fails: vec!["omp"],
-            grok_registered: true,
-            omp_registered: true,
+            grok_entry: EntryKind::Stdio,
+            omp_entry: EntryKind::Stdio,
             ..Default::default()
         };
         let mut summary = UpdateSummary::default();
@@ -3599,12 +3620,18 @@ mod tests {
         let grok = home.path().join(".grok").join("config.toml");
 
         let scan = ops.harness_scan();
-        assert!(!scan.grok_registered && !scan.omp_registered, "no files");
+        assert!(
+            scan.grok_entry == EntryKind::Absent && scan.omp_entry == EntryKind::Absent,
+            "no files"
+        );
 
         write_file(&grok, "[mcp_servers.other]\ncommand = \"x\"\n");
         write_file(&omp, "{\"mcpServers\": {\"other\": {}}}");
         let scan = ops.harness_scan();
-        assert!(!scan.grok_registered && !scan.omp_registered, "no entry");
+        assert!(
+            scan.grok_entry == EntryKind::Absent && scan.omp_entry == EntryKind::Absent,
+            "no entry"
+        );
 
         write_file(&grok, "[mcp_servers.symforge]\ncommand = \"x\"\n");
         write_file(
@@ -3612,17 +3639,50 @@ mod tests {
             "{\"mcpServers\": {\"symforge\": {\"command\": \"x\"}}}",
         );
         let scan = ops.harness_scan();
-        assert!(scan.grok_registered && scan.omp_registered, "entry present");
+        assert!(
+            scan.grok_entry == EntryKind::Stdio && scan.omp_entry == EntryKind::Stdio,
+            "entry present"
+        );
 
         write_file(&grok, "[mcp_servers.symforge\nbad = LEAKMARKER");
         write_file(&omp, "{ not json LEAKMARKER");
         let scan = ops.harness_scan();
-        assert!(!scan.grok_registered && !scan.omp_registered, "unparsable");
+        assert!(
+            scan.grok_entry == EntryKind::Absent && scan.omp_entry == EntryKind::Absent,
+            "unparsable"
+        );
         assert_eq!(
             std::fs::read_to_string(&grok).unwrap(),
             "[mcp_servers.symforge\nbad = LEAKMARKER",
             "an unparsable config is never written"
         );
+    }
+
+    #[test]
+    fn a_remote_grok_or_omp_entry_is_skipped_with_a_note_not_reregistered() {
+        let (prefix, _modules) = fake_install();
+        let home = tempfile::tempdir().unwrap();
+        let mut ops = RealUpdateOps::new(
+            std::env::consts::OS,
+            TEST_PACKAGE,
+            prefix.path().to_path_buf(),
+            home.path().to_path_buf(),
+        );
+        write_file(
+            &home.path().join(".grok").join("config.toml"),
+            "[mcp_servers.symforge]\nurl = \"http://127.0.0.1:8787/mcp\"\n",
+        );
+        write_file(
+            &home.path().join(".omp").join("agent").join("mcp.json"),
+            r#"{"mcpServers":{"symforge":{"type":"http","url":"http://127.0.0.1:8787/mcp"}}}"#,
+        );
+
+        let (targets, notes) = plan_reregistration(&ops.harness_scan());
+
+        assert!(targets.is_empty(), "{targets:?}");
+        let text = notes.join("\n");
+        assert!(text.contains("Grok (it attaches over HTTP"), "{text}");
+        assert!(text.contains("Oh My Pi (it attaches over HTTP"), "{text}");
     }
 
     #[test]
