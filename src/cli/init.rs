@@ -1047,16 +1047,6 @@ fn reconcile_native_stdio_args(
     )
 }
 
-/// Whether `symforge update` must re-run init for this entry. A command that
-/// already names the live binary is not enough: wrapper args left beside it
-/// still launch the wrong process.
-pub(crate) fn stdio_launch_args_need_rewrite(existing: &[String], native_command: &str) -> bool {
-    match reconcile_native_stdio_args(existing, native_command) {
-        Ok(next) => next != existing,
-        Err(_) => true,
-    }
-}
-
 fn json_launch_is_remote(entry: &serde_json::Map<String, Value>) -> bool {
     // Remote type names are the ones the harness docs actually use. A local
     // stdio entry (`stdio`, `local`, or no type) is not remote.
@@ -1172,6 +1162,46 @@ fn toml_has_symforge(text: &str) -> bool {
             .and_then(Item::as_table_like)
             .is_some_and(|table| table.get("symforge").is_some())
     })
+}
+
+/// What a client config holds for SymForge, by the rule the writers use to
+/// decide whether there is a launch command to repoint (`*_launch_is_remote`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntryKind {
+    Absent,
+    Stdio,
+    Remote,
+}
+
+pub(crate) fn toml_symforge_entry(text: &str) -> EntryKind {
+    let Ok(doc) = text.parse::<DocumentMut>() else {
+        return EntryKind::Absent;
+    };
+    let Some(entry) = doc
+        .get("mcp_servers")
+        .and_then(Item::as_table_like)
+        .and_then(|table| table.get("symforge"))
+    else {
+        return EntryKind::Absent;
+    };
+    match entry.as_table_like() {
+        Some(server) if toml_launch_is_remote(server) => EntryKind::Remote,
+        _ => EntryKind::Stdio,
+    }
+}
+
+pub(crate) fn json_symforge_entry(text: &str) -> EntryKind {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return EntryKind::Absent;
+    };
+    match value
+        .get("mcpServers")
+        .and_then(|servers| servers.get("symforge"))
+    {
+        None => EntryKind::Absent,
+        Some(entry) if entry.as_object().is_some_and(json_launch_is_remote) => EntryKind::Remote,
+        Some(_) => EntryKind::Stdio,
+    }
 }
 
 fn json_has_symforge(text: &str) -> bool {
@@ -1706,7 +1736,10 @@ pub fn register_grok_mcp_server(
         );
         set_toml_item_preserving_decor(symforge, "args", value(Array::new()));
     }
-    set_toml_item_preserving_decor(symforge, "enabled", value(true));
+    // A user's `enabled = false` is theirs; update runs this on every run.
+    if symforge.get("enabled").is_none() {
+        set_toml_item_preserving_decor(symforge, "enabled", value(true));
+    }
     if symforge.get("env").is_none_or(|item| !item.is_table_like()) {
         symforge.insert("env", Item::Table(Table::new()));
     }
@@ -4073,6 +4106,41 @@ url = 'http://127.0.0.1:9/mcp'
         assert_eq!(
             doc["mcp_servers"]["symforge"]["url"].as_str(),
             Some("http://127.0.0.1:9/mcp")
+        );
+    }
+
+    #[test]
+    fn grok_registration_keeps_a_disabled_flag_and_defaults_it_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[mcp_servers.symforge]\ncommand = '/old/symforge'\nenabled = false\n",
+        )
+        .unwrap();
+        register_grok_mcp_server(&path, "/usr/local/bin/symforge").unwrap();
+        let doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let entry = &doc["mcp_servers"]["symforge"];
+        assert_eq!(entry["enabled"].as_bool(), Some(false), "{doc}");
+        assert_eq!(
+            entry["command"].as_str(),
+            Some(native_command_path("/usr/local/bin/symforge").as_str()),
+            "the rest of the entry is still repaired"
+        );
+        assert_eq!(entry["env"]["RUST_LOG"].as_str(), Some("off"));
+
+        std::fs::write(&path, "[mcp_servers.symforge]\ncommand = '/old/symforge'\n").unwrap();
+        register_grok_mcp_server(&path, "/usr/local/bin/symforge").unwrap();
+        let doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            doc["mcp_servers"]["symforge"]["enabled"].as_bool(),
+            Some(true)
         );
     }
 

@@ -380,56 +380,12 @@ pub fn registered_command(status: &HarnessStatus) -> Option<String> {
             .parse::<DocumentMut>()
             .ok()?
             .get("mcp_servers")?
-            .as_table()?
+            .as_table_like()?
             .get(SYMFORGE_SERVER_NAME)?
-            .as_table()?
+            .as_table_like()?
             .get("command")?
             .as_str()
             .map(str::to_string),
-    }
-}
-
-/// The `args` of the SymForge stdio entry.
-///
-/// `Some([])` when the entry exists and `args` is absent. `None` when the
-/// config cannot be read, the entry is absent, or `args` is not a string array.
-pub fn registered_stdio_args(status: &HarnessStatus) -> Option<Vec<String>> {
-    let text = read_config_text(&status.config_path).ok()?;
-    match status.format {
-        HarnessFormat::Json => {
-            let value: Value = serde_json::from_str(&text).ok()?;
-            let entry = value.get("mcpServers")?.get(SYMFORGE_SERVER_NAME)?;
-            match entry.get("args") {
-                None | Some(Value::Null) => Some(Vec::new()),
-                Some(Value::Array(values)) => {
-                    let mut args = Vec::with_capacity(values.len());
-                    for value in values {
-                        args.push(value.as_str()?.to_string());
-                    }
-                    Some(args)
-                }
-                Some(_) => None,
-            }
-        }
-        HarnessFormat::Toml => {
-            let doc = text.parse::<DocumentMut>().ok()?;
-            let entry = doc
-                .get("mcp_servers")?
-                .as_table()?
-                .get(SYMFORGE_SERVER_NAME)?
-                .as_table()?;
-            match entry.get("args") {
-                None => Some(Vec::new()),
-                Some(item) => {
-                    let array = item.as_array()?;
-                    let mut args = Vec::with_capacity(array.len());
-                    for value in array.iter() {
-                        args.push(value.as_str()?.to_string());
-                    }
-                    Some(args)
-                }
-            }
-        }
     }
 }
 
@@ -677,6 +633,27 @@ mod tests {
             config_path: path,
             format: HarnessFormat::Json,
         }
+    }
+
+    #[test]
+    fn registered_command_reads_an_inline_table_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[mcp_servers]\nsymforge = { command = \"/opt/symforge\" }\n",
+        )
+        .unwrap();
+        let status = HarnessStatus {
+            id: HarnessId::Codex,
+            config_path: path,
+            format: HarnessFormat::Toml,
+            state: HarnessState::PresentCurrent,
+        };
+        assert_eq!(
+            registered_command(&status).as_deref(),
+            Some("/opt/symforge")
+        );
     }
 
     #[test]
