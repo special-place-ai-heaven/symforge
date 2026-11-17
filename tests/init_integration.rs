@@ -450,7 +450,11 @@ SYMFORGE_WORKSPACE_ROOT = "/repo/init/ran/in"
         Some(expected_command.as_str())
     );
     assert_eq!(symforge["args"].as_array().map(|args| args.len()), Some(0));
-    assert_eq!(symforge["enabled"].as_bool(), Some(true));
+    assert_eq!(
+        symforge["enabled"].as_bool(),
+        Some(false),
+        "a disabled flag the user set is kept, as for every other client"
+    );
     assert_eq!(symforge["env"]["RUST_LOG"].as_str(), Some("off"));
     assert!(
         symforge["env"].get("SYMFORGE_WORKSPACE_ROOT").is_none(),
