@@ -544,7 +544,7 @@ f2a81ae06d5917fc2efc8545d3bffc289370092ea77cc4f93cbdf685c866d274  protocol/sessi
 
 732cd5d4916ecccb4554c004e8c7c799b78888f75bee6173fccd46f3286ce28a  protocol/tool_contract.rs
 
-5bc33392012aae17c2f3f7d95e6aea9ca0a295a1e509963dbde4a8c658384db6  protocol/tools.rs
+f9814d0ade742894aba361ccc3c35c3e7570f6ce35bc55df5c78be2ffbe65fc2  protocol/tools.rs
 
 ccaa0f8a3ff262982f65a97e4f41b0cdc5e73bb8b5cf6e0ccbac2139ae53ef0d  protocol/tools/tests/find_references.rs
 

@@ -1016,12 +1016,9 @@ fn admission_degradation_view_from_disk(
 /// degraded block from reporting a withheld file's exact byte length: the view
 /// a renderer could leak from is never built.
 ///
-/// The first refusal runs BEFORE any syscall, so the answer is a pure function
-/// of the requested path plus the manifest and is identical for a demoted file
-/// that exists and one that does not — otherwise the difference between this
-/// block and `File not found:` is a one-bit existence oracle. `refuse_by_policy`
-/// therefore names no finding lines; only the gate's read lane, which opens the
-/// file anyway, adds them. The second runs
+/// The first refusal checks the requested path against the manifest. A present
+/// withheld file names its finding lines; a missing one gets the same refusal
+/// without lines (docs/solutions/withheld-file-diagnostics.md). The second runs
 /// on the RESOLVED path, which can differ from the requested string (absolute
 /// arguments do not normalize against a catalog key) and is the only clause
 /// that catches a content-detected demotion reached that way.
