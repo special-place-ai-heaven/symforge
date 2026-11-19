@@ -11,7 +11,8 @@ pub(super) fn validate(request: &SymbolReadRequest) -> Result<(), QueryRefusalKi
         return Err(QueryRefusalKind::InvalidRequest);
     }
     if let Some(targets) = &request.targets {
-        if targets.is_empty() || targets.len() > 10_000 {
+        if targets.is_empty() || targets.len() > super::guidance::read_contract::MAX_SYMBOL_TARGETS
+        {
             return Err(QueryRefusalKind::InvalidRequest);
         }
         for target in targets {

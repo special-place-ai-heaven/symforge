@@ -2,6 +2,9 @@
 use super::serde_input::{lenient_bool, lenient_u32};
 use crate::live_index::search;
 use serde::{Deserialize, Serialize};
+
+pub(crate) const MAX_SYMBOL_TARGETS: usize = 10_000;
+
 #[cfg_attr(feature = "server", derive(schemars::JsonSchema))]
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

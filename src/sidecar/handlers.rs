@@ -887,6 +887,13 @@ async fn impact_text(
                 )
             },
             &mut cache,
+            &mut |live, relative| {
+                crate::index_lifecycle::guidance::read_gate::refuse_by_policy_naming_lines_with(
+                    live,
+                    relative,
+                    &mut |_| {},
+                )
+            },
         )
     })
     .await

@@ -1196,7 +1196,11 @@ pub(crate) fn render_withheld_files_section(
     let mut withheld: Vec<(&str, String)> = entries
         .iter()
         .filter_map(|entry| {
-            let path = entry.path.normalized_utf8.as_deref()?;
+            let path = entry
+                .path
+                .normalized_utf8
+                .as_deref()
+                .unwrap_or(entry.path.public_id.as_str());
             let FileDisposition::MetadataOnly { reason } = &entry.disposition else {
                 return None;
             };
@@ -1242,6 +1246,13 @@ pub(crate) fn render_withheld_files_section(
         section.push_str(&format!(
             "\n  {}. {path} - {detail}",
             window.offset + index + 1
+        ));
+    }
+    if shown.is_empty() {
+        section.push_str(&format!(
+            "\n  (offset {} is past the end of the {total} withheld file{})",
+            window.offset,
+            if total == 1 { "" } else { "s" }
         ));
     }
     if total > window.offset.saturating_add(shown.len()) {
@@ -2410,14 +2421,14 @@ pub(crate) fn render_health_report(
         crate::live_index::store::configured_inflight_byte_budget(),
         &inputs.settled_unreadable,
     ));
-    // Issue #876: from the same entry capture, so the counts are this report's
-    // generation; every lane (local, daemon session, embed) renders it.
     if let Some(manifest) = generation.manifest.as_deref()
         && let Some(withheld) = render_withheld_files_section(&manifest.entries, quarantine_window)
     {
         result.push('\n');
         result.push_str(&withheld);
     }
+    // Issue #876: from the same entry capture, so the counts are this report's
+    // generation; every lane (local, daemon session, embed) renders it.
     result.push('\n');
     result.push_str(&format_memory_health(&generation));
     result.push('\n');
@@ -2574,6 +2585,29 @@ mod withheld_files_section_tests {
                 },
             },
         )
+    }
+
+    #[test]
+    fn health_withheld_list_keeps_entries_without_a_utf8_path() {
+        let mut odd = content("placeholder", "secret.uri-credentials", 2);
+        odd.path.normalized_utf8 = None;
+        odd.path.public_id = "src/odd-name.rs".to_string();
+        let entries = vec![content("src/a.rs", "secret.uri-credentials", 1), odd];
+        let section = render_withheld_files_section(&entries, QuarantineWindow::default())
+            .expect("withheld files must render");
+        assert!(section.contains("2 files"), "{section}");
+        assert!(section.contains("src/odd-name.rs"), "{section}");
+    }
+
+    #[test]
+    fn health_withheld_list_says_so_when_the_offset_is_past_the_end() {
+        let entries = vec![content("src/a.rs", "secret.uri-credentials", 1)];
+        let section =
+            render_withheld_files_section(&entries, QuarantineWindow::from_args(Some(5), Some(2)))
+                .expect("section");
+        assert!(section.contains("1 file"), "{section}");
+        assert!(section.contains("offset 5 is past the end"), "{section}");
+        assert!(!section.contains("1. "), "{section}");
     }
 
     #[test]

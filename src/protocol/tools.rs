@@ -290,9 +290,11 @@ pub struct CheckpointNowInput {
 pub struct HealthInput {
     /// Maximum quarantine registry entries to render (default 10, capped at
     /// 1000). Raise to retrieve more of the full partial/failed file list.
+    /// The same window also pages the list of files withheld by admission policy.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub quarantine_limit: Option<u32>,
-    /// Offset into the ranked quarantine registry for paging (default 0).
+    /// Offset into the ranked quarantine registry for paging (default 0). The same
+    /// offset also pages the list of files withheld by admission policy.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub quarantine_offset: Option<u32>,
 }
@@ -911,11 +913,10 @@ fn admission_degradation_view_from_lookup(
     }
 }
 
-fn admission_degradation_view_from_disk(
-    live: &LiveIndex,
+fn repo_relative_file(
     repo_root: &Path,
     path: &str,
-) -> Option<AdmissionDegradationView> {
+) -> Option<(std::path::PathBuf, std::fs::Metadata, String)> {
     let canonical_root = std::fs::canonicalize(repo_root).ok()?;
     let raw_path = Path::new(path);
     let candidate = if raw_path.is_absolute() {
@@ -939,6 +940,15 @@ fn admission_degradation_view_from_disk(
         .map(|relative| relative.to_string_lossy().replace('\\', "/"))
         .filter(|relative| !relative.is_empty())
         .unwrap_or_else(|| crate::protocol::read_gate::normalize_requested_path(path));
+    Some((canonical_candidate, metadata, relative_path))
+}
+
+fn admission_degradation_view_from_disk(
+    live: &LiveIndex,
+    repo_root: &Path,
+    path: &str,
+) -> Option<AdmissionDegradationView> {
+    let (canonical_candidate, metadata, relative_path) = repo_relative_file(repo_root, path)?;
 
     // The binary sniff below OPENS the file, so the admission gate's no-bytes
     // policy decides first and a demoted path is never read here. Callers
@@ -1006,21 +1016,39 @@ fn admission_degradation_view_from_disk(
 /// degraded block from reporting a withheld file's exact byte length: the view
 /// a renderer could leak from is never built.
 ///
-/// A recorded content demotion is refused with its rule, count and finding
-/// lines, the lines recomputed from a bounded re-read of the file; when the
-/// file cannot be read the same refusal is returned without lines. The second
-/// check runs on the RESOLVED path, which can differ from the requested string
-/// (absolute arguments do not normalize against a catalog key) and is the only
-/// clause that catches a content-detected demotion reached that way.
+/// The first refusal runs BEFORE any syscall, so the answer is a pure function
+/// of the requested path plus the manifest and is identical for a demoted file
+/// that exists and one that does not — otherwise the difference between this
+/// block and `File not found:` is a one-bit existence oracle. `refuse_by_policy`
+/// therefore names no finding lines; only the gate's read lane, which opens the
+/// file anyway, adds them. The second runs
+/// on the RESOLVED path, which can differ from the requested string (absolute
+/// arguments do not normalize against a catalog key) and is the only clause
+/// that catches a content-detected demotion reached that way.
 fn admission_degradation_view_for_path(
     index: &LiveIndex,
     repo_root: Option<&Path>,
     path: &str,
 ) -> Result<Option<AdmissionDegradationView>, String> {
+    admission_degradation_view_with(index, repo_root, path, &mut |checked| {
+        crate::protocol::read_gate::refuse_by_policy_naming_lines(index, checked)
+    })
+}
+
+fn admission_degradation_view_with(
+    index: &LiveIndex,
+    repo_root: Option<&Path>,
+    path: &str,
+    refuse: &mut dyn FnMut(&str) -> Option<String>,
+) -> Result<Option<AdmissionDegradationView>, String> {
     // Normalized first (pure string work) so `./x` and `x` refuse alike.
     let requested = crate::protocol::read_gate::normalize_requested_path(path);
-    if let Some(refusal) =
-        crate::protocol::read_gate::refuse_by_policy_naming_lines(index, &requested)
+    if let Some(refusal) = refuse(&requested) {
+        return Err(refusal);
+    }
+    if let Some((_, _, resolved)) = repo_root.and_then(|root| repo_relative_file(root, path))
+        && resolved != requested
+        && let Some(refusal) = refuse(&resolved)
     {
         return Err(refusal);
     }
@@ -1033,9 +1061,7 @@ fn admission_degradation_view_for_path(
     else {
         return Ok(None);
     };
-    if let Some(refusal) =
-        crate::protocol::read_gate::refuse_by_policy_naming_lines(index, &view.path)
-    {
+    if let Some(refusal) = refuse(&view.path) {
         return Err(refusal);
     }
     Ok(Some(view))
@@ -1599,11 +1625,22 @@ enum CapturedGetSymbolsEntry {
     },
 }
 
-fn unresolved_batch_target(index: &LiveIndex, path: &str) -> CapturedGetSymbolsEntry {
-    let requested = crate::protocol::read_gate::normalize_requested_path(path);
-    match crate::protocol::read_gate::refuse_by_policy_naming_lines(index, &requested) {
-        Some(refusal) => CapturedGetSymbolsEntry::Withheld { refusal },
-        None => CapturedGetSymbolsEntry::FileNotFound {
+fn unresolved_batch_target(
+    index: &LiveIndex,
+    repo_root: Option<&Path>,
+    memo: &mut HashMap<String, Option<String>>,
+    path: &str,
+) -> CapturedGetSymbolsEntry {
+    let mut refuse = |checked: &str| {
+        memo.entry(checked.to_string())
+            .or_insert_with(|| {
+                crate::protocol::read_gate::refuse_by_policy_naming_lines(index, checked)
+            })
+            .clone()
+    };
+    match admission_degradation_view_with(index, repo_root, path, &mut refuse) {
+        Err(refusal) => CapturedGetSymbolsEntry::Withheld { refusal },
+        Ok(_) => CapturedGetSymbolsEntry::FileNotFound {
             path: path.to_string(),
         },
     }
@@ -1903,6 +1940,14 @@ impl SymForgeServer {
                 record_read_outcome(ReadOutcome::InvalidRequest);
                 return "Error: targets array is empty.".to_string();
             }
+            if targets.len() > crate::index_lifecycle::guidance::read_contract::MAX_SYMBOL_TARGETS {
+                record_read_outcome(ReadOutcome::InvalidRequest);
+                return format!(
+                    "Error: targets array has {} entries; the limit is {}.",
+                    targets.len(),
+                    crate::index_lifecycle::guidance::read_contract::MAX_SYMBOL_TARGETS
+                );
+            }
             // Spec 036 item 3: each target's file is compared with the disk
             // (and re-indexed when it differs) before the capture.
             let mut paths: Vec<&str> = targets.iter().map(|target| target.path.as_str()).collect();
@@ -1926,6 +1971,8 @@ impl SymForgeServer {
                 record_read_outcome(unavailable_outcome(&generation.health));
                 return message;
             }
+            let repo_root = self.capture_repo_root();
+            let mut memo: HashMap<String, Option<String>> = HashMap::new();
             let captured = {
                 let guard = &generation.live;
 
@@ -1939,10 +1986,20 @@ impl SymForgeServer {
                                 kind: target.kind.clone(),
                                 symbol_line: target.symbol_line,
                             },
-                            None => unresolved_batch_target(guard, &target.path),
+                            None => unresolved_batch_target(
+                                guard,
+                                repo_root.as_deref(),
+                                &mut memo,
+                                &target.path,
+                            ),
                         },
                         None => match guard.capture_shared_file(&target.path) {
-                            None => unresolved_batch_target(guard, &target.path),
+                            None => unresolved_batch_target(
+                                guard,
+                                repo_root.as_deref(),
+                                &mut memo,
+                                &target.path,
+                            ),
                             Some(file) => CapturedGetSymbolsEntry::CodeSlice {
                                 file,
                                 start_byte: target.start_byte.unwrap_or(0) as usize,
@@ -14476,7 +14533,7 @@ mod tests {
             .await;
         assert!(
             result.contains(
-                "Status: indexed and unchanged\nBasis: re-read from disk; content hash identical"
+                "Status: indexed and unchanged\nBasis: re-read from disk; content hash identical to the indexed copy"
             ),
             "the status must say what was observed; got: {result}"
         );
@@ -35384,6 +35441,97 @@ mod tests {
             .get_symbol(Parameters(get_symbol_input("src/probe.rs", "a")))
             .await;
         assert_withheld_probe_refusal(&out);
+    }
+
+    fn batch_target(path: &str) -> super::SymbolTarget {
+        super::SymbolTarget {
+            path: path.to_string(),
+            name: Some("a".to_string()),
+            kind: None,
+            symbol_line: None,
+            start_byte: None,
+            end_byte: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_symbol_batch_reads_evidence_once_per_distinct_withheld_path() {
+        let (_repo, server) = withheld_probe_server();
+        let mut input = get_symbol_input("", "");
+        input.targets = Some((0..50).map(|_| batch_target("src/probe.rs")).collect());
+        crate::index_lifecycle::guidance::read_gate::reset_evidence_reads_for_tests();
+        let out = server.get_symbol(Parameters(input)).await;
+        assert_eq!(
+            out.matches(WITHHELD_REFUSAL_PREFIX).count(),
+            50,
+            "{}",
+            refusal_shape(&out)
+        );
+        assert_eq!(
+            crate::index_lifecycle::guidance::read_gate::evidence_reads_for_tests(),
+            1,
+            "one scan per distinct path, not per target"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_symbol_batch_refuses_an_absolute_path_to_a_withheld_file() {
+        let (repo, server) = withheld_probe_server();
+        let absolute = repo
+            .path()
+            .join("src/probe.rs")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut input = get_symbol_input("", "");
+        input.targets = Some(vec![batch_target(&absolute)]);
+        let out = server.get_symbol(Parameters(input)).await;
+        assert_withheld_probe_refusal(&out);
+        assert!(!out.contains("File not found"), "{}", refusal_shape(&out));
+    }
+
+    #[tokio::test]
+    async fn get_symbol_batch_caps_the_number_of_targets() {
+        let (_repo, server) = withheld_probe_server();
+        let mut input = get_symbol_input("", "");
+        input.targets = Some((0..10_001).map(|_| batch_target("src/probe.rs")).collect());
+        let out = server.get_symbol(Parameters(input)).await;
+        assert!(out.starts_with("Error: targets"), "{}", refusal_shape(&out));
+        assert!(
+            !out.starts_with(WITHHELD_REFUSAL_PREFIX),
+            "{}",
+            refusal_shape(&out)
+        );
+    }
+
+    #[test]
+    fn caller_supplied_reader_names_lines_without_touching_the_index_root() {
+        let (repo, mut live) = admission_probe_repo();
+        live.manifest_entries = vec![recorded_content_demotion(
+            "src/probe.rs",
+            "secret.context-assignment",
+        )];
+        let bytes = fs::read(repo.path().join("src/probe.rs")).expect("read probe");
+        live.indexed_root = None;
+        crate::index_lifecycle::guidance::read_gate::reset_evidence_reads_for_tests();
+        let mut reads = 0;
+        let refusal =
+            crate::index_lifecycle::guidance::read_gate::refuse_by_policy_naming_lines_via(
+                &live,
+                "src/probe.rs",
+                &mut |_| {},
+                &mut || {
+                    reads += 1;
+                    Some(bytes.clone())
+                },
+            )
+            .expect("a recorded demotion must refuse");
+        assert_names_rule_and_line_without_bypass(&refusal);
+        assert_eq!(reads, 1);
+        assert_eq!(
+            crate::index_lifecycle::guidance::read_gate::evidence_reads_for_tests(),
+            0,
+            "the ambient disk reader must not run"
+        );
     }
 
     #[tokio::test]

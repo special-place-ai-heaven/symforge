@@ -211,14 +211,11 @@ pub(crate) fn classify_admitted_bytes_with(
     None
 }
 
-/// The refusal for a RECORDED content demotion, naming its finding lines from a
-/// bounded re-read of the file. `None` when the refusal is not a recorded
-/// content match (a path rule or a detector failure takes precedence) or no
-/// lines were recovered; the caller then keeps the line-free policy refusal.
-pub(crate) fn recorded_refusal_naming_lines_with(
+pub(crate) fn recorded_refusal_naming_lines_via(
     live: &LiveIndex,
     relative_path: &str,
     record: &mut dyn FnMut(WithheldMeta),
+    read_bytes: &mut dyn FnMut() -> Option<Vec<u8>>,
 ) -> Option<String> {
     if crate::knowledge::sensitive_path_rule(relative_path).is_some() {
         return None;
@@ -239,7 +236,10 @@ pub(crate) fn recorded_refusal_naming_lines_with(
     {
         return None;
     }
-    let (line_ranges, findings) = recorded_finding_evidence(live, relative_path, rule_ids);
+    let (line_ranges, findings) = match read_bytes() {
+        Some(bytes) => recorded_finding_evidence_from_bytes(relative_path, &bytes, rule_ids),
+        None => (Vec::new(), Vec::new()),
+    };
     if !findings.is_empty() {
         record(WithheldMeta::from_content_findings(
             relative_path,
@@ -251,36 +251,63 @@ pub(crate) fn recorded_refusal_naming_lines_with(
     })
 }
 
-/// [`refuse_by_policy_with`], plus the finding lines of a recorded content
-/// demotion when the file can be re-read. For lanes that render the refusal.
+pub(crate) fn recorded_refusal_naming_lines_with(
+    live: &LiveIndex,
+    relative_path: &str,
+    record: &mut dyn FnMut(WithheldMeta),
+) -> Option<String> {
+    recorded_refusal_naming_lines_via(live, relative_path, record, &mut || {
+        disk_evidence_bytes(live, relative_path)
+    })
+}
+
+pub(crate) fn refuse_by_policy_naming_lines_via(
+    live: &LiveIndex,
+    relative_path: &str,
+    record: &mut dyn FnMut(WithheldMeta),
+    read_bytes: &mut dyn FnMut() -> Option<Vec<u8>>,
+) -> Option<String> {
+    let refusal = refuse_by_policy_with(live, relative_path, record)?;
+    Some(
+        recorded_refusal_naming_lines_via(live, relative_path, record, read_bytes)
+            .unwrap_or(refusal),
+    )
+}
+
 pub(crate) fn refuse_by_policy_naming_lines_with(
     live: &LiveIndex,
     relative_path: &str,
     record: &mut dyn FnMut(WithheldMeta),
 ) -> Option<String> {
-    let refusal = refuse_by_policy_with(live, relative_path, record)?;
-    Some(recorded_refusal_naming_lines_with(live, relative_path, record).unwrap_or(refusal))
+    refuse_by_policy_naming_lines_via(live, relative_path, record, &mut || {
+        disk_evidence_bytes(live, relative_path)
+    })
 }
 
-fn recorded_finding_evidence(
-    live: &LiveIndex,
-    relative_path: &str,
-    recorded: &[String],
-) -> (
-    Vec<(u32, u32)>,
-    Vec<crate::knowledge::SecretFindingDescriptor>,
-) {
-    let Some(root) = live.indexed_root.as_deref() else {
-        return (Vec::new(), Vec::new());
-    };
-    let Ok(Some(full_path)) = crate::discovery::resolve_repo_path(root, relative_path) else {
-        return (Vec::new(), Vec::new());
-    };
+#[cfg(all(test, feature = "server"))]
+thread_local! {
+    static EVIDENCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, feature = "server"))]
+pub(crate) fn reset_evidence_reads_for_tests() {
+    EVIDENCE_READS.with(|reads| reads.set(0));
+}
+
+#[cfg(all(test, feature = "server"))]
+pub(crate) fn evidence_reads_for_tests() -> usize {
+    EVIDENCE_READS.with(std::cell::Cell::get)
+}
+
+fn disk_evidence_bytes(live: &LiveIndex, relative_path: &str) -> Option<Vec<u8>> {
+    #[cfg(all(test, feature = "server"))]
+    EVIDENCE_READS.with(|reads| reads.set(reads.get() + 1));
+    let root = live.indexed_root.as_deref()?;
+    let full_path = crate::discovery::resolve_repo_path(root, relative_path)
+        .ok()
+        .flatten()?;
     let budget = crate::knowledge::SECRET_SCAN_MAX_BYTES as u64 + 1;
-    let Ok(bytes) = read_regular_file_limited(&full_path, Some(budget)) else {
-        return (Vec::new(), Vec::new());
-    };
-    recorded_finding_evidence_from_bytes(relative_path, &bytes, recorded)
+    read_regular_file_limited(&full_path, Some(budget)).ok()
 }
 
 /// Match bounded current bytes to the recorded rule set before adding actionable

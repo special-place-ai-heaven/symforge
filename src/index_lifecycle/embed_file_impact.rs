@@ -141,6 +141,22 @@ pub(super) fn admit(
             receipt
         },
         &mut cache,
+        &mut |live, relative| {
+            super::guidance::read_gate::refuse_by_policy_naming_lines_via(
+                live,
+                relative,
+                &mut |_| {},
+                &mut || {
+                    authority
+                        .read_regular_beneath_anchor(
+                            Path::new(relative),
+                            crate::knowledge::SECRET_SCAN_MAX_BYTES,
+                        )
+                        .ok()
+                        .flatten()
+                },
+            )
+        },
     );
     match rendered {
         Ok(render) => Ok(FileImpactAdmission {

@@ -203,8 +203,6 @@ pub(crate) fn refuse_by_policy(live: &LiveIndex, relative_path: &str) -> Option<
     )
 }
 
-/// [`refuse_by_policy`] for a lane that renders the refusal: a recorded content
-/// demotion also names its finding lines, recomputed from a bounded re-read.
 pub(crate) fn refuse_by_policy_naming_lines(
     live: &LiveIndex,
     relative_path: &str,
