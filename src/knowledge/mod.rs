@@ -223,7 +223,8 @@ pub fn scan_secret_spans(path: &str, bytes: &[u8]) -> SecretSpansScan {
             return SecretSpansScan::Indeterminate { reason: *reason };
         }
     };
-    let (relaxed, rust) = (relaxed_code_path(path), is_rust_path(path));
+    let scan_path = classify_scan_path(path);
+    let (relaxed, rust) = (scan_path.relaxed, scan_path.rust);
     let mut spans = Vec::new();
     for rule in rules {
         if !rule
@@ -261,13 +262,14 @@ pub fn scan_secret_spans(path: &str, bytes: &[u8]) -> SecretSpansScan {
                     secret.end(),
                     relaxed.then_some(rust),
                 )
-                .is_some_and(|from| !expression_carries_quoted_payload(bytes, from, false, relaxed))
-                {
+                .is_some_and(|from| {
+                    !expression_carries_quoted_payload(bytes, from, false, scan_path)
+                }) {
                     continue;
                 }
             } else if (rule.id == CONTEXT_ASSIGNMENT_RULE_ID
                 && (assignment_is_code_expression(
-                    path,
+                    scan_path,
                     bytes,
                     match_start,
                     secret.start(),
@@ -622,17 +624,21 @@ fn closing_delimiter_after(bytes: &[u8], from: usize, delimiter: u8) -> Option<u
         .map(|offset| from + offset)
 }
 
-fn enclosing_literal_end(bytes: &[u8], capture_end: usize, rust: bool) -> Option<Option<usize>> {
-    let window_start = capture_end.saturating_sub(QUOTE_PARITY_LINE_BOUND);
-    if window_start > 0 && !bytes[window_start..capture_end].contains(&b'\n') {
+fn sole_open_delimiter(bytes: &[u8], at: usize, rust: bool) -> Option<u8> {
+    let window_start = at.saturating_sub(QUOTE_PARITY_LINE_BOUND);
+    if window_start > 0 && !bytes[window_start..at].contains(&b'\n') {
         return None;
     }
-    let delimiter = match open_literal_delimiters(bytes, capture_end, rust) {
-        [true, false, false] => b'"',
-        [false, true, false] => b'\'',
-        [false, false, true] => b'`',
-        _ => return None,
-    };
+    match open_literal_delimiters(bytes, at, rust) {
+        [true, false, false] => Some(b'"'),
+        [false, true, false] => Some(b'\''),
+        [false, false, true] => Some(b'`'),
+        _ => None,
+    }
+}
+
+fn enclosing_literal_end(bytes: &[u8], capture_end: usize, rust: bool) -> Option<Option<usize>> {
+    let delimiter = sole_open_delimiter(bytes, capture_end, rust)?;
     let close = closing_delimiter_after(bytes, capture_end, delimiter)?;
     if span_fences_payload(&bytes[capture_end..close]) {
         return Some(None);
@@ -669,23 +675,27 @@ fn is_angle_placeholder(bytes: &[u8], start: usize, code_capture_end: Option<usi
     if bytes.get(start) != Some(&b'<') {
         return false;
     }
-    let line_end = bytes[start..]
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map_or(bytes.len(), |offset| start + offset);
     let opener = start
         .checked_sub(1)
         .and_then(|index| bytes.get(index).copied())
         .filter(|byte| matches!(byte, b'"' | b'\'' | b'`'));
-    let end = match opener {
-        Some(quote) => match bytes[start..line_end]
+    let bounded_line = &bytes[start..bytes.len().min(start + ANGLE_PLACEHOLDER_LINE_BOUND)];
+    let line_end = match bounded_line.iter().position(|byte| *byte == b'\n') {
+        Some(offset) => start + offset,
+        None if start + bounded_line.len() == bytes.len() => bytes.len(),
+        None => start + bounded_line.len(),
+    };
+    let end = match (opener, code_capture_end) {
+        (Some(quote), _) => match bytes[start..line_end]
             .iter()
             .position(|byte| *byte == quote)
         {
             Some(offset) => start + offset,
             None => return false,
         },
-        None => code_capture_end.unwrap_or(line_end),
+        (None, Some(capture_end)) => capture_end,
+        (None, None) if line_end - start == ANGLE_PLACEHOLDER_LINE_BOUND => return false,
+        (None, None) => line_end,
     };
     let value = bytes[start..end].trim_ascii_end();
     let Some(first_close) = value.iter().position(|byte| *byte == b'>') else {
@@ -774,20 +784,19 @@ fn uri_credentials_are_placeholder(
 /// CLOSING quote as an opening one and inverts quote parity for the whole
 /// window.
 fn assignment_is_code_expression(
-    path: &str,
+    scan_path: ScanPath,
     bytes: &[u8],
     match_start: usize,
     value_start: usize,
     value: &[u8],
 ) -> bool {
-    if !is_code_path(path) {
+    if !scan_path.code {
         return false;
     }
-    if separator_is_path_not_assignment(bytes, match_start, value_start) {
+    if separator_is_path_not_assignment(bytes, match_start, value_start, scan_path.relaxed) {
         return true;
     }
-    let rust = is_rust_path(path);
-    let relaxed = !is_config_like_path(path);
+    let (rust, relaxed) = (scan_path.rust, scan_path.relaxed);
     let quote_before_value = value_start
         .checked_sub(1)
         .and_then(|index| bytes.get(index).copied())
@@ -813,21 +822,49 @@ fn assignment_is_code_expression(
             && match_is_inside_string_literal(bytes, match_start, rust)
             && !match_is_inside_string_literal(bytes, value_start, rust);
         if closes_keyword_literal {
-            return !expression_carries_quoted_payload(bytes, value_start, true, relaxed);
+            return !expression_carries_quoted_payload(bytes, value_start, true, scan_path);
         }
-        return relaxed && fixture_and_rest_are_clean(bytes, value_start, value, rust);
+        return relaxed && fixture_and_rest_are_clean(bytes, value_start, value, scan_path);
     }
     if match_is_inside_string_literal(bytes, value_start, rust) {
         return capture_is_single_interpolation(value)
-            || (relaxed && fixture_and_rest_are_clean(bytes, value_start, value, rust));
+            || (relaxed && fixture_and_rest_are_clean(bytes, value_start, value, scan_path));
     }
-    !expression_carries_quoted_payload(bytes, value_start, false, relaxed)
+    !expression_carries_quoted_payload(bytes, value_start, false, scan_path)
 }
 
-fn fixture_and_rest_are_clean(bytes: &[u8], value_start: usize, value: &[u8], rust: bool) -> bool {
-    literal_reads_as_fixture(value)
-        && right_hand_side_continuation(bytes, value_start, value_start + value.len(), Some(rust))
-            .is_some_and(|from| !expression_carries_quoted_payload(bytes, from, false, true))
+fn fixture_and_rest_are_clean(
+    bytes: &[u8],
+    value_start: usize,
+    value: &[u8],
+    scan_path: ScanPath,
+) -> bool {
+    literal_reads_as_fixture(value, scan_path.test)
+        && proven_literal_end(
+            bytes,
+            value_start,
+            value_start + value.len(),
+            scan_path.rust,
+        )
+        .is_some_and(|from| !expression_carries_quoted_payload(bytes, from, false, scan_path))
+}
+
+fn proven_literal_end(
+    bytes: &[u8],
+    value_start: usize,
+    value_end: usize,
+    rust: bool,
+) -> Option<usize> {
+    let delimiter = match value_start
+        .checked_sub(1)
+        .and_then(|index| bytes.get(index).copied())
+        .filter(|byte| matches!(byte, b'"' | b'\'' | b'`'))
+    {
+        Some(quote) => quote,
+        None => sole_open_delimiter(bytes, value_start, rust)?,
+    };
+    let close = closing_delimiter_after(bytes, value_end, delimiter)?;
+    (!span_fences_payload(&bytes[value_end..close])).then_some(close + 1)
 }
 
 /// True when `value_start` sits inside a string, char or template literal that
@@ -885,7 +922,12 @@ fn open_literal_delimiters(bytes: &[u8], value_start: usize, rust: bool) -> [boo
 /// leaves no bracket open, fences no payload, and does not continue onto the
 /// next line, so a path CALL or constant carrying a literal — on this line or
 /// on a continuation line — is still judged by the ordinary steps.
-fn separator_is_path_not_assignment(bytes: &[u8], match_start: usize, value_start: usize) -> bool {
+fn separator_is_path_not_assignment(
+    bytes: &[u8],
+    match_start: usize,
+    value_start: usize,
+    relaxed: bool,
+) -> bool {
     let Some(separator) = bytes[match_start..value_start]
         .iter()
         .position(|byte| matches!(byte, b':' | b'='))
@@ -903,7 +945,7 @@ fn separator_is_path_not_assignment(bytes: &[u8], match_start: usize, value_star
     // The line proves nothing when the expression continues past it
     // (a C++ constant whose literal sits on the next line, a builder chain):
     // fall through to the ordinary steps, whose walk follows continuations.
-    if line_end < bytes.len() && line_break_continues_expression(bytes, line_end, true) {
+    if line_end < bytes.len() && line_break_continues_expression(bytes, line_end, relaxed) {
         return false;
     }
     let rest = &bytes[separator + 2..line_end];
@@ -1067,6 +1109,7 @@ const FIXTURE_MAX_SEGMENTS: usize = 3;
 const FIXTURE_MAX_WORD_CHARS: usize = 12;
 const NAMED_COMPANION_MAX_CHARS: usize = 8;
 const QUOTE_PARITY_LINE_BOUND: usize = 4096;
+const ANGLE_PLACEHOLDER_LINE_BOUND: usize = 4096;
 
 fn is_listed(segment: &[u8], words: &[&str]) -> bool {
     words
@@ -1074,7 +1117,11 @@ fn is_listed(segment: &[u8], words: &[&str]) -> bool {
         .any(|word| segment.eq_ignore_ascii_case(word.as_bytes()))
 }
 
-fn literal_reads_as_fixture(value: &[u8]) -> bool {
+fn is_one_case(word: &[u8]) -> bool {
+    word.iter().all(u8::is_ascii_lowercase) || word.iter().all(u8::is_ascii_uppercase)
+}
+
+fn literal_reads_as_fixture(value: &[u8], test_path: bool) -> bool {
     if !value.iter().all(|byte| {
         byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b' ' | b'.' | b'!' | b'%')
     }) {
@@ -1087,26 +1134,31 @@ fn literal_reads_as_fixture(value: &[u8]) -> bool {
     if segments.is_empty() || segments.len() > FIXTURE_MAX_SEGMENTS {
         return false;
     }
-    let (mut marked, mut named) = (false, 0_usize);
+    let (mut marked, mut named, mut words, mut digits) = (false, 0_usize, 0_usize, false);
     for segment in &segments {
         if segment.iter().all(u8::is_ascii_digit) {
             if segment.len() > FIXTURE_MAX_DIGIT_GROUP {
                 return false;
             }
+            digits = true;
             continue;
         }
         if !segment.iter().all(u8::is_ascii_alphabetic) {
             return false;
         }
+        words += 1;
         if is_listed(segment, FIXTURE_MARKERS) {
             marked = true;
         } else if is_listed(segment, CREDENTIAL_NAMES) {
             named += 1;
-        } else if segment.len() > FIXTURE_MAX_WORD_CHARS {
+        } else if segment.len() > FIXTURE_MAX_WORD_CHARS || !is_one_case(segment) {
             return false;
         }
     }
-    marked || (named == 1 && literal_is_name_with_companion(value, &segments))
+    if digits && words < 2 {
+        return false;
+    }
+    marked || (test_path && named == 1 && literal_is_name_with_companion(value, &segments))
 }
 
 fn literal_is_name_with_companion(value: &[u8], segments: &[&[u8]]) -> bool {
@@ -1126,33 +1178,61 @@ fn literal_is_name_with_companion(value: &[u8], segments: &[&[u8]]) -> bool {
         })
 }
 
-fn fenced_literal_is_benign(before: &[u8], content: &[u8]) -> bool {
+fn comparand_reads_as_word(content: &[u8]) -> bool {
+    let Some((first, rest)) = content.split_first() else {
+        return false;
+    };
+    content.iter().all(u8::is_ascii_alphabetic)
+        && (content.iter().all(u8::is_ascii_lowercase)
+            || (first.is_ascii_uppercase() && rest.iter().all(u8::is_ascii_lowercase))
+            || is_listed(content, CREDENTIAL_NAMES))
+}
+
+fn fenced_literal_is_benign(before: &[u8], content: &[u8], test_path: bool) -> bool {
     let before = before.trim_ascii_end();
-    literal_reads_as_fixture(content)
+    literal_reads_as_fixture(content, test_path)
         || ((before.ends_with(b"==") || before.ends_with(b"!="))
-            && content.iter().all(u8::is_ascii_alphabetic))
+            && comparand_reads_as_word(content))
 }
 
-fn is_code_path(path: &str) -> bool {
-    crate::domain::LanguageId::from_path(path).is_some_and(|language| language.is_code_language())
+#[derive(Clone, Copy)]
+struct ScanPath {
+    code: bool,
+    rust: bool,
+    relaxed: bool,
+    test: bool,
 }
 
-fn is_rust_path(path: &str) -> bool {
-    crate::domain::LanguageId::from_path(path) == Some(crate::domain::LanguageId::Rust)
-}
-
-fn is_config_like_path(path: &str) -> bool {
+fn classify_scan_path(path: &str) -> ScanPath {
+    let language = crate::domain::LanguageId::from_path(path);
+    let code = language.is_some_and(|language| language.is_code_language());
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    ScanPath {
+        code,
+        rust: language == Some(crate::domain::LanguageId::Rust),
+        relaxed: code && !is_config_like_path(&normalized),
+        test: is_test_path(&normalized),
+    }
+}
+
+fn is_config_like_path(normalized: &str) -> bool {
     let mut segments = normalized.rsplit('/');
     let basename = segments.next().unwrap_or("");
     basename.ends_with(".gradle.kts")
         || basename.ends_with(".gradle")
-        || (basename.starts_with("settings") && basename.ends_with(".py"))
-        || segments.any(|segment| segment == "config")
+        || basename.contains("settings")
+        || basename.contains(".config.")
+        || basename.starts_with("ormconfig")
+        || basename == "mix.exs"
+        || segments.any(|segment| matches!(segment, "config" | "settings" | "conf"))
 }
 
-fn relaxed_code_path(path: &str) -> bool {
-    is_code_path(path) && !is_config_like_path(path)
+fn is_test_path(normalized: &str) -> bool {
+    let mut segments = normalized.rsplit('/');
+    let basename = segments.next().unwrap_or("");
+    basename.contains(".spec.")
+        || basename.contains(".test.")
+        || segments.any(|segment| matches!(segment, "test" | "tests" | "__tests__" | "fixtures"))
 }
 
 /// Length of the bounded char literal opening at `at` (which holds `'`), but
@@ -1206,8 +1286,8 @@ fn bounded_char_literal_len(window: &[u8], at: usize) -> Option<usize> {
 /// skipping `"` and `` ` `` literals whole. Returns `true` — exemption
 /// WITHDRAWN — when any of:
 ///   * a delimiter-fenced run of at least [`CONTEXT_ASSIGNMENT_MIN_PAYLOAD`]
-///     payload bytes appears anywhere in the window — except, when `code`
-///     is set, a fixture-shaped literal or a letters-only comparand of `==`
+///     payload bytes appears anywhere in the window — except, on a relaxed
+///     code path, a fixture-shaped literal or a word-shaped comparand of `==`
 ///     or `!=`;
 ///   * a `"` or `` ` `` literal opens in the window and never closes inside it;
 ///   * the window is exhausted before the expression terminates at depth 0
@@ -1258,7 +1338,7 @@ fn expression_carries_quoted_payload(
     bytes: &[u8],
     from: usize,
     after_closed_literal: bool,
-    code: bool,
+    scan_path: ScanPath,
 ) -> bool {
     let end = from
         .saturating_add(CONTEXT_ASSIGNMENT_SCAN_BOUND)
@@ -1281,8 +1361,12 @@ fn expression_carries_quoted_payload(
                 }
                 if run - (index + 1) >= CONTEXT_ASSIGNMENT_MIN_PAYLOAD
                     && window.get(run) == Some(&byte)
-                    && !(code
-                        && fenced_literal_is_benign(&window[..index], &window[index + 1..run]))
+                    && !(scan_path.relaxed
+                        && fenced_literal_is_benign(
+                            &window[..index],
+                            &window[index + 1..run],
+                            scan_path.test,
+                        ))
                 {
                     return true;
                 }
@@ -1338,7 +1422,7 @@ fn expression_carries_quoted_payload(
                 // this rule exists to catch (H2). Continue only on a
                 // continuation operator; an ordinary next statement still ends
                 // the walk.
-                if !line_break_continues_expression(window, index, code) {
+                if !line_break_continues_expression(window, index, scan_path.relaxed) {
                     return false;
                 }
                 index += 1;
@@ -1371,7 +1455,8 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
     // one bit per byte, so 512 KiB for a file of nothing but newlines.
     let mut line_bits: Vec<u64> = Vec::new();
     let mut findings: Vec<SecretFindingDescriptor> = Vec::new();
-    let (relaxed, rust) = (relaxed_code_path(path), is_rust_path(path));
+    let scan_path = classify_scan_path(path);
+    let (relaxed, rust) = (scan_path.relaxed, scan_path.rust);
     for rule in rules {
         if !rule
             .keywords
@@ -1422,13 +1507,14 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
                     secret.end(),
                     relaxed.then_some(rust),
                 )
-                .is_some_and(|from| !expression_carries_quoted_payload(bytes, from, false, relaxed))
-                {
+                .is_some_and(|from| {
+                    !expression_carries_quoted_payload(bytes, from, false, scan_path)
+                }) {
                     continue;
                 }
             } else if (rule.id == CONTEXT_ASSIGNMENT_RULE_ID
                 && (assignment_is_code_expression(
-                    path,
+                    scan_path,
                     bytes,
                     match_start,
                     secret.start(),
@@ -3235,7 +3321,7 @@ mod tests {
                 [
                     "const u = 'https://a.example/?",
                     &token,
-                    "=${credential_name}#frag';\nconst b = 1;\n",
+                    "=${credential_name}#a\"b';\nconst b = 1;\n",
                 ]
                 .concat(),
                 MxVerdict::Clean,
@@ -3281,7 +3367,153 @@ mod tests {
                 .concat(),
                 MxVerdict::Clean,
             ),
+            (
+                "RV29 fixture inside an ambiguous literal then a real argument",
+                "src/a.ts",
+                [
+                    "f(\"it's x?",
+                    &token,
+                    "=sample-key more\", \"",
+                    &real,
+                    "\");\nconst q = '\"';\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "RV30 python comparison against a mixed-case letter run",
+                "src/probe.py",
+                ["is_", &password, " = supplied == \"QwErTyUiOpAsDfGh\"\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "RV31 name with a capitalised companion outside tests",
+                "src/probe.ts",
+                [
+                    "const ",
+                    &password,
+                    " = \"Super_",
+                    &["Sec", "ret"].concat(),
+                    "\";\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "RV32 name with a lowercase companion outside tests",
+                "src/probe.ts",
+                ["const ", &password, " = \"admin-", &password, "\";\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "RV33 python key name plus a short random word outside tests",
+                "src/probe.py",
+                [&secret_kw, " = \"key-qwrtzpln\"\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "RV34 name with a mixed-case companion on a test path",
+                "src/probe.spec.ts",
+                [
+                    "const ",
+                    &password,
+                    " = \"Super_",
+                    &["Sec", "ret"].concat(),
+                    "\";\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "C5a python local settings module",
+                "app/local_settings.py",
+                [&password, " = \"", &synthetic, "\"\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "C5b python module under a settings directory",
+                "app/settings/base.py",
+                [&password, " = \"", &synthetic, "\"\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "C5c python module under a conf directory",
+                "app/conf/app.py",
+                [&password, " = \"", &synthetic, "\"\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "C5d ts basename containing settings",
+                "src/app_settings.ts",
+                ["const ", &password, " = \"", &synthetic, "\";\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "C5e js dotted config basename",
+                "webpack.config.js",
+                ["const ", &password, " = \"", &synthetic, "\";\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "C5f elixir mix project file",
+                "mix.exs",
+                ["config :app, ", &password, ": \"", &synthetic, "\"\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "C5g ts orm config basename",
+                "ormconfig.ts",
+                ["const ", &password, " = \"", &synthetic, "\";\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "RV36 marker with a mixed-case random word",
+                "src/probe.spec.ts",
+                ["const ", &password, " = \"fake-QwErTyUiOpAs\";\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "RV37 marker with a mixed-case random word and digits",
+                "src/probe.spec.ts",
+                ["const ", &password, " = \"Example_QwErTyUiOpAs_99\";\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "RV38 marker alone with a digit group",
+                "src/probe.spec.ts",
+                ["const ", &password, " = \"Sample!123\";\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "RV39 code path quote open with no closer falls back to the plain walk",
+                "src/probe.ts",
+                [
+                    "const u = `x?",
+                    &token,
+                    "=${credential_name}#frag\n  more`;\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
         ]
+    }
+
+    #[test]
+    fn long_line_of_angle_values_scans_in_bounded_time() {
+        let unit = [&mx_token(), "=<abcdefg1> "].concat();
+        let count = (1 << 20) / unit.len();
+        let body = [unit.repeat(count), "\n".to_owned()].concat();
+        let started = std::time::Instant::now();
+        let scan = scan_secret_bytes("deploy.env", body.as_bytes());
+        let elapsed = started.elapsed();
+        assert!(
+            !matches!(scan, SecretScan::Indeterminate { .. }),
+            "unexpected {scan:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "{count} angle captures took {elapsed:?}"
+        );
     }
 
     #[test]
