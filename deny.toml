@@ -5,4 +5,6 @@ version = 2
 yanked = "deny"
 # Add `{ id = "RUSTSEC-....", reason = "..." }` here only with a written reason
 # and an exit condition.
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained with no patched release; it arrives through symforge, vendored rmcp and schemars. Remove this entry once all three move to jiff or time." },
+]
