@@ -310,6 +310,7 @@ pub(super) fn render_routed(
                 suppressed_by_noise: value.suppressed_by_noise as usize,
                 excluded_knowledge_files: value.excluded_knowledge_files as usize,
                 withheld_policy_files: value.withheld_policy_files as usize,
+                withheld_policy_paths: value.withheld_policy_paths.clone(),
                 withheld_size_files: value.withheld_size_files as usize,
                 unparsed_files: value.unparsed_files as usize,
                 files: files

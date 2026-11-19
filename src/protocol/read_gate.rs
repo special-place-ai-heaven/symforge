@@ -29,9 +29,7 @@
 
 use std::path::{Component, Path};
 
-use crate::domain::{FileDisposition, MetadataOnlyReason};
 use crate::live_index::LiveIndex;
-use crate::protocol::format;
 
 /// What the generation has to say about one path.
 #[derive(Debug, PartialEq, Eq)]
@@ -132,7 +130,6 @@ use crate::index_lifecycle::guidance::read_gate::open_for_gate_read;
 /// shared gate owns them so the embedded lanes read through the same door.
 #[cfg(test)]
 use crate::index_lifecycle::guidance::read_gate::read_regular_file;
-use crate::index_lifecycle::guidance::read_gate::read_regular_file_limited;
 
 /// Working-tree text for `relative_path`, admitted by [`admit_disk_read`].
 ///
@@ -206,6 +203,19 @@ pub(crate) fn refuse_by_policy(live: &LiveIndex, relative_path: &str) -> Option<
     )
 }
 
+/// [`refuse_by_policy`] for a lane that renders the refusal: a recorded content
+/// demotion also names its finding lines, recomputed from a bounded re-read.
+pub(crate) fn refuse_by_policy_naming_lines(
+    live: &LiveIndex,
+    relative_path: &str,
+) -> Option<String> {
+    crate::index_lifecycle::guidance::read_gate::refuse_by_policy_naming_lines_with(
+        live,
+        relative_path,
+        &mut crate::protocol::withheld::record_pending_withheld,
+    )
+}
+
 /// A caller's path as a catalog key: separators forward, no leading `./`,
 /// no leading or trailing `/`. Pure string work, no filesystem access.
 pub(crate) use crate::index_lifecycle::guidance::read_gate::normalize_requested_path;
@@ -224,79 +234,10 @@ pub(crate) use crate::index_lifecycle::guidance::read_gate::unverified_notice;
 /// a detector failure take precedence exactly as in [`refuse_by_policy`]) or no
 /// lines were recovered; the caller then renders the policy refusal unchanged.
 fn recorded_refusal_naming_lines(live: &LiveIndex, relative_path: &str) -> Option<String> {
-    if crate::knowledge::sensitive_path_rule(relative_path).is_some() {
-        return None;
-    }
-    let Some(FileDisposition::MetadataOnly {
-        reason:
-            MetadataOnlyReason::SensitiveContent {
-                rule_ids,
-                finding_count,
-            },
-    }) = live.capture_file_disposition(relative_path)
-    else {
-        return None;
-    };
-    if rule_ids
-        .iter()
-        .any(|id| id == crate::knowledge::INDETERMINATE_RULE_ID)
-    {
-        return None;
-    }
-    let (line_ranges, findings) = recorded_finding_evidence(live, relative_path, rule_ids);
-    if !findings.is_empty() {
-        crate::protocol::withheld::record_pending_withheld(
-            crate::protocol::withheld::WithheldMeta::from_content_findings(
-                relative_path,
-                &findings,
-            ),
-        );
-    }
-    (!line_ranges.is_empty()).then(|| {
-        format::content_withheld_by_admission(relative_path, rule_ids, *finding_count, &line_ranges)
-    })
-}
-
-/// Finding lines for a RECORDED content demotion, computed at refusal time.
-///
-/// The manifest records the verdict (rule ids, count) but not where the
-/// findings sit — persisting lines would change the snapshot schema. So the
-/// gate re-reads the file ITSELF, scans it, and keeps only the line numbers;
-/// the bytes are dropped here and never reach a caller. Lines are returned only
-/// when the fresh scan names exactly the recorded rules; if the file moved on,
-/// the refusal names the recorded verdict without lines rather than pairing it
-/// with positions from different content.
-///
-/// The read is bounded like every other gate read: a spelling the shared
-/// repository-path resolver admits as the file's own name beneath the indexed
-/// root, a regular file opened once, and no more than the scan budget read
-/// from that one handle. Any doubt yields no lines, and the refusal itself
-/// never depends on this read.
-fn recorded_finding_evidence(
-    live: &LiveIndex,
-    relative_path: &str,
-    recorded: &[String],
-) -> (
-    Vec<(u32, u32)>,
-    Vec<crate::knowledge::SecretFindingDescriptor>,
-) {
-    let Some(root) = live.indexed_root.as_deref() else {
-        return (Vec::new(), Vec::new());
-    };
-    // The shared resolver admits only a spelling whose canonical path is,
-    // component for component, the spelling itself beneath the root: no link
-    // on any component, no alias, no escape.
-    let Ok(Some(full_path)) = crate::discovery::resolve_repo_path(root, relative_path) else {
-        return (Vec::new(), Vec::new());
-    };
-    let budget = crate::knowledge::SECRET_SCAN_MAX_BYTES as u64 + 1;
-    let Ok(bytes) = read_regular_file_limited(&full_path, Some(budget)) else {
-        return (Vec::new(), Vec::new());
-    };
-    crate::index_lifecycle::guidance::read_gate::recorded_finding_evidence_from_bytes(
+    crate::index_lifecycle::guidance::read_gate::recorded_refusal_naming_lines_with(
+        live,
         relative_path,
-        &bytes,
-        recorded,
+        &mut crate::protocol::withheld::record_pending_withheld,
     )
 }
 

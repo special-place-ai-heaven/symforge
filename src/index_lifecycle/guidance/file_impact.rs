@@ -248,6 +248,14 @@ pub fn co_changes_result_view(
     lines.join("\n")
 }
 
+fn human_size(size: Option<u64>) -> String {
+    match size {
+        None => "unknown".to_string(),
+        Some(bytes) if bytes < 1024 * 1024 => format!("{:.1} KB", bytes as f64 / 1024.0),
+        Some(bytes) => format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)),
+    }
+}
+
 fn impact_skipped_text(published: &PublishedGeneration, path: &str) -> String {
     use crate::domain::index::AdmissionTier;
 
@@ -267,7 +275,12 @@ fn impact_skipped_text(published: &PublishedGeneration, path: &str) -> String {
         .reason
         .map(|reason| reason.to_string())
         .unwrap_or_else(|| "policy".to_string());
-    let size_mb = view.size.unwrap_or(0) as f64 / (1024.0 * 1024.0);
+    let withheld =
+        super::read_gate::refuse_by_policy_naming_lines_with(&published.live, path, &mut |_| {});
+    let reason_detail = match withheld {
+        Some(_) => format!("reason: {reason}"),
+        None => format!("reason: {reason}, size {}", human_size(view.size)),
+    };
 
     // SF-AAP-002 is scoped to genuinely NON-PARSER files (no code parser exists
     // for the type — the artifact/binary case). A parser-supported file demoted
@@ -282,17 +295,18 @@ fn impact_skipped_text(published: &PublishedGeneration, path: &str) -> String {
 
     // Key the recovery sentence on the read gate's predicted verdict (spec-023):
     // "Use get_file_content" must never point at a read the gate will refuse.
-    let raw_read_advice =
-        if super::read_gate::disk_read_would_refuse(&published.live, path, view.size) {
-            "Its contents are withheld by the admission policy — get_file_content will refuse \
+    let raw_read_advice = if let Some(refusal) = &withheld {
+        refusal.as_str()
+    } else if super::read_gate::disk_read_would_refuse(&published.live, path, view.size) {
+        "Its contents are withheld by the admission policy — get_file_content will refuse \
          this file."
-        } else {
-            "Use get_file_content for raw reads."
-        };
+    } else {
+        "Use get_file_content for raw reads."
+    };
 
     if has_code_parser {
         return format!(
-            "Not indexed: {path} is {tier_label} — reason: {reason}, size {size_mb:.1} MB. \
+            "Not indexed: {path} is {tier_label} — {reason_detail}. \
              The admission gate applies to analyze_file_impact the same as bulk load \
              and the watcher (no force-admit). {raw_read_advice}"
         );
@@ -306,7 +320,7 @@ fn impact_skipped_text(published: &PublishedGeneration, path: &str) -> String {
         "── Impact: {path} ──\n\
          Status: exists (analysis unsupported — {tier_label}, no code parser)\n\
          exists: true\n\
-         Tier: {tier_label} — reason: {reason}, size {size_mb:.1} MB\n\
+         Tier: {tier_label} — {reason_detail}\n\
          Generation: {generation}\n\
          The file IS tracked (metadata only), not absent; impact/symbol analysis is \
          unsupported for this file type. {raw_read_advice}"
@@ -680,8 +694,13 @@ fn edit_impact(
     lines.push(format!("── Impact: {} ──", path));
 
     if added.is_empty() && changed.is_empty() && removed.is_empty() {
+        let basis = if matches!(receipt.outcome, ReindexOutcome::HashSkip) {
+            "re-read from disk; content hash identical"
+        } else {
+            "re-read from disk; no symbol added, changed or removed"
+        };
         lines.push(format!(
-            "Status: indexed and unchanged\nSymbols: {}\nTip: Use what_changed to see recent modifications.",
+            "Status: indexed and unchanged\nBasis: {basis}\nSymbols: {}\nTip: Use what_changed to see recent modifications.",
             post_symbols.len()
         ));
     } else {

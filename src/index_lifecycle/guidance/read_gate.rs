@@ -211,6 +211,78 @@ pub(crate) fn classify_admitted_bytes_with(
     None
 }
 
+/// The refusal for a RECORDED content demotion, naming its finding lines from a
+/// bounded re-read of the file. `None` when the refusal is not a recorded
+/// content match (a path rule or a detector failure takes precedence) or no
+/// lines were recovered; the caller then keeps the line-free policy refusal.
+pub(crate) fn recorded_refusal_naming_lines_with(
+    live: &LiveIndex,
+    relative_path: &str,
+    record: &mut dyn FnMut(WithheldMeta),
+) -> Option<String> {
+    if crate::knowledge::sensitive_path_rule(relative_path).is_some() {
+        return None;
+    }
+    let Some(FileDisposition::MetadataOnly {
+        reason:
+            MetadataOnlyReason::SensitiveContent {
+                rule_ids,
+                finding_count,
+            },
+    }) = live.capture_file_disposition(relative_path)
+    else {
+        return None;
+    };
+    if rule_ids
+        .iter()
+        .any(|id| id == crate::knowledge::INDETERMINATE_RULE_ID)
+    {
+        return None;
+    }
+    let (line_ranges, findings) = recorded_finding_evidence(live, relative_path, rule_ids);
+    if !findings.is_empty() {
+        record(WithheldMeta::from_content_findings(
+            relative_path,
+            &findings,
+        ));
+    }
+    (!line_ranges.is_empty()).then(|| {
+        format::content_withheld_by_admission(relative_path, rule_ids, *finding_count, &line_ranges)
+    })
+}
+
+/// [`refuse_by_policy_with`], plus the finding lines of a recorded content
+/// demotion when the file can be re-read. For lanes that render the refusal.
+pub(crate) fn refuse_by_policy_naming_lines_with(
+    live: &LiveIndex,
+    relative_path: &str,
+    record: &mut dyn FnMut(WithheldMeta),
+) -> Option<String> {
+    let refusal = refuse_by_policy_with(live, relative_path, record)?;
+    Some(recorded_refusal_naming_lines_with(live, relative_path, record).unwrap_or(refusal))
+}
+
+fn recorded_finding_evidence(
+    live: &LiveIndex,
+    relative_path: &str,
+    recorded: &[String],
+) -> (
+    Vec<(u32, u32)>,
+    Vec<crate::knowledge::SecretFindingDescriptor>,
+) {
+    let Some(root) = live.indexed_root.as_deref() else {
+        return (Vec::new(), Vec::new());
+    };
+    let Ok(Some(full_path)) = crate::discovery::resolve_repo_path(root, relative_path) else {
+        return (Vec::new(), Vec::new());
+    };
+    let budget = crate::knowledge::SECRET_SCAN_MAX_BYTES as u64 + 1;
+    let Ok(bytes) = read_regular_file_limited(&full_path, Some(budget)) else {
+        return (Vec::new(), Vec::new());
+    };
+    recorded_finding_evidence_from_bytes(relative_path, &bytes, recorded)
+}
+
 /// Match bounded current bytes to the recorded rule set before adding actionable
 /// positions to a refusal. A changed verdict never weakens the recorded refusal.
 pub(crate) fn recorded_finding_evidence_from_bytes(

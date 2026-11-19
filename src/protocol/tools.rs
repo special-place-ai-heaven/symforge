@@ -1006,15 +1006,12 @@ fn admission_degradation_view_from_disk(
 /// degraded block from reporting a withheld file's exact byte length: the view
 /// a renderer could leak from is never built.
 ///
-/// The first refusal runs BEFORE any syscall, so the answer is a pure function
-/// of the requested path plus the manifest and is identical for a demoted file
-/// that exists and one that does not — otherwise the difference between this
-/// block and `File not found:` is a one-bit existence oracle. `refuse_by_policy`
-/// therefore names no finding lines; only the gate's read lane, which opens the
-/// file anyway, adds them. The second runs
-/// on the RESOLVED path, which can differ from the requested string (absolute
-/// arguments do not normalize against a catalog key) and is the only clause
-/// that catches a content-detected demotion reached that way.
+/// A recorded content demotion is refused with its rule, count and finding
+/// lines, the lines recomputed from a bounded re-read of the file; when the
+/// file cannot be read the same refusal is returned without lines. The second
+/// check runs on the RESOLVED path, which can differ from the requested string
+/// (absolute arguments do not normalize against a catalog key) and is the only
+/// clause that catches a content-detected demotion reached that way.
 fn admission_degradation_view_for_path(
     index: &LiveIndex,
     repo_root: Option<&Path>,
@@ -1022,7 +1019,9 @@ fn admission_degradation_view_for_path(
 ) -> Result<Option<AdmissionDegradationView>, String> {
     // Normalized first (pure string work) so `./x` and `x` refuse alike.
     let requested = crate::protocol::read_gate::normalize_requested_path(path);
-    if let Some(refusal) = crate::protocol::read_gate::refuse_by_policy(index, &requested) {
+    if let Some(refusal) =
+        crate::protocol::read_gate::refuse_by_policy_naming_lines(index, &requested)
+    {
         return Err(refusal);
     }
     let Some(view) = index
@@ -1034,7 +1033,9 @@ fn admission_degradation_view_for_path(
     else {
         return Ok(None);
     };
-    if let Some(refusal) = crate::protocol::read_gate::refuse_by_policy(index, &view.path) {
+    if let Some(refusal) =
+        crate::protocol::read_gate::refuse_by_policy_naming_lines(index, &view.path)
+    {
         return Err(refusal);
     }
     Ok(Some(view))
@@ -1593,6 +1594,19 @@ enum CapturedGetSymbolsEntry {
     FileNotFound {
         path: String,
     },
+    Withheld {
+        refusal: String,
+    },
+}
+
+fn unresolved_batch_target(index: &LiveIndex, path: &str) -> CapturedGetSymbolsEntry {
+    let requested = crate::protocol::read_gate::normalize_requested_path(path);
+    match crate::protocol::read_gate::refuse_by_policy_naming_lines(index, &requested) {
+        Some(refusal) => CapturedGetSymbolsEntry::Withheld { refusal },
+        None => CapturedGetSymbolsEntry::FileNotFound {
+            path: path.to_string(),
+        },
+    }
 }
 
 // ─── Tool handlers ───────────────────────────────────────────────────────────
@@ -1789,6 +1803,7 @@ fn batch_symbol_outcome(captured: &[CapturedGetSymbolsEntry]) -> ReadOutcome {
             }
             CapturedGetSymbolsEntry::CodeSlice { .. } => ReadOutcome::Found,
             CapturedGetSymbolsEntry::FileNotFound { .. } => ReadOutcome::NotFound,
+            CapturedGetSymbolsEntry::Withheld { .. } => ReadOutcome::InvalidRequest,
         };
         if outcome == ReadOutcome::Found {
             return ReadOutcome::Found;
@@ -1924,14 +1939,10 @@ impl SymForgeServer {
                                 kind: target.kind.clone(),
                                 symbol_line: target.symbol_line,
                             },
-                            None => CapturedGetSymbolsEntry::FileNotFound {
-                                path: target.path.clone(),
-                            },
+                            None => unresolved_batch_target(guard, &target.path),
                         },
                         None => match guard.capture_shared_file(&target.path) {
-                            None => CapturedGetSymbolsEntry::FileNotFound {
-                                path: target.path.clone(),
-                            },
+                            None => unresolved_batch_target(guard, &target.path),
                             Some(file) => CapturedGetSymbolsEntry::CodeSlice {
                                 file,
                                 start_byte: target.start_byte.unwrap_or(0) as usize,
@@ -1954,7 +1965,8 @@ impl SymForgeServer {
                     | CapturedGetSymbolsEntry::CodeSlice { file, .. } => {
                         Some(PathBuf::from(&file.relative_path))
                     }
-                    CapturedGetSymbolsEntry::FileNotFound { .. } => None,
+                    CapturedGetSymbolsEntry::FileNotFound { .. }
+                    | CapturedGetSymbolsEntry::Withheld { .. } => None,
                 })
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
@@ -1966,7 +1978,8 @@ impl SymForgeServer {
                     | CapturedGetSymbolsEntry::CodeSlice { file, .. } => Some(
                         format::competent_manual_baseline_chars(file.as_ref().content.len()),
                     ),
-                    CapturedGetSymbolsEntry::FileNotFound { .. } => None,
+                    CapturedGetSymbolsEntry::FileNotFound { .. }
+                    | CapturedGetSymbolsEntry::Withheld { .. } => None,
                 })
                 .sum();
             record_read_outcome(batch_symbol_outcome(&captured));
@@ -1996,6 +2009,7 @@ impl SymForgeServer {
                         line_numbers,
                     ),
                     CapturedGetSymbolsEntry::FileNotFound { path } => format::not_found_file(&path),
+                    CapturedGetSymbolsEntry::Withheld { refusal } => refusal,
                 })
                 .collect::<Vec<_>>()
                 .join("\n---\n");
@@ -14447,6 +14461,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn analyze_file_impact_unchanged_names_what_was_observed() {
+        let (dir, server, _file_path) = setup_edit_test(b"pub fn alpha() {}\n");
+        let _ = dir;
+        let result = server
+            .analyze_file_impact(Parameters(super::AnalyzeFileImpactInput {
+                project: None,
+                path: "src/lib.rs".to_string(),
+                new_file: None,
+                include_co_changes: None,
+                co_changes_limit: None,
+                estimate: None,
+            }))
+            .await;
+        assert!(
+            result.contains(
+                "Status: indexed and unchanged\nBasis: re-read from disk; content hash identical"
+            ),
+            "the status must say what was observed; got: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_analyze_file_impact_deleted_file() {
         let source = b"pub fn gone() {}\n";
         let (dir, server, file_path) = setup_edit_test(source);
@@ -17021,6 +17057,7 @@ mod tests {
             overflow_count: 0,
             excluded_knowledge_files: 0,
             withheld_policy_files: 0,
+            withheld_policy_paths: Vec::new(),
             withheld_size_files: 0,
             unparsed_files: 0,
         }
@@ -35318,10 +35355,97 @@ mod tests {
         assert_names_rule_and_line_without_bypass(&rendered);
     }
 
-    /// Caller level: the degradation block for a recorded demotion is the same
-    /// with the file present and deleted, so it is no existence oracle.
+    fn withheld_probe_server() -> (TempDir, SymForgeServer) {
+        let (repo, mut live) = admission_probe_repo();
+        live.manifest_entries = vec![recorded_content_demotion(
+            "src/probe.rs",
+            "secret.context-assignment",
+        )];
+        let root = repo.path().to_path_buf();
+        (repo, make_server_with_root(live, Some(root)))
+    }
+
+    fn assert_withheld_probe_refusal(out: &str) {
+        assert!(out.starts_with(WITHHELD_REFUSAL_PREFIX), "{out}");
+        for needle in ["secret.context-assignment", "matched 1 time at line 2"] {
+            assert!(
+                out.contains(needle),
+                "must contain {needle:?}; shape: {}",
+                refusal_shape(out)
+            );
+        }
+        assert!(!out.contains(&oracle_opaque()), "must not echo the value");
+    }
+
+    #[tokio::test]
+    async fn get_symbol_single_refusal_names_the_finding_lines() {
+        let (_repo, server) = withheld_probe_server();
+        let out = server
+            .get_symbol(Parameters(get_symbol_input("src/probe.rs", "a")))
+            .await;
+        assert_withheld_probe_refusal(&out);
+    }
+
+    #[tokio::test]
+    async fn get_symbol_batch_refuses_a_withheld_file_like_single_mode() {
+        let (_repo, server) = withheld_probe_server();
+        let mut input = get_symbol_input("", "");
+        input.targets = Some(vec![
+            super::SymbolTarget {
+                path: "src/probe.rs".to_string(),
+                name: Some("a".to_string()),
+                kind: None,
+                symbol_line: None,
+                start_byte: None,
+                end_byte: None,
+            },
+            super::SymbolTarget {
+                path: "src/absent.rs".to_string(),
+                name: Some("a".to_string()),
+                kind: None,
+                symbol_line: None,
+                start_byte: None,
+                end_byte: None,
+            },
+        ]);
+        let out = server.get_symbol(Parameters(input)).await;
+        assert_withheld_probe_refusal(&out);
+        assert!(
+            out.contains("File not found: src/absent.rs"),
+            "an absent file keeps the not-found answer; shape: {}",
+            refusal_shape(&out)
+        );
+        assert!(
+            !out.contains("File not found: src/probe.rs"),
+            "a withheld file is not absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn analyze_file_impact_names_the_rule_and_lines_of_a_withheld_file() {
+        let (_repo, server) = withheld_probe_server();
+        let out = server
+            .analyze_file_impact(Parameters(super::AnalyzeFileImpactInput {
+                project: None,
+                path: "src/probe.rs".to_string(),
+                new_file: None,
+                include_co_changes: None,
+                co_changes_limit: None,
+                estimate: None,
+            }))
+            .await;
+        for needle in ["secret.context-assignment", "matched 1 time at line 2"] {
+            assert!(out.contains(needle), "must contain {needle:?}; got: {out}");
+        }
+        assert!(
+            !out.contains(" MB"),
+            "size is not the reason a file is withheld; got: {out}"
+        );
+        assert!(!out.contains(&oracle_opaque()), "must not echo the value");
+    }
+
     #[test]
-    fn degradation_view_for_a_recorded_demotion_ignores_file_existence() {
+    fn degradation_view_for_a_recorded_demotion_names_lines_only_when_the_file_is_readable() {
         let (repo, mut live) = admission_probe_repo();
         live.manifest_entries = vec![recorded_content_demotion(
             "src/probe.rs",
@@ -35337,16 +35461,15 @@ mod tests {
             )
         };
         let present = degrade(&live).expect("a recorded demotion must be refused");
+        assert_names_rule_and_line_without_bypass(&present);
         fs::remove_file(repo.path().join("src/probe.rs")).expect("remove probe");
         let absent = degrade(&live).expect("a recorded demotion must be refused");
-        assert_eq!(
-            present, absent,
-            "the degradation view must not depend on existence"
-        );
         assert!(
-            present.starts_with(WITHHELD_REFUSAL_PREFIX) && !present.contains(" at line"),
-            "shape: {}",
-            refusal_shape(&present)
+            absent.starts_with(WITHHELD_REFUSAL_PREFIX)
+                && absent.contains("secret.context-assignment")
+                && !absent.contains(" at line"),
+            "an unreadable file keeps the recorded verdict without lines; shape: {}",
+            refusal_shape(&absent)
         );
     }
 

@@ -162,8 +162,8 @@ fn count_in_scope_withheld_files(
     index: &LiveIndex,
     options: &TextSearchOptions,
     glob_filters: &CompiledTextGlobFilters,
-) -> (usize, usize) {
-    let mut policy = 0usize;
+) -> (usize, usize, Vec<String>) {
+    let mut policy_paths: Vec<&str> = Vec::new();
     let mut size = 0usize;
     for entry in &index.manifest_entries {
         let Some(path) = entry.path.normalized_utf8.as_deref() else {
@@ -186,7 +186,7 @@ fn count_in_scope_withheld_files(
                 reason:
                     crate::domain::MetadataOnlyReason::SensitivePath { .. }
                     | crate::domain::MetadataOnlyReason::SensitiveContent { .. },
-            } => policy += 1,
+            } => policy_paths.push(path),
             FileDisposition::MetadataOnly {
                 reason: crate::domain::MetadataOnlyReason::OversizedData,
             }
@@ -196,8 +196,17 @@ fn count_in_scope_withheld_files(
             _ => {}
         }
     }
-    (policy, size)
+    let policy = policy_paths.len();
+    policy_paths.sort_unstable();
+    let listed = policy_paths
+        .into_iter()
+        .take(WITHHELD_PATHS_LISTED)
+        .map(str::to_string)
+        .collect();
+    (policy, size, listed)
 }
+
+pub(crate) const WITHHELD_PATHS_LISTED: usize = 10;
 
 fn with_excluded_knowledge_count(
     mut result: TextSearchResult,
@@ -207,8 +216,9 @@ fn with_excluded_knowledge_count(
 ) -> TextSearchResult {
     result.excluded_knowledge_files =
         count_in_scope_knowledge_only_files(index, &options.path_scope, options.search_scope);
-    let (policy, size) = count_in_scope_withheld_files(index, options, glob_filters);
+    let (policy, size, policy_paths) = count_in_scope_withheld_files(index, options, glob_filters);
     result.withheld_policy_files = policy;
+    result.withheld_policy_paths = policy_paths;
     result.withheld_size_files = size;
     result
 }
@@ -805,6 +815,7 @@ pub struct TextSearchResult {
     pub excluded_knowledge_files: usize,
     /// In-scope files admission withheld by policy (path or content). Neutral.
     pub withheld_policy_files: usize,
+    pub withheld_policy_paths: Vec<String>,
     /// In-scope files withheld for size (oversized data or per-file ceiling).
     pub withheld_size_files: usize,
     /// Structural search only: candidate files whose parse was cancelled at
@@ -1721,6 +1732,7 @@ fn search_structural_with_compiler(
             overflow_count: 0,
             excluded_knowledge_files: 0,
             withheld_policy_files: 0,
+            withheld_policy_paths: Vec::new(),
             withheld_size_files: 0,
             unparsed_files,
         },
@@ -2079,11 +2091,13 @@ where
             options.search_scope,
         ),
         withheld_policy_files: 0,
+        withheld_policy_paths: Vec::new(),
         withheld_size_files: 0,
         unparsed_files: 0,
     };
-    let (policy, size) = count_in_scope_withheld_files(index, options, glob_filters);
+    let (policy, size, policy_paths) = count_in_scope_withheld_files(index, options, glob_filters);
     result.withheld_policy_files = policy;
+    result.withheld_policy_paths = policy_paths;
     result.withheld_size_files = size;
     result
 }
@@ -4430,6 +4444,7 @@ mod tests {
                 overflow_count: 0,
                 excluded_knowledge_files: 0,
                 withheld_policy_files: 0,
+                withheld_policy_paths: Vec::new(),
                 withheld_size_files: 0,
                 unparsed_files,
             },

@@ -570,6 +570,7 @@ fn test_search_text_result_view_group_by_symbol_keeps_duplicate_names_separate()
             overflow_count: 0,
             excluded_knowledge_files: 0,
             withheld_policy_files: 0,
+            withheld_policy_paths: Vec::new(),
             withheld_size_files: 0,
             unparsed_files: 0,
         }),
@@ -602,6 +603,7 @@ fn empty_text_search_result(
         overflow_count: 0,
         excluded_knowledge_files: 0,
         withheld_policy_files: 0,
+        withheld_policy_paths: Vec::new(),
         withheld_size_files: 0,
         unparsed_files: 0,
     })
@@ -983,6 +985,52 @@ fn withheld_report_wording_is_identical_for_path_rule_and_content_rule() {
         note(&content_rule),
         "path vs content withholding must render identically\npath:\n{path_rule}\ncontent:\n{content_rule}"
     );
+}
+
+#[test]
+fn withheld_note_lists_the_withheld_paths_with_a_cap() {
+    let mut index = make_index(vec![make_file(
+        "src/lib.rs",
+        b"fn needle() {}\n",
+        vec![make_symbol("needle", SymbolKind::Function, 0, 0, 1)],
+    )]);
+    let mut entries = vec![catalog_indexed(
+        "src/lib.rs",
+        crate::domain::IndexTargets::Code,
+        LanguageId::Rust,
+    )];
+    for n in 0..12 {
+        entries.push(catalog_metadata_only(
+            &format!("src/secret{n:02}.rs"),
+            crate::domain::MetadataOnlyReason::SensitiveContent {
+                rule_ids: vec!["content-rule".to_string()],
+                finding_count: 1,
+            },
+        ));
+    }
+    index.manifest_entries = entries;
+    let rendered = search_text_result_view(
+        search::search_text_with_options(
+            &index,
+            Some("needle"),
+            None,
+            false,
+            &search::TextSearchOptions::for_current_code_search(),
+        ),
+        None,
+        None,
+        None,
+        SearchSuggestionContext::default(),
+    );
+    assert!(
+        rendered.contains("12 in-scope files withheld by admission policy"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("src/secret00.rs"), "{rendered}");
+    assert!(rendered.contains("src/secret09.rs"), "{rendered}");
+    assert!(!rendered.contains("src/secret10.rs"), "{rendered}");
+    assert!(rendered.contains("and 2 more"), "{rendered}");
+    assert!(!rendered.contains("content-rule"), "{rendered}");
 }
 
 #[test]

@@ -430,6 +430,7 @@ pub(crate) fn append_unparsed_note(message: String, unparsed: usize) -> String {
 pub(crate) fn append_withheld_admission_note(
     message: String,
     policy: usize,
+    policy_paths: &[String],
     size: usize,
 ) -> String {
     if policy == 0 && size == 0 {
@@ -446,10 +447,21 @@ pub(crate) fn append_withheld_admission_note(
         let noun = if size == 1 { "file" } else { "files" };
         parts.push(format!("{size} in-scope {noun} over the size threshold"));
     }
-    format!(
+    let mut note = format!(
         "{message}\nThis search did not include {}.",
         parts.join(" and ")
-    )
+    );
+    if !policy_paths.is_empty() {
+        note.push_str(&format!(
+            "\nWithheld by admission policy: {}",
+            policy_paths.join(", ")
+        ));
+        if policy > policy_paths.len() {
+            note.push_str(&format!(" and {} more", policy - policy_paths.len()));
+        }
+        note.push('.');
+    }
+    note
 }
 
 /// The regex error repeats the pattern; the leading echo keeps this many characters.
@@ -570,6 +582,7 @@ pub fn search_text_result_view(
             append_withheld_admission_note(
                 append_excluded_knowledge_note(message, result.excluded_knowledge_files),
                 result.withheld_policy_files,
+                result.withheld_policy_paths.as_slice(),
                 result.withheld_size_files,
             ),
             result.unparsed_files,
@@ -612,6 +625,7 @@ pub fn search_text_result_view(
             append_withheld_admission_note(
                 lines.join("\n"),
                 result.withheld_policy_files,
+                result.withheld_policy_paths.as_slice(),
                 result.withheld_size_files,
             ),
             result.unparsed_files,
@@ -772,6 +786,7 @@ pub fn search_text_result_view(
         append_withheld_admission_note(
             lines.join("\n"),
             result.withheld_policy_files,
+            result.withheld_policy_paths.as_slice(),
             result.withheld_size_files,
         ),
         result.unparsed_files,
@@ -810,6 +825,7 @@ pub fn search_text_count_view(
         append_withheld_admission_note(
             lines.join("\n"),
             found.withheld_policy_files,
+            found.withheld_policy_paths.as_slice(),
             found.withheld_size_files,
         ),
         found.unparsed_files,

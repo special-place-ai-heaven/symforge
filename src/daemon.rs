@@ -14335,6 +14335,7 @@ mod tests {
                 overflow_count: 0,
                 excluded_knowledge_files: excluded,
                 withheld_policy_files: 0,
+                withheld_policy_paths: Vec::new(),
                 withheld_size_files: 0,
                 unparsed_files: 0,
             }
