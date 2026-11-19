@@ -288,13 +288,11 @@ pub struct CheckpointNowInput {
 /// both preserves the historical default (offset 0, limit 10).
 #[derive(Default, Deserialize, Serialize, JsonSchema)]
 pub struct HealthInput {
-    /// Maximum quarantine registry entries to render (default 10, capped at
-    /// 1000). Raise to retrieve more of the full partial/failed file list.
-    /// The same window also pages the list of files withheld by admission policy.
+    /// Max quarantine and withheld-file entries to render (default 10, cap
+    /// 1000). Raise to page the full lists.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub quarantine_limit: Option<u32>,
-    /// Offset into the ranked quarantine registry for paging (default 0). The same
-    /// offset also pages the list of files withheld by admission policy.
+    /// Offset into the quarantine and withheld-file lists (default 0).
     #[serde(default, deserialize_with = "lenient_u32")]
     pub quarantine_offset: Option<u32>,
 }
@@ -1019,9 +1017,10 @@ fn admission_degradation_view_from_disk(
 /// The first refusal checks the requested path against the manifest. A present
 /// withheld file names its finding lines; a missing one gets the same refusal
 /// without lines (docs/solutions/withheld-file-diagnostics.md). The second runs
-/// on the RESOLVED path, which can differ from the requested string (absolute
-/// arguments do not normalize against a catalog key) and is the only clause
-/// that catches a content-detected demotion reached that way.
+/// on the path RESOLVED beneath the repo root and the third on the resolved
+/// view's path; either can differ from the requested string (absolute
+/// arguments do not normalize against a catalog key) and they catch a
+/// content-detected demotion reached that way.
 fn admission_degradation_view_for_path(
     index: &LiveIndex,
     repo_root: Option<&Path>,

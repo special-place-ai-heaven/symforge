@@ -1,6 +1,8 @@
 # Withheld file diagnostics
 
-Every tool that refuses or skips a file withheld by the admission policy gives the same reason: path, rule id(s), match count and the matched line numbers. Matched text is never shown.
+Every MCP and daemon text tool that refuses or skips a file withheld by the admission policy gives the same reason: path, rule id(s), match count and the matched line numbers. Matched text is never shown.
+
+The embed `get_symbol` text still renders `Source withheld: <path>`; its typed withheld row carries the details.
 
 ## Where lines come from
 

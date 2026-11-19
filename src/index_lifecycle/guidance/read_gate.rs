@@ -284,24 +284,41 @@ pub(crate) fn refuse_by_policy_naming_lines_with(
     })
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(test)]
 thread_local! {
     static EVIDENCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(test)]
 pub(crate) fn reset_evidence_reads_for_tests() {
     EVIDENCE_READS.with(|reads| reads.set(0));
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "embed"))]
+static AMBIENT_EVIDENCE_PATHS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(all(test, feature = "embed"))]
+pub(crate) fn ambient_evidence_paths_for_tests() -> Vec<String> {
+    AMBIENT_EVIDENCE_PATHS
+        .lock()
+        .map(|paths| paths.clone())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
 pub(crate) fn evidence_reads_for_tests() -> usize {
     EVIDENCE_READS.with(std::cell::Cell::get)
 }
 
 fn disk_evidence_bytes(live: &LiveIndex, relative_path: &str) -> Option<Vec<u8>> {
-    #[cfg(all(test, feature = "server"))]
-    EVIDENCE_READS.with(|reads| reads.set(reads.get() + 1));
+    #[cfg(test)]
+    {
+        EVIDENCE_READS.with(|reads| reads.set(reads.get() + 1));
+        #[cfg(all(test, feature = "embed"))]
+        if let Ok(mut paths) = AMBIENT_EVIDENCE_PATHS.lock() {
+            paths.push(relative_path.to_string());
+        }
+    }
     let root = live.indexed_root.as_deref()?;
     let full_path = crate::discovery::resolve_repo_path(root, relative_path)
         .ok()
