@@ -1189,6 +1189,80 @@ pub(crate) fn render_disposition_line(entries: &[CatalogEntry]) -> String {
     )
 }
 
+pub(crate) fn render_withheld_files_section(
+    entries: &[CatalogEntry],
+    window: QuarantineWindow,
+) -> Option<String> {
+    let mut withheld: Vec<(&str, String)> = entries
+        .iter()
+        .filter_map(|entry| {
+            let path = entry
+                .path
+                .normalized_utf8
+                .as_deref()
+                .unwrap_or(entry.path.public_id.as_str());
+            let FileDisposition::MetadataOnly { reason } = &entry.disposition else {
+                return None;
+            };
+            let detail = match reason {
+                crate::domain::MetadataOnlyReason::SensitivePath { rule_id } => {
+                    format!("path rule {rule_id}")
+                }
+                crate::domain::MetadataOnlyReason::SensitiveContent { rule_ids, .. }
+                    if rule_ids
+                        .iter()
+                        .any(|id| id == crate::knowledge::INDETERMINATE_RULE_ID) =>
+                {
+                    "content not inspected".to_string()
+                }
+                crate::domain::MetadataOnlyReason::SensitiveContent {
+                    rule_ids,
+                    finding_count,
+                } => format!(
+                    "content rule {} matched {finding_count} time{}",
+                    rule_ids.join(", "),
+                    if *finding_count == 1 { "" } else { "s" }
+                ),
+                _ => return None,
+            };
+            Some((path, detail))
+        })
+        .collect();
+    if withheld.is_empty() {
+        return None;
+    }
+    withheld.sort_unstable();
+    let total = withheld.len();
+    let shown = withheld
+        .iter()
+        .skip(window.offset)
+        .take(window.limit)
+        .collect::<Vec<_>>();
+    let mut section = format!(
+        "Withheld by admission policy: {total} file{}",
+        if total == 1 { "" } else { "s" }
+    );
+    for (index, (path, detail)) in shown.iter().enumerate() {
+        section.push_str(&format!(
+            "\n  {}. {path} - {detail}",
+            window.offset + index + 1
+        ));
+    }
+    if shown.is_empty() {
+        section.push_str(&format!(
+            "\n  (offset {} is past the end of the {total} withheld file{})",
+            window.offset,
+            if total == 1 { "" } else { "s" }
+        ));
+    }
+    if total > window.offset.saturating_add(shown.len()) {
+        section.push_str(
+            "\n  (use health with quarantine_limit/quarantine_offset to page the full list)",
+        );
+    }
+    Some(section)
+}
+
 /// Names the manifest entries the index could not read (SF-ADOPT-01), so a
 /// degraded freshness line has a cause a human can act on. `None` when there
 /// are none. Paths without a UTF-8 form render as their public id. A file is
@@ -2347,6 +2421,12 @@ pub(crate) fn render_health_report(
         crate::live_index::store::configured_inflight_byte_budget(),
         &inputs.settled_unreadable,
     ));
+    if let Some(manifest) = generation.manifest.as_deref()
+        && let Some(withheld) = render_withheld_files_section(&manifest.entries, quarantine_window)
+    {
+        result.push('\n');
+        result.push_str(&withheld);
+    }
     // Issue #876: from the same entry capture, so the counts are this report's
     // generation; every lane (local, daemon session, embed) renders it.
     result.push('\n');
@@ -2470,6 +2550,116 @@ mod memory_section_tests {
         assert_eq!(
             lines[3],
             "allocator: not identified (only jemalloc is probed)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod withheld_files_section_tests {
+    use super::*;
+    use crate::domain::{
+        CatalogPath, FileClassification, IndexTargets, MetadataOnlyReason, ParseStatus,
+    };
+
+    fn entry(path: &str, disposition: FileDisposition) -> CatalogEntry {
+        CatalogEntry {
+            path: CatalogPath {
+                public_id: path.to_string(),
+                normalized_utf8: Some(path.to_string()),
+            },
+            size: 10,
+            language: None,
+            classification: FileClassification::for_indexed_path(path, IndexTargets::Code),
+            disposition,
+            content_hash: None,
+        }
+    }
+
+    fn content(path: &str, rule: &str, count: u32) -> CatalogEntry {
+        entry(
+            path,
+            FileDisposition::MetadataOnly {
+                reason: MetadataOnlyReason::SensitiveContent {
+                    rule_ids: vec![rule.to_string()],
+                    finding_count: count,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn health_withheld_list_keeps_entries_without_a_utf8_path() {
+        let mut odd = content("placeholder", "secret.uri-credentials", 2);
+        odd.path.normalized_utf8 = None;
+        odd.path.public_id = "src/odd-name.rs".to_string();
+        let entries = vec![content("src/a.rs", "secret.uri-credentials", 1), odd];
+        let section = render_withheld_files_section(&entries, QuarantineWindow::default())
+            .expect("withheld files must render");
+        assert!(section.contains("2 files"), "{section}");
+        assert!(section.contains("src/odd-name.rs"), "{section}");
+    }
+
+    #[test]
+    fn health_withheld_list_says_so_when_the_offset_is_past_the_end() {
+        let entries = vec![content("src/a.rs", "secret.uri-credentials", 1)];
+        let section =
+            render_withheld_files_section(&entries, QuarantineWindow::from_args(Some(5), Some(2)))
+                .expect("section");
+        assert!(section.contains("1 file"), "{section}");
+        assert!(section.contains("offset 5 is past the end"), "{section}");
+        assert!(!section.contains("1. "), "{section}");
+    }
+
+    #[test]
+    fn health_lists_withheld_files_with_reason_rule_and_count_paged() {
+        let entries = vec![
+            content("src/b.rs", "secret.context-assignment", 5),
+            entry(
+                ".env",
+                FileDisposition::MetadataOnly {
+                    reason: MetadataOnlyReason::SensitivePath {
+                        rule_id: "path.environment-credentials".to_string(),
+                    },
+                },
+            ),
+            content("src/a.rs", "secret.uri-credentials", 1),
+            entry(
+                "src/ok.rs",
+                FileDisposition::Indexed {
+                    targets: IndexTargets::Code,
+                    parse_status: ParseStatus::Parsed,
+                },
+            ),
+        ];
+        let first =
+            render_withheld_files_section(&entries, QuarantineWindow::from_args(Some(0), Some(2)))
+                .expect("withheld files must render");
+        assert!(first.contains("3 files"), "{first}");
+        assert!(
+            first.contains(".env") && first.contains("path.environment-credentials"),
+            "{first}"
+        );
+        assert!(
+            first.contains("src/a.rs") && first.contains("secret.uri-credentials"),
+            "{first}"
+        );
+        assert!(!first.contains("src/b.rs"), "{first}");
+        assert!(
+            first.contains("quarantine_limit/quarantine_offset"),
+            "{first}"
+        );
+        let second =
+            render_withheld_files_section(&entries, QuarantineWindow::from_args(Some(2), Some(2)))
+                .expect("second page");
+        assert!(
+            second.contains("src/b.rs")
+                && second.contains("secret.context-assignment")
+                && second.contains("matched 5 times"),
+            "{second}"
+        );
+        assert!(
+            render_withheld_files_section(&entries[3..], QuarantineWindow::default()).is_none(),
+            "no withheld files, no section"
         );
     }
 }

@@ -358,3 +358,30 @@ fn s10_file_impact_updates_census_and_queries_without_whole_worktree_reload() {
     assert_eq!(symbols[0].name, "gamma");
     assert_eq!(symbols[0].path, "src/lib.rs");
 }
+
+#[test]
+fn analyze_file_impact_names_the_lines_of_a_withheld_file_from_the_authority() {
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path());
+    fs::create_dir_all(root.path().join("config")).unwrap();
+    fs::write(
+        root.path().join("config/app.json"),
+        "{\n  \"marker\": \"indexed_marker_value\",\n  \"password\": \"S3cretValue9xAb\"\n}\n",
+    )
+    .unwrap();
+    let runtime = ProcessIndexRuntime::acquire().unwrap();
+    let handle = open(&runtime, root.path());
+
+    let withheld = impact(
+        &handle,
+        FileImpactRequest {
+            path: "config/app.json".into(),
+            ..Default::default()
+        },
+    );
+    assert!(
+        withheld.contains("matched 1 time at line 3"),
+        "the authority-backed reader must supply the lines; got: {withheld}"
+    );
+    assert!(!withheld.contains("S3cretValue9xAb"), "{withheld}");
+}

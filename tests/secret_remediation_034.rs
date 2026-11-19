@@ -730,7 +730,10 @@ async fn plant_and_dismiss(dir: &Path) -> SymForgeServer {
 /// response echoes the query, so the path is the only honest signal.
 async fn planted_file_is_searchable(server: &SymForgeServer) -> bool {
     let hit = dispatch(server, "search_text", json!({ "query": INDEX_MARKER })).await;
-    result_text(&hit).contains("config/app.json")
+    result_text(&hit)
+        .lines()
+        .filter(|line| !line.starts_with("Withheld by admission policy:"))
+        .any(|line| line.contains("config/app.json"))
 }
 
 fn state_placement(root: &Path) -> symforge::domain::StatePlacement {

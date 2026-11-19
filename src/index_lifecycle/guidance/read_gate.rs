@@ -211,6 +211,129 @@ pub(crate) fn classify_admitted_bytes_with(
     None
 }
 
+pub(crate) fn recorded_refusal_naming_lines_via(
+    live: &LiveIndex,
+    relative_path: &str,
+    record: &mut dyn FnMut(WithheldMeta),
+    read_bytes: &mut dyn FnMut() -> Option<Vec<u8>>,
+) -> Option<String> {
+    if crate::knowledge::sensitive_path_rule(relative_path).is_some() {
+        return None;
+    }
+    let Some(FileDisposition::MetadataOnly {
+        reason:
+            MetadataOnlyReason::SensitiveContent {
+                rule_ids,
+                finding_count,
+            },
+    }) = live.capture_file_disposition(relative_path)
+    else {
+        return None;
+    };
+    if rule_ids
+        .iter()
+        .any(|id| id == crate::knowledge::INDETERMINATE_RULE_ID)
+    {
+        return None;
+    }
+    let (line_ranges, findings) = match read_bytes() {
+        Some(bytes) => recorded_finding_evidence_from_bytes(relative_path, &bytes, rule_ids),
+        None => (Vec::new(), Vec::new()),
+    };
+    if !findings.is_empty() {
+        record(WithheldMeta::from_content_findings(
+            relative_path,
+            &findings,
+        ));
+    }
+    (!line_ranges.is_empty()).then(|| {
+        format::content_withheld_by_admission(relative_path, rule_ids, *finding_count, &line_ranges)
+    })
+}
+
+pub(crate) fn recorded_refusal_naming_lines_with(
+    live: &LiveIndex,
+    relative_path: &str,
+    record: &mut dyn FnMut(WithheldMeta),
+) -> Option<String> {
+    recorded_refusal_naming_lines_via(live, relative_path, record, &mut || {
+        disk_evidence_bytes(live, relative_path)
+    })
+}
+
+pub(crate) fn refuse_by_policy_naming_lines_via(
+    live: &LiveIndex,
+    relative_path: &str,
+    record: &mut dyn FnMut(WithheldMeta),
+    read_bytes: &mut dyn FnMut() -> Option<Vec<u8>>,
+) -> Option<String> {
+    let refusal = refuse_by_policy_with(live, relative_path, record)?;
+    Some(
+        recorded_refusal_naming_lines_via(live, relative_path, record, read_bytes)
+            .unwrap_or(refusal),
+    )
+}
+
+pub(crate) fn refuse_by_policy_naming_lines_with(
+    live: &LiveIndex,
+    relative_path: &str,
+    record: &mut dyn FnMut(WithheldMeta),
+) -> Option<String> {
+    refuse_by_policy_naming_lines_via(live, relative_path, record, &mut || {
+        disk_evidence_bytes(live, relative_path)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static EVIDENCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_evidence_reads_for_tests() {
+    EVIDENCE_READS.with(|reads| reads.set(0));
+}
+
+#[cfg(all(test, feature = "embed"))]
+static AMBIENT_EVIDENCE_PATHS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(all(test, feature = "embed"))]
+pub(crate) fn clear_ambient_evidence_paths_for_tests() {
+    if let Ok(mut paths) = AMBIENT_EVIDENCE_PATHS.lock() {
+        paths.clear();
+    }
+}
+
+#[cfg(all(test, feature = "embed"))]
+pub(crate) fn ambient_evidence_paths_for_tests() -> Vec<String> {
+    AMBIENT_EVIDENCE_PATHS
+        .lock()
+        .map(|paths| paths.clone())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(crate) fn evidence_reads_for_tests() -> usize {
+    EVIDENCE_READS.with(std::cell::Cell::get)
+}
+
+fn disk_evidence_bytes(live: &LiveIndex, relative_path: &str) -> Option<Vec<u8>> {
+    #[cfg(test)]
+    {
+        EVIDENCE_READS.with(|reads| reads.set(reads.get() + 1));
+        #[cfg(all(test, feature = "embed"))]
+        if let Ok(mut paths) = AMBIENT_EVIDENCE_PATHS.lock() {
+            paths.push(relative_path.to_string());
+        }
+    }
+    let root = live.indexed_root.as_deref()?;
+    let full_path = crate::discovery::resolve_repo_path(root, relative_path)
+        .ok()
+        .flatten()?;
+    let budget = crate::knowledge::SECRET_SCAN_MAX_BYTES as u64 + 1;
+    read_regular_file_limited(&full_path, Some(budget)).ok()
+}
+
 /// Match bounded current bytes to the recorded rule set before adding actionable
 /// positions to a refusal. A changed verdict never weakens the recorded refusal.
 pub(crate) fn recorded_finding_evidence_from_bytes(

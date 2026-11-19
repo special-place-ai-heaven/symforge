@@ -167,6 +167,8 @@ pub struct TextSearchResult {
     pub excluded_by_usage: u64,
     pub excluded_knowledge_files: u64,
     pub withheld_policy_files: u64,
+    #[serde(default)]
+    pub withheld_policy_paths: Vec<String>,
     pub withheld_size_files: u64,
     /// Structural search: candidate files whose parse was cancelled or failed.
     #[serde(default)]

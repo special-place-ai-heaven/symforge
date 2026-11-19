@@ -1,6 +1,7 @@
 ── Impact: src/edit.rs ──
 Status: indexed and unchanged
+Basis: re-read from disk; content hash identical to the indexed copy
 Symbols: 0
 Tip: Use what_changed to see recent modifications.
 
-~300 tokens estimated vs whole-file read; ~300 tokens estimated vs ~50-line windowed read (assumed baseline, not measured)
+~283 tokens estimated vs whole-file read; ~283 tokens estimated vs ~50-line windowed read (assumed baseline, not measured)

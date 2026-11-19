@@ -141,6 +141,22 @@ pub(super) fn admit(
             receipt
         },
         &mut cache,
+        &mut |live, relative| {
+            super::guidance::read_gate::refuse_by_policy_naming_lines_via(
+                live,
+                relative,
+                &mut |_| {},
+                &mut || {
+                    authority
+                        .read_regular_beneath_anchor(
+                            Path::new(relative),
+                            crate::knowledge::SECRET_SCAN_MAX_BYTES,
+                        )
+                        .ok()
+                        .flatten()
+                },
+            )
+        },
     );
     match rendered {
         Ok(render) => Ok(FileImpactAdmission {
@@ -187,4 +203,64 @@ pub(super) fn project(
     };
     budget.required(rendered.len())?;
     Ok(QueryOutput::FileImpact(FileImpactReport { rendered }))
+}
+
+#[cfg(test)]
+mod authority_reader_tests {
+    use crate::embed::parity::file_impact::FileImpactRequest;
+    use crate::embed::parity::{QueryLimits, QueryOutput, QueryPolicy, QueryRequest};
+    use crate::embed::{EmbeddedSourceSpec, ProcessIndexRuntime, SourceRuntimePhase};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn withheld_file_lines_come_from_the_authority_reader_not_the_index_root() {
+        super::super::guidance::read_gate::clear_ambient_evidence_paths_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("config")).unwrap();
+        std::fs::write(
+            root.path().join("config/authority-probe.json"),
+            "{\n  \"marker\": \"indexed_marker_value\",\n  \"password\": \"S3cretValue9xAb\"\n}\n",
+        )
+        .unwrap();
+        let runtime = ProcessIndexRuntime::acquire().unwrap();
+        let handle = runtime
+            .open_embedded_source(EmbeddedSourceSpec::current_worktree(
+                root.path().to_path_buf(),
+            ))
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(20);
+        while handle.runtime_view().phase != SourceRuntimePhase::Current {
+            assert!(Instant::now() < until, "source never reached Current");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let request = QueryRequest::FileImpact(FileImpactRequest {
+            path: "config/authority-probe.json".into(),
+            ..Default::default()
+        });
+        let claim = handle
+            .query_with_policy(
+                &request,
+                QueryLimits::default(),
+                QueryPolicy {
+                    allow_derived_state_preparation: true,
+                },
+                None,
+                None,
+            )
+            .expect("impact query");
+        let QueryOutput::FileImpact(report) = claim.value() else {
+            panic!("unexpected output");
+        };
+        assert!(
+            report.rendered.contains("matched 1 time at line 3"),
+            "got: {}",
+            report.rendered
+        );
+        assert!(
+            !super::super::guidance::read_gate::ambient_evidence_paths_for_tests()
+                .iter()
+                .any(|path| path == "config/authority-probe.json"),
+            "the embed lane must not read evidence through the index root"
+        );
+    }
 }
