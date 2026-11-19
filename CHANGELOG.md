@@ -46,6 +46,15 @@ Embedders keep their own response bytes and check them with `ReplayOutcome::resp
 
 AAP S14-S16 add opt-in refresh-safe snapshot reads for Graph, File, SymbolSearch, and References via `EmbeddedSourceHandle::query_allowing_refresh`; the claim keeps the prior publication identity and reports `Refreshing`. Strict `query` remains Current-only, and mutating/mixed-disk variants are refused before freshening. `change_version` plus blocking `wait_for_change` provide lossless phase/publication event waits. `begin_graph_publication_lease` pins one Graph snapshot across pages for at most 30 seconds; no more than eight leases are live per source, and expired leases return `GraphPublicationLeaseExpired`.
 
+## [11.22.6](https://github.com/special-place-ai-heaven/symforge/compare/v11.22.5...v11.22.6) (2026-11-19)
+
+
+### Bug Fixes
+
+* **admission:** name rule and lines for withheld files in every tool ([#929](https://github.com/special-place-ai-heaven/symforge/issues/929)) ([9234264](https://github.com/special-place-ai-heaven/symforge/commit/9234264b86683b23c3547aedbccb747b54394c52))
+* **update:** leave disabled and remote Grok and OMP entries as the user set them ([62c827f](https://github.com/special-place-ai-heaven/symforge/commit/62c827f73c272d6e2c93ff91a211db453ad4e796))
+* **update:** repair every harness on each update run ([#931](https://github.com/special-place-ai-heaven/symforge/issues/931)) ([62c827f](https://github.com/special-place-ai-heaven/symforge/commit/62c827f73c272d6e2c93ff91a211db453ad4e796))
+
 ## [11.22.5](https://github.com/special-place-ai-heaven/symforge/compare/v11.22.4...v11.22.5) (2026-11-19)
 
 
