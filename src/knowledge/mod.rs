@@ -64,7 +64,13 @@ pub fn decode_searchable_text(bytes: &[u8]) -> Result<DecodedText<'_>, std::str:
 /// Bumped to 7: the natural-language label exemption no longer admits
 /// Diceware-style multi-word or long Title-Case mashed passphrases under
 /// credential keys, so a v6 manifest admits files v7 withholds.
-pub const SECRET_POLICY_VERSION: u32 = 7;
+///
+/// Bumped to 8: on code paths, fixture-shaped literals, comparisons against a
+/// credential kind's name, object entries on the next line, and interpolations
+/// inside a template literal no longer withdraw the context-assignment
+/// exemption. A v7 manifest withholds files v8 admits, so it must be
+/// re-scouted rather than trusted.
+pub const SECRET_POLICY_VERSION: u32 = 8;
 pub const SECRET_SCAN_MAX_BYTES: usize = crate::domain::index::METADATA_ONLY_CODE_BYTES as usize;
 /// The one reserved rule id every [`DetectorFailure`] collapses onto. Public so
 /// the disclosure gate can tell an indeterminate verdict — which a reindex
@@ -254,9 +260,11 @@ pub fn scan_secret_spans(path: &str, bytes: &[u8]) -> SecretSpansScan {
                 && (is_placeholder(secret.as_bytes())
                     || is_angle_placeholder(bytes, secret.start()))
             {
-                if right_hand_side_continuation(bytes, secret.start(), secret.end())
-                    .is_some_and(|from| !expression_carries_quoted_payload(bytes, from, false))
-                {
+                if right_hand_side_continuation(bytes, secret.start(), secret.end()).is_some_and(
+                    |from| {
+                        !expression_carries_quoted_payload(bytes, from, false, is_code_path(path))
+                    },
+                ) {
                     continue;
                 }
             } else if (rule.id == CONTEXT_ASSIGNMENT_RULE_ID
@@ -587,6 +595,11 @@ fn assignment_value_looks_like_credential(
 /// `<<FILL_IN:`. Resuming there would start the walk inside the literal, so the
 /// walk resumes past that literal's closing quote instead — and `None` (never
 /// exempt) when the line ends before the quote closes.
+///
+/// The same holds for an unquoted capture sitting inside a literal opened
+/// earlier on the line (`` `…?key=${name}#fragment` ``): the walk resumes past
+/// that literal's closing delimiter. When the line leaves more than one
+/// delimiter class open the literal is ambiguous, and the answer is `None`.
 fn right_hand_side_continuation(
     bytes: &[u8],
     capture_start: usize,
@@ -596,15 +609,22 @@ fn right_hand_side_continuation(
         .checked_sub(1)
         .and_then(|index| bytes.get(index).copied())
         .filter(|byte| matches!(byte, b'"' | b'\'' | b'`'));
-    match (opener, bytes.get(capture_end)) {
-        (_, Some(b'"' | b'\'' | b'`')) => Some(capture_end + 1),
-        (Some(quote), _) => bytes[capture_end..]
-            .iter()
-            .take_while(|byte| **byte != b'\n')
-            .position(|byte| *byte == quote)
-            .map(|offset| capture_end + offset + 1),
-        (None, _) => Some(capture_end),
-    }
+    let opener = match (opener, bytes.get(capture_end)) {
+        (_, Some(b'"' | b'\'' | b'`')) => return Some(capture_end + 1),
+        (Some(quote), _) => quote,
+        (None, _) => match open_literal_delimiters(bytes, capture_start, false) {
+            [false, false, false] => return Some(capture_end),
+            [true, false, false] => b'"',
+            [false, true, false] => b'\'',
+            [false, false, true] => b'`',
+            _ => return None,
+        },
+    };
+    bytes[capture_end..]
+        .iter()
+        .take_while(|byte| **byte != b'\n')
+        .position(|byte| *byte == opener)
+        .map(|offset| capture_end + offset + 1)
 }
 
 /// `<<FILL_IN: model key>>`, `<your key>`: template syntax, not a credential —
@@ -708,10 +728,14 @@ fn uri_credentials_are_placeholder(
 /// guards scan.
 ///
 /// Three steps, IN THIS ORDER. The order is load-bearing, not stylistic:
-///  1. the value OPENS a literal — never exempt;
+///  1. the value OPENS a literal — exempt only when the literal reads as a
+///     fixture or a name ([`literal_reads_as_fixture`]) AND the rest of the
+///     right-hand side carries no payload, exactly as a placeholder is judged;
 ///  2. the value sits INSIDE a literal opened earlier on this line — exempt only
-///     if the WHOLE capture is one interpolation placeholder, so a credential
-///     embedded in a URL or connection string stays sensitive;
+///     if the WHOLE capture is one interpolation placeholder, reads as a
+///     fixture, or is a word-shaped value for a reserved test host
+///     ([`capture_is_word_value_for_reserved_host`]), so a credential embedded
+///     in a URL or connection string stays sensitive;
 ///  3. otherwise — walk the right-hand-side expression.
 ///
 /// Step 2 returns in BOTH directions. That is what guarantees step 3's walk
@@ -758,13 +782,19 @@ fn assignment_is_code_expression(
         let closes_keyword_literal = compact_keyword_literal
             && match_is_inside_string_literal(bytes, match_start, rust)
             && !match_is_inside_string_literal(bytes, value_start, rust);
-        return closes_keyword_literal
-            && !expression_carries_quoted_payload(bytes, value_start, true);
+        if closes_keyword_literal {
+            return !expression_carries_quoted_payload(bytes, value_start, true, true);
+        }
+        return literal_reads_as_fixture(value)
+            && right_hand_side_continuation(bytes, value_start, value_start + value.len())
+                .is_some_and(|from| !expression_carries_quoted_payload(bytes, from, false, true));
     }
     if match_is_inside_string_literal(bytes, value_start, rust) {
-        return capture_is_single_interpolation(value);
+        return capture_is_single_interpolation(value)
+            || literal_reads_as_fixture(value)
+            || capture_is_word_value_for_reserved_host(bytes, value_start, value);
     }
-    !expression_carries_quoted_payload(bytes, value_start, false)
+    !expression_carries_quoted_payload(bytes, value_start, false, true)
 }
 
 /// True when `value_start` sits inside a string, char or template literal that
@@ -784,6 +814,13 @@ fn assignment_is_code_expression(
 /// parity mistake (an apostrophe in a comment, an odd backtick in a doc
 /// comment, a raw-string hash count) reports "inside", which fails closed.
 fn match_is_inside_string_literal(bytes: &[u8], value_start: usize, rust: bool) -> bool {
+    open_literal_delimiters(bytes, value_start, rust).contains(&true)
+}
+
+/// Which delimiter classes — `"`, `'`, `` ` ``, in that order — are open at
+/// `value_start`, by the parity walk [`match_is_inside_string_literal`]
+/// documents.
+fn open_literal_delimiters(bytes: &[u8], value_start: usize, rust: bool) -> [bool; 3] {
     let line_start = bytes[..value_start]
         .iter()
         .rposition(|byte| *byte == b'\n')
@@ -809,7 +846,7 @@ fn match_is_inside_string_literal(bytes: &[u8], value_start: usize, rust: bool) 
         }
         index += 1;
     }
-    double || single || backtick
+    [double, single, backtick]
 }
 
 /// A doubled colon after the keyword (`CancellationToken::new`, a doc link to
@@ -836,7 +873,7 @@ fn separator_is_path_not_assignment(bytes: &[u8], match_start: usize, value_star
     // The line proves nothing when the expression continues past it
     // (a C++ constant whose literal sits on the next line, a builder chain):
     // fall through to the ordinary steps, whose walk follows continuations.
-    if line_end < bytes.len() && line_break_continues_expression(bytes, line_end) {
+    if line_end < bytes.len() && line_break_continues_expression(bytes, line_end, true) {
         return false;
     }
     let rest = &bytes[separator + 2..line_end];
@@ -910,19 +947,168 @@ fn capture_is_single_interpolation(value: &[u8]) -> bool {
 /// doc-comment example (`(e.g. "model-id")`) as this field's payload. Accepted
 /// cost, pinned by matrix row PB4: a JavaScript declarator list interrupted by
 /// a `//` comment line hides the declarators after it.
-fn line_break_continues_expression(window: &[u8], newline: usize) -> bool {
+///
+/// A SECOND carve-out, code paths only (owner ruling 2026-11-19): a trailing
+/// comma followed by a line that opens an object or struct entry
+/// ([`line_opens_object_entry`]) ends the expression too. That entry is its own
+/// key: when the key is a credential key the rule matches it on its own, and
+/// when it is not, its value is no more credential-bound than it would be on
+/// any other line. This retires the G10b regression the comma rule accepted.
+/// Accepted cost: a TypeScript declarator list whose later declarator carries
+/// a type annotation (`other: string = …`) is no longer followed.
+fn line_break_continues_expression(window: &[u8], newline: usize, code: bool) -> bool {
     const CONTINUATION: &[u8] = b"+-*|&^%=.?:\\,";
     let trailing = window[..newline]
         .iter()
         .rposition(|byte| !byte.is_ascii_whitespace())
         .map(|index| window[index]);
     let next_line = window[newline + 1..].trim_ascii_start();
-    if trailing == Some(b',') && (next_line.starts_with(b"//") || next_line.starts_with(b"#[")) {
+    if trailing == Some(b',')
+        && (next_line.starts_with(b"//")
+            || next_line.starts_with(b"#[")
+            || (code && line_opens_object_entry(next_line)))
+    {
         return false;
     }
     let leading = next_line.first().copied();
     trailing.is_some_and(|byte| CONTINUATION.contains(&byte))
         || leading.is_some_and(|byte| CONTINUATION.contains(&byte))
+}
+
+/// Whether `line` opens with an object or struct entry: an identifier or a
+/// one-line quoted string, then a single `:` (never the `::` of a path).
+fn line_opens_object_entry(line: &[u8]) -> bool {
+    let key_len = match line.first().copied() {
+        Some(quote @ (b'"' | b'\'')) => line[1..]
+            .iter()
+            .position(|byte| *byte == quote || *byte == b'\n')
+            .filter(|offset| line[1 + offset] == quote)
+            .map(|offset| offset + 2),
+        Some(byte) if byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$') => Some(
+            line.iter()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$'))
+                .count(),
+        ),
+        _ => None,
+    };
+    key_len.is_some_and(|len| {
+        let rest = &line[len..];
+        let rest = &rest[rest
+            .iter()
+            .take_while(|byte| matches!(byte, b' ' | b'\t'))
+            .count()..];
+        rest.first() == Some(&b':') && rest.get(1) != Some(&b':')
+    })
+}
+
+/// Words that mark a literal as a test fixture, a placeholder, or a name for
+/// the credential kind rather than a credential.
+const FIXTURE_WORDS: &[&str] = &[
+    "synthetic",
+    "fixture",
+    "fake",
+    "dummy",
+    "mock",
+    "stub",
+    "sample",
+    "example",
+    "placeholder",
+    "test",
+    "credential",
+    "secret",
+    "password",
+    "passwd",
+    "token",
+    "key",
+];
+/// Longest all-digit segment a fixture literal may carry (`!23`, `%21`).
+const FIXTURE_MAX_DIGIT_GROUP: usize = 3;
+
+/// True when a code literal reads as a fixture or a name, not a credential:
+/// split on every non-alphanumeric byte, each segment is purely alphabetic or
+/// a short digit group, and at least one segment is a [`FIXTURE_WORDS`] word.
+/// A segment mixing letters and digits (high-entropy material, `Password123`)
+/// disqualifies the whole literal. Applied on CODE paths only; config, data
+/// and env files keep judging such values as credentials.
+fn literal_reads_as_fixture(value: &[u8]) -> bool {
+    word_segments_marked(value) == Some(true)
+}
+
+/// `None` when any segment of `value` disqualifies it as words (letters mixed
+/// with digits, or a digit group longer than [`FIXTURE_MAX_DIGIT_GROUP`]) or
+/// it carries no alphabetic segment at all; otherwise whether a
+/// [`FIXTURE_WORDS`] word is among the segments.
+fn word_segments_marked(value: &[u8]) -> Option<bool> {
+    let mut marked = false;
+    let mut alphabetic = false;
+    for segment in value
+        .split(|byte| !byte.is_ascii_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+    {
+        if segment.iter().all(u8::is_ascii_digit) {
+            if segment.len() > FIXTURE_MAX_DIGIT_GROUP {
+                return None;
+            }
+            continue;
+        }
+        if !segment.iter().all(u8::is_ascii_alphabetic) {
+            return None;
+        }
+        alphabetic = true;
+        marked |= FIXTURE_WORDS
+            .iter()
+            .any(|word| segment.eq_ignore_ascii_case(word.as_bytes()));
+    }
+    alphabetic.then_some(marked)
+}
+
+/// True when the capture is a word-shaped query value (see
+/// [`word_segments_marked`]) inside a URL, in the same literal, whose host is
+/// reserved for testing and documentation (RFC 2606 and RFC 6761:
+/// `localhost`, `*.test`, `*.example`, `*.invalid`, `*.localhost`,
+/// `example.com`/`.net`/`.org`). A userinfo section, any quote or whitespace
+/// between the URL and the capture, or a value mixing letters and digits keeps
+/// the capture sensitive.
+fn capture_is_word_value_for_reserved_host(bytes: &[u8], value_start: usize, value: &[u8]) -> bool {
+    if word_segments_marked(value).is_none() {
+        return false;
+    }
+    let line_start = bytes[..value_start]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let Some(scheme_end) = bytes[line_start..value_start]
+        .windows(3)
+        .rposition(|window| window == b"://")
+    else {
+        return false;
+    };
+    let host_start = line_start + scheme_end + 3;
+    let url = &bytes[host_start..value_start];
+    if url
+        .iter()
+        .any(|byte| matches!(byte, b'"' | b'\'' | b'`' | b'@') || byte.is_ascii_whitespace())
+    {
+        return false;
+    }
+    let host_len = url
+        .iter()
+        .take_while(|byte| !matches!(byte, b'/' | b':' | b'?' | b'#'))
+        .count();
+    let host = url[..host_len].to_ascii_lowercase();
+    host == b"localhost"
+        || [".test", ".example", ".invalid", ".localhost"]
+            .iter()
+            .any(|suffix| host.ends_with(suffix.as_bytes()))
+        || ["example.com", "example.net", "example.org"]
+            .iter()
+            .any(|domain| {
+                host == domain.as_bytes() || host.ends_with([".", domain].concat().as_bytes())
+            })
+}
+
+fn is_code_path(path: &str) -> bool {
+    crate::domain::LanguageId::from_path(path).is_some_and(|language| language.is_code_language())
 }
 
 /// Length of the bounded char literal opening at `at` (which holds `'`), but
@@ -976,7 +1162,10 @@ fn bounded_char_literal_len(window: &[u8], at: usize) -> Option<usize> {
 /// skipping `"` and `` ` `` literals whole. Returns `true` — exemption
 /// WITHDRAWN — when any of:
 ///   * a delimiter-fenced run of at least [`CONTEXT_ASSIGNMENT_MIN_PAYLOAD`]
-///     payload bytes appears anywhere in the window;
+///     payload bytes appears anywhere in the window — except, on a code path
+///     (`code`), one that reads as a fixture or a name
+///     ([`literal_reads_as_fixture`]), such as the comparand of a check
+///     against the credential kind's own name;
 ///   * a `"` or `` ` `` literal opens in the window and never closes inside it;
 ///   * the window is exhausted before the expression terminates at depth 0
 ///     (UNBALANCED or OVER-BOUND — fail closed).
@@ -1026,6 +1215,7 @@ fn expression_carries_quoted_payload(
     bytes: &[u8],
     from: usize,
     after_closed_literal: bool,
+    code: bool,
 ) -> bool {
     let end = from
         .saturating_add(CONTEXT_ASSIGNMENT_SCAN_BOUND)
@@ -1048,6 +1238,7 @@ fn expression_carries_quoted_payload(
                 }
                 if run - (index + 1) >= CONTEXT_ASSIGNMENT_MIN_PAYLOAD
                     && window.get(run) == Some(&byte)
+                    && !(code && literal_reads_as_fixture(&window[index + 1..run]))
                 {
                     return true;
                 }
@@ -1103,7 +1294,7 @@ fn expression_carries_quoted_payload(
                 // this rule exists to catch (H2). Continue only on a
                 // continuation operator; an ordinary next statement still ends
                 // the walk.
-                if !line_break_continues_expression(window, index) {
+                if !line_break_continues_expression(window, index, code) {
                     return false;
                 }
                 index += 1;
@@ -1180,9 +1371,11 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
                 // outside the literal this capture closed. Same withdrawal test
                 // the code-expression exemption answers to, applied at the one
                 // boundary both exemptions pass through.
-                if right_hand_side_continuation(bytes, secret.start(), secret.end())
-                    .is_some_and(|from| !expression_carries_quoted_payload(bytes, from, false))
-                {
+                if right_hand_side_continuation(bytes, secret.start(), secret.end()).is_some_and(
+                    |from| {
+                        !expression_carries_quoted_payload(bytes, from, false, is_code_path(path))
+                    },
+                ) {
                     continue;
                 }
             } else if (rule.id == CONTEXT_ASSIGNMENT_RULE_ID
@@ -1821,8 +2014,8 @@ mod tests {
                 .concat(),
                 MxVerdict::Sensitive(1),
             ),
-            // G10b: the accepted D1 regression — the walk now follows the
-            // struct-literal field comma into the next field's value.
+            // G10b: the D1 regression, retired by the object-entry carve-out
+            // (owner ruling 2026-11-19): a next-line field is its own key.
             (
                 "G10b rust struct literal sibling field",
                 "src/probe.rs",
@@ -1834,7 +2027,7 @@ mod tests {
                     "\",\n};",
                 ]
                 .concat(),
-                MxVerdict::Sensitive(1),
+                MxVerdict::Clean,
             ),
             // D1-scan: a long post-D1 walk passes over a later independent
             // match; the scanner must still find it (count pins resume).
@@ -2548,6 +2741,270 @@ mod tests {
         assert!(
             failures.is_empty(),
             "precision rows off expectation: {failures:?}"
+        );
+    }
+
+    /// (row id, path, body, expected) for the 2026-11-19 ruling that ordinary
+    /// TypeScript source which only names or handles credentials is not
+    /// withheld. Every CLEAN row reproduces the code shape of a false positive
+    /// measured in a real repository, with synthetic fragments; every
+    /// SENSITIVE row is the same shape carrying a real-looking value, or the
+    /// same value on a config path.
+    fn code_handling_rows() -> Vec<(&'static str, &'static str, String, MxVerdict)> {
+        let password = mx_password();
+        let secret_kw = ["sec", "ret"].concat();
+        let token = mx_token();
+        let is_password = ["is", "Pass", "word"].concat();
+        let login_password = ["login", "Pass", "word"].concat();
+        let transient_secret = ["transient", "Sec", "ret"].concat();
+        let session_token = ["session_", "token"].concat();
+        let apikey_camel = ["api", "Key"].concat();
+        let synthetic = ["SYNTHETIC_TRANSIENT_FORM_", "SEC", "RET"].concat();
+        let stored = ["stored-", "pass", "word"].concat();
+        let spaced = ["SYNTHETIC CREDENTIAL", "!23"].concat();
+        let real = mx_real();
+        let weak = ["Pass", "word", "123!"].concat();
+        vec![
+            (
+                "CH1 object property from a comparison against the key word",
+                "src/recorder.service.ts",
+                [
+                    "const m = {\n  ",
+                    &secret_kw,
+                    ": (c.inputType || \"\").toLowerCase() === \"",
+                    &password,
+                    "\",\n  surfaceKey: c.surfaceKey,\n};\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "CH1c comparison against a real-looking literal",
+                "src/recorder.service.ts",
+                [
+                    "const ",
+                    &is_password,
+                    " = c.inputType === \"",
+                    &real,
+                    "\";\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "CH2 boolean const from a comparison against the key word",
+                "src/recorder.service.ts",
+                [
+                    "const ",
+                    &is_password,
+                    " = info.inputType === \"",
+                    &password,
+                    "\";\nconst shown = 1;\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "CH3 placeholder entry followed by a quoted-key entry",
+                "src/recorder.service.ts",
+                [
+                    "const m = {\n  name: \"{{name}}\",\n  ",
+                    &password,
+                    ": \"{{",
+                    &password,
+                    "}}\",\n  \"{{email}}\": \"{{email}}\",\n};\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "CH4 comment naming a query parameter with an angle placeholder",
+                "src/recorder.service.ts",
+                [
+                    "// names like `",
+                    &token,
+                    "`/`auth` are common (e.g. `?",
+                    &token,
+                    "=<public-kit-",
+                    &token,
+                    ">`), and blocking them broke it. The\n// next line.\nconst a = 1;\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "CH5 field from a member access followed by a sibling URL field",
+                "src/recorder.service.spec.ts",
+                [
+                    "f({\n  ",
+                    &login_password,
+                    ": creds.p,\n  credentialOrigins: [\"http://app.example\"],\n});\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "CH5c sibling credential key still caught on its own",
+                "src/recorder.service.spec.ts",
+                [
+                    "f({\n  ",
+                    &login_password,
+                    ": creds.p,\n  ",
+                    &apikey_camel,
+                    ": \"",
+                    &real,
+                    "\",\n});\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "CH6 synthetic fixture marker literal",
+                "src/recorder.service.spec.ts",
+                ["const ", &transient_secret, " = \"", &synthetic, "\";\n"].concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "CH6c high-entropy literal under the same key",
+                "src/recorder.service.spec.ts",
+                ["const ", &transient_secret, " = \"", &real, "\";\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "CH6j synthetic fixture marker on a config path",
+                "config.json",
+                ["{\"", &password, "\": \"", &synthetic, "\"}\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "CH7 literal that names its own credential kind",
+                "src/recorder.service.spec.ts",
+                [
+                    "f(7, { username: \"stored-user\", ",
+                    &password,
+                    ": \"",
+                    &stored,
+                    "\" }, identity);\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "CH7e self-naming literal on an env path",
+                "deploy.env",
+                [&password.to_ascii_uppercase(), "=", &stored, "\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "CH7c self-naming literal followed by a real literal",
+                "src/recorder.service.spec.ts",
+                [
+                    "const ", &password, " = \"", &stored, "\" + \"", &real, "\";\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "CH8 fixture value in a query string inside a literal",
+                "src/recorder.service.spec.ts",
+                [
+                    "const r = {\n  url: () => \"https://attacker.example/collect?",
+                    &session_token,
+                    "=novel-value\",\n  method: () => \"GET\",\n};\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "CH8c real value in a query string inside a literal",
+                "src/recorder.service.spec.ts",
+                [
+                    "const r = {\n  url: () => \"https://attacker.example/collect?",
+                    &session_token,
+                    "=",
+                    &real,
+                    "\",\n  method: () => \"GET\",\n};\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "CH8h word value for a non-reserved host",
+                "src/recorder.service.spec.ts",
+                [
+                    "const r = {\n  url: () => \"https://collector.prod.io/c?",
+                    &session_token,
+                    "=novel-value\",\n  method: () => \"GET\",\n};\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "CH9 template interpolation before a URL fragment",
+                "src/recorder.service.spec.ts",
+                [
+                    "const r = {\n  url: () =>\n    `https://app.example/api/items?",
+                    &token,
+                    "=${credentialLiteral}#details`,\n  request: () => ({ a: 1 }),\n};\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "CH9c template interpolation then a literal in the same string",
+                "src/recorder.service.spec.ts",
+                [
+                    "const r = {\n  url: () =>\n    `https://app.example/api/items?",
+                    &token,
+                    "=${credentialLiteral}",
+                    &real,
+                    "#details`,\n  request: () => ({ a: 1 }),\n};\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "CH10 spaced fixture literal with a short digit group",
+                "src/recorder.service.spec.ts",
+                [
+                    "f({\n  applicationId: 10,\n  ",
+                    &login_password,
+                    ": \"",
+                    &spaced,
+                    "\",\n});\n",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "CH10c word with digits glued on stays caught",
+                "src/recorder.service.spec.ts",
+                [
+                    "f({\n  applicationId: 10,\n  ",
+                    &login_password,
+                    ": \"",
+                    &weak,
+                    "\",\n});\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+        ]
+    }
+
+    #[test]
+    fn code_handling_credentials_matrix_pins() {
+        let mut failures = Vec::new();
+        for (id, path, body, expected) in code_handling_rows() {
+            match scan_verdict(path, &body) {
+                Ok(actual) if actual == expected => {}
+                Ok(actual) => failures.push(format!("{id}: expected {expected:?}, got {actual:?}")),
+                Err(error) => failures.push(format!("{id}: {error}")),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "code-handling rows off expectation: {failures:?}"
         );
     }
 
