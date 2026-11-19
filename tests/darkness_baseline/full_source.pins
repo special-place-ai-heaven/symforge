@@ -324,7 +324,7 @@ c5913bb10d48dec3ecc1335534f49a5650e7a7639a026533845a9f99931f50fc  internals.rs
 
 2f92e67683df7de8851bb27c92f5db038918ff65c6374c623849024165be83cf  knowledge/curation_contract.rs
 
-1e483f1f20917c54b2cfa7b4b3c2d35735e478543c006c12bbbc39ea3de66ee2  knowledge/mod.rs
+1dc7855c7bf27241a595b2dd83e0575d91a2ede686ede378c020bdf9a14abe6d  knowledge/mod.rs
 
 80d72e8a39c54db6c1d62018a39288bf6c3d66effeb76f1d8a602be81e63b062  knowledge/review.rs
 
@@ -544,7 +544,7 @@ f2a81ae06d5917fc2efc8545d3bffc289370092ea77cc4f93cbdf685c866d274  protocol/sessi
 
 732cd5d4916ecccb4554c004e8c7c799b78888f75bee6173fccd46f3286ce28a  protocol/tool_contract.rs
 
-268eaef5a08fe4fe1ca2368d4e52c3970cc22b15fb9b88769ab523cf2073a5c8  protocol/tools.rs
+1ccb94deedda9eec72e3d7d54e07ccf8beb6998c53d59adbcd2468645c371c43  protocol/tools.rs
 
 ccaa0f8a3ff262982f65a97e4f41b0cdc5e73bb8b5cf6e0ccbac2139ae53ef0d  protocol/tools/tests/find_references.rs
 
