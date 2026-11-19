@@ -214,10 +214,11 @@ mod authority_reader_tests {
 
     #[test]
     fn withheld_file_lines_come_from_the_authority_reader_not_the_index_root() {
+        super::super::guidance::read_gate::clear_ambient_evidence_paths_for_tests();
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("config")).unwrap();
         std::fs::write(
-            root.path().join("config/app.json"),
+            root.path().join("config/authority-probe.json"),
             "{\n  \"marker\": \"indexed_marker_value\",\n  \"password\": \"S3cretValue9xAb\"\n}\n",
         )
         .unwrap();
@@ -233,7 +234,7 @@ mod authority_reader_tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let request = QueryRequest::FileImpact(FileImpactRequest {
-            path: "config/app.json".into(),
+            path: "config/authority-probe.json".into(),
             ..Default::default()
         });
         let claim = handle
@@ -258,7 +259,7 @@ mod authority_reader_tests {
         assert!(
             !super::super::guidance::read_gate::ambient_evidence_paths_for_tests()
                 .iter()
-                .any(|path| path == "config/app.json"),
+                .any(|path| path == "config/authority-probe.json"),
             "the embed lane must not read evidence through the index root"
         );
     }

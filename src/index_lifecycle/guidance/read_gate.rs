@@ -298,6 +298,13 @@ pub(crate) fn reset_evidence_reads_for_tests() {
 static AMBIENT_EVIDENCE_PATHS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(all(test, feature = "embed"))]
+pub(crate) fn clear_ambient_evidence_paths_for_tests() {
+    if let Ok(mut paths) = AMBIENT_EVIDENCE_PATHS.lock() {
+        paths.clear();
+    }
+}
+
+#[cfg(all(test, feature = "embed"))]
 pub(crate) fn ambient_evidence_paths_for_tests() -> Vec<String> {
     AMBIENT_EVIDENCE_PATHS
         .lock()
