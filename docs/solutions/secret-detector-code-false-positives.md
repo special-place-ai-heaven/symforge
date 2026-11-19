@@ -28,11 +28,12 @@ A path is **config-like** (`is_config_like_path`) when any of these holds:
 - it sits under a `config`, `settings` or `conf` directory;
 - its basename contains `settings` (this covers `local_settings.py`) or contains
   `.config.` (`webpack.config.js`);
-- its basename starts with `ormconfig`;
+- its basename starts with `ormconfig` or `config.` (`app/config.py`), or
+  contains `-config.` or `_config.` (`wp-config.php`);
 - it is `mix.exs`;
 - it is a `*.gradle` or `*.gradle.kts` build script.
 
-These are pinned by rows C5a to C5g and RV18 to RV20.
+These are pinned by rows C5a to C5g, D4, D5 and RV18 to RV20.
 
 A path is a **test path** (`is_test_path`) when its basename contains `.spec.` or
 `.test.`, or when it sits under a `test`, `tests`, `__tests__` or `fixtures`
@@ -71,15 +72,18 @@ A fixture literal is judged like a placeholder, so the rest of the right-hand si
 is still walked. The walk may only start from a resume point that
 `proven_literal_end` actually proves: the closing delimiter of the literal the
 capture sits in, found on the same line, with no quote-fenced payload before it.
+The search for that closer skips backslash-escaped bytes, so `\"` does not end the
+literal early (D1, D2; the same search serves `enclosing_literal_end`).
 When the literal is ambiguous or has no closer, the value is not exempt. Step 2
 never uses the version 7 fallback (RV29).
 
 ### Comparisons (`fenced_literal_is_benign`, `comparand_reads_as_word`)
 
 Inside the right-hand-side walk, a quoted literal right after `==`, `===`, `!=` or
-`!==` is not a payload when its content is a word: all lowercase, or one leading
-capital followed by lowercase, or a listed credential name. A mixed-case or
-letters-and-digits comparand still matches (RV30, CH1c).
+`!==` is not a payload when its content is a word. A word is a listed credential
+name, or at most 12 letters that are all lowercase or one leading capital followed
+by lowercase. A longer run, a mixed-case run, or a letters-and-digits comparand
+still matches (C2l, C2t, RV30, CH1c).
 
 ### Next-line object entries (`line_opens_object_entry`)
 
@@ -137,8 +141,14 @@ Both now scan linearly.
   if it was meant as a weak real password.
 - A word-shaped comparand of `==` is admitted, even if it is a weak real password
   check.
-- A marker word plus up to two one-case words of up to 12 letters is admitted,
-  including all-lowercase random letters.
+- A marker word plus long one-case random letters still passes in code. Up to two
+  one-case words of up to 12 letters are allowed beside a marker. Follow-up: L3.
+- Any `test`, `tests`, `__tests__` or `fixtures` folder anywhere in the path counts
+  as a test path, for example `infra/test/`. Follow-up: L5.
+- `settings` anywhere in a basename makes UI files such as `SettingsPage.tsx`
+  config-like, so they are judged strictly.
+- `is_test_path` does not recognise `*_test.go`, `test_*.py` or `src/tests.rs`.
+  Those files are judged more strictly, so nothing leaks.
 - In `x: Map<A>= v`, the `>=` is still read as a comparison, so that line counts as
   an object entry.
 - The quoted env-var name row S9 in `src/protocol/tools.rs` (`API_KEY_NAME`) stays

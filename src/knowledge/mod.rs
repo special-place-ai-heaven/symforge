@@ -616,6 +616,19 @@ fn right_hand_side_continuation(
     }
 }
 
+fn unescaped_delimiter_after(bytes: &[u8], from: usize, delimiter: u8) -> Option<usize> {
+    let mut index = from;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'\n' => return None,
+            b'\\' => index += 2,
+            _ if byte == delimiter => return Some(index),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
 fn closing_delimiter_after(bytes: &[u8], from: usize, delimiter: u8) -> Option<usize> {
     bytes[from..]
         .iter()
@@ -639,7 +652,7 @@ fn sole_open_delimiter(bytes: &[u8], at: usize, rust: bool) -> Option<u8> {
 
 fn enclosing_literal_end(bytes: &[u8], capture_end: usize, rust: bool) -> Option<Option<usize>> {
     let delimiter = sole_open_delimiter(bytes, capture_end, rust)?;
-    let close = closing_delimiter_after(bytes, capture_end, delimiter)?;
+    let close = unescaped_delimiter_after(bytes, capture_end, delimiter)?;
     if span_fences_payload(&bytes[capture_end..close]) {
         return Some(None);
     }
@@ -863,7 +876,7 @@ fn proven_literal_end(
         Some(quote) => quote,
         None => sole_open_delimiter(bytes, value_start, rust)?,
     };
-    let close = closing_delimiter_after(bytes, value_end, delimiter)?;
+    let close = unescaped_delimiter_after(bytes, value_end, delimiter)?;
     (!span_fences_payload(&bytes[value_end..close])).then_some(close + 1)
 }
 
@@ -1110,6 +1123,7 @@ const FIXTURE_MAX_WORD_CHARS: usize = 12;
 const NAMED_COMPANION_MAX_CHARS: usize = 8;
 const QUOTE_PARITY_LINE_BOUND: usize = 4096;
 const ANGLE_PLACEHOLDER_LINE_BOUND: usize = 4096;
+const COMPARAND_MAX_CHARS: usize = 12;
 
 fn is_listed(segment: &[u8], words: &[&str]) -> bool {
     words
@@ -1183,9 +1197,10 @@ fn comparand_reads_as_word(content: &[u8]) -> bool {
         return false;
     };
     content.iter().all(u8::is_ascii_alphabetic)
-        && (content.iter().all(u8::is_ascii_lowercase)
-            || (first.is_ascii_uppercase() && rest.iter().all(u8::is_ascii_lowercase))
-            || is_listed(content, CREDENTIAL_NAMES))
+        && (is_listed(content, CREDENTIAL_NAMES)
+            || (content.len() <= COMPARAND_MAX_CHARS
+                && (content.iter().all(u8::is_ascii_lowercase)
+                    || (first.is_ascii_uppercase() && rest.iter().all(u8::is_ascii_lowercase)))))
 }
 
 fn fenced_literal_is_benign(before: &[u8], content: &[u8], test_path: bool) -> bool {
@@ -1223,6 +1238,9 @@ fn is_config_like_path(normalized: &str) -> bool {
         || basename.contains("settings")
         || basename.contains(".config.")
         || basename.starts_with("ormconfig")
+        || basename.starts_with("config.")
+        || basename.contains("-config.")
+        || basename.contains("_config.")
         || basename == "mix.exs"
         || segments.any(|segment| matches!(segment, "config" | "settings" | "conf"))
 }
@@ -3494,6 +3512,70 @@ mod tests {
                 ]
                 .concat(),
                 MxVerdict::Clean,
+            ),
+            (
+                "D1 python fixture value then an escaped-quote literal in the same string",
+                "src/probe.py",
+                [
+                    "dsn = \"host=db ",
+                    &password,
+                    "=fake-db-pass ",
+                    &secret_kw,
+                    "=\\\"",
+                    &real,
+                    "\\\"\"\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "D2 ts placeholder then an escaped-quote literal in the same string",
+                "src/probe.ts",
+                [
+                    "const u = \"",
+                    &token,
+                    "=${credentialLiteral} ",
+                    &secret_kw,
+                    "=\\\"",
+                    &real,
+                    "\\\"\";\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "C2l comparison against a long lowercase letter run",
+                "src/probe.ts",
+                [
+                    "const ",
+                    &is_password,
+                    " = supplied === \"qwrtzplnvbdfghjk\";\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "C2t comparison against a long capitalised letter run",
+                "src/probe.ts",
+                [
+                    "const ",
+                    &is_password,
+                    " = supplied === \"Qwrtzplnvbdfghjk\";\n",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "D4 python config module basename",
+                "app/config.py",
+                [&password, " = \"", &synthetic, "\"\n"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "D5 php hyphenated config basename",
+                "wp-config.php",
+                ["<?php\n$", &password, " = \"", &synthetic, "\";\n"].concat(),
+                MxVerdict::Sensitive(1),
             ),
         ]
     }
