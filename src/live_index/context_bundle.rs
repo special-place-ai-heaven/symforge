@@ -14,6 +14,10 @@ pub struct ContextBundleReferenceView {
     pub file_path: String,
     pub line_number: u32,
     pub enclosing: Option<String>,
+    pub enclosing_name: Option<String>,
+    pub enclosing_kind: Option<String>,
+    pub enclosing_start_line: Option<u32>,
+    pub confidence: &'static str,
     /// When callees are deduplicated by name, this holds the total call-site count.
     /// Defaults to 1 for non-deduplicated entries.
     pub occurrence_count: usize,
@@ -105,9 +109,26 @@ impl LiveIndex {
         kind_filter: Option<&str>,
         symbol_line: Option<u32>,
     ) -> ContextBundleView {
-        use crate::domain::ReferenceKind;
-
         const CONTEXT_BUNDLE_SECTION_CAP: usize = 20;
+        self.capture_context_bundle_view_with_cap(
+            path,
+            name,
+            kind_filter,
+            symbol_line,
+            CONTEXT_BUNDLE_SECTION_CAP,
+        )
+    }
+
+    /// Capture `ContextBundleView` with a caller/type-usage entry cap (`section_cap`).
+    pub fn capture_context_bundle_view_with_cap(
+        &self,
+        path: &str,
+        name: &str,
+        kind_filter: Option<&str>,
+        symbol_line: Option<u32>,
+        section_cap: usize,
+    ) -> ContextBundleView {
+        use crate::domain::ReferenceKind;
 
         let Some(file) = self.get_file(path) else {
             return ContextBundleView::FileNotFound {
@@ -145,53 +166,59 @@ impl LiveIndex {
         let body = String::from_utf8_lossy(&file.content[clamped_start..clamped_end]).into_owned();
         let byte_count = end.saturating_sub(start);
 
-        let capture_section = |refs: &[(&str, &ReferenceRecord)]| -> ContextBundleSectionView {
-            let entries: Vec<ContextBundleReferenceView> = refs
-                .iter()
-                .take(CONTEXT_BUNDLE_SECTION_CAP)
-                .map(|(file_path, reference)| {
-                    let enclosing = self.get_file(file_path).and_then(|f| {
-                        reference
-                            .enclosing_symbol_index
-                            .and_then(|idx| f.symbols.get(idx as usize))
-                            .map(|symbol| format!("in {} {}", symbol.kind, symbol.name))
-                    });
+        let capture_section =
+            |refs: &[(&str, &ReferenceRecord, &'static str)]| -> ContextBundleSectionView {
+                let entries: Vec<ContextBundleReferenceView> = refs
+                    .iter()
+                    .take(section_cap)
+                    .map(|(file_path, reference, confidence)| {
+                        let enclosing_sym = self.get_file(file_path).and_then(|f| {
+                            reference
+                                .enclosing_symbol_index
+                                .and_then(|idx| f.symbols.get(idx as usize))
+                        });
 
-                    ContextBundleReferenceView {
-                        display_name: reference
-                            .qualified_name
-                            .as_deref()
-                            .unwrap_or(&reference.name)
-                            .to_string(),
-                        file_path: (*file_path).to_string(),
-                        line_number: reference.line_range.0 + 1,
-                        enclosing,
-                        occurrence_count: 1,
-                    }
-                })
-                .collect();
+                        ContextBundleReferenceView {
+                            display_name: reference
+                                .qualified_name
+                                .as_deref()
+                                .unwrap_or(&reference.name)
+                                .to_string(),
+                            file_path: (*file_path).to_string(),
+                            line_number: reference.line_range.0 + 1,
+                            enclosing: enclosing_sym
+                                .map(|symbol| format!("in {} {}", symbol.kind, symbol.name)),
+                            enclosing_name: enclosing_sym.map(|symbol| symbol.name.clone()),
+                            enclosing_kind: enclosing_sym.map(|symbol| symbol.kind.to_string()),
+                            enclosing_start_line: enclosing_sym
+                                .map(|symbol| symbol.line_range.0 + 1),
+                            confidence,
+                            occurrence_count: 1,
+                        }
+                    })
+                    .collect();
 
-            let unique_count = {
-                let mut names: Vec<&str> = refs.iter().map(|(_, r)| r.name.as_str()).collect();
-                names.sort_unstable();
-                names.dedup();
-                names.len()
+                let unique_count = {
+                    let mut names: Vec<&str> =
+                        refs.iter().map(|(_, r, _)| r.name.as_str()).collect();
+                    names.sort_unstable();
+                    names.dedup();
+                    names.len()
+                };
+
+                ContextBundleSectionView {
+                    total_count: refs.len(),
+                    overflow_count: refs.len().saturating_sub(entries.len()),
+                    entries,
+                    unique_count,
+                }
             };
-
-            ContextBundleSectionView {
-                total_count: refs.len(),
-                overflow_count: refs.len().saturating_sub(entries.len()),
-                entries,
-                unique_count,
-            }
-        };
 
         // Maximum number of unique callee names to show in a deduplicated section.
         const CALLEE_UNIQUE_CAP: usize = 30;
 
         let capture_callee_section =
             |refs: &[(&str, &ReferenceRecord)]| -> ContextBundleSectionView {
-                // Group callees by name (short name, not qualified) and count occurrences.
                 let mut name_counts: std::collections::HashMap<&str, (usize, usize)> =
                     std::collections::HashMap::new();
                 for (idx, (_file_path, reference)) in refs.iter().enumerate() {
@@ -201,7 +228,6 @@ impl LiveIndex {
                     entry.0 += 1;
                 }
 
-                // Sort by frequency (descending), then alphabetically for ties.
                 let mut sorted_names: Vec<(&str, usize, usize)> = name_counts
                     .into_iter()
                     .map(|(name, (count, first_idx))| (name, count, first_idx))
@@ -215,11 +241,10 @@ impl LiveIndex {
                     .iter()
                     .map(|(name, count, first_idx)| {
                         let (file_path, reference) = &refs[*first_idx];
-                        let enclosing = self.get_file(file_path).and_then(|f| {
+                        let enclosing_sym = self.get_file(file_path).and_then(|f| {
                             reference
                                 .enclosing_symbol_index
                                 .and_then(|idx| f.symbols.get(idx as usize))
-                                .map(|symbol| format!("in {} {}", symbol.kind, symbol.name))
                         });
 
                         ContextBundleReferenceView {
@@ -230,7 +255,13 @@ impl LiveIndex {
                                 .to_string(),
                             file_path: (*file_path).to_string(),
                             line_number: reference.line_range.0 + 1,
-                            enclosing,
+                            enclosing: enclosing_sym
+                                .map(|symbol| format!("in {} {}", symbol.kind, symbol.name)),
+                            enclosing_name: enclosing_sym.map(|symbol| symbol.name.clone()),
+                            enclosing_kind: enclosing_sym.map(|symbol| symbol.kind.to_string()),
+                            enclosing_start_line: enclosing_sym
+                                .map(|symbol| symbol.line_range.0 + 1),
+                            confidence: "exact",
                             occurrence_count: *count,
                         }
                     })
@@ -246,13 +277,13 @@ impl LiveIndex {
                 }
             };
 
-        let callers =
-            self.collect_exact_symbol_references(path, file, sym_rec, Some(ReferenceKind::Call));
+        let callers = self.collect_exact_symbol_references_with_confidence(
+            path,
+            file,
+            sym_rec,
+            Some(ReferenceKind::Call),
+        );
         let callees = self.callees_for_symbol(path, sym_idx);
-        // SF-002: a same-name member call (`receiver.<name>()`) from inside this
-        // symbol's body resolves to a same-named method on an unresolved receiver
-        // type, NOT to this symbol calling itself. Split those out and surface
-        // them separately rather than rendering the method as its own callee.
         let (unresolved_self_calls, resolved_callees): (
             Vec<&ReferenceRecord>,
             Vec<&ReferenceRecord>,
@@ -275,23 +306,24 @@ impl LiveIndex {
                     file_path: path.to_string(),
                     line_number: reference.line_range.0 + 1,
                     enclosing: None,
+                    enclosing_name: None,
+                    enclosing_kind: None,
+                    enclosing_start_line: None,
+                    confidence: "exact",
                     occurrence_count: 1,
                 })
                 .collect();
-        let type_usages = self.collect_exact_symbol_references(
+        let type_usages = self.collect_exact_symbol_references_with_confidence(
             path,
             file,
             sym_rec,
             Some(ReferenceKind::TypeUsage),
         );
 
-        // Resolve type dependencies: collect type names referenced within this symbol,
-        // then find their definitions across the index (recursive, depth-limited to 2).
         let type_refs = self.type_refs_for_symbol(path, sym_idx);
         let type_names: Vec<&str> = type_refs
             .iter()
             .map(|r| r.name.as_str())
-            // Exclude the target symbol's own name to avoid self-referential dependencies.
             .filter(|n| *n != name)
             .collect::<std::collections::HashSet<_>>()
             .into_iter()

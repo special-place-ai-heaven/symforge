@@ -356,6 +356,24 @@ fn format_context_bundle_section(title: &str, section: &ContextBundleSectionView
             external_count += 1;
         }
 
+        if title == "Callers" {
+            let caller_label = match (&entry.enclosing_kind, &entry.enclosing_name) {
+                (Some(kind), Some(caller)) => format!("{kind} {caller}"),
+                (None, Some(caller)) => caller.clone(),
+                _ => "<module>".to_string(),
+            };
+            let conf_suffix = if entry.confidence == "heuristic_receiver" {
+                "  [heuristic_receiver]"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "  {:<30} {}:{}  (calls {}){}",
+                caller_label, entry.file_path, entry.line_number, entry.display_name, conf_suffix
+            ));
+            continue;
+        }
+
         // Build the name part, appending ×N for deduplicated entries.
         let name_part = if entry.occurrence_count > 1 {
             format!("{} (×{})", entry.display_name, entry.occurrence_count)

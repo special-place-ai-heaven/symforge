@@ -304,7 +304,7 @@ pub const CODE_READ_OPS: &[CodeOpDescriptor] = &[
             },
         ],
         return_type: "list[RefHit]",
-        typed_dicts: "class RefHit(TypedDict):\n    path: str\n    line: int\n    text: str\n    enclosing_symbol: str | None\n    caller_kind: str | None",
+        typed_dicts: "class RefHit(TypedDict):\n    path: str\n    line: int\n    text: str\n    enclosing_symbol: str | None\n    enclosing_line: int | None\n    caller_kind: str | None",
         keywords: &[
             "references",
             "callers",
@@ -510,15 +510,22 @@ pub const CODE_READ_OPS: &[CodeOpDescriptor] = &[
                 doc: "Case-sensitive matching.",
             },
             ParamSpec {
+                name: "group_by",
+                py_type: "str | None",
+                required: false,
+                default_repr: "None",
+                doc: "Pass 'count' for exact per-file match counts.",
+            },
+            ParamSpec {
                 name: "limit",
                 py_type: "int | None",
                 required: false,
                 default_repr: "None",
-                doc: "Max matches.",
+                doc: "Max matches (or max files when group_by='count').",
             },
         ],
-        return_type: "list[TextHit]",
-        typed_dicts: "class TextHit(TypedDict):\n    path: str\n    line: int\n    preview: str\n    enclosing_symbol: str | None",
+        return_type: "list[TextHit] | list[TextCountHit]",
+        typed_dicts: "class TextHit(TypedDict):\n    path: str\n    line: int\n    preview: str\n    enclosing_symbol: str | None\n\nclass TextCountHit(TypedDict):\n    path: str\n    count: int",
         keywords: &[
             "grep", "text", "search", "regex", "pattern", "ast", "literal", "code",
         ],
@@ -651,7 +658,7 @@ pub const CODE_READ_OPS: &[CodeOpDescriptor] = &[
             },
         ],
         return_type: "SymbolContextOut",
-        typed_dicts: "class SymbolContextOut(TypedDict):\n    path: str | None\n    name: str | None\n    kind: str | None\n    body: str | None\n    callers: list[dict]\n    callees: list[dict]\n    type_usages: list[dict]\n    dependencies: list[dict]",
+        typed_dicts: "class CallerRef(TypedDict):\n    name: str\n    path: str\n    caller_kind: str | None\n    caller_line: int | None\n    call_line: int\n    call_expr: str\n    confidence: str\n    occurrences: int\n\nclass SymbolContextOut(TypedDict):\n    path: str | None\n    name: str | None\n    kind: str | None\n    body: str | None\n    total_callers: int\n    callers: list[CallerRef]\n    callees: list[dict]\n    type_usages: list[dict]\n    dependencies: list[dict]",
         keywords: &[
             "context", "trace", "callers", "callees", "bundle", "types", "graph",
         ],

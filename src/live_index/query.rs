@@ -11,7 +11,7 @@ pub(crate) use super::disambiguation::{
     SymbolSelectorMatch, render_symbol_selector, resolve_symbol_selector,
 };
 use crate::domain::index::FileClassification;
-use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolRecord};
+use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolKind, SymbolRecord};
 // Consumed by the shared `plan_edit` (guidance::edit_plan) in every build.
 #[cfg(test)]
 use super::disambiguation::matches_exact_symbol_qualified_name;
@@ -251,7 +251,13 @@ fn imported_scope(language: &LanguageId, reference: &ReferenceRecord) -> Option<
         return None;
     }
 
-    let qualified_name = reference.qualified_name.as_deref()?;
+    let qualified_name = reference
+        .qualified_name
+        .as_deref()
+        .unwrap_or(reference.name.as_str());
+    if qualified_name.is_empty() {
+        return None;
+    }
     match language {
         LanguageId::CSharp => Some(qualified_name.to_string()),
         LanguageId::Java => {
@@ -2238,8 +2244,23 @@ impl LiveIndex {
         target_symbol: &'a SymbolRecord,
         kind_filter: Option<ReferenceKind>,
     ) -> Vec<(&'a str, &'a ReferenceRecord)> {
+        self.collect_exact_symbol_references_with_confidence(path, file, target_symbol, kind_filter)
+            .into_iter()
+            .map(|(p, r, _)| (p, r))
+            .collect()
+    }
+
+    pub(super) fn collect_exact_symbol_references_with_confidence<'a>(
+        &'a self,
+        path: &'a str,
+        file: &'a IndexedFile,
+        target_symbol: &'a SymbolRecord,
+        kind_filter: Option<ReferenceKind>,
+    ) -> Vec<(&'a str, &'a ReferenceRecord, &'static str)> {
         let target_name = target_symbol.name.as_str();
         let module_path = resolve_module_path(path, &file.language);
+        let target_scope = declared_scope(file);
+        let target_container = enclosing_container_type(file, target_symbol);
 
         // Index of the target symbol within its own file's symbol list. Used to
         // suppress the SF-002 self-member-call false positive: a method whose
@@ -2255,7 +2276,7 @@ impl LiveIndex {
             .position(|symbol| symbol.byte_range == target_symbol.byte_range)
             .map(|idx| idx as u32);
 
-        let mut refs: Vec<(&str, &ReferenceRecord)> = file
+        let mut refs: Vec<(&str, &ReferenceRecord, &'static str)> = file
             .references
             .iter()
             .filter(|reference| {
@@ -2263,6 +2284,15 @@ impl LiveIndex {
                     && target_symbol_index.is_some()
                     && reference.enclosing_symbol_index == target_symbol_index
                     && is_receiver_method_call(file, reference)
+                {
+                    return false;
+                }
+                if reference.kind == ReferenceKind::Call
+                    && let Some((ref target_ty, target_gen)) = target_container
+                    && matches!(
+                        classify_call_receiver(file, reference, target_ty, target_gen),
+                        ReceiverCheck::Contradicted
+                    )
                 {
                     return false;
                 }
@@ -2276,7 +2306,7 @@ impl LiveIndex {
                     kind_filter,
                 )
             })
-            .map(|reference| (path, reference))
+            .map(|reference| (path, reference, "exact"))
             .collect();
 
         let dependent_refs = self.find_dependents_for_file(path);
@@ -2301,47 +2331,14 @@ impl LiveIndex {
             if ref_path == path {
                 continue;
             }
-            // Already collected from the dependent scan?
             if refs
                 .iter()
-                .any(|(p, r)| *p == ref_path && r.byte_range == ref_record.byte_range)
+                .any(|(p, r, _)| *p == ref_path && r.byte_range == ref_record.byte_range)
             {
                 continue;
             }
-
-            let reference_matches = matches_exact_symbol_reference(
-                ref_record,
-                target_name,
-                &file.language,
-                target_symbol.kind,
-                module_path.as_deref(),
-                self.get_file(ref_path),
-                kind_filter,
-            );
-
-            if !reference_matches {
-                continue;
-            }
-
-            if dependent_paths.contains(ref_path) {
-                // Within known dependents: accept any matching reference (original behavior)
-                refs.push((ref_path, ref_record));
-            } else if let Some(qn) = ref_record.qualified_name.as_deref() {
-                // Outside dependents: only accept if the reference has a qualified name
-                // that matches the target's module path.  This catches fully-qualified
-                // calls (e.g. `engine::optimize_deterministic()`) where the caller has
-                // no separate `use` import and therefore never enters dependent_paths.
-                // Simple name-only matches are excluded to avoid false positives from
-                // unrelated files that happen to use the same function name.
-                if matches_qualified_name_from(
-                    self.get_file(ref_path).map(|f| (f, ref_record)),
-                    &file.language,
-                    qn,
-                    target_name,
-                    module_path.as_deref(),
-                ) {
-                    refs.push((ref_path, ref_record));
-                }
+            if let Some(conf) = evaluate_cross_file(ref_path, ref_record) {
+                refs.push((ref_path, ref_record, conf));
             }
         }
 

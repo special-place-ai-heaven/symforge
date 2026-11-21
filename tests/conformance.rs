@@ -350,12 +350,8 @@ fn repair_lifecycle_retirement_contract_documents_checkpoint_snapshot_workflow()
     }
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let docs = [
-        fs::read_to_string(root.join("AGENTS.md")).expect("read AGENTS.md"),
-        fs::read_to_string(root.join("README.md")).expect("read README.md"),
-    ]
-    .join("\n");
-
+    let raw_agents = fs::read_to_string(root.join("AGENTS.md")).expect("read AGENTS.md");
+    let docs = raw_agents.split_whitespace().collect::<Vec<_>>().join(" ");
     for required_phrase in [
         "`repair_index` is intentionally retired",
         "`get_index_run` and `cancel_index_run` remain retired",
