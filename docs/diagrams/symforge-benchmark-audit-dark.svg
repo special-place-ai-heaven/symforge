@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 530" width="1080" height="530" role="img" aria-labelledby="bTitle bDesc">
+  <title id="bTitle">SymForge Measured Benchmark Breakdown (2026-11-09 Audit, 36 Paired Runs)</title>
+  <desc id="bDesc">Paired horizontal bar chart from the 2026-11-09 Product Audit showing retrieved characters and tool calls on Sonnet across 6 tasks: large savings on caller tracing (-76%), symbol lookup (-51%), and function understanding (-39%), alongside honest overhead on nearby single-file reads (+32%, +57%) and literal string counting (+535%), plus V12 Code Mode summary metrics.</desc>
+  <rect x="0" y="0" width="1080" height="530" rx="14" fill="#0c101a" stroke="#294c70" stroke-width="1.5"/>
+
+  <text x="32" y="34" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="17" font-weight="700" fill="#e6edf3">Measured Retrieval Breakdown — Where SymForge Wins &amp; Where rg / Read Wins</text>
+  <text x="1048" y="34" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#8b9bb4">Source: 2026-11-09 Audit (36 paired runs)</text>
+
+  <rect x="32" y="50" width="12" height="12" rx="3" fill="#6e7681"/>
+  <text x="50" y="60" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#8b9bb4">Native (Read / Grep / Glob)</text>
+  <rect x="250" y="50" width="12" height="12" rx="3" fill="#3fb950"/>
+  <text x="268" y="60" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#8b9bb4">SymForge wins (symbol &amp; caller queries)</text>
+  <rect x="525" y="50" width="12" height="12" rx="3" fill="#d29922"/>
+  <text x="543" y="60" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#8b9bb4">Use rg -c or windowed Read instead (honest trade-off)</text>
+  <line x1="24" y1="74" x2="1056" y2="74" stroke="#294c70" stroke-width="1"/>
+
+  
+  <rect x="24" y="92" width="1032" height="54" rx="8" fill="#111927" stroke="#294c70" stroke-width="1"/>
+  <text x="38" y="114" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#e6edf3">T2 · Find all callers</text>
+  <text x="38" y="132" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#8b9bb4">find_references vs grep+read</text>
+
+  <rect x="280" y="103" width="282" height="12" rx="4" fill="#6e7681"/>
+  <text x="568" y="113" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#8b9bb4">Native: 16,636 ch</text>
+
+  <rect x="280" y="122" width="67" height="12" rx="4" fill="#3fb950"/>
+  <text x="353" y="132" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#3fb950">SymForge: 3,972 ch</text>
+
+  <text x="885" y="123" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#8b9bb4">8.5 → 2.0 calls</text>
+  <rect x="902" y="105" width="136" height="28" rx="14" fill="#123220"/>
+  <text x="970" y="123" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#3fb950">-76% chars</text>
+  <rect x="24" y="153" width="1032" height="54" rx="8" fill="#111927" stroke="#294c70" stroke-width="1"/>
+  <text x="38" y="175" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#e6edf3">T5 · Locate &amp; read fn</text>
+  <text x="38" y="193" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#8b9bb4">get_symbol vs grep+read</text>
+
+  <rect x="280" y="164" width="72" height="12" rx="4" fill="#6e7681"/>
+  <text x="358" y="174" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#8b9bb4">Native: 4,247 ch</text>
+
+  <rect x="280" y="183" width="35" height="12" rx="4" fill="#3fb950"/>
+  <text x="321" y="193" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#3fb950">SymForge: 2,085 ch</text>
+
+  <text x="885" y="184" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#8b9bb4">2.0 → 2.0 calls</text>
+  <rect x="902" y="166" width="136" height="28" rx="14" fill="#123220"/>
+  <text x="970" y="184" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#3fb950">-51% chars</text>
+  <rect x="24" y="214" width="1032" height="54" rx="8" fill="#111927" stroke="#294c70" stroke-width="1"/>
+  <text x="38" y="236" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#e6edf3">T1 · Understand one fn</text>
+  <text x="38" y="254" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#8b9bb4">symbol_context vs Read</text>
+
+  <rect x="280" y="225" width="369" height="12" rx="4" fill="#6e7681"/>
+  <text x="655" y="235" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#8b9bb4">Native: 21,759 ch</text>
+
+  <rect x="280" y="244" width="224" height="12" rx="4" fill="#3fb950"/>
+  <text x="510" y="254" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#3fb950">SymForge: 13,200 ch</text>
+
+  <text x="885" y="245" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#8b9bb4">8.0 → 5.0 calls</text>
+  <rect x="902" y="227" width="136" height="28" rx="14" fill="#123220"/>
+  <text x="970" y="245" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#3fb950">-39% chars</text>
+  <rect x="24" y="275" width="1032" height="54" rx="8" fill="#111927" stroke="#294c70" stroke-width="1"/>
+  <text x="38" y="297" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#e6edf3">T3 · Module-wide facts</text>
+  <text x="38" y="315" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#8b9bb4">1 windowed Read beats 4 calls</text>
+
+  <rect x="280" y="286" width="149" height="12" rx="4" fill="#6e7681"/>
+  <text x="435" y="296" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#8b9bb4">Native: 8,766 ch</text>
+
+  <rect x="280" y="305" width="196" height="12" rx="4" fill="#d29922"/>
+  <text x="482" y="315" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#d29922">SymForge: 11,546 ch</text>
+
+  <text x="885" y="306" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#8b9bb4">3.5 → 7.0 calls</text>
+  <rect x="902" y="288" width="136" height="28" rx="14" fill="#34260d"/>
+  <text x="970" y="306" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#d29922">+32% chars</text>
+  <rect x="24" y="336" width="1032" height="54" rx="8" fill="#111927" stroke="#294c70" stroke-width="1"/>
+  <text x="38" y="358" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#e6edf3">T6 · Multi-region debug</text>
+  <text x="38" y="376" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#8b9bb4">nearby lines in 1 file</text>
+
+  <rect x="280" y="347" width="246" height="12" rx="4" fill="#6e7681"/>
+  <text x="532" y="357" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#8b9bb4">Native: 14,534 ch</text>
+
+  <rect x="280" y="366" width="388" height="12" rx="4" fill="#d29922"/>
+  <text x="674" y="376" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#d29922">SymForge: 22,882 ch</text>
+
+  <text x="885" y="367" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#8b9bb4">6.5 → 10.5 calls</text>
+  <rect x="902" y="349" width="136" height="28" rx="14" fill="#34260d"/>
+  <text x="970" y="367" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#d29922">+57% chars</text>
+  <rect x="24" y="397" width="1032" height="54" rx="8" fill="#111927" stroke="#294c70" stroke-width="1"/>
+  <text x="38" y="419" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#e6edf3">T4 · Literal string count</text>
+  <text x="38" y="437" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#8b9bb4">use rg -c (160 chars)!</text>
+
+  <rect x="280" y="408" width="22" height="12" rx="4" fill="#6e7681"/>
+  <text x="308" y="418" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#8b9bb4">Native: 1,281 ch</text>
+
+  <rect x="280" y="427" width="138" height="12" rx="4" fill="#d29922"/>
+  <text x="424" y="437" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#d29922">SymForge: 8,139 ch</text>
+
+  <text x="885" y="428" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#8b9bb4">2.0 → 2.5 calls</text>
+  <rect x="902" y="410" width="136" height="28" rx="14" fill="#34260d"/>
+  <text x="970" y="428" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#d29922">+535% chars</text>
+
+  <rect x="24" y="464" width="1032" height="48" rx="8" fill="#132f4c" stroke="#5ab4dd" stroke-width="1.2"/>
+  <text x="42" y="493" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#5ab4dd">How V12 Directly Targets Audit Bottlenecks:</text>
+  <text x="336" y="493" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" fill="#e6edf3">Upfront schema: 66,181 B → 3,980 B (-94.0%) or 0 B (CLI)  |  Chained lookups: N turns → 1 Monty VM turn</text>
+</svg>

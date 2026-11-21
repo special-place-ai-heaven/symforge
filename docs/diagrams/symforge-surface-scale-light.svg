@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 412" width="1080" height="412" role="img" aria-labelledby="sTitle sDesc">
+  <title id="sTitle">SymForge 12.0.0 Upfront Schema Cost by Surface Profile</title>
+  <desc id="sDesc">Proportional bar chart comparing upfront tools/list byte and token cost across CLI skill-only (0 B), code surface (3,980 B, -94.0%), compact surface (4,552 B, -93.1%), core surface (28,162 B, -57.4%), and default full surface (66,181 B).</desc>
+  <rect x="0" y="0" width="1080" height="412" rx="14" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="40" y="36" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="17" font-weight="700" fill="#0f172a">Upfront Context Cost per Session (Measured `tools/list` Payload in v12.0.0)</text>
+  <text x="1040" y="36" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" fill="#475569">43 registered · pick the smallest surface that fits</text>
+  <line x1="24" y1="54" x2="1056" y2="54" stroke="#cbd5e1" stroke-width="1"/>
+  
+  <rect x="24" y="78" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="40" y="101" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="700" fill="#0f172a">CLI + SKILL.md</text>
+  <text x="40" y="119" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#475569">--code-skill --skill-only</text>
+
+  <rect x="255" y="90" width="430" height="14" rx="7" fill="#e2e8f0"/>
+  <rect x="255" y="90" width="4" height="14" rx="7" fill="#16a34a"/>
+  <text x="255" y="121" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#475569">Zero MCP tools · shell `symforge q` + `symforge code run`</text>
+
+  <text x="860" y="103" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#0f172a">0 B (0 tok)</text>
+  <rect x="878" y="90" width="160" height="28" rx="14" fill="#e2e8f0"/>
+  <text x="958" y="108" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#16a34a">-100%</text>
+  <rect x="24" y="142" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="40" y="165" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="700" fill="#0f172a">code (V12)</text>
+  <text x="40" y="183" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#475569">SYMFORGE_SURFACE=code</text>
+
+  <rect x="255" y="154" width="430" height="14" rx="7" fill="#e2e8f0"/>
+  <rect x="255" y="154" width="26" height="14" rx="7" fill="#0284c7"/>
+  <text x="255" y="185" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#475569">4 tools: code_search · code_execute · symforge_edit · status</text>
+
+  <text x="860" y="167" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#0f172a">3,980 B (~995 tok)</text>
+  <rect x="878" y="154" width="160" height="28" rx="14" fill="#e2e8f0"/>
+  <text x="958" y="172" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#0284c7">-94.0%</text>
+  <rect x="24" y="206" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="40" y="229" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="700" fill="#0f172a">compact</text>
+  <text x="40" y="247" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#475569">SYMFORGE_SURFACE=compact</text>
+
+  <rect x="255" y="218" width="430" height="14" rx="7" fill="#e2e8f0"/>
+  <rect x="255" y="218" width="30" height="14" rx="7" fill="#2563eb"/>
+  <text x="255" y="249" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#475569">3 tools: symforge · symforge_edit · status (non-code clients)</text>
+
+  <text x="860" y="231" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#0f172a">4,552 B (~1,138 tok)</text>
+  <rect x="878" y="218" width="160" height="28" rx="14" fill="#e2e8f0"/>
+  <text x="958" y="236" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#2563eb">-93.1%</text>
+  <rect x="24" y="270" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="40" y="293" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="700" fill="#0f172a">core</text>
+  <text x="40" y="311" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#475569">SYMFORGE_SURFACE=core</text>
+
+  <rect x="255" y="282" width="430" height="14" rx="7" fill="#e2e8f0"/>
+  <rect x="255" y="282" width="183" height="14" rx="7" fill="#d97706"/>
+  <text x="255" y="313" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#475569">13 everyday read/search/edit tools listed eagerly</text>
+
+  <text x="860" y="295" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#0f172a">28,162 B (~7,040 tok)</text>
+  <rect x="878" y="282" width="160" height="28" rx="14" fill="#e2e8f0"/>
+  <text x="958" y="300" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#d97706">-57.4%</text>
+  <rect x="24" y="334" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="40" y="357" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="700" fill="#0f172a">full (default)</text>
+  <text x="40" y="375" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#475569">SYMFORGE_SURFACE=full</text>
+
+  <rect x="255" y="346" width="430" height="14" rx="7" fill="#e2e8f0"/>
+  <rect x="255" y="346" width="430" height="14" rx="7" fill="#64748b"/>
+  <text x="255" y="377" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#475569">All 40 specialized tools listed in every session</text>
+
+  <text x="860" y="359" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#0f172a">66,181 B (~16,545 tok)</text>
+  <rect x="878" y="346" width="160" height="28" rx="14" fill="#e2e8f0"/>
+  <text x="958" y="364" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#64748b">baseline</text>
+</svg>
