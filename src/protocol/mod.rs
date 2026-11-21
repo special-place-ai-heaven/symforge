@@ -1,4 +1,5 @@
 pub mod ccr;
+pub mod code_mode_tools;
 pub mod conventions;
 pub(crate) mod deferred_stdio;
 pub(crate) mod edit;
@@ -325,7 +326,10 @@ fn disabled_analytics_recorder(
 
 impl SymForgeServer {
     pub(crate) fn tool_router() -> ToolRouter<Self> {
-        Self::core_tool_router() + Self::edit_tool_router() + Self::secret_remediate_tool_router()
+        Self::core_tool_router()
+            + Self::edit_tool_router()
+            + Self::secret_remediate_tool_router()
+            + Self::code_mode_tool_router()
     }
 
     /// Create a new server with the given shared index, project name, and watcher state.
@@ -1035,7 +1039,7 @@ impl SymForgeServer {
         self.analytics_recorder.read().status()
     }
 
-    fn restore_local_project_evidence(&self) {
+    pub(super) fn restore_local_project_evidence(&self) {
         if let Some(evidence) = self.local_project_evidence() {
             result_status::record_project_evidence(evidence);
         } else {
@@ -1509,7 +1513,7 @@ impl SymForgeServer {
     }
 
     /// Mark the daemon proxy healthy again (successful call or reconnect).
-    fn note_daemon_recovered(&self) {
+    pub(super) fn note_daemon_recovered(&self) {
         let was_degraded = {
             let mut state = self.daemon_degraded.lock();
             let was_degraded = state.degraded;
@@ -1530,7 +1534,7 @@ impl SymForgeServer {
 
     /// Record a proxy failure with endpoint provenance (base URL only — never
     /// auth material) for health rendering and rediscovery decisions.
-    fn note_daemon_failure(&self, endpoint: &str, failure: String) {
+    pub(super) fn note_daemon_failure(&self, endpoint: &str, failure: String) {
         let was_healthy = {
             let mut state = self.daemon_degraded.lock();
             let was_healthy = !state.degraded;
@@ -1580,7 +1584,7 @@ impl SymForgeServer {
     /// After a successful reconnect, republish this adapter's session
     /// descriptor so sidecar/hook discovery resolves the NEW session id and
     /// endpoint instead of the stale pre-reconnect ones.
-    fn republish_session_descriptor(&self, client: &crate::daemon::DaemonSessionClient) {
+    pub(super) fn republish_session_descriptor(&self, client: &crate::daemon::DaemonSessionClient) {
         let state_dir = self.descriptor_state_dir.read().clone();
         let (Some(state_dir), Some(port)) = (state_dir, client.port()) else {
             return;
@@ -1631,7 +1635,7 @@ impl SymForgeServer {
     /// [`normalize_root`](crate::live_index::store::normalize_root) helper so the
     /// steady state (same project, repeated calls) never reloads on a cosmetic
     /// `\\?\` / trailing-slash / separator / case difference.
-    async fn ensure_local_index(&self) {
+    pub(super) async fn ensure_local_index(&self) {
         {
             let mut watcher = self.watcher_info.lock();
             *watcher = WatcherInfo::detached_local_fallback();
@@ -2065,6 +2069,12 @@ impl SymForgeServer {
                     secret_remediate_tool,
                     secret_remediate::SecretRemediateInput
                 )
+            }
+            "code_search" => {
+                call_statused!(code_search_tool, code_mode_tools::CodeSearchInput)
+            }
+            "code_execute" => {
+                call_statused!(code_execute_tool, code_mode_tools::CodeExecuteInput)
             }
             other => {
                 let text = format!(

@@ -149,6 +149,55 @@ pub fn compact_surface_tools() -> Vec<Tool> {
     ]
 }
 
+/// Production `tools/list` for `SYMFORGE_SURFACE=code` (`code_search` | `code_execute` | `symforge_edit` | `status`).
+pub fn code_surface_tools() -> Vec<rmcp::model::Tool> {
+    let read_only = || {
+        let mut ann = rmcp::model::ToolAnnotations::default();
+        ann.read_only_hint = Some(true);
+        ann.open_world_hint = Some(false);
+        Some(ann)
+    };
+    let mut search = surface_tool(
+        "code_search",
+        "Discover Python read functions and TypedDict return types for code_execute. Omit query for 1-line index.",
+        schema_object::<crate::protocol::code_mode_tools::CodeSearchInput>(),
+    );
+    search.annotations = read_only();
+
+    let mut execute = surface_tool(
+        "code_execute",
+        "Run one zero-egress Python script chaining read-only index queries; returns only the final JSON value.",
+        schema_object::<crate::protocol::code_mode_tools::CodeExecuteInput>(),
+    );
+    execute.annotations = read_only();
+
+    vec![
+        search,
+        execute,
+        surface_tool(
+            CompactSurfaceTool::SymforgeEdit.as_str(),
+            "STEL structural edit facade - symbol-aware edits with economics gate.",
+            schema_object::<StelEditRequest>(),
+        ),
+        surface_tool(
+            CompactSurfaceTool::Status.as_str(),
+            "STEL trust envelope and index health summary.",
+            schema_object::<StelStatusRequest>(),
+        ),
+    ]
+}
+
+/// UTF-8 JSON byte length of the production `code` `tools/list` payload
+/// (including MCP 2025-06-18+ `outputSchema` on `status`).
+pub fn code_surface_list_schema_bytes() -> (usize, usize) {
+    let tools = crate::protocol::surface_probe::with_output_schemas(code_surface_tools());
+    let payload = json!({ "tools": tools });
+    let bytes = serde_json::to_string(&payload)
+        .expect("code surface tools must serialize")
+        .len();
+    (tools.len(), bytes)
+}
+
 /// UTF-8 JSON byte length of the production compact `tools/list` payload.
 pub fn compact_surface_list_schema_bytes() -> (usize, usize) {
     let tools = compact_surface_tools();

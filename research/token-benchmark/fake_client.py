@@ -44,6 +44,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", action="store_true")
     ap.add_argument("--install-hooks", action="store_true")
+    ap.add_argument("--install-code-skill", action="store_true")
+    ap.add_argument("--skill-only", action="store_true")
     ap.add_argument("--task")
     ap.add_argument("--arm")
     ap.add_argument("--mode")
@@ -61,6 +63,11 @@ def main() -> int:
                            "SessionStart": [{"hooks": [{"type": "command", "command": "fake-hook"}]}]}}
         (d / "settings.json").write_text(json.dumps(hooks), encoding="utf-8")
         return 0
+    if a.install_code_skill:
+        d = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "skills" / "symforge-code"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text("---\nname: symforge-code\n---\n", encoding="utf-8")
+        return 0
     sys.stdin.read()
     script = json.loads(SCRIPT.read_text(encoding="utf-8"))
     task = script["tasks"][a.task]
@@ -68,12 +75,17 @@ def main() -> int:
     rng = random.Random(seed)
     mcp = bool(json.loads(Path(a.mcp_config).read_text())["mcpServers"])
     fails = rng.random() < script["fail_rate"][a.arm]
-    tools = dict(task["tools"]["sf" if mcp else "native"])
+    if a.arm == "d":
+        tools = dict(task["tools"].get("code_mcp", {"mcp__symforge__code_execute": 1}))
+    elif a.arm == "e":
+        tools = dict(task["tools"].get("cli_code", {"Bash": 1}))
+    else:
+        tools = dict(task["tools"]["sf" if mcp else "native"])
     if a.arm == "c" and rng.random() < 0.5:  # unsteered: sometimes ignores the index and greps
         tools = dict(task["tools"]["native"])
     if [a.task, a.arm, a.mode, a.rep] in script["allowlist_violation_cells"]:
         tools["mcp__symforge__search_symbols"] = 1
-    factor = task["factor"].get(a.arm if mcp else "a", 1.0)
+    factor = task["factor"].get(a.arm if (mcp or a.arm == "e") else "a", 1.0)
     total = int(task["base_tokens"] * factor * rng.uniform(0.85, 1.15) * (1.08 if a.mode == "on" and "Read" in tools else 1.0))
     names = [n for n, k in tools.items() for _ in range(k)]
     turns = len(names) + 1
@@ -82,8 +94,9 @@ def main() -> int:
     if a.mode == "on" and mcp:
         emit({"type": "system", "subtype": "hook_response", "hook_event": "SessionStart"})
     for i, name in enumerate(names):
+        tool_input = {"command": "symforge code run -c 'search_symbols(query=\"x\")'"} if (a.arm == "e" and name == "Bash" and i == 0) else {}
         emit({"type": "assistant", "message": {"id": f"m{i}", "model": "synthetic-fake-client",
-              "content": [{"type": "tool_use", "id": f"t{i}", "name": name, "input": {}}],
+              "content": [{"type": "tool_use", "id": f"t{i}", "name": name, "input": tool_input}],
               "usage": {"input_tokens": 40, "cache_creation_input_tokens": int(total * 0.12 / turns),
                         "cache_read_input_tokens": int(total * 0.85 / turns), "output_tokens": int(total * 0.03 / turns)}}})
         payload = "x" * rng.randint(200, 3000)

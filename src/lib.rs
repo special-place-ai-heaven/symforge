@@ -52,12 +52,12 @@ pub use internals::{stel, stel_core};
 
 #[cfg(all(feature = "server", not(feature = "__test-internals")))]
 pub(crate) use internals::{
-    analytics, cli, daemon, observability, path_shadow, protocol, server, sidecar,
+    analytics, cli, codemode, daemon, observability, path_shadow, protocol, server, sidecar,
     version_registry, watcher, worktree,
 };
 #[cfg(all(feature = "server", feature = "__test-internals"))]
 pub use internals::{
-    analytics, cli, daemon, observability, path_shadow, protocol, server, sidecar,
+    analytics, cli, codemode, daemon, observability, path_shadow, protocol, server, sidecar,
     version_registry, watcher, worktree,
 };
 

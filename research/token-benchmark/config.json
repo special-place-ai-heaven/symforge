@@ -6,10 +6,12 @@
   "arms": {
     "a": {"label": "native tools only", "mcp": false, "steering": false},
     "b": {"label": "SymForge available, steered", "mcp": true, "steering": true},
-    "c": {"label": "SymForge available, no steering", "mcp": true, "steering": false}
+    "c": {"label": "SymForge available, no steering", "mcp": true, "steering": false},
+    "d": {"label": "SymForge MCP code surface (SYMFORGE_SURFACE=code)", "mcp": true, "steering": true, "steering_file": "steering_code.md", "server_env": {"SYMFORGE_SURFACE": "code"}},
+    "e": {"label": "SymForge CLI Code Mode skill (symforge code / q, no MCP)", "mcp": false, "steering": true, "steering_file": "steering_cli_code.md", "install_code_skill": true}
   },
   "headline_pair": ["a", "c"],
-  "secondary_pairs": [["a", "b"]],
+  "secondary_pairs": [["a", "b"], ["a", "d"], ["a", "e"]],
   "modes": {
     "off": {"hooks": false, "rules": false},
     "on": {"hooks": true, "rules": true}
@@ -23,7 +25,8 @@
   "symforge": {
     "command": "symforge",
     "server_env": {"SYMFORGE_NO_DAEMON": "1", "SYMFORGE_AUTO_INDEX": "true", "NO_COLOR": "1"},
-    "hook_install": ["{symforge}", "init", "--client", "claude"]
+    "hook_install": ["{symforge}", "init", "--client", "claude"],
+    "code_skill_install": ["{symforge}", "init", "--client", "claude", "--code-skill", "--skill-only"]
   },
   "client": {
     "version_pin": "",

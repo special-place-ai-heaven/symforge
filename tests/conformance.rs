@@ -71,6 +71,8 @@ const EXPECTED_TOOLS: &[&str] = &[
     "symforge",
     "symforge_edit",
     "secret_remediate",
+    "code_search",
+    "code_execute",
 ];
 
 const PUBLIC_CONFORMANCE_CORPUS_VERSION: u8 = 1;
@@ -654,6 +656,8 @@ fn all_tools_have_annotations() {
         "health_compact",
         "status",
         "symforge",
+        "code_search",
+        "code_execute",
     ];
 
     const DESTRUCTIVE_WRITE: &[&str] = &[

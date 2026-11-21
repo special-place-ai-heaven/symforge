@@ -89,6 +89,9 @@ server = [
     # Issue #876: jemalloc for the binary on Linux glibc (target-gated below).
     "dep:tikv-jemallocator",
     "dep:tikv-jemalloc-sys",
+    # Feature 037: pure-Rust Python 3.14 subset VM for Code Mode (`symforge code` + `SYMFORGE_SURFACE=code`).
+    "dep:monty",
+    "dep:monty-types",
 ]
 # Engine-only build for library embedders (e.g. AAP): parsing + live_index +
 # query + git, exposed via the `symforge::embed` facade. Compiles NONE of the
@@ -195,6 +198,8 @@ socket2 = { version = "0.6", optional = true }
 # `index.bin.zst` export/import (contracts/team-artifact.md, C-S1A-005).
 zstd = "0.14"
 cap-std = "4.0.3"
+monty = { version = "1.6", optional = true }
+monty-types = { version = "1.6", optional = true }
 
 # Issue #876: the `symforge` binary's global allocator on Linux glibc, chosen
 # by measurement (docs/solutions/allocator-comparison-876.md): background

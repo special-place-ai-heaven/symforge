@@ -85,7 +85,7 @@ def compare(records: list[dict], mode: str, native: str, other: str, decision: d
     }
 
 
-def category_table(records: list[dict], mode: str, arms: list[str]) -> dict:
+def category_table(records: list[dict], mode: str, arms: list[str], prices: dict | None = None) -> dict:
     out = {}
     for c in CATEGORIES:
         row = {}
@@ -96,7 +96,9 @@ def category_table(records: list[dict], mode: str, arms: list[str]) -> dict:
             row[a] = {"runs": len(rs), "pass_rate": (len(ok) / len(rs)) if rs else None,
                       "median_total_tokens": m("total_tokens"), "median_round_trips": m("round_trips"),
                       "median_tool_result_tokens_est": m("tool_result_tokens_est"),
-                      "median_wall_s": _med([r["metrics"]["wall_ms"] / 1000 for r in ok if r["metrics"].get("wall_ms")])}
+                      "median_wall_s": _med([r["metrics"]["wall_ms"] / 1000 for r in ok if r["metrics"].get("wall_ms")]),
+                      "median_price_usd": _med([price(r, prices) for r in ok]) if prices else None,
+                      "median_symforge_cli_calls": _med([r["metrics"].get("symforge_cli_calls", 0) for r in ok])}
         out[c] = row
     return out
 
@@ -143,6 +145,7 @@ def build_report(records: list[dict], cfg: dict, expected_cells_per_mode_pair: i
                 "rule_sentinel_hits_median": _med([r["metrics"]["rule_sentinel_hits"] for r in rs]),
                 "cells_with_rule_injection": sum(1 for r in rs if r["metrics"]["rule_sentinel_hits"] > 0),
                 "median_price_usd": _med([price(r, cfg["prices_usd_per_mtok"]) for r in rs]),
+                "median_symforge_cli_calls": _med([r["metrics"].get("symforge_cli_calls", 0) for r in rs]),
             }
     return {
         "run_ids": run_ids, "synthetic": synthetic, "model": cfg["model"],
@@ -150,7 +153,7 @@ def build_report(records: list[dict], cfg: dict, expected_cells_per_mode_pair: i
         "claim": "NOT ADMISSIBLE (synthetic data)" if synthetic else ("ACCEPTED" if accepted else "NOT ACCEPTED"),
         "rule_outcome": "ACCEPT" if accepted else "REJECT",
         "status_counts": dict(statuses), "comparisons": comps,
-        "categories": {m: category_table(records, m, arms) for m in cfg["modes"]},
+        "categories": {m: category_table(records, m, arms, cfg["prices_usd_per_mtok"]) for m in cfg["modes"]},
         "arm_mode_config": per_arm_mode, "cell_config_check": cell_config_check(records, cfg),
     }
 
@@ -190,23 +193,26 @@ def render_markdown(rep: dict) -> str:
         L.append("")
     for mode, table in rep["categories"].items():
         L += [f"## Per-category medians, mode {mode} (oracle-passing valid runs)", "",
-              "| category | arm | runs | pass rate | median total tokens | median round trips | median tool-result tokens (chars/4) | median wall s |",
-              "|---|---|---|---|---|---|---|---|"]
+              "| category | arm | runs | pass rate | median total tokens | median round trips | median tool-result tokens (chars/4) | median wall s | median price USD | median cli_calls |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
         for cat, row in table.items():
             for arm, v in row.items():
                 pr = "n/a" if v["pass_rate"] is None else f"{v['pass_rate']:.2f}"
                 ws = "n/a" if v["median_wall_s"] is None else f"{v['median_wall_s']:.1f}"
+                mp = "n/a" if v.get("median_price_usd") is None else f"{v['median_price_usd']:.4f}"
+                cc = _num(v.get("median_symforge_cli_calls"))
                 L.append(f"| {cat} | {arm} | {v['runs']} | {pr} | {_num(v['median_total_tokens'])} | "
-                         f"{_num(v['median_round_trips'])} | {_num(v['median_tool_result_tokens_est'])} | {ws} |")
+                         f"{_num(v['median_round_trips'])} | {_num(v['median_tool_result_tokens_est'])} | {ws} | {mp} | {cc} |")
         L.append("")
     L += ["## Hook and rule configuration per arm and mode", "",
           "Every cell record carries its own configuration (`config` in cells.jsonl); this table summarises it.", "",
-          "| arm/mode | cells | client hooks installed | path-scoped rules present | cells where rule text was injected | median rule-sentinel hits | median price USD (assumed rates) |",
-          "|---|---|---|---|---|---|---|"]
+          "| arm/mode | cells | client hooks installed | path-scoped rules present | cells where rule text was injected | median rule-sentinel hits | median price USD (assumed rates) | median cli_calls |",
+          "|---|---|---|---|---|---|---|---|"]
     for k, v in rep["arm_mode_config"].items():
         mp = "n/a" if v["median_price_usd"] is None else f"{v['median_price_usd']:.4f}"
+        cc = _num(v.get("median_symforge_cli_calls"))
         L.append(f"| {k} | {v['cells']} | {v['hooks']} | {v['rules']} | {v['cells_with_rule_injection']} | "
-                 f"{_num(v['rule_sentinel_hits_median'])} | {mp} |")
+                 f"{_num(v['rule_sentinel_hits_median'])} | {mp} | {cc} |")
     return "\n".join(L) + "\n"
 
 

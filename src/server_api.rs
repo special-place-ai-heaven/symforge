@@ -63,6 +63,9 @@ pub fn run(args: Vec<OsString>) -> Result<ServerExit, ServerBootstrapError> {
     match crate::cli::entry::run_main(args) {
         Ok(crate::cli::entry::MainExit::Success) => Ok(ServerExit::Success),
         Ok(crate::cli::entry::MainExit::ServeRefusedToStart) => Ok(ServerExit::RefusedToStart),
+        Ok(crate::cli::entry::MainExit::JsonCommandError) => {
+            Err(ServerBootstrapError::from_dispatch(&anyhow::anyhow!("")))
+        }
         Err(error) => Err(ServerBootstrapError::from_dispatch(&error)),
     }
 }

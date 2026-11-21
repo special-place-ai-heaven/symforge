@@ -7,4 +7,5 @@ yanked = "deny"
 # and an exit condition.
 ignore = [
     { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained with no patched release; it arrives through symforge, vendored rmcp and schemars. Remove this entry once all three move to jiff or time." },
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill is unmaintained (unused on x86_64/aarch64 host targets); pulled transitively by postcard 1.1 default heapless-cas feature from monty 1.6. Remove once monty sets default-features = false on postcard or postcard drops heapless 0.7." },
 ]

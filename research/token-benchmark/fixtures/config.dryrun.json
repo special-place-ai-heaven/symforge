@@ -9,5 +9,8 @@
     "pass_env": [],
     "timeout_s": 120
   },
-  "symforge": {"hook_install": ["{python}", "{here}/fake_client.py", "--install-hooks"]}
+  "symforge": {
+    "hook_install": ["{python}", "{here}/fake_client.py", "--install-hooks"],
+    "code_skill_install": ["{python}", "{here}/fake_client.py", "--install-code-skill", "--skill-only"]
+  }
 }

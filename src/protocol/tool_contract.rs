@@ -39,6 +39,7 @@ use crate::index_lifecycle::guidance::request_refusal::{
     condition_refusal, conflicting_selection_refusal, current_value, literal, normalized,
 };
 use crate::protocol::SymForgeServer;
+use crate::protocol::code_mode_tools::{CodeExecuteInput, CodeSearchInput};
 use crate::protocol::edit::{
     BatchEditInput, BatchInsertInput, BatchRenameInput, DeleteSymbolInput, EditWithinSymbolInput,
     InsertSymbolInput, ReplaceSymbolBodyInput,
@@ -369,6 +370,16 @@ pub(crate) static TOOL_CONTRACTS: &[ToolContract] = &[
         "remediation preview or result, never secret bytes",
         r#"{"scope":"repo","finding_ids":["{finding_id}"],"action":"externalize"}"#,
     ),
+    row(
+        "code_search",
+        "Python read function stubs and TypedDict return types",
+        r#"{"query":"references"}"#,
+    ),
+    row(
+        "code_execute",
+        "JSON result of the sandboxed Python read script",
+        r#"{"code":"len(search_symbols(query=\"target_fn\"))"}"#,
+    ),
 ];
 
 /// The contract of `tool`, if it has one.
@@ -480,6 +491,8 @@ probe_table! {
     ("status", StelStatusRequest),
     ("symforge_edit", StelEditRequest),
     ("secret_remediate", SecretRemediateInput),
+    ("code_search", CodeSearchInput),
+    ("code_execute", CodeExecuteInput),
 }
 
 /// An argument counts as given unless it is absent or `false`: `false` is the default of

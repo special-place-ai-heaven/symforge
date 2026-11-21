@@ -135,6 +135,9 @@ jobs:
           SYMFORGE_REQUIRE_SSHSIG: '1'
         run: python -m unittest discover -s execution -p 'test_*.py'
 
+      - name: Run standing token-benchmark harness tests
+        run: python -m unittest discover -s research/token-benchmark/tests -p 'test_*.py'
+
       - name: Verify every text blob in the index is LF
         shell: bash
         run: |

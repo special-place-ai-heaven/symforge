@@ -5975,7 +5975,8 @@ impl SymForgeServer {
             // the compact surface, so name only callable recovery there. `since=`
             // is always valid and is offered on every surface.
             let attach = match crate::protocol::surface_probe::connection_surface_or_env() {
-                crate::protocol::surface_probe::SurfaceProfile::Compact => {
+                crate::protocol::surface_probe::SurfaceProfile::Compact
+                | crate::protocol::surface_probe::SurfaceProfile::Code => {
                     "set SYMFORGE_WORKSPACE_ROOT (or run `symforge init`) and reconnect"
                 }
                 crate::protocol::surface_probe::SurfaceProfile::Core
@@ -20623,7 +20624,8 @@ mod tests {
             "guidance must always offer the surface-neutral `since=` recovery: {result}"
         );
         match crate::protocol::surface_probe::surface_profile_from_env() {
-            crate::protocol::surface_probe::SurfaceProfile::Compact => assert!(
+            crate::protocol::surface_probe::SurfaceProfile::Compact
+            | crate::protocol::surface_probe::SurfaceProfile::Code => assert!(
                 !result.contains("index_folder"),
                 "compact guidance must not name the gated index_folder tool: {result}"
             ),

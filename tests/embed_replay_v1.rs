@@ -338,7 +338,17 @@ fn child_replay_process() {
         ReserveOutcome::Acquired(lease) => {
             fs::write(result, b"acquired").unwrap();
             if mode == "crash_started" {
-                store.mark_started(&lease).unwrap();
+                match std::env::var("SYMFORGE_REPLAY_TEST_NOW_MS") {
+                    Ok(now) => {
+                        let now_ms: u64 = now.parse().expect("now milliseconds");
+                        store
+                            .mark_started_at(&lease, UNIX_EPOCH + Duration::from_millis(now_ms))
+                            .unwrap();
+                    }
+                    Err(_) => {
+                        store.mark_started(&lease).unwrap();
+                    }
+                }
                 std::process::exit(0);
             }
             if mode == "complete_then_exit" {
@@ -718,11 +728,11 @@ fn started_is_never_taken_over_even_when_expired() {
     let result = dir.path().join("result");
     assert!(
         child_lease("crash_started", dir.path(), &state, &result, 200)
+            .env("SYMFORGE_REPLAY_TEST_NOW_MS", PINNED_PAST_MS.to_string())
             .status()
             .unwrap()
             .success()
     );
-    std::thread::sleep(Duration::from_millis(500));
     match store(dir.path(), &state)
         .reserve_with_lease(&key(), &request(), Duration::from_secs(30))
         .unwrap()

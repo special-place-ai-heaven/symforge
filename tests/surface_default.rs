@@ -223,13 +223,15 @@ async fn full_surface_advertises_exactly_40_tools() {
         .map(|tool| tool.name.to_string())
         .collect();
     let mut expected = registered.clone();
-    assert!(
-        expected.remove("symforge"),
-        "registered router must contain the `symforge` facade the full surface filters out"
-    );
+    for hidden in ["symforge", "code_search", "code_execute"] {
+        assert!(
+            expected.remove(hidden),
+            "registered router must contain `{hidden}` filtered off the full surface"
+        );
+    }
     assert_eq!(
         advertised, expected,
-        "full surface must be the registered router minus only the `symforge` facade"
+        "full surface must be the registered router minus compact/code-only tools"
     );
 }
 
