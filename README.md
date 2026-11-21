@@ -22,7 +22,7 @@
 SymForge gives an AI coding agent a symbol-level view of a repository so it can ask structured questions instead of reading whole files, running broad greps, or editing code with blind string replacement. Written in Rust and parsed with tree-sitter, the 12.0.0 engine runs in three lanes:
 
 - **MCP server** (`full`, `code`, `core`, or `compact` surface over stdio or Streamable HTTP), backed by an optional shared local daemon.
-- **Zero-egress CLI & `SKILL.md`** (`symforge code` and `symforge q`), for shell-capable agents that want typed symbol queries and multi-step Python chaining with zero upfront MCP schema tokens.
+- **Zero-egress CLI & `SKILL.md`** (`symforge code` and `symforge q`), for shell-capable agents that want typed symbol queries and single-turn multi-step chaining with zero upfront MCP schema tokens.
 - **In-process Rust library** (`symforge::embed`), compiling the indexing, search, git, and edit core without the server or CLI.
 
 Every MCP answer carries a machine-readable **trust envelope**: match type, source authority, completeness, and `file:line` evidence. When SymForge cannot answer exhaustively, it says so rather than guessing.
@@ -35,7 +35,7 @@ Every MCP answer carries a machine-readable **trust envelope**: match type, sour
 Coding agents spend most of their context window *finding* code, not changing it. SymForge answers from an in-memory, symbol-level index:
 
 - **Read by symbol.** File outlines, imports, consumers, and individual or batched symbol bodies (`targets[]`), keeping whole-file reads rare.
-- **Chain in one turn.** Run multi-step discovery, caller lookup, and body filtering inside a zero-egress Python 3.14-subset sandbox (`code_execute` or `symforge code run`) instead of spending one model round trip per lookup.
+- **Chain in one turn (100% pure Rust).** Run multi-step discovery, caller lookup, and body filtering inside `monty`—a pure-Rust bytecode VM compiled directly into `symforge` with zero Python runtime or OS access (`code_execute` or `symforge code run`).
 - **Search with structure.** Text matches grouped by enclosing symbol, plus symbol, path, concept, and AST-pattern search with bounded output and stated ranking reasons.
 - **Trace impact.** Call sites, file dependents, symbol diffs, and git blast radius seeded from changed symbols.
 - **Edit structurally.** Replace, insert, delete, and rename by indexed AST range, validated before disk write, with a pre-write `.symforge/tee/` snapshot and a receipt naming what landed on disk.
@@ -49,7 +49,7 @@ Details: [Home, Why SymForge](https://github.com/special-place-ai-heaven/symforg
 %%{init: {"flowchart": {"htmlLabels": false, "wrappingWidth": 400}}}%%
 flowchart TD
     accTitle: SymForge 12.0.0 architecture
-    accDescr: MCP clients, shell-skill agents, and Rust embedders query one LiveIndex backed by ArcSwap lock-free reads. Startup restores a SHA-256-verified format-11 snapshot or treats older formats as untrusted seeds, while MCP surfaces, the Monty zero-egress Python sandbox, admit_disk_read, and the structural edit engine share the live index.
+    accDescr: MCP clients, shell-skill agents, and Rust embedders query one LiveIndex backed by ArcSwap lock-free reads. Startup restores a SHA-256-verified format-11 snapshot or treats older formats as untrusted seeds, while MCP surfaces, the pure-Rust Monty bytecode VM, admit_disk_read, and the structural edit engine share the live index.
 
     subgraph Clients["Clients"]
         MCP["MCP clients\nClaude · Codex · Gemini\nCursor · Grok · OMP"]
@@ -79,7 +79,7 @@ flowchart TD
 
     subgraph Lanes["Answer + write lanes"]
         SURF["MCP surfaces\n40 full · 13 core · 4 code · 3 compact"]
-        SANDBOX["Monty Python sandbox\n15 typed read ops, zero egress"]
+        SANDBOX["Monty VM (100% Rust)\n15 typed read ops, zero egress"]
         GATE["read_gate\nadmit_disk_read"]
         EDITS["structural edit engine"]
     end
@@ -139,11 +139,28 @@ Details: [Install and Client Setup, Install](https://github.com/special-place-ai
 
 ## Code Mode and CLI
 
-Loading all 40 MCP schemas costs ~16.5k tokens up front (`66,181 B`), and chaining discovery -> references -> symbol bodies over individual MCP calls spends a full model turn per step. V12 eliminates both costs through two surfaces backed by the same `monty` pure-Rust Python 3.14-subset interpreter:
+Loading all 40 MCP schemas costs ~16.5k tokens up front (`66,181 B`), and chaining discovery -> references -> symbol bodies over individual MCP calls spends a full model turn per step. V12 eliminates both costs with a **100% pure-Rust bytecode VM** (`monty`, compiled straight into the `symforge` binary—**no Python runtime or interpreter is installed or spawned**; Python-subset syntax is simply the compact query grammar the LLM writes):
 
 1. **MCP `code` surface** (`SYMFORGE_SURFACE=code` or `symforge serve --surface code`): advertises 4 tools (`code_search`, `code_execute`, `symforge_edit`, `status`) in **3,980 B** (~995 tokens, **−94.0%** vs `full`).
 2. **Shell CLI + `SKILL.md`** (`symforge init --code-skill --skill-only`): zero MCP tools, invoking `symforge q` for single queries and `symforge code run` for multi-step scripts against the warm daemon (`/v1/sessions/{id}/code-query`, preserving `ProjectEvidence`) or read-only `.symforge/index.bin`.
 
+```mermaid
+sequenceDiagram
+    accTitle: Single-turn Code Mode execution inside pure-Rust SymForge
+    accDescr: Instead of multiple LLM turns transferring large intermediate tool outputs, the agent sends one short query script to symforge, where the embedded pure-Rust Monty VM chains search_symbols, find_references, and get_symbol in memory through admit_disk_read and returns only the final compact JSON.
+    participant Agent as AI Agent (LLM)
+    participant VM as Monty Bytecode VM (100% Rust, NoOs)
+    participant Index as LiveIndex + admit_disk_read (Rust RAM)
+
+    Agent->>VM: code_execute / symforge code run (4-line query script)
+    VM->>Index: 1. search_symbols(query="enforce_compact_surface", kind="fn")
+    Index-->>VM: symbol span + path (stays in Rust RAM)
+    VM->>Index: 2. find_references(name=..., kind="call")
+    Index-->>VM: 40 call sites filtered to top 3 in VM (stays in Rust RAM)
+    VM->>Index: 3. get_symbol(targets=top_3) via admit_disk_read
+    Index-->>VM: permitted symbol bodies (secret files withheld)
+    VM-->>Agent: 1 compact JSON result (~600 B, 1 LLM turn)
+```
 ```bash
 # Single quote-free query (parses JSON scalars/arrays or falls back to string; works in bash, cmd, PowerShell)
 symforge q search_symbols -a query=execute_script -a kind=fn
@@ -190,6 +207,19 @@ Details: [Configure a client](https://github.com/special-place-ai-heaven/symforg
 
 The protocol layer runs on vendored `rmcp 3.10.0`, serving MCP **2026-07-28** alongside `2025-11-25`, `2025-06-18`, `2025-03-26`, and `2024-11-05` from a frozen allow-list.
 
+
+```mermaid
+%%{init: {"flowchart": {"htmlLabels": false, "wrappingWidth": 260}}}%%
+flowchart LR
+    accTitle: SymForge structural edit lifecycle
+    accDescr: Every structural edit resolves the exact AST byte span from LiveIndex, checks disk admission, saves a pre-write backup under .symforge/tee/, validates the resulting file with tree-sitter before touching the workspace, writes atomically, re-parses the bytes that landed on disk, and publishes a new ArcSwap generation.
+    SPAN["1. Resolve AST\nbyte span"] --> GATE["2. admit_disk_read\nsecret & drift check"]
+    GATE --> TEE["3. Pre-write backup\n.symforge/tee/"]
+    TEE --> PARSE["4. tree-sitter\nsyntax check"]
+    PARSE --> WRITE["5. Atomic write\n(or worktree route)"]
+    WRITE --> REINDEX["6. Re-parse from\nactual disk bytes"]
+    REINDEX --> SWAP["7. ArcSwap publish\n+ edit receipt"]
+```
 The seven structural edit tools (`replace_symbol_body`, `edit_within_symbol`, `insert_symbol`, `delete_symbol`, `batch_edit`, `batch_insert`, `batch_rename`) accept an optional `working_directory` naming a sibling git worktree (`symforge_edit` accepts and forwards it unadvertised), e.g. `{"path": "src/lib.rs", "symbol_name": "hello", "new_body": "fn hello() {}", "working_directory": "../feature-wt"}`. Passing `working_directory` is explicit call-time routing consent: SymForge validates the git worktree, writes there without polluting the primary index entry, and reports `wrote_to`, `indexed_path`, and `rerouted` so parallel agents can edit isolated worktrees against one shared index.
 
 Details: [Tool Reference](https://github.com/special-place-ai-heaven/symforge/wiki/Tool-Reference#the-tool-surface), [Protocol](https://github.com/special-place-ai-heaven/symforge/wiki/Tool-Reference#protocol), [Compact surface](https://github.com/special-place-ai-heaven/symforge/wiki/Tool-Reference#compact-surface), and [Runtime Model, Worktree-aware editing](https://github.com/special-place-ai-heaven/symforge/wiki/Runtime-Model#worktree-aware-editing).
