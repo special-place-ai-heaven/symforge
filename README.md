@@ -378,12 +378,21 @@ SymForge is built for large repositories and large source files—saving context
 
 <p align="center">
   <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/diagrams/symforge-polyglot-rtk-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="./docs/diagrams/symforge-polyglot-rtk-light.svg">
+    <img alt="SymForge 12.0.0 vs. RTK 1.2.1 vs. Native — 6-Language Polyglot Token Benchmark" src="./docs/diagrams/symforge-polyglot-rtk-dark.svg" width="100%">
+  </picture>
+</p>
+
+<p align="center">
+  <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./docs/diagrams/symforge-benchmark-audit-dark.svg">
     <source media="(prefers-color-scheme: light)" srcset="./docs/diagrams/symforge-benchmark-audit-light.svg">
     <img alt="SymForge 2026-11-09 Paired Benchmark Breakdown" src="./docs/diagrams/symforge-benchmark-audit-dark.svg" width="100%">
   </picture>
 </p>
 
+- **6-Language Polyglot & RTK Benchmark** ([`research/v12-polyglot-bench/`](./research/v12-polyglot-bench), 30 deterministic auto-graded tasks across `12,389` files in **Rust, C#, TypeScript, Python, Java, and Go** using exact `tiktoken` `o200k_base` counts): at **30/30 (100%)** oracle accuracy across 6 five-task sessions, `Native Raw` (`rg` + file read) consumes **500,024 tokens** (143 turns), `RTK 1.2.1` CLI consumes **305,798 tokens** (−38.8%, 63 turns; `rtk read -l aggressive` strips function bodies and omits AST caller chains), `SYMFORGE_SURFACE=full` consumes **208,032 tokens** (−58.4%, 48 turns, including **14,187 tokens**/session of 40-tool schema), **`SYMFORGE_SURFACE=code` consumes 26,166 tokens (−94.8% vs. Native, −91.4% vs. RTK, 36 turns, 880-token schema)**, and **`symforge code run` + `rtk git` hybrid consumes 15,498 tokens (−96.9% vs. Native, −94.9% vs. RTK, 36 turns)**. Includes Stage 2 smol-LLM multi-turn harness (`stage2_smol_agent.py`).
 - **2026-11-09 Product Audit** ([`docs/reviews/2026-11-09-product-audit/AUDIT.md`](./docs/reviews/2026-11-09-product-audit/AUDIT.md), 36 paired runs across Sonnet and Haiku on 11.x): measured **17,300 tokens (`69,295 B`)** of upfront schema overhead on the 40-tool `full` surface (`66,181 B` / ~16.5k tokens in 12.0.0). SymForge retrieved **39–76% less content in up to 4× fewer calls** on caller/reference tracing and symbol lookup, but **32–535% more content** on literal counting and nearby single-file reads, yielding a confound-adjusted **2–12% net difference** on mixed read tasks with no round-trip reduction. Those findings directly drove V12's `code` surface (**3,980 B / ~995 tokens**, −94.0% schema overhead) and single-turn `code_execute` / `symforge q` chaining.
 - **Earlier cohorts:** the 2026-10-05 five-pair 11.x cohort returned `NO_WIN` (−603,609 total tokens, −40,011 paired median where three of five pairs cost more); the 8.14.1 two-pair benchmark measured −24.8% tokens within a narrow scope.
 - **Standing 5-arm benchmark** ([`research/token-benchmark/`](./research/token-benchmark), CI-tested): compares native tools, steered/unsteered `full` MCP, `SYMFORGE_SURFACE=code`, and zero-MCP `symforge-code` CLI skill across repositories with path-scoped rule confounds tracked. Live 5-arm V12 cohort runs have not yet been published, so no general V12 net percentage is claimed.
