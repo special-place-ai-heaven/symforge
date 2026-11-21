@@ -13,6 +13,7 @@
 pub mod admin;
 pub mod analytics;
 pub mod browser;
+pub mod code;
 pub mod entry;
 pub mod harness;
 pub mod harness_apply;
@@ -74,6 +75,15 @@ pub enum Commands {
         /// The Bearer key for the attach URL (omit for a keyless loopback serve).
         #[arg(long, requires = "serve_url")]
         serve_key: Option<String>,
+
+        /// Write the opt-in `symforge-code` SKILL.md for shell-capable coding harnesses
+        /// (Claude Code, Codex, OMP), teaching `symforge code idioms|stubs|run` and `symforge q`.
+        #[arg(long)]
+        code_skill: bool,
+
+        /// Write ONLY `SKILL.md` for `--client` without modifying MCP configs, hooks, or guidance files.
+        #[arg(long, conflicts_with = "scan")]
+        skill_only: bool,
     },
     /// Run the shared local daemon that tracks project and session state
     Daemon,
@@ -95,6 +105,11 @@ pub enum Commands {
     },
     /// Update the npm-managed SymForge install
     Update,
+    /// Execute zero-egress Python 3.14-subset Code Mode scripts or inspect typed stubs/idioms
+    Code(code::CodeCliArgs),
+    /// Run a single structured read-only query and print pure JSON to stdout (alias `query`)
+    #[command(name = "q", visible_alias = "query")]
+    Query(code::QueryCliArgs),
 }
 
 /// Supported `symforge init` targets.

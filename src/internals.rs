@@ -84,6 +84,9 @@ pub mod analytics;
 #[path = "cli/mod.rs"]
 pub mod cli;
 #[cfg(feature = "server")]
+#[path = "codemode/mod.rs"]
+pub mod codemode;
+#[cfg(feature = "server")]
 #[path = "daemon.rs"]
 pub mod daemon;
 #[cfg(feature = "server")]

@@ -470,7 +470,8 @@ pub(crate) enum EditError {
 /// names a forbidden capability.
 fn session_stale_recovery() -> String {
     match crate::protocol::surface_probe::connection_surface_or_env() {
-        crate::protocol::surface_probe::SurfaceProfile::Compact => {
+        crate::protocol::surface_probe::SurfaceProfile::Compact
+        | crate::protocol::surface_probe::SurfaceProfile::Code => {
             "set SYMFORGE_WORKSPACE_ROOT to the project path (or run `symforge init` for \
              this harness) and reconnect to refresh repo_root, or set SYMFORGE_SURFACE=full \
              for the full tool surface"

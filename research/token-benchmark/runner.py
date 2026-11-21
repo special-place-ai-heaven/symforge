@@ -131,7 +131,8 @@ def mcp_config(cfg: dict, arm: dict) -> dict:
     if not arm["mcp"]:
         return {"mcpServers": {}}
     sf = cfg["symforge"]
-    return {"mcpServers": {"symforge": {"type": "stdio", "command": sf["command"], "args": [], "env": dict(sf["server_env"])}}}
+    env = {**sf["server_env"], **arm.get("server_env", {})}
+    return {"mcpServers": {"symforge": {"type": "stdio", "command": sf["command"], "args": [], "env": env}}}
 
 
 def build_command(cfg: dict, arm: dict, values: dict[str, str]) -> list[str]:
@@ -183,6 +184,7 @@ def run_cell(cfg: dict, repo: dict, task: dict, arm_id: str, mode_id: str, rep: 
         pristine, commit = prepare_pristine(repo, work, cfg, no_fetch)
         setup = setup_worktree(pristine, commit, wt, task, mode)
         env = client_env(cfg, home)
+        steering_file = arm.get("steering_file", "steering.md")
         values = {
             "python": cfg["python"], "here": str(HERE), "symforge": cfg["symforge"]["command"], "model": cfg["model"],
             "effort": cfg.get("effort", "medium"), "task_id": task["id"], "arm": arm_id, "mode": mode_id, "rep": str(rep),
@@ -190,10 +192,14 @@ def run_cell(cfg: dict, repo: dict, task: dict, arm_id: str, mode_id: str, rep: 
             "allowed_tools": ",".join(transcript.allowed_patterns(arm, cfg["tools"])),
             "disallowed_tools": ",".join(cfg["tools"]["disallowed"]),
             "max_budget_usd": cfg["client"]["max_budget_usd"],
-            "steering_text": (HERE / "steering.md").read_text(encoding="utf-8"),
+            "steering_text": (HERE / steering_file).read_text(encoding="utf-8"),
         }
         if mode["hooks"] and arm["mcp"]:
             run([subst(a, values) for a in cfg["symforge"]["hook_install"]], cwd=wt, env=env)
+        if arm.get("install_code_skill"):
+            skill_cmd = cfg["symforge"].get("code_skill_install")
+            if skill_cmd:
+                run([subst(a, values) for a in skill_cmd], cwd=wt, env=env)
         hooks = installed_hooks(home)
         (cell_dir / "mcp.json").write_text(json.dumps(mcp_config(cfg, arm), indent=1), encoding="utf-8")
         values["mcp_config"] = str(cell_dir / "mcp.json")

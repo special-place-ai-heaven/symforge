@@ -34,6 +34,29 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(m["answer"], "ANSWER: final")
         self.assertEqual(m["client_version"], "9.9")
         self.assertTrue(m["has_result"])
+        self.assertEqual(m["symforge_cli_calls"], 0)
+
+    def test_symforge_cli_bash_invocations_are_counted(self):
+        u = {"input_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 5}
+        lines = stream(
+            {"type": "assistant", "message": {"id": "a1", "usage": u, "content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "symforge code run -c 'repo_map()'"}},
+                {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "symforge q search_symbols '{\"query\":\"foo\"}'"}},
+                {"type": "tool_use", "id": "t3", "name": "Bash", "input": {"command": "symforge query get_symbol '{\"name\":\"bar\"}'"}},
+                {"type": "tool_use", "id": "t4", "name": "Bash", "input": {"command": "\"/usr/local/bin/symforge\" code stubs"}},
+                {"type": "tool_use", "id": "t5", "name": "Bash", "input": {"command": "'/opt/sym forge/symforge' q search_symbols '{}'"}},
+                {"type": "tool_use", "id": "t6", "name": "Bash", "input": {"command": r"C:\Tools\symforge.exe code idioms"}},
+                {"type": "tool_use", "id": "t7", "name": "Bash", "input": {"command": r'"C:/Program Files/SymForge/symforge.exe" q status "{}"'}},
+                {"type": "tool_use", "id": "t8", "name": "Bash", "input": {"command": "cd src && symforge code run -c '1'"}},
+                {"type": "tool_use", "id": "t9", "name": "Bash", "input": {"command": "pytest -q"}},
+                {"type": "tool_use", "id": "t10", "name": "Bash", "input": {"command": "echo symforge_code_notes.md"}},
+                {"type": "tool_use", "id": "t11", "name": "Bash", "input": {"command": "cat symforge-query.txt"}},
+                {"type": "tool_use", "id": "t12", "name": "Bash", "input": {"command": "ls symforge code_dir.bak/foo || git grep symforge_query"}},
+            ]}},
+            {"type": "result", "subtype": "success", "duration_ms": 100, "result": "ANSWER: ok"},
+        )
+        m = transcript.parse_stream(lines)
+        self.assertEqual(m["symforge_cli_calls"], 8)
 
     def test_rule_sentinel_counted_outside_assistant_text_only(self):
         lines = stream(

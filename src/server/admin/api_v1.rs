@@ -324,6 +324,7 @@ fn profile_label(profile: SurfaceProfile) -> &'static str {
         SurfaceProfile::Core => "core",
         SurfaceProfile::Full => "full",
         SurfaceProfile::Compact => "compact",
+        SurfaceProfile::Code => "code",
         SurfaceProfile::Meta => "meta",
     }
 }

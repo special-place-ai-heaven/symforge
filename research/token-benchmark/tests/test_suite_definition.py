@@ -55,9 +55,13 @@ class SuiteTests(unittest.TestCase):
     def test_config_names_model_and_client_only_as_configuration(self):
         self.assertTrue(CFG["model"])
         self.assertIn("{model}", CFG["client"]["command"])
-        self.assertEqual(sorted(CFG["arms"]), ["a", "b", "c"])
+        self.assertEqual(sorted(CFG["arms"]), ["a", "b", "c", "d", "e"])
         self.assertEqual(CFG["repetitions"], 5)
         self.assertIn(list(CFG["headline_pair"]), [["a", "b"], ["a", "c"]])
+        self.assertEqual(
+            CFG["symforge"]["code_skill_install"],
+            ["{symforge}", "init", "--client", "claude", "--code-skill", "--skill-only"],
+        )
         for py in ("runner.py", "bench.py", "aggregate.py", "oracles.py", "transcript.py"):
             text = (ROOT / py).read_text(encoding="utf-8")
             self.assertIsNone(re.search(r"claude-(opus|sonnet|haiku|fable)-\d", text), py)

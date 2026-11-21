@@ -496,6 +496,8 @@ const WIRED_PRODUCTION_FILES: &[&str] = &[
     // `guidance::request_refusal` (the MCP request check and the embed wire check).
     "src/protocol/tool_contract.rs",
     "src/embed/parity/host/request_check.rs",
+    // Feature 037: pure-Rust Code Mode read-only backend routes through shared guidance + activation.
+    "src/codemode/backend.rs",
 ];
 
 /// The frozen publication_roots census (C4): the state structs that retired
@@ -958,6 +960,7 @@ fn source_splicing_is_allowlisted() {
             ("src/internals.rs", "#[path = \"analytics/mod.rs\"]"),
             ("src/internals.rs", "#[path = \"capability/mod.rs\"]"),
             ("src/internals.rs", "#[path = \"cli/mod.rs\"]"),
+            ("src/internals.rs", "#[path = \"codemode/mod.rs\"]"),
             ("src/internals.rs", "#[path = \"daemon.rs\"]"),
             ("src/internals.rs", "#[path = \"discovery/mod.rs\"]"),
             ("src/internals.rs", "#[path = \"domain/mod.rs\"]"),
@@ -1004,8 +1007,8 @@ fn source_splicing_is_allowlisted() {
     let seen: std::collections::BTreeSet<_> = result.allowlisted_seen.iter().collect();
     assert_eq!(
         (result.allowlisted_seen.len(), seen.len()),
-        (33, 33),
-        "three test-fixture include!(concat!( sites, the 28 internals-wrapper \
+        (34, 34),
+        "three test-fixture include!(concat!( sites, the 29 internals-wrapper \
          remounts, the claim_provenance mount, and one quoting comment, each \
          seen EXACTLY ONCE as a (file, line) allowlist entry; a duplicate or \
          a new splice site is a deliberate allowlist change, got: {:?}",
@@ -1874,7 +1877,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 // test shards add only nextest's `--partition` selector. Three cargo lines out,
 // three in, none a doctest lane; census still 91/53/2.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "7d2d7a2847253397:46866"),
+    ("ci.yml", "95c02503c590bbb8:47014"),
     ("release.yml", "b174946ff2c434bb:115022"),
 ];
 

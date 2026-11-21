@@ -124,10 +124,14 @@ class DecisionRuleTests(unittest.TestCase):
         self.assertEqual(len(report(recs)["cell_config_check"]["mismatched"]), 1)
 
     def test_markdown_renders_synthetic_banner_and_every_section(self):
-        md = aggregate.render_markdown(report(suite([100, 100, 100], [80, 80, 80], synthetic=True)))
-        for needle in ("SYNTHETIC DATA", "Decision rule results", "Per-category medians", "Hook and rule configuration"):
+        rep = report(suite([100, 100, 100], [80, 80, 80], synthetic=True))
+        self.assertEqual(rep["arm_mode_config"]["a/off"]["median_symforge_cli_calls"], 0)
+        self.assertGreater(rep["categories"]["off"]["discovery"]["a"]["median_price_usd"], 0)
+        self.assertEqual(rep["categories"]["off"]["discovery"]["a"]["median_symforge_cli_calls"], 0)
+        md = aggregate.render_markdown(rep)
+        for needle in ("SYNTHETIC DATA", "Decision rule results", "Per-category medians", "Hook and rule configuration",
+                       "median price USD", "median cli_calls"):
             self.assertIn(needle, md)
-
 
 if __name__ == "__main__":
     unittest.main()

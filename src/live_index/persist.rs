@@ -3719,7 +3719,7 @@ async fn background_verify_with_hook_authority<F, C>(
     }
 }
 
-#[cfg(feature = "embed")]
+#[cfg(any(feature = "server", feature = "embed"))]
 pub(crate) fn background_verify_bound<C>(
     index: &crate::live_index::store::SharedIndex,
     root: &Path,
