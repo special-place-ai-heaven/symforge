@@ -46,6 +46,17 @@ Embedders keep their own response bytes and check them with `ReplayOutcome::resp
 
 AAP S14-S16 add opt-in refresh-safe snapshot reads for Graph, File, SymbolSearch, and References via `EmbeddedSourceHandle::query_allowing_refresh`; the claim keeps the prior publication identity and reports `Refreshing`. Strict `query` remains Current-only, and mutating/mixed-disk variants are refused before freshening. `change_version` plus blocking `wait_for_change` provide lossless phase/publication event waits. `begin_graph_publication_lease` pins one Graph snapshot across pages for at most 30 seconds; no more than eight leases are live per source, and expired leases return `GraphPublicationLeaseExpired`.
 
+## [12.0.0](https://github.com/special-place-ai-heaven/symforge/compare/v11.22.6...v12.0.0) (2026-11-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **code-mode:** Introduces the V12 4-tool `code` surface profile (`SYMFORGE_SURFACE=code` / `symforge serve --surface code`) and non-MCP `symforge code` / `symforge q` agent lanes alongside V11 surfaces.
+
+### Features
+
+* **code-mode:** add zero-egress Python Code Mode and CLI query lanes (V12 cut) ([#933](https://github.com/special-place-ai-heaven/symforge/issues/933)) ([17e5b6b](https://github.com/special-place-ai-heaven/symforge/commit/17e5b6bb18f5e7d146eaf92ee9042cc73bef5100))
+
 ## [11.22.6](https://github.com/special-place-ai-heaven/symforge/compare/v11.22.5...v11.22.6) (2026-11-19)
 
 
