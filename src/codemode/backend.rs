@@ -1756,6 +1756,7 @@ pub struct DaemonCodeBackend {
     project_override: Option<String>,
     owns_session: bool,
     closed: Mutex<bool>,
+    last_evidence: Mutex<Option<crate::protocol::result_status::ProjectEvidence>>,
 }
 
 impl DaemonCodeBackend {
@@ -1784,6 +1785,7 @@ impl DaemonCodeBackend {
             project_override,
             owns_session: false,
             closed: Mutex::new(false),
+            last_evidence: Mutex::new(None),
         }
     }
 
@@ -1801,7 +1803,13 @@ impl DaemonCodeBackend {
             project_override,
             owns_session: true,
             closed: Mutex::new(false),
+            last_evidence: Mutex::new(None),
         }
+    }
+
+    /// Returns the most recent `ProjectEvidence` receipt observed from `/code-query`.
+    pub fn take_last_evidence(&self) -> Option<crate::protocol::result_status::ProjectEvidence> {
+        self.last_evidence.lock().take()
     }
 
     pub fn close_best_effort(&self) {
@@ -1839,11 +1847,15 @@ impl CodeReadBackend for DaemonCodeBackend {
             project: self.project_override.clone(),
         };
         let session = self.session.clone();
-        self.handle.block_on(async move {
+        let (result, evidence) = self.handle.block_on(async move {
             session
                 .call_code_query(&req)
                 .await
-                .map_err(|e| CodeBackendError::refusal("daemon_transport", e.to_string()))?
-        })
+                .map_err(|e| CodeBackendError::refusal("daemon_transport", e.to_string()))
+        })?;
+        if let Some(ev) = evidence {
+            *self.last_evidence.lock() = Some(ev);
+        }
+        result
     }
 }

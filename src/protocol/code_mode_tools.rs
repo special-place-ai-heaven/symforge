@@ -154,7 +154,9 @@ impl SymForgeServer {
                 let handle = tokio::runtime::Handle::current();
                 tokio::task::spawn_blocking(move || {
                     let backend = DaemonCodeBackend::new_borrowed(handle, session, proj);
-                    execute_script(&req, &backend)
+                    let outcome = execute_script(&req, &backend);
+                    let evidence = backend.take_last_evidence();
+                    (outcome, evidence)
                 })
                 .await
                 .map_err(|join| {
@@ -175,7 +177,7 @@ impl SymForgeServer {
                 };
 
             let first_session = daemon_lock.read().await.clone();
-            let first_outcome = run_against_daemon(
+            let (first_outcome, first_evidence) = run_against_daemon(
                 first_session.clone(),
                 exec_req.clone(),
                 pinned_project_id.clone(),
@@ -183,6 +185,14 @@ impl SymForgeServer {
             .await?;
 
             let Some(transport_err) = is_transport_failure(&first_outcome) else {
+                if let Some(ev) = first_evidence
+                    && super::result_status::project_evidence_matches_selector(
+                        &ev,
+                        selector.as_deref(),
+                    )
+                {
+                    super::result_status::record_project_evidence(ev);
+                }
                 self.note_daemon_recovered();
                 return render_execute_call_result(first_outcome);
             };
@@ -235,7 +245,7 @@ impl SymForgeServer {
 
                 if reconnected {
                     let retry_session = daemon_lock.read().await.clone();
-                    let retry_outcome = run_against_daemon(
+                    let (retry_outcome, retry_evidence) = run_against_daemon(
                         retry_session.clone(),
                         exec_req.clone(),
                         pinned_project_id,
@@ -251,6 +261,14 @@ impl SymForgeServer {
                         self.ensure_local_index().await;
                         self.restore_local_project_evidence();
                     } else {
+                        if let Some(ev) = retry_evidence
+                            && super::result_status::project_evidence_matches_selector(
+                                &ev,
+                                selector.as_deref(),
+                            )
+                        {
+                            super::result_status::record_project_evidence(ev);
+                        }
                         self.note_daemon_recovered();
                         return render_execute_call_result(retry_outcome);
                     }

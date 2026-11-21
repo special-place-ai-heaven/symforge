@@ -15,8 +15,9 @@ use std::time::Duration;
 use clap::{Args, Subcommand};
 use serde_json::{Map, Value, json};
 
+use crate::cli::entry::MainExit;
 use crate::codemode::{
-    CodeModeLimits, CodeReadBackend, CodeReadOp, DaemonCodeBackend, ExecuteRequest,
+    CodeModeLimits, CodeReadBackend, CodeReadOp, DaemonCodeBackend, ExecuteRequest, ExecuteStatus,
     LocalCodeBackend, execute_script, render_idioms, render_stubs,
 };
 
@@ -106,15 +107,15 @@ pub struct QueryCliArgs {
     pub project: Option<String>,
 }
 
-pub fn run_code_cli(args: CodeCliArgs) -> anyhow::Result<()> {
+pub fn run_code_cli(args: CodeCliArgs) -> anyhow::Result<MainExit> {
     match args.command {
         CodeSubcommand::Idioms => {
             print!("{}", render_idioms());
-            Ok(())
+            Ok(MainExit::Success)
         }
         CodeSubcommand::Stubs(stubs) => {
             print!("{}", render_stubs(stubs.query.as_deref(), stubs.limit));
-            Ok(())
+            Ok(MainExit::Success)
         }
         CodeSubcommand::Run(run_args) => run_code_script(run_args),
     }
@@ -209,7 +210,7 @@ fn run_with_resolved_backend<T>(
     Ok(work(&local, "local"))
 }
 
-fn run_code_script(args: CodeRunArgs) -> anyhow::Result<()> {
+fn run_code_script(args: CodeRunArgs) -> anyhow::Result<MainExit> {
     let source = read_script_source(&args)?;
     let root = resolve_target_root(args.root.as_deref())?;
 
@@ -233,42 +234,64 @@ fn run_code_script(args: CodeRunArgs) -> anyhow::Result<()> {
         execute_script(&req, backend)
     })?;
 
+    let exit = if outcome.status == ExecuteStatus::Ok {
+        MainExit::Success
+    } else {
+        MainExit::JsonCommandError
+    };
     println!("{}", serde_json::to_string(&outcome)?);
-    Ok(())
+    Ok(exit)
 }
 
-pub fn run_query_cli(args: QueryCliArgs) -> anyhow::Result<()> {
+fn print_query_error(
+    op_name: Option<&str>,
+    kind: &str,
+    message: impl Into<String>,
+) -> anyhow::Result<MainExit> {
+    let err_json = match op_name {
+        Some(op) => json!({
+            "status": "error",
+            "op": op,
+            "error": {
+                "kind": kind,
+                "message": message.into(),
+            }
+        }),
+        None => json!({
+            "status": "error",
+            "error": {
+                "kind": kind,
+                "message": message.into(),
+            }
+        }),
+    };
+    println!("{}", serde_json::to_string(&err_json)?);
+    Ok(MainExit::JsonCommandError)
+}
+
+pub fn run_query_cli(args: QueryCliArgs) -> anyhow::Result<MainExit> {
     let Some(op) = CodeReadOp::from_cli_name(args.op.trim()) else {
         let valid: Vec<&str> = crate::codemode::CODE_READ_OPS
             .iter()
             .map(|d| d.name)
             .collect();
-        let err_json = json!({
-            "status": "error",
-            "error": {
-                "kind": "unknown_operation",
-                "message": format!(
-                    "unknown read operation '{}'; valid operations: {}",
-                    args.op,
-                    valid.join(", ")
-                ),
-            }
-        });
-        println!("{}", serde_json::to_string(&err_json)?);
-        return Ok(());
+        return print_query_error(
+            None,
+            "unknown_operation",
+            format!(
+                "unknown read operation '{}'; valid operations: {}",
+                args.op,
+                valid.join(", ")
+            ),
+        );
     };
 
     if args.args_file.is_some() && args.args_json.is_some() {
-        let err_json = json!({
-            "status": "error",
-            "op": op.as_str(),
-            "error": {
-                "kind": "invalid_request",
-                "message": "pass either positional JSON arguments or `--args-file`, not both",
-            }
-        });
-        println!("{}", serde_json::to_string(&err_json)?);
-        return Ok(());
+        return print_query_error(
+            Some(op.as_str()),
+            "invalid_request",
+            "pass either positional JSON arguments or `--args-file`, not both",
+        );
     }
 
     let raw_args = if let Some(file_path) = &args.args_file {
@@ -276,16 +299,11 @@ pub fn run_query_cli(args: QueryCliArgs) -> anyhow::Result<()> {
             Ok(text) if text.trim().is_empty() => "{}".to_owned(),
             Ok(text) => text,
             Err(e) => {
-                let err_json = json!({
-                    "status": "error",
-                    "op": op.as_str(),
-                    "error": {
-                        "kind": "invalid_request",
-                        "message": format!("cannot read --args-file '{}': {e}", file_path.display()),
-                    }
-                });
-                println!("{}", serde_json::to_string(&err_json)?);
-                return Ok(());
+                return print_query_error(
+                    Some(op.as_str()),
+                    "invalid_request",
+                    format!("cannot read --args-file '{}': {e}", file_path.display()),
+                );
             }
         }
     } else {
@@ -295,33 +313,19 @@ pub fn run_query_cli(args: QueryCliArgs) -> anyhow::Result<()> {
                 Ok(buf) if buf.trim().is_empty() => "{}".to_owned(),
                 Ok(buf) => buf,
                 Err(e) => {
-                    let err_json = json!({
-                        "status": "error",
-                        "op": op.as_str(),
-                        "error": {
-                            "kind": "invalid_request",
-                            "message": e.to_string(),
-                        }
-                    });
-                    println!("{}", serde_json::to_string(&err_json)?);
-                    return Ok(());
+                    return print_query_error(Some(op.as_str()), "invalid_request", e.to_string());
                 }
             },
             Some(inline) => {
                 if inline.len() > MAX_CLI_INPUT_BYTES {
-                    let err_json = json!({
-                        "status": "error",
-                        "op": op.as_str(),
-                        "error": {
-                            "kind": "invalid_request",
-                            "message": format!(
-                                "inline arguments exceed maximum allowed size of {} bytes (2 MiB)",
-                                MAX_CLI_INPUT_BYTES
-                            ),
-                        }
-                    });
-                    println!("{}", serde_json::to_string(&err_json)?);
-                    return Ok(());
+                    return print_query_error(
+                        Some(op.as_str()),
+                        "invalid_request",
+                        format!(
+                            "inline arguments exceed maximum allowed size of {} bytes (2 MiB)",
+                            MAX_CLI_INPUT_BYTES
+                        ),
+                    );
                 }
                 inline.to_owned()
             }
@@ -331,57 +335,37 @@ pub fn run_query_cli(args: QueryCliArgs) -> anyhow::Result<()> {
     let parsed: Value = match serde_json::from_str(&raw_args) {
         Ok(v) => v,
         Err(e) => {
-            let err_json = json!({
-                "status": "error",
-                "op": op.as_str(),
-                "error": {
-                    "kind": "invalid_json",
-                    "message": format!("invalid JSON arguments: {e}"),
-                }
-            });
-            println!("{}", serde_json::to_string(&err_json)?);
-            return Ok(());
+            return print_query_error(
+                Some(op.as_str()),
+                "invalid_json",
+                format!("invalid JSON arguments: {e}"),
+            );
         }
     };
 
     let Value::Object(mut kwargs): Value = parsed else {
-        let err_json = json!({
-            "status": "error",
-            "op": op.as_str(),
-            "error": {
-                "kind": "invalid_json",
-                "message": "arguments must be a JSON object (e.g. '{\"query\":\"foo\"}' or `-a query=foo`)",
-            }
-        });
-        println!("{}", serde_json::to_string(&err_json)?);
-        return Ok(());
+        return print_query_error(
+            Some(op.as_str()),
+            "invalid_json",
+            "arguments must be a JSON object (e.g. '{\"query\":\"foo\"}' or `-a query=foo`)",
+        );
     };
 
     for entry in &args.arg {
         let Some((raw_key, raw_val)) = entry.split_once('=') else {
-            let err_json = json!({
-                "status": "error",
-                "op": op.as_str(),
-                "error": {
-                    "kind": "invalid_request",
-                    "message": format!("invalid `--arg` '{entry}': expected `KEY=VALUE`"),
-                }
-            });
-            println!("{}", serde_json::to_string(&err_json)?);
-            return Ok(());
+            return print_query_error(
+                Some(op.as_str()),
+                "invalid_request",
+                format!("invalid `--arg` '{entry}': expected `KEY=VALUE`"),
+            );
         };
         let key = raw_key.trim();
         if key.is_empty() {
-            let err_json = json!({
-                "status": "error",
-                "op": op.as_str(),
-                "error": {
-                    "kind": "invalid_request",
-                    "message": format!("invalid `--arg` '{entry}': key must be non-empty"),
-                }
-            });
-            println!("{}", serde_json::to_string(&err_json)?);
-            return Ok(());
+            return print_query_error(
+                Some(op.as_str()),
+                "invalid_request",
+                format!("invalid `--arg` '{entry}': key must be non-empty"),
+            );
         }
         let val = serde_json::from_str::<Value>(raw_val)
             .unwrap_or_else(|_| Value::String(raw_val.to_owned()));
@@ -395,23 +379,29 @@ pub fn run_query_cli(args: QueryCliArgs) -> anyhow::Result<()> {
     })?;
     let duration_ms = started.elapsed().as_millis() as u64;
 
-    let payload = match result {
-        Ok(value) => json!({
-            "status": "ok",
-            "op": op.as_str(),
-            "value": value,
-            "duration_ms": duration_ms,
-        }),
-        Err(err) => json!({
-            "status": "error",
-            "op": op.as_str(),
-            "duration_ms": duration_ms,
-            "error": {
-                "kind": err.kind,
-                "message": err.message,
-            }
-        }),
+    let (payload, exit) = match result {
+        Ok(value) => (
+            json!({
+                "status": "ok",
+                "op": op.as_str(),
+                "value": value,
+                "duration_ms": duration_ms,
+            }),
+            MainExit::Success,
+        ),
+        Err(err) => (
+            json!({
+                "status": "error",
+                "op": op.as_str(),
+                "duration_ms": duration_ms,
+                "error": {
+                    "kind": err.kind,
+                    "message": err.message,
+                }
+            }),
+            MainExit::JsonCommandError,
+        ),
     };
     println!("{}", serde_json::to_string(&payload)?);
-    Ok(())
+    Ok(exit)
 }

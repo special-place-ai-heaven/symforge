@@ -18,7 +18,10 @@ fn main() -> std::process::ExitCode {
         // generic failure, so operators/CI can detect a refused bind.
         Ok(symforge::server_api::ServerExit::RefusedToStart) => std::process::ExitCode::from(2),
         Err(error) => {
-            eprintln!("Error: {error}");
+            let text = error.to_string();
+            if !text.is_empty() {
+                eprintln!("Error: {text}");
+            }
             std::process::ExitCode::FAILURE
         }
     }

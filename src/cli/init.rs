@@ -242,12 +242,14 @@ pub fn install_code_skill_for_client(
     let body = render_symforge_code_skill_markdown(&bin_display);
     let mut targets: Vec<PathBuf> = Vec::new();
 
-    let claude_installed =
-        home_dir.join(".claude").is_dir() || home_dir.join(".claude.json").exists();
+    let claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir.join(".claude"));
+    let claude_installed = claude_config_dir.is_dir() || home_dir.join(".claude.json").exists();
     if client == InitClient::Claude || (client == InitClient::All && claude_installed) {
         targets.push(
-            home_dir
-                .join(".claude")
+            claude_config_dir
                 .join("skills")
                 .join("symforge-code")
                 .join("SKILL.md"),

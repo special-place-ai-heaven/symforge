@@ -278,17 +278,19 @@ async fn daemon_proxied_code_execute_preserves_session_across_multiple_calls_and
     let server = SymForgeServer::new_daemon_proxy(session.clone());
 
     for round in 1..=3 {
-        let res = server
-            .dispatch_tool_result_for_tests(
+        let res = symforge::protocol::result_status::with_project_evidence_scope(
+            None,
+            server.dispatch_tool_result_for_tests(
                 "code_execute",
                 json!({
                     "code": format!(
                         "hits = search_symbols(query=\"add_pair\", kind=\"fn\")\n{{\"round\": {round}, \"name\": hits[0][\"name\"]}}"
                     )
                 }),
-            )
-            .await
-            .expect("code_execute over daemon");
+            ),
+        )
+        .await
+        .expect("code_execute over daemon");
         assert_ne!(
             res.is_error,
             Some(true),
@@ -300,6 +302,18 @@ async fn daemon_proxied_code_execute_preserves_session_across_multiple_calls_and
         assert_eq!(parsed["status"], "ok", "round {round} outcome: {parsed}");
         assert_eq!(parsed["value"]["round"], round);
         assert_eq!(parsed["value"]["name"], "add_pair");
+        // Verify daemon ProjectEvidence receipt was attached to `_meta` (never degraded/unavailable).
+        let meta = res.meta.as_ref().expect("result _meta present");
+        let ev = meta
+            .0
+            .get("symforge/project_evidence")
+            .expect("symforge/project_evidence attached");
+        assert!(
+            ev.get("project_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("project-v1-")),
+            "expected verified daemon project_id receipt on _meta, got: {ev}"
+        );
     }
 
     // Verify the underlying daemon session is still alive and healthy (not degraded or closed).
@@ -314,7 +328,7 @@ async fn daemon_proxied_code_execute_preserves_session_across_multiple_calls_and
     );
 
     // Explicit direct query on the original `session` proves `DELETE /v1/sessions/{id}` was never called.
-    let probe = session
+    let (probe_res, probe_ev) = session
         .call_code_query(&symforge::codemode::DaemonCodeQueryRequest {
             op: symforge::codemode::CodeReadOp::SearchSymbols,
             kwargs: serde_json::from_value(json!({"query": "triple"})).unwrap(),
@@ -322,7 +336,14 @@ async fn daemon_proxied_code_execute_preserves_session_across_multiple_calls_and
         })
         .await
         .expect("session must still be open on daemon");
-    assert!(probe.is_ok(), "direct code-query probe failed: {probe:?}");
+    assert!(
+        probe_res.is_ok(),
+        "direct code-query probe failed: {probe_res:?}"
+    );
+    assert!(
+        probe_ev.is_some(),
+        "daemon /code-query must emit PROJECT_EVIDENCE_HEADER receipt"
+    );
 
     let _ = session.close().await;
     let _ = daemon.shutdown_tx.send(());

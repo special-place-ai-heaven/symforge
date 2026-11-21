@@ -3269,7 +3269,10 @@ impl DaemonSessionClient {
     pub async fn call_code_query(
         &self,
         query: &crate::codemode::DaemonCodeQueryRequest,
-    ) -> anyhow::Result<Result<serde_json::Value, crate::codemode::CodeBackendError>> {
+    ) -> anyhow::Result<(
+        Result<serde_json::Value, crate::codemode::CodeBackendError>,
+        Option<crate::protocol::result_status::ProjectEvidence>,
+    )> {
         let request = self
             .http_client
             .post(format!(
@@ -3277,19 +3280,38 @@ impl DaemonSessionClient {
                 self.base_url, self.session_id
             ))
             .json(query);
-        let reply = apply_daemon_auth_header(request, self.auth_token.as_deref())
+        let request = apply_daemon_auth_header(request, self.auth_token.as_deref()).header(
+            crate::protocol::surface_probe::CONNECTION_SURFACE_HEADER,
+            crate::protocol::surface_probe::surface_profile_label(
+                crate::protocol::surface_probe::surface_profile_from_env(),
+            ),
+        );
+        let response = request
             .send()
             .await
             .context("calling daemon code-query")?
             .error_for_status()
-            .context("daemon code-query status")?
+            .context("daemon code-query status")?;
+        let project_evidence = if let Some(header) = response
+            .headers()
+            .get(crate::protocol::result_status::PROJECT_EVIDENCE_HEADER)
+            && let Ok(evidence) = serde_json::from_slice::<
+                crate::protocol::result_status::ProjectEvidence,
+            >(header.as_bytes())
+        {
+            Some(evidence)
+        } else {
+            None
+        };
+        let reply = response
             .json::<crate::codemode::DaemonCodeQueryResponse>()
             .await
             .context("decoding daemon code-query body")?;
-        Ok(match reply {
+        let result = match reply {
             crate::codemode::DaemonCodeQueryResponse::Ok { value } => Ok(value),
             crate::codemode::DaemonCodeQueryResponse::Error { error } => Err(error),
-        })
+        };
+        Ok((result, project_evidence))
     }
 }
 
@@ -6500,8 +6522,11 @@ async fn code_query_handler(
     headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
     Json(req): Json<crate::codemode::DaemonCodeQueryRequest>,
-) -> Result<Json<crate::codemode::DaemonCodeQueryResponse>, (StatusCode, String)> {
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    use axum::response::IntoResponse;
+
     let _activity = authorize_daemon_request(&state, &headers).map_err(daemon_auth_error)?;
+    let _connection_surface = connection_surface_from_headers(&headers);
     let selector = req
         .project
         .as_deref()
@@ -6519,7 +6544,8 @@ async fn code_query_handler(
         Err(msg) => {
             return Ok(Json(crate::codemode::DaemonCodeQueryResponse::Error {
                 error: crate::codemode::CodeBackendError::refusal("project_routing", msg),
-            }));
+            })
+            .into_response());
         }
     };
     let op = req.op;
@@ -6528,7 +6554,7 @@ async fn code_query_handler(
     let outcome = state
         .governor
         .execute_non_abortable(&op_label, async move {
-            let res = tokio::task::spawn_blocking(move || {
+            let (res, evidence) = tokio::task::spawn_blocking(move || {
                 runtime.token_stats.record_tool_call(op.as_str());
                 let source_set = runtime.index.data_plane().published_source_set();
                 let generation = source_set.current_generation();
@@ -6537,8 +6563,21 @@ async fn code_query_handler(
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("project");
+                let evidence = crate::protocol::result_status::ProjectEvidence {
+                    project_id: runtime.project_id.clone(),
+                    project_name: project_name.to_string(),
+                    canonical_root: Some(normalized_path_string(&runtime.canonical_root)),
+                    generation: generation.publication_generation,
+                    index_state: generation.health.status_label().to_string(),
+                    trust: crate::live_index::store::TrustHeadline::of(&generation)
+                        .label()
+                        .to_string(),
+                    load_source: generation.live.load_source().label().to_string(),
+                    index_files: generation.health.file_count,
+                    index_symbols: generation.health.symbol_count,
+                };
                 let server = &runtime.server;
-                crate::codemode::execute_op_on_generation(
+                let res = crate::codemode::execute_op_on_generation(
                     op,
                     kwargs,
                     &generation,
@@ -6550,32 +6589,61 @@ async fn code_query_handler(
                             server.bump_frecency(&[PathBuf::from(path)]);
                         }
                     },
-                )
+                );
+                (res, evidence)
             })
             .await
             .map_err(|join_err| anyhow::anyhow!("code-query task panicked: {join_err}"))?;
-            Ok::<Result<serde_json::Value, crate::codemode::CodeBackendError>, anyhow::Error>(res)
+            Ok::<
+                (
+                    Result<serde_json::Value, crate::codemode::CodeBackendError>,
+                    crate::protocol::result_status::ProjectEvidence,
+                ),
+                anyhow::Error,
+            >((res, evidence))
         })
         .await;
 
-    match outcome {
-        Ok(Ok(Ok(value))) => Ok(Json(crate::codemode::DaemonCodeQueryResponse::Ok { value })),
-        Ok(Ok(Err(error))) => Ok(Json(crate::codemode::DaemonCodeQueryResponse::Error {
-            error,
-        })),
-        Ok(Err(join_err)) => Ok(Json(crate::codemode::DaemonCodeQueryResponse::Error {
-            error: crate::codemode::CodeBackendError::refusal(
-                "internal_error",
-                join_err.to_string(),
-            ),
-        })),
-        Err(gov_err) => Ok(Json(crate::codemode::DaemonCodeQueryResponse::Error {
-            error: crate::codemode::CodeBackendError::refusal(
-                "governor_error",
-                gov_err.to_string(),
-            ),
-        })),
+    let (body, response_evidence) = match outcome {
+        Ok(Ok((Ok(value), evidence))) => (
+            crate::codemode::DaemonCodeQueryResponse::Ok { value },
+            Some(evidence),
+        ),
+        Ok(Ok((Err(error), evidence))) => (
+            crate::codemode::DaemonCodeQueryResponse::Error { error },
+            Some(evidence),
+        ),
+        Ok(Err(join_err)) => (
+            crate::codemode::DaemonCodeQueryResponse::Error {
+                error: crate::codemode::CodeBackendError::refusal(
+                    "internal_error",
+                    join_err.to_string(),
+                ),
+            },
+            None,
+        ),
+        Err(gov_err) => (
+            crate::codemode::DaemonCodeQueryResponse::Error {
+                error: crate::codemode::CodeBackendError::refusal(
+                    "governor_error",
+                    gov_err.to_string(),
+                ),
+            },
+            None,
+        ),
+    };
+
+    let mut response = Json(body).into_response();
+    if let Some(evidence) = response_evidence
+        && let Ok(json_str) = serde_json::to_string(&evidence)
+        && let Ok(header_val) = axum::http::HeaderValue::try_from(json_str)
+    {
+        response.headers_mut().insert(
+            crate::protocol::result_status::PROJECT_EVIDENCE_HEADER,
+            header_val,
+        );
     }
+    Ok(response)
 }
 
 /// Dogfood #6 parity for daemon-proxied sidecar routes: the local sidecar
@@ -9300,6 +9368,11 @@ mod tests {
         assert_eq!(
             connection_surface_from_headers(&headers),
             Some(SurfaceProfile::Core)
+        );
+        headers.insert(CONNECTION_SURFACE_HEADER, "code".parse().unwrap());
+        assert_eq!(
+            connection_surface_from_headers(&headers),
+            Some(SurfaceProfile::Code)
         );
 
         // Non-canonical value is ignored (falls back to env), never echoed.

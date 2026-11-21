@@ -390,7 +390,15 @@ fn cli_q_supports_quote_free_key_value_args_for_windows_and_powershell() {
         .env("SYMFORGE_HOME", isolated_home.path())
         .output()
         .expect("run symforge q with unknown --arg");
-    assert!(bad_out.status.success());
+    assert!(
+        !bad_out.status.success(),
+        "failed symforge q must exit non-zero so shell callers never mask errors"
+    );
+    assert!(
+        bad_out.stderr.is_empty(),
+        "JSON error responses must keep stderr empty: {}",
+        String::from_utf8_lossy(&bad_out.stderr)
+    );
     let bad_parsed: Value = serde_json::from_slice(&bad_out.stdout).expect("valid error json");
     assert_eq!(bad_parsed["status"], "error");
     assert_eq!(bad_parsed["error"]["kind"], "invalid_request");
@@ -401,6 +409,30 @@ fn cli_q_supports_quote_free_key_value_args_for_windows_and_powershell() {
             .contains("bogus_kwarg"),
         "got: {bad_parsed}"
     );
+
+    // Failed `symforge code run` script also exits non-zero with pure JSON stdout and empty stderr.
+    let fail_script_out = hidden_command(symforge_bin())
+        .args([
+            "code",
+            "run",
+            "-c",
+            "1 / 0",
+            "--root",
+            repo.path().to_str().unwrap(),
+        ])
+        .env("SYMFORGE_NO_DAEMON", "1")
+        .env("SYMFORGE_HOME", isolated_home.path())
+        .output()
+        .expect("run failing symforge code run");
+    assert!(
+        !fail_script_out.status.success(),
+        "failing symforge code run must exit non-zero"
+    );
+    assert!(fail_script_out.stderr.is_empty());
+    let fail_parsed: Value =
+        serde_json::from_slice(&fail_script_out.stdout).expect("valid error json");
+    assert_eq!(fail_parsed["status"], "error");
+    assert_eq!(fail_parsed["error"]["exception_type"], "ZeroDivisionError");
 }
 
 #[test]
