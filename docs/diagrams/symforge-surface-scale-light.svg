@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 416" width="1080" height="416" role="img" aria-labelledby="sTitle sDesc">
+  <title id="sTitle">SymForge 12.0.0 Upfront Schema Cost by Surface Profile</title>
+  <desc id="sDesc">Traffic-light color-coded bar chart of upfront tools/list schema size: green (good) for CLI skill-only (0 B), code surface (3,980 B, -94%), and compact (4,552 B, -93.1%); orange (moderate warning) for core (28,162 B); and red (heavy tax) for eager full surface (66,181 B / ~16.5k tokens).</desc>
+  <rect x="0" y="0" width="1080" height="416" rx="14" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="32" y="35" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="17" font-weight="700" fill="#0f172a">Upfront Schema Cost per Session (Lower Is Better — Measured `tools/list` Bytes)</text>
+
+  <circle cx="32" cy="57" r="5" fill="#2ea043"/>
+  <text x="43" y="61" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" font-weight="600" fill="#2ea043">Good (&lt; 5 KB / &lt; 1.2k tok)</text>
+  <circle cx="222" cy="57" r="5" fill="#d97706"/>
+  <text x="233" y="61" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" font-weight="600" fill="#d97706">Warning: Moderate (~7k tok)</text>
+  <circle cx="425" cy="57" r="5" fill="#dc2626"/>
+  <text x="436" y="61" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" font-weight="600" fill="#dc2626">Bad if client loads all schemas eagerly (~16.5k tok)</text>
+  <line x1="24" y1="72" x2="1056" y2="72" stroke="#cbd5e1" stroke-width="1"/>
+  
+  <rect x="24" y="84" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="40" y="107" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="700" fill="#0f172a">CLI + SKILL.md</text>
+  <text x="40" y="125" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#475569">--code-skill --skill-only</text>
+
+  <rect x="248" y="96" width="410" height="14" rx="7" fill="#e2e8f0"/>
+  <rect x="248" y="96" width="5" height="14" rx="7" fill="#2ea043"/>
+  <text x="248" y="127" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#475569">Zero MCP schema loaded · shell `symforge q` + `symforge code run`</text>
+
+  <text x="850" y="115" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#0f172a">0 B (0 tok)</text>
+  <rect x="866" y="97" width="174" height="28" rx="14" fill="#dcfce7"/>
+  <text x="953" y="115" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#2ea043">✓ GOOD · -100%</text>
+  <rect x="24" y="147" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="40" y="170" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="700" fill="#0f172a">code (V12)</text>
+  <text x="40" y="188" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#475569">SYMFORGE_SURFACE=code</text>
+
+  <rect x="248" y="159" width="410" height="14" rx="7" fill="#e2e8f0"/>
+  <rect x="248" y="159" width="25" height="14" rx="7" fill="#2ea043"/>
+  <text x="248" y="190" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#475569">4 tools: code_search · code_execute · symforge_edit · status</text>
+
+  <text x="850" y="178" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#0f172a">3,980 B (~995 tok)</text>
+  <rect x="866" y="160" width="174" height="28" rx="14" fill="#dcfce7"/>
+  <text x="953" y="178" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#2ea043">✓ GOOD · -94.0%</text>
+  <rect x="24" y="210" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="40" y="233" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="700" fill="#0f172a">compact</text>
+  <text x="40" y="251" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#475569">SYMFORGE_SURFACE=compact</text>
+
+  <rect x="248" y="222" width="410" height="14" rx="7" fill="#e2e8f0"/>
+  <rect x="248" y="222" width="28" height="14" rx="7" fill="#2ea043"/>
+  <text x="248" y="253" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#475569">3 tools: symforge · symforge_edit · status (non-code clients)</text>
+
+  <text x="850" y="241" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#0f172a">4,552 B (~1,138 tok)</text>
+  <rect x="866" y="223" width="174" height="28" rx="14" fill="#dcfce7"/>
+  <text x="953" y="241" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#2ea043">✓ GOOD · -93.1%</text>
+  <rect x="24" y="273" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="40" y="296" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="700" fill="#0f172a">core</text>
+  <text x="40" y="314" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#475569">SYMFORGE_SURFACE=core</text>
+
+  <rect x="248" y="285" width="410" height="14" rx="7" fill="#e2e8f0"/>
+  <rect x="248" y="285" width="174" height="14" rx="7" fill="#d97706"/>
+  <text x="248" y="316" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#475569">13 everyday tools listed eagerly (~7k tokens up front)</text>
+
+  <text x="850" y="304" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#0f172a">28,162 B (~7,040 tok)</text>
+  <rect x="866" y="286" width="174" height="28" rx="14" fill="#fef3c7"/>
+  <text x="953" y="304" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#d97706">⚠ MODERATE · -57%</text>
+  <rect x="24" y="336" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="40" y="359" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="700" fill="#0f172a">full (default)</text>
+  <text x="40" y="377" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#475569">SYMFORGE_SURFACE=full</text>
+
+  <rect x="248" y="348" width="410" height="14" rx="7" fill="#e2e8f0"/>
+  <rect x="248" y="348" width="410" height="14" rx="7" fill="#dc2626"/>
+  <text x="248" y="379" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#475569">All 40 schemas paid up front on clients that do not defer tool loading</text>
+
+  <text x="850" y="367" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#0f172a">66,181 B (~16,545 tok)</text>
+  <rect x="866" y="349" width="174" height="28" rx="14" fill="#fee2e2"/>
+  <text x="953" y="367" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#dc2626">✕ HEAVY · 16.5k tok</text>
+</svg>
