@@ -1,0 +1,2246 @@
+{
+  "benchmark": "symforge-v12-polyglot-rtk-stage1",
+  "tokenizer": "tiktoken:o200k_base",
+  "total_repos": 6,
+  "total_indexed_files": 12389,
+  "total_tasks": 30,
+  "mcp_schemas": {
+    "full": {
+      "surface": "full",
+      "tool_count": 40,
+      "schema_bytes": 63454,
+      "schema_tokens": 14187
+    },
+    "code": {
+      "surface": "code",
+      "tool_count": 4,
+      "schema_bytes": 3808,
+      "schema_tokens": 880
+    }
+  },
+  "repos": [
+    {
+      "repo_id": "rust-tokio",
+      "language": "Rust",
+      "display_name": "tokio-rs/tokio",
+      "commit_sha": "8bdf1e9dfdaa85808bdbe6ac9b0173100fde9951",
+      "indexed_files": 890,
+      "warm_status_ms": 94.3,
+      "payload_tokens": {
+        "native_raw": 81960,
+        "native_window": 14082,
+        "rtk_cli": 50510,
+        "symforge_full_mcp": 9121,
+        "symforge_code_mcp": 2279,
+        "symforge_cli_rtk": 1543
+      },
+      "session_5task_tokens": {
+        "native_raw": 81960,
+        "native_window": 14082,
+        "rtk_cli": 50510,
+        "symforge_full_mcp": 23308,
+        "symforge_code_mcp": 3159,
+        "symforge_cli_rtk": 1543
+      },
+      "turns": {
+        "native_raw": 18,
+        "native_window": 19,
+        "rtk_cli": 11,
+        "symforge_full_mcp": 8,
+        "symforge_code_mcp": 6,
+        "symforge_cli_rtk": 6
+      },
+      "wall_ms": {
+        "native_raw": 58.0,
+        "native_window": 63.1,
+        "rtk_cli": 263.0,
+        "symforge_full_mcp": 3592.6,
+        "symforge_code_mcp": 2656.1,
+        "symforge_cli_rtk": 2674.0
+      },
+      "oracle_passed": {
+        "native_raw": 5,
+        "native_window": 5,
+        "rtk_cli": 5,
+        "symforge_full_mcp": 5,
+        "symforge_code_mcp": 5,
+        "symforge_cli_rtk": 5
+      }
+    },
+    {
+      "repo_id": "csharp-polly",
+      "language": "C#",
+      "display_name": "App-vNext/Polly",
+      "commit_sha": "ad7d87bf1c1cee65f4a90f1afb192094111df6eb",
+      "indexed_files": 986,
+      "warm_status_ms": 122.2,
+      "payload_tokens": {
+        "native_raw": 35621,
+        "native_window": 20560,
+        "rtk_cli": 33234,
+        "symforge_full_mcp": 15645,
+        "symforge_code_mcp": 3941,
+        "symforge_cli_rtk": 2492
+      },
+      "session_5task_tokens": {
+        "native_raw": 35621,
+        "native_window": 20560,
+        "rtk_cli": 33234,
+        "symforge_full_mcp": 29832,
+        "symforge_code_mcp": 4821,
+        "symforge_cli_rtk": 2492
+      },
+      "turns": {
+        "native_raw": 33,
+        "native_window": 35,
+        "rtk_cli": 9,
+        "symforge_full_mcp": 8,
+        "symforge_code_mcp": 6,
+        "symforge_cli_rtk": 6
+      },
+      "wall_ms": {
+        "native_raw": 60.5,
+        "native_window": 65.0,
+        "rtk_cli": 273.1,
+        "symforge_full_mcp": 3028.8,
+        "symforge_code_mcp": 2161.2,
+        "symforge_cli_rtk": 2178.7
+      },
+      "oracle_passed": {
+        "native_raw": 5,
+        "native_window": 5,
+        "rtk_cli": 5,
+        "symforge_full_mcp": 5,
+        "symforge_code_mcp": 5,
+        "symforge_cli_rtk": 5
+      }
+    },
+    {
+      "repo_id": "ts-tanstack-query",
+      "language": "TypeScript",
+      "display_name": "TanStack/query",
+      "commit_sha": "0827cf2cb22e2c81ef210271c25fc50e9f1e7328",
+      "indexed_files": 5594,
+      "warm_status_ms": 113.3,
+      "payload_tokens": {
+        "native_raw": 120129,
+        "native_window": 30709,
+        "rtk_cli": 40684,
+        "symforge_full_mcp": 18265,
+        "symforge_code_mcp": 3274,
+        "symforge_cli_rtk": 2244
+      },
+      "session_5task_tokens": {
+        "native_raw": 120129,
+        "native_window": 30709,
+        "rtk_cli": 40684,
+        "symforge_full_mcp": 32452,
+        "symforge_code_mcp": 4154,
+        "symforge_cli_rtk": 2244
+      },
+      "turns": {
+        "native_raw": 35,
+        "native_window": 36,
+        "rtk_cli": 11,
+        "symforge_full_mcp": 8,
+        "symforge_code_mcp": 6,
+        "symforge_cli_rtk": 6
+      },
+      "wall_ms": {
+        "native_raw": 71.3,
+        "native_window": 74.4,
+        "rtk_cli": 337.8,
+        "symforge_full_mcp": 15073.6,
+        "symforge_code_mcp": 11387.0,
+        "symforge_cli_rtk": 11401.1
+      },
+      "oracle_passed": {
+        "native_raw": 5,
+        "native_window": 5,
+        "rtk_cli": 5,
+        "symforge_full_mcp": 5,
+        "symforge_code_mcp": 5,
+        "symforge_cli_rtk": 5
+      }
+    },
+    {
+      "repo_id": "python-fastapi",
+      "language": "Python",
+      "display_name": "fastapi/fastapi",
+      "commit_sha": "05e6df7e906c3decba377c37548019973f40bf15",
+      "indexed_files": 3003,
+      "warm_status_ms": 112.6,
+      "payload_tokens": {
+        "native_raw": 136517,
+        "native_window": 7558,
+        "rtk_cli": 73335,
+        "symforge_full_mcp": 7312,
+        "symforge_code_mcp": 2390,
+        "symforge_cli_rtk": 1806
+      },
+      "session_5task_tokens": {
+        "native_raw": 136517,
+        "native_window": 7558,
+        "rtk_cli": 73335,
+        "symforge_full_mcp": 21499,
+        "symforge_code_mcp": 3270,
+        "symforge_cli_rtk": 1806
+      },
+      "turns": {
+        "native_raw": 13,
+        "native_window": 15,
+        "rtk_cli": 9,
+        "symforge_full_mcp": 8,
+        "symforge_code_mcp": 6,
+        "symforge_cli_rtk": 6
+      },
+      "wall_ms": {
+        "native_raw": 61.8,
+        "native_window": 66.9,
+        "rtk_cli": 229.6,
+        "symforge_full_mcp": 10582.7,
+        "symforge_code_mcp": 7419.0,
+        "symforge_cli_rtk": 7437.5
+      },
+      "oracle_passed": {
+        "native_raw": 5,
+        "native_window": 4,
+        "rtk_cli": 5,
+        "symforge_full_mcp": 5,
+        "symforge_code_mcp": 5,
+        "symforge_cli_rtk": 5
+      }
+    },
+    {
+      "repo_id": "java-gson",
+      "language": "Java",
+      "display_name": "google/gson",
+      "commit_sha": "e5f02ab6c24567d3ca5200afc4076337746b3349",
+      "indexed_files": 315,
+      "warm_status_ms": 101.3,
+      "payload_tokens": {
+        "native_raw": 77717,
+        "native_window": 27357,
+        "rtk_cli": 73368,
+        "symforge_full_mcp": 63809,
+        "symforge_code_mcp": 4798,
+        "symforge_cli_rtk": 3943
+      },
+      "session_5task_tokens": {
+        "native_raw": 77717,
+        "native_window": 27357,
+        "rtk_cli": 73368,
+        "symforge_full_mcp": 77996,
+        "symforge_code_mcp": 5678,
+        "symforge_cli_rtk": 3943
+      },
+      "turns": {
+        "native_raw": 31,
+        "native_window": 32,
+        "rtk_cli": 12,
+        "symforge_full_mcp": 8,
+        "symforge_code_mcp": 6,
+        "symforge_cli_rtk": 6
+      },
+      "wall_ms": {
+        "native_raw": 63.3,
+        "native_window": 67.7,
+        "rtk_cli": 483.6,
+        "symforge_full_mcp": 1809.2,
+        "symforge_code_mcp": 1322.0,
+        "symforge_cli_rtk": 1349.1
+      },
+      "oracle_passed": {
+        "native_raw": 5,
+        "native_window": 4,
+        "rtk_cli": 5,
+        "symforge_full_mcp": 5,
+        "symforge_code_mcp": 5,
+        "symforge_cli_rtk": 5
+      }
+    },
+    {
+      "repo_id": "go-gh-cli",
+      "language": "Go",
+      "display_name": "cli/cli",
+      "commit_sha": "de06af2c2ea536d5722fda35dc2001565f9b9f64",
+      "indexed_files": 1601,
+      "warm_status_ms": 144.3,
+      "payload_tokens": {
+        "native_raw": 48080,
+        "native_window": 7262,
+        "rtk_cli": 34667,
+        "symforge_full_mcp": 8758,
+        "symforge_code_mcp": 4204,
+        "symforge_cli_rtk": 3470
+      },
+      "session_5task_tokens": {
+        "native_raw": 48080,
+        "native_window": 7262,
+        "rtk_cli": 34667,
+        "symforge_full_mcp": 22945,
+        "symforge_code_mcp": 5084,
+        "symforge_cli_rtk": 3470
+      },
+      "turns": {
+        "native_raw": 13,
+        "native_window": 14,
+        "rtk_cli": 11,
+        "symforge_full_mcp": 8,
+        "symforge_code_mcp": 6,
+        "symforge_cli_rtk": 6
+      },
+      "wall_ms": {
+        "native_raw": 83.9,
+        "native_window": 89.0,
+        "rtk_cli": 346.5,
+        "symforge_full_mcp": 5955.4,
+        "symforge_code_mcp": 5101.6,
+        "symforge_cli_rtk": 5144.4
+      },
+      "oracle_passed": {
+        "native_raw": 5,
+        "native_window": 3,
+        "rtk_cli": 5,
+        "symforge_full_mcp": 5,
+        "symforge_code_mcp": 5,
+        "symforge_cli_rtk": 5
+      }
+    }
+  ],
+  "grand_totals": {
+    "native_raw": {
+      "upfront_schema_tokens_per_session": 0,
+      "total_payload_tokens_30tasks": 500024,
+      "total_session_tokens_6repos": 500024,
+      "reduction_vs_native_raw_pct": 0.0,
+      "reduction_vs_rtk_pct": -63.5,
+      "total_turns_30tasks": 143,
+      "total_wall_ms_30tasks": 398.8,
+      "oracle_passed_of_30": 30
+    },
+    "native_window": {
+      "upfront_schema_tokens_per_session": 0,
+      "total_payload_tokens_30tasks": 107528,
+      "total_session_tokens_6repos": 107528,
+      "reduction_vs_native_raw_pct": 78.5,
+      "reduction_vs_rtk_pct": 64.8,
+      "total_turns_30tasks": 151,
+      "total_wall_ms_30tasks": 426.1,
+      "oracle_passed_of_30": 26
+    },
+    "rtk_cli": {
+      "upfront_schema_tokens_per_session": 0,
+      "total_payload_tokens_30tasks": 305798,
+      "total_session_tokens_6repos": 305798,
+      "reduction_vs_native_raw_pct": 38.8,
+      "reduction_vs_rtk_pct": 0.0,
+      "total_turns_30tasks": 63,
+      "total_wall_ms_30tasks": 1933.6,
+      "oracle_passed_of_30": 30
+    },
+    "symforge_full_mcp": {
+      "upfront_schema_tokens_per_session": 14187,
+      "total_payload_tokens_30tasks": 122910,
+      "total_session_tokens_6repos": 208032,
+      "reduction_vs_native_raw_pct": 58.4,
+      "reduction_vs_rtk_pct": 32.0,
+      "total_turns_30tasks": 48,
+      "total_wall_ms_30tasks": 40042.3,
+      "oracle_passed_of_30": 30
+    },
+    "symforge_code_mcp": {
+      "upfront_schema_tokens_per_session": 880,
+      "total_payload_tokens_30tasks": 20886,
+      "total_session_tokens_6repos": 26166,
+      "reduction_vs_native_raw_pct": 94.8,
+      "reduction_vs_rtk_pct": 91.4,
+      "total_turns_30tasks": 36,
+      "total_wall_ms_30tasks": 30046.9,
+      "oracle_passed_of_30": 30
+    },
+    "symforge_cli_rtk": {
+      "upfront_schema_tokens_per_session": 0,
+      "total_payload_tokens_30tasks": 15498,
+      "total_session_tokens_6repos": 15498,
+      "reduction_vs_native_raw_pct": 96.9,
+      "reduction_vs_rtk_pct": 94.9,
+      "total_turns_30tasks": 36,
+      "total_wall_ms_30tasks": 30184.8,
+      "oracle_passed_of_30": 30
+    }
+  },
+  "tasks": [
+    {
+      "task_id": "rust-tokio__T1_symbol_slice",
+      "repo_id": "rust-tokio",
+      "language": "Rust",
+      "archetype": "T1_symbol_slice",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 84946,
+          "payload_tokens": 19567,
+          "turns": 2,
+          "wall_ms": 9.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 5246,
+          "payload_tokens": 1315,
+          "turns": 2,
+          "wall_ms": 10.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 90004,
+          "payload_tokens": 20735,
+          "turns": 2,
+          "wall_ms": 36.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "aggressive_stripped_body_fallback_to_full_read"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 670,
+          "payload_tokens": 186,
+          "turns": 2,
+          "wall_ms": 980.9,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 323,
+          "payload_tokens": 87,
+          "turns": 1,
+          "wall_ms": 486.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 323,
+          "payload_tokens": 87,
+          "turns": 1,
+          "wall_ms": 486.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "rust-tokio__T2_caller_chain",
+      "repo_id": "rust-tokio",
+      "language": "Rust",
+      "archetype": "T2_caller_chain",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 14132,
+          "payload_tokens": 3479,
+          "turns": 4,
+          "wall_ms": 8.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 5179,
+          "payload_tokens": 1478,
+          "turns": 4,
+          "wall_ms": 10.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 14132,
+          "payload_tokens": 3479,
+          "turns": 4,
+          "wall_ms": 76.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "rtk_rg_omits_enclosing_symbol_requires_file_reads"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 6398,
+          "payload_tokens": 1658,
+          "turns": 2,
+          "wall_ms": 1059.6,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 1182,
+          "payload_tokens": 317,
+          "turns": 1,
+          "wall_ms": 574.4,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 1182,
+          "payload_tokens": 317,
+          "turns": 1,
+          "wall_ms": 574.4,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "rust-tokio__T3_subsystem_orient",
+      "repo_id": "rust-tokio",
+      "language": "Rust",
+      "archetype": "T3_subsystem_orient",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 158264,
+          "payload_tokens": 38607,
+          "turns": 8,
+          "wall_ms": 0.4,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 30737,
+          "payload_tokens": 8595,
+          "turns": 8,
+          "wall_ms": 3.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 26755,
+          "payload_tokens": 6725,
+          "turns": 1,
+          "wall_ms": 36.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "aggressive_multi_file_outline"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 15120,
+          "payload_tokens": 4743,
+          "turns": 1,
+          "wall_ms": 499.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 515,
+          "payload_tokens": 165,
+          "turns": 1,
+          "wall_ms": 521.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 515,
+          "payload_tokens": 165,
+          "turns": 1,
+          "wall_ms": 521.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "rust-tokio__T4_edit_prep",
+      "repo_id": "rust-tokio",
+      "language": "Rust",
+      "archetype": "T4_edit_prep",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 82571,
+          "payload_tokens": 18961,
+          "turns": 2,
+          "wall_ms": 10.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 5343,
+          "payload_tokens": 1348,
+          "turns": 3,
+          "wall_ms": 10.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 82571,
+          "payload_tokens": 18961,
+          "turns": 2,
+          "wall_ms": 48.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 4208,
+          "payload_tokens": 1130,
+          "turns": 1,
+          "wall_ms": 557.4,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 800,
+          "payload_tokens": 191,
+          "turns": 1,
+          "wall_ms": 562.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 800,
+          "payload_tokens": 191,
+          "turns": 1,
+          "wall_ms": 562.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "rust-tokio__T5_literal_git_hybrid",
+      "repo_id": "rust-tokio",
+      "language": "Rust",
+      "archetype": "T5_literal_git_hybrid",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 4161,
+          "payload_tokens": 1346,
+          "turns": 2,
+          "wall_ms": 29.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 4161,
+          "payload_tokens": 1346,
+          "turns": 2,
+          "wall_ms": 29.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 2050,
+          "payload_tokens": 610,
+          "turns": 2,
+          "wall_ms": 65.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "rtk_git_log_compression"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 4426,
+          "payload_tokens": 1404,
+          "turns": 2,
+          "wall_ms": 495.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 4955,
+          "payload_tokens": 1519,
+          "turns": 2,
+          "wall_ms": 511.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 2844,
+          "payload_tokens": 783,
+          "turns": 2,
+          "wall_ms": 529.6,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "symforge_code_plus_rtk_git_synergy"
+        }
+      }
+    },
+    {
+      "task_id": "csharp-polly__T1_symbol_slice",
+      "repo_id": "csharp-polly",
+      "language": "C#",
+      "archetype": "T1_symbol_slice",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 77365,
+          "payload_tokens": 17314,
+          "turns": 2,
+          "wall_ms": 9.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 9034,
+          "payload_tokens": 2072,
+          "turns": 2,
+          "wall_ms": 10.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 73070,
+          "payload_tokens": 16376,
+          "turns": 1,
+          "wall_ms": 18.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "aggressive_sufficed"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 3910,
+          "payload_tokens": 1031,
+          "turns": 2,
+          "wall_ms": 829.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 2602,
+          "payload_tokens": 632,
+          "turns": 1,
+          "wall_ms": 428.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 2602,
+          "payload_tokens": 632,
+          "turns": 1,
+          "wall_ms": 428.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "csharp-polly__T2_caller_chain",
+      "repo_id": "csharp-polly",
+      "language": "C#",
+      "archetype": "T2_caller_chain",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 11836,
+          "payload_tokens": 2421,
+          "turns": 3,
+          "wall_ms": 8.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 7903,
+          "payload_tokens": 1899,
+          "turns": 4,
+          "wall_ms": 10.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 11836,
+          "payload_tokens": 2421,
+          "turns": 3,
+          "wall_ms": 59.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "rtk_rg_omits_enclosing_symbol_requires_file_reads"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 17762,
+          "payload_tokens": 4156,
+          "turns": 2,
+          "wall_ms": 881.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 1661,
+          "payload_tokens": 401,
+          "turns": 1,
+          "wall_ms": 475.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 1661,
+          "payload_tokens": 401,
+          "turns": 1,
+          "wall_ms": 475.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "csharp-polly__T3_subsystem_orient",
+      "repo_id": "csharp-polly",
+      "language": "C#",
+      "archetype": "T3_subsystem_orient",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 60681,
+          "payload_tokens": 12553,
+          "turns": 24,
+          "wall_ms": 1.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 53530,
+          "payload_tokens": 12850,
+          "turns": 24,
+          "wall_ms": 3.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 60659,
+          "payload_tokens": 12553,
+          "turns": 1,
+          "wall_ms": 83.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "aggressive_multi_file_outline"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 22010,
+          "payload_tokens": 5712,
+          "turns": 1,
+          "wall_ms": 441.6,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 827,
+          "payload_tokens": 205,
+          "turns": 1,
+          "wall_ms": 397.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 827,
+          "payload_tokens": 205,
+          "turns": 1,
+          "wall_ms": 397.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "csharp-polly__T4_edit_prep",
+      "repo_id": "csharp-polly",
+      "language": "C#",
+      "archetype": "T4_edit_prep",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 6726,
+          "payload_tokens": 1266,
+          "turns": 2,
+          "wall_ms": 10.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 7353,
+          "payload_tokens": 1672,
+          "turns": 3,
+          "wall_ms": 10.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 6726,
+          "payload_tokens": 1266,
+          "turns": 2,
+          "wall_ms": 46.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 10732,
+          "payload_tokens": 2621,
+          "turns": 1,
+          "wall_ms": 446.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 2007,
+          "payload_tokens": 461,
+          "turns": 1,
+          "wall_ms": 432.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 2007,
+          "payload_tokens": 461,
+          "turns": 1,
+          "wall_ms": 432.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "csharp-polly__T5_literal_git_hybrid",
+      "repo_id": "csharp-polly",
+      "language": "C#",
+      "archetype": "T5_literal_git_hybrid",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 6133,
+          "payload_tokens": 2067,
+          "turns": 2,
+          "wall_ms": 30.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 6133,
+          "payload_tokens": 2067,
+          "turns": 2,
+          "wall_ms": 30.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 1829,
+          "payload_tokens": 618,
+          "turns": 2,
+          "wall_ms": 65.6,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "rtk_git_log_compression"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 6398,
+          "payload_tokens": 2125,
+          "turns": 2,
+          "wall_ms": 429.6,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 6945,
+          "payload_tokens": 2242,
+          "turns": 2,
+          "wall_ms": 427.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 2641,
+          "payload_tokens": 793,
+          "turns": 2,
+          "wall_ms": 444.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "symforge_code_plus_rtk_git_synergy"
+        }
+      }
+    },
+    {
+      "task_id": "ts-tanstack-query__T1_symbol_slice",
+      "repo_id": "ts-tanstack-query",
+      "language": "TypeScript",
+      "archetype": "T1_symbol_slice",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 41265,
+          "payload_tokens": 10119,
+          "turns": 2,
+          "wall_ms": 8.9,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 3857,
+          "payload_tokens": 1046,
+          "turns": 2,
+          "wall_ms": 9.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 42825,
+          "payload_tokens": 10445,
+          "turns": 2,
+          "wall_ms": 35.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "aggressive_stripped_body_fallback_to_full_read"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 2035,
+          "payload_tokens": 552,
+          "turns": 2,
+          "wall_ms": 3862.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 1450,
+          "payload_tokens": 397,
+          "turns": 1,
+          "wall_ms": 2000.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 1450,
+          "payload_tokens": 397,
+          "turns": 1,
+          "wall_ms": 2000.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "ts-tanstack-query__T2_caller_chain",
+      "repo_id": "ts-tanstack-query",
+      "language": "TypeScript",
+      "archetype": "T2_caller_chain",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 55768,
+          "payload_tokens": 13617,
+          "turns": 4,
+          "wall_ms": 13.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 6944,
+          "payload_tokens": 1919,
+          "turns": 4,
+          "wall_ms": 14.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 55768,
+          "payload_tokens": 13617,
+          "turns": 4,
+          "wall_ms": 80.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "rtk_rg_omits_enclosing_symbol_requires_file_reads"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 7345,
+          "payload_tokens": 1860,
+          "turns": 2,
+          "wall_ms": 4137.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 2220,
+          "payload_tokens": 581,
+          "turns": 1,
+          "wall_ms": 2176.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 2220,
+          "payload_tokens": 581,
+          "turns": 1,
+          "wall_ms": 2176.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "ts-tanstack-query__T3_subsystem_orient",
+      "repo_id": "ts-tanstack-query",
+      "language": "TypeScript",
+      "archetype": "T3_subsystem_orient",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 348629,
+          "payload_tokens": 84912,
+          "turns": 25,
+          "wall_ms": 1.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 89128,
+          "payload_tokens": 24712,
+          "turns": 25,
+          "wall_ms": 3.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 27373,
+          "payload_tokens": 6171,
+          "turns": 1,
+          "wall_ms": 98.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "aggressive_multi_file_outline"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 16816,
+          "payload_tokens": 4353,
+          "turns": 1,
+          "wall_ms": 2113.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 591,
+          "payload_tokens": 154,
+          "turns": 1,
+          "wall_ms": 2089.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 591,
+          "payload_tokens": 154,
+          "turns": 1,
+          "wall_ms": 2089.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "ts-tanstack-query__T4_edit_prep",
+      "repo_id": "ts-tanstack-query",
+      "language": "TypeScript",
+      "archetype": "T4_edit_prep",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 40755,
+          "payload_tokens": 9992,
+          "turns": 2,
+          "wall_ms": 12.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 5425,
+          "payload_tokens": 1543,
+          "turns": 3,
+          "wall_ms": 12.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 40755,
+          "payload_tokens": 9992,
+          "turns": 2,
+          "wall_ms": 54.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 37428,
+          "payload_tokens": 9952,
+          "turns": 1,
+          "wall_ms": 2275.9,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 1809,
+          "payload_tokens": 481,
+          "turns": 1,
+          "wall_ms": 2372.4,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 1809,
+          "payload_tokens": 481,
+          "turns": 1,
+          "wall_ms": 2372.4,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "ts-tanstack-query__T5_literal_git_hybrid",
+      "repo_id": "ts-tanstack-query",
+      "language": "TypeScript",
+      "archetype": "T5_literal_git_hybrid",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 4640,
+          "payload_tokens": 1489,
+          "turns": 2,
+          "wall_ms": 35.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 4640,
+          "payload_tokens": 1489,
+          "turns": 2,
+          "wall_ms": 35.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 1576,
+          "payload_tokens": 459,
+          "turns": 2,
+          "wall_ms": 69.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "rtk_git_log_compression"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 4906,
+          "payload_tokens": 1548,
+          "turns": 2,
+          "wall_ms": 2684.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 5416,
+          "payload_tokens": 1661,
+          "turns": 2,
+          "wall_ms": 2747.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 2352,
+          "payload_tokens": 631,
+          "turns": 2,
+          "wall_ms": 2761.6,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "symforge_code_plus_rtk_git_synergy"
+        }
+      }
+    },
+    {
+      "task_id": "python-fastapi__T1_symbol_slice",
+      "repo_id": "python-fastapi",
+      "language": "Python",
+      "archetype": "T1_symbol_slice",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 278061,
+          "payload_tokens": 53345,
+          "turns": 2,
+          "wall_ms": 11.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 3622,
+          "payload_tokens": 869,
+          "turns": 2,
+          "wall_ms": 11.9,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 15321,
+          "payload_tokens": 3455,
+          "turns": 1,
+          "wall_ms": 23.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "aggressive_sufficed"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 1119,
+          "payload_tokens": 282,
+          "turns": 2,
+          "wall_ms": 3087.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 788,
+          "payload_tokens": 186,
+          "turns": 1,
+          "wall_ms": 1482.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 788,
+          "payload_tokens": 186,
+          "turns": 1,
+          "wall_ms": 1482.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "python-fastapi__T2_caller_chain",
+      "repo_id": "python-fastapi",
+      "language": "Python",
+      "archetype": "T2_caller_chain",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 69195,
+          "payload_tokens": 14706,
+          "turns": 3,
+          "wall_ms": 9.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 8857,
+          "payload_tokens": 2168,
+          "turns": 4,
+          "wall_ms": 11.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 69195,
+          "payload_tokens": 14706,
+          "turns": 3,
+          "wall_ms": 64.6,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "rtk_rg_omits_enclosing_symbol_requires_file_reads"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 2671,
+          "payload_tokens": 652,
+          "turns": 2,
+          "wall_ms": 2966.6,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 2764,
+          "payload_tokens": 712,
+          "turns": 1,
+          "wall_ms": 1476.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 2764,
+          "payload_tokens": 712,
+          "turns": 1,
+          "wall_ms": 1476.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "python-fastapi__T3_subsystem_orient",
+      "repo_id": "python-fastapi",
+      "language": "Python",
+      "archetype": "T3_subsystem_orient",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 66354,
+          "payload_tokens": 14188,
+          "turns": 4,
+          "wall_ms": 0.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 7807,
+          "payload_tokens": 2137,
+          "turns": 4,
+          "wall_ms": 3.0,
+          "oracle_passed": false,
+          "missing_facts": [
+            "analyze_param",
+            "solve_dependencies"
+          ],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 6595,
+          "payload_tokens": 1480,
+          "turns": 1,
+          "wall_ms": 24.4,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "aggressive_multi_file_outline"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 13193,
+          "payload_tokens": 3565,
+          "turns": 1,
+          "wall_ms": 1484.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 566,
+          "payload_tokens": 159,
+          "turns": 1,
+          "wall_ms": 1453.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 566,
+          "payload_tokens": 159,
+          "turns": 1,
+          "wall_ms": 1453.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "python-fastapi__T4_edit_prep",
+      "repo_id": "python-fastapi",
+      "language": "Python",
+      "archetype": "T4_edit_prep",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 277960,
+          "payload_tokens": 53327,
+          "turns": 2,
+          "wall_ms": 10.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 5779,
+          "payload_tokens": 1433,
+          "turns": 3,
+          "wall_ms": 10.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 277960,
+          "payload_tokens": 53327,
+          "turns": 2,
+          "wall_ms": 46.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 7444,
+          "payload_tokens": 1803,
+          "turns": 1,
+          "wall_ms": 1488.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 894,
+          "payload_tokens": 210,
+          "turns": 1,
+          "wall_ms": 1493.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 894,
+          "payload_tokens": 210,
+          "turns": 1,
+          "wall_ms": 1493.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "python-fastapi__T5_literal_git_hybrid",
+      "repo_id": "python-fastapi",
+      "language": "Python",
+      "archetype": "T5_literal_git_hybrid",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 2607,
+          "payload_tokens": 951,
+          "turns": 2,
+          "wall_ms": 30.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 2607,
+          "payload_tokens": 951,
+          "turns": 2,
+          "wall_ms": 30.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 1147,
+          "payload_tokens": 367,
+          "turns": 2,
+          "wall_ms": 70.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "rtk_git_log_compression"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 2873,
+          "payload_tokens": 1010,
+          "turns": 2,
+          "wall_ms": 1555.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 3395,
+          "payload_tokens": 1123,
+          "turns": 2,
+          "wall_ms": 1513.6,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 1935,
+          "payload_tokens": 539,
+          "turns": 2,
+          "wall_ms": 1532.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "symforge_code_plus_rtk_git_synergy"
+        }
+      }
+    },
+    {
+      "task_id": "java-gson__T1_symbol_slice",
+      "repo_id": "java-gson",
+      "language": "Java",
+      "archetype": "T1_symbol_slice",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 60059,
+          "payload_tokens": 14459,
+          "turns": 2,
+          "wall_ms": 9.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 4228,
+          "payload_tokens": 1103,
+          "turns": 2,
+          "wall_ms": 10.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 61011,
+          "payload_tokens": 14619,
+          "turns": 2,
+          "wall_ms": 35.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "aggressive_stripped_body_fallback_to_full_read"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 4879,
+          "payload_tokens": 1243,
+          "turns": 2,
+          "wall_ms": 499.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 4479,
+          "payload_tokens": 1130,
+          "turns": 1,
+          "wall_ms": 263.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 4479,
+          "payload_tokens": 1130,
+          "turns": 1,
+          "wall_ms": 263.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "java-gson__T2_caller_chain",
+      "repo_id": "java-gson",
+      "language": "Java",
+      "archetype": "T2_caller_chain",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 28222,
+          "payload_tokens": 5961,
+          "turns": 4,
+          "wall_ms": 10.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 6659,
+          "payload_tokens": 1675,
+          "turns": 4,
+          "wall_ms": 12.1,
+          "oracle_passed": false,
+          "missing_facts": [
+            "testGetDelegateAdapter"
+          ],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 28222,
+          "payload_tokens": 5961,
+          "turns": 4,
+          "wall_ms": 110.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "rtk_rg_omits_enclosing_symbol_requires_file_reads"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 5170,
+          "payload_tokens": 1242,
+          "turns": 2,
+          "wall_ms": 502.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 2256,
+          "payload_tokens": 551,
+          "turns": 1,
+          "wall_ms": 249.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 2256,
+          "payload_tokens": 551,
+          "turns": 1,
+          "wall_ms": 249.5,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "java-gson__T3_subsystem_orient",
+      "repo_id": "java-gson",
+      "language": "Java",
+      "archetype": "T3_subsystem_orient",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 192352,
+          "payload_tokens": 41410,
+          "turns": 21,
+          "wall_ms": 1.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 84070,
+          "payload_tokens": 21117,
+          "turns": 21,
+          "wall_ms": 3.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 176548,
+          "payload_tokens": 37756,
+          "turns": 2,
+          "wall_ms": 167.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "aggressive_dropped_java_classes_fallback_minimal"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 22601,
+          "payload_tokens": 6087,
+          "turns": 1,
+          "wall_ms": 241.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 838,
+          "payload_tokens": 219,
+          "turns": 1,
+          "wall_ms": 240.4,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 838,
+          "payload_tokens": 219,
+          "turns": 1,
+          "wall_ms": 240.4,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "java-gson__T4_edit_prep",
+      "repo_id": "java-gson",
+      "language": "Java",
+      "archetype": "T4_edit_prep",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 59760,
+          "payload_tokens": 14385,
+          "turns": 2,
+          "wall_ms": 9.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 7711,
+          "payload_tokens": 1960,
+          "turns": 3,
+          "wall_ms": 9.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 59760,
+          "payload_tokens": 14385,
+          "turns": 2,
+          "wall_ms": 68.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 201697,
+          "payload_tokens": 53677,
+          "turns": 1,
+          "wall_ms": 277.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 4939,
+          "payload_tokens": 1223,
+          "turns": 1,
+          "wall_ms": 283.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 4939,
+          "payload_tokens": 1223,
+          "turns": 1,
+          "wall_ms": 283.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "java-gson__T5_literal_git_hybrid",
+      "repo_id": "java-gson",
+      "language": "Java",
+      "archetype": "T5_literal_git_hybrid",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 5107,
+          "payload_tokens": 1502,
+          "turns": 2,
+          "wall_ms": 32.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 5107,
+          "payload_tokens": 1502,
+          "turns": 2,
+          "wall_ms": 32.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 2477,
+          "payload_tokens": 647,
+          "turns": 2,
+          "wall_ms": 101.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "rtk_git_log_compression"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 5372,
+          "payload_tokens": 1560,
+          "turns": 2,
+          "wall_ms": 288.4,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 5905,
+          "payload_tokens": 1675,
+          "turns": 2,
+          "wall_ms": 285.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 3275,
+          "payload_tokens": 820,
+          "turns": 2,
+          "wall_ms": 312.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "symforge_code_plus_rtk_git_synergy"
+        }
+      }
+    },
+    {
+      "task_id": "go-gh-cli__T1_symbol_slice",
+      "repo_id": "go-gh-cli",
+      "language": "Go",
+      "archetype": "T1_symbol_slice",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 49507,
+          "payload_tokens": 13345,
+          "turns": 2,
+          "wall_ms": 11.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 3387,
+          "payload_tokens": 1025,
+          "turns": 2,
+          "wall_ms": 11.9,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 51301,
+          "payload_tokens": 13730,
+          "turns": 2,
+          "wall_ms": 48.4,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "aggressive_stripped_body_fallback_to_full_read"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 2861,
+          "payload_tokens": 819,
+          "turns": 2,
+          "wall_ms": 1513.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 2530,
+          "payload_tokens": 720,
+          "turns": 1,
+          "wall_ms": 757.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 2530,
+          "payload_tokens": 720,
+          "turns": 1,
+          "wall_ms": 757.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "go-gh-cli__T2_caller_chain",
+      "repo_id": "go-gh-cli",
+      "language": "Go",
+      "archetype": "T2_caller_chain",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 23120,
+          "payload_tokens": 6651,
+          "turns": 4,
+          "wall_ms": 10.8,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 4943,
+          "payload_tokens": 1565,
+          "turns": 4,
+          "wall_ms": 12.4,
+          "oracle_passed": false,
+          "missing_facts": [
+            "NewCmdAgentTask",
+            "TestNewCmdCreate"
+          ],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 23120,
+          "payload_tokens": 6651,
+          "turns": 4,
+          "wall_ms": 97.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "rtk_rg_omits_enclosing_symbol_requires_file_reads"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 4761,
+          "payload_tokens": 1335,
+          "turns": 2,
+          "wall_ms": 1897.9,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 3406,
+          "payload_tokens": 1076,
+          "turns": 1,
+          "wall_ms": 1024.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 3406,
+          "payload_tokens": 1076,
+          "turns": 1,
+          "wall_ms": 1024.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "go-gh-cli__T3_subsystem_orient",
+      "repo_id": "go-gh-cli",
+      "language": "Go",
+      "archetype": "T3_subsystem_orient",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 50194,
+          "payload_tokens": 13592,
+          "turns": 3,
+          "wall_ms": 0.2,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 4962,
+          "payload_tokens": 1590,
+          "turns": 3,
+          "wall_ms": 3.0,
+          "oracle_passed": false,
+          "missing_facts": [
+            "NewCreateContext",
+            "createRun"
+          ],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 2351,
+          "payload_tokens": 528,
+          "turns": 1,
+          "wall_ms": 24.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "aggressive_multi_file_outline"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 9485,
+          "payload_tokens": 2742,
+          "turns": 1,
+          "wall_ms": 717.4,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 533,
+          "payload_tokens": 161,
+          "turns": 1,
+          "wall_ms": 698.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 533,
+          "payload_tokens": 161,
+          "turns": 1,
+          "wall_ms": 698.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "go-gh-cli__T4_edit_prep",
+      "repo_id": "go-gh-cli",
+      "language": "Go",
+      "archetype": "T4_edit_prep",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 49121,
+          "payload_tokens": 13240,
+          "turns": 2,
+          "wall_ms": 11.6,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 5716,
+          "payload_tokens": 1830,
+          "turns": 3,
+          "wall_ms": 11.6,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 49121,
+          "payload_tokens": 13240,
+          "turns": 2,
+          "wall_ms": 54.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 9314,
+          "payload_tokens": 2552,
+          "turns": 1,
+          "wall_ms": 805.7,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 3010,
+          "payload_tokens": 823,
+          "turns": 1,
+          "wall_ms": 805.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 3010,
+          "payload_tokens": 823,
+          "turns": 1,
+          "wall_ms": 805.0,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        }
+      }
+    },
+    {
+      "task_id": "go-gh-cli__T5_literal_git_hybrid",
+      "repo_id": "go-gh-cli",
+      "language": "Go",
+      "archetype": "T5_literal_git_hybrid",
+      "arms": {
+        "native_raw": {
+          "payload_bytes": 3415,
+          "payload_tokens": 1252,
+          "turns": 2,
+          "wall_ms": 50.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "native_window": {
+          "payload_bytes": 3415,
+          "payload_tokens": 1252,
+          "turns": 2,
+          "wall_ms": 50.1,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "rtk_cli": {
+          "payload_bytes": 1596,
+          "payload_tokens": 518,
+          "turns": 2,
+          "wall_ms": 121.4,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "rtk_git_log_compression"
+        },
+        "symforge_full_mcp": {
+          "payload_bytes": 3680,
+          "payload_tokens": 1310,
+          "turns": 2,
+          "wall_ms": 1021.3,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_code_mcp": {
+          "payload_bytes": 4201,
+          "payload_tokens": 1424,
+          "turns": 2,
+          "wall_ms": 1816.6,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": ""
+        },
+        "symforge_cli_rtk": {
+          "payload_bytes": 2382,
+          "payload_tokens": 690,
+          "turns": 2,
+          "wall_ms": 1859.4,
+          "oracle_passed": true,
+          "missing_facts": [],
+          "note": "symforge_code_plus_rtk_git_synergy"
+        }
+      }
+    }
+  ]
+}
