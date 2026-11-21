@@ -48,9 +48,9 @@ b969119b47e464142f47ef7d404d598d88407450b63066fd2cac654a2ea5f539  cli/update.rs
 
 6b5ebddfb76c15316c1ca393ba63fbf138c66556dbc04e5f2319d50fb6729e54  cli/version.rs
 
-605aecb88ae558786d2bd37e5fc676a3032c95bc5040fd6c4d94bd03f1cfe530  codemode/backend.rs
+00ab1ca52bd59e24d093255869ca22288413c5bc1cdf2cbdad59ab3913193548  codemode/backend.rs
 
-ca7d51265b8fc1d3b21306e260a269402eb7a6609c8e2970806ed49867c1e50c  codemode/catalog.rs
+968f9793fcd7c3fb78c29d0b8807c85cb5b722d78f54c15b108c35da8c8314aa  codemode/catalog.rs
 
 a8885ac2cadf2d7dae351189dbb686f43bbddbf7f2abd1259d3a9e67337a62ec  codemode/mod.rs
 
@@ -298,7 +298,7 @@ ff4866135a166bf18ab86bdb591bb06f8718f000553dc7c6b82f4989ddf36465  index_lifecycl
 
 3192996f7d69534d8b2293fe5e38b6b44930af5b02fed4a45adfd17b5443ef5d  index_lifecycle/guidance/source.rs
 
-a15ecceed25d84d79522453354b6b3fc5f4670bb67398e2f3f81764e54a3728c  index_lifecycle/guidance/symbol_context.rs
+171fc1c3f9da82ae109aa466ba93c51aa4c3f6bf9c6326f84e8dc119395a18b9  index_lifecycle/guidance/symbol_context.rs
 
 d6a69f1c29de3ae7e945203fcdb3dedb617b10ac412464425178454a002aa17c  index_lifecycle/guidance/symbol_read.rs
 
@@ -356,7 +356,7 @@ abc492b3381b96c401b2f42d1c9d7ea52255051d12bce42f6ebfb637fafefa9b  lib.rs
 
 0766ab2b3c8633d7f51386feb308271a53340fd40ef69cabf273cb569b6cfe29  lifecycle_identity.rs
 
-aa1c351e570819095eb7529e77b561580507b966944efdcf5b8e59964f4c556a  live_index/context_bundle.rs
+8e80ab62b678ab8664f24e4de3b6383ee6ad6a154620f5ddc88ff5332465f9f5  live_index/context_bundle.rs
 
 c3107afd66124b961a382ebcc4fa7286d7399f06b64eb4d2952a13dac5f36198  live_index/coupling/lifecycle.rs
 
@@ -368,7 +368,7 @@ e3fdc2be5e6657b1c250d976aae9e2a213554da501ce85ad04aca283786eb652  live_index/cou
 
 c59e1323c8939295f6c15d8b874785362673ae5576b564a3c31e09aa92ba1e74  live_index/coupling/walker.rs
 
-0ea23db691533bedbfca7ca06c3a777ddecac7924f3ba4f9421ce4732dee0cc1  live_index/disambiguation.rs
+c9ad8eb9509b5e94f1a24003ea9fff01247e3e510c1fcc9cf9b4e3155ca81e4f  live_index/disambiguation.rs
 
 73caebe540f86b6116041b7c2d1671a89040afcee85ac5cdf8ea53fad125921e  live_index/frecency.rs
 
@@ -394,7 +394,7 @@ c3a6d258b64edc186969b5d926042967f412c72e8afc3d67e16ed057d7acecab  live_index/per
 
 e9bded0e817f58d773b483af7d58856c956096eb8f4ff71130bd3e47d7b3208f  live_index/qualified_usages.rs
 
-eb01a5e49bbb8662431e1069c51159f2445d5f60ff415a193172b0d2e06bce6a  live_index/query.rs
+0bdb2e5c473644ef660a03de0172b37d502936d8ff3ae5669800c1a964874e4f  live_index/query.rs
 
 47eac41dc97e1b8ae7d264ec80b2fb51c369aa3a44c92b7fe2a0a8d586cde4cb  live_index/rank_signals.rs
 
@@ -516,7 +516,7 @@ a7adb304ce0cf3ed59fa915099ef0b3b0ffe4a0516aa1355c74a434ffe3c31b5  protocol/edit_
 
 397d40d250e90e059490ad3dee1864e365feac22974e2ea57ef6f00f7c833085  protocol/format.rs
 
-17d17b8b366116b151c3ff1757756fbfe48f4b82459cb870ec500026f7813fa7  protocol/format/tests.rs
+b125e13a75c1aad35f523ad5b91549767bcd9e43eaac9d247aacd31fd9660eaa  protocol/format/tests.rs
 
 a35b53d32bfd7cb79ea6f8e76c2d8fb348924abaa74afe95a23dab0b000d940e  protocol/investigation.rs
 

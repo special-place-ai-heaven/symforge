@@ -582,11 +582,18 @@ pub fn execute_op_on_generation(
                     .into_iter()
                     .take(cap)
                     .map(|entry| {
+                        let enc_line = generation.live.get_file(&entry.file_path).and_then(|f| {
+                            f.symbols
+                                .iter()
+                                .find(|s| s.name == entry.implementor)
+                                .map(|s| s.line_range.0.saturating_add(1))
+                        });
                         json!({
                             "path": entry.file_path,
                             "line": entry.line,
                             "text": format!("impl {} for {}", entry.trait_name, entry.implementor),
                             "enclosing_symbol": entry.implementor,
+                            "enclosing_line": enc_line,
                             "caller_kind": "impl",
                         })
                     })
@@ -628,19 +635,26 @@ pub fn execute_op_on_generation(
                 let idx_file = generation.live.get_file(&file.file_path);
                 for hit in file.hits.into_iter().take(limits.max_per_file) {
                     if let Some(ref_line) = hit.context_lines.iter().find(|l| l.is_reference_line) {
-                        let (enc_name, enc_kind) = idx_file
+                        let (enc_name, enc_kind, enc_line) = idx_file
                             .and_then(|f| {
                                 let zb = ref_line.line_number.saturating_sub(1);
                                 crate::domain::find_enclosing_symbol(&f.symbols, zb)
                                     .and_then(|i| f.symbols.get(i as usize))
                             })
-                            .map(|s| (Some(s.name.clone()), Some(s.kind.to_string())))
-                            .unwrap_or((None, None));
+                            .map(|s| {
+                                (
+                                    Some(s.name.clone()),
+                                    Some(s.kind.to_string()),
+                                    Some(s.line_range.0.saturating_add(1)),
+                                )
+                            })
+                            .unwrap_or((None, None, None));
                         out.push(json!({
                             "path": file.file_path,
                             "line": ref_line.line_number,
                             "text": ref_line.text,
                             "enclosing_symbol": enc_name,
+                            "enclosing_line": enc_line,
                             "caller_kind": enc_kind,
                         }));
                     }
@@ -879,6 +893,27 @@ pub fn execute_op_on_generation(
                 .result
                 .map_err(|e| CodeBackendError::invalid_args(format!("{e:?}")))?;
 
+            if input.group_by.as_deref() == Some("count") {
+                let cap = input.limit.unwrap_or(200).clamp(1, 1000) as usize;
+                let mut counts: Vec<Value> = Vec::new();
+                for file in res.files {
+                    if check_secret_or_scope_refusal(&generation.live, &file.path).is_some() {
+                        continue;
+                    }
+                    if file.matches.is_empty() {
+                        continue;
+                    }
+                    counts.push(json!({
+                        "path": file.path,
+                        "count": file.matches.len(),
+                    }));
+                    if counts.len() >= cap {
+                        break;
+                    }
+                }
+                return Ok(Value::Array(counts));
+            }
+
             let cap = input.limit.unwrap_or(50).clamp(1, 500) as usize;
             let mut out = Vec::new();
             for file in res.files {
@@ -1112,11 +1147,14 @@ pub fn execute_op_on_generation(
             {
                 return Err(CodeBackendError::refusal("policy_withheld", refusal));
             }
-            let view = generation.live.capture_context_bundle_view(
+            const CODE_MODE_CALLERS_CAP: usize = 100;
+            const CODE_MODE_SECTION_CAP: usize = 20;
+            let view = generation.live.capture_context_bundle_view_with_cap(
                 &target_path,
                 &input.name,
                 input.symbol_kind.as_deref(),
                 input.symbol_line,
+                usize::MAX,
             );
             match view {
                 ContextBundleView::Found(found) => {
@@ -1131,11 +1169,36 @@ pub fn execute_op_on_generation(
                                     .is_test
                             })
                     };
+                    let filtered_callers: Vec<&crate::live_index::ContextBundleReferenceView> =
+                        found
+                            .callers
+                            .entries
+                            .iter()
+                            .filter(|e| include_tests_flag || !is_test_entry(&e.file_path))
+                            .collect();
+                    let total_callers = filtered_callers.len();
+                    let callers_json: Vec<Value> = filtered_callers
+                        .into_iter()
+                        .take(CODE_MODE_CALLERS_CAP)
+                        .map(|e| {
+                            json!({
+                                "name": e.enclosing_name.as_deref().unwrap_or("<module>"),
+                                "path": e.file_path,
+                                "caller_kind": e.enclosing_kind,
+                                "caller_line": e.enclosing_start_line,
+                                "call_line": e.line_number,
+                                "call_expr": e.display_name,
+                                "confidence": e.confidence,
+                                "occurrences": e.occurrence_count,
+                            })
+                        })
+                        .collect();
                     let map_refs =
                         |sec: &crate::live_index::ContextBundleSectionView| -> Vec<Value> {
                             sec.entries
                                 .iter()
                                 .filter(|e| include_tests_flag || !is_test_entry(&e.file_path))
+                                .take(CODE_MODE_SECTION_CAP)
                                 .map(|e| {
                                     json!({
                                         "name": e.display_name,
@@ -1188,7 +1251,8 @@ pub fn execute_op_on_generation(
                         "name": input.name,
                         "kind": found.kind_label,
                         "body": found.body,
-                        "callers": map_refs(&found.callers),
+                        "total_callers": total_callers,
+                        "callers": callers_json,
                         "callees": map_refs(&found.callees),
                         "type_usages": map_refs(&found.type_usages),
                         "dependencies": deps,

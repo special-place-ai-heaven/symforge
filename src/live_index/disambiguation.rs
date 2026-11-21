@@ -311,7 +311,7 @@ pub(crate) fn symbol_belongs_to_type(
 /// definition (`struct`/`enum`/`trait`/`class`/`interface`). Returns `None` for
 /// any other kind. Generic parameters and path qualifiers are stripped so
 /// `impl Cache<K, V>` and `crate::foo::Cache` both resolve to `Cache`.
-fn container_target_type(symbol: &SymbolRecord) -> Option<&str> {
+pub(super) fn container_target_type(symbol: &SymbolRecord) -> Option<&str> {
     let raw = match symbol.kind {
         SymbolKind::Impl => {
             let name = symbol.name.as_str();

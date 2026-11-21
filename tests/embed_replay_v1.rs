@@ -615,21 +615,23 @@ fn reservation_lease_expiry_allows_exactly_one_takeover() {
     );
 }
 
+#[cfg(feature = "__test-internals")]
 #[test]
 fn stale_owner_token_rejected_after_takeover() {
     let dir = tempfile::tempdir().unwrap();
     let store = store(dir.path(), &dir.path().join("state"));
     let key = key();
     let request = request();
+    let t0 = UNIX_EPOCH + Duration::from_millis(PINNED_PAST_MS);
+    let lease_for = Duration::from_millis(80);
     let old = acquired(
         store
-            .reserve_with_lease(&key, &request, Duration::from_millis(80))
+            .reserve_with_lease_at(&key, &request, lease_for, t0)
             .unwrap(),
     );
-    std::thread::sleep(Duration::from_millis(300));
     let new = acquired(
         store
-            .reserve_with_lease(&key, &request, Duration::from_secs(30))
+            .reserve_with_lease_at(&key, &request, Duration::from_secs(30), t0 + lease_for)
             .unwrap(),
     );
     assert!(new.took_over());
@@ -639,7 +641,7 @@ fn stale_owner_token_rejected_after_takeover() {
     let rejected =
         ReplayOutcome::from_response_and_post_image(OutcomeKind::Rejected, b"no", b"post").unwrap();
     assert!(matches!(
-        store.mark_started(&old),
+        store.mark_started_at(&old, t0 + lease_for),
         Err(ReplayError::StaleOwner)
     ));
     assert!(matches!(
@@ -661,7 +663,7 @@ fn stale_owner_token_rejected_after_takeover() {
     let still = store.inspect(&key).unwrap().unwrap();
     assert_eq!(still.state, ReplayState::NotStarted);
     assert_eq!(still.generation, generation);
-    store.mark_started(&new).unwrap();
+    store.mark_started_at(&new, t0 + lease_for).unwrap();
 }
 
 #[cfg(feature = "__test-internals")]
@@ -747,21 +749,23 @@ fn started_is_never_taken_over_even_when_expired() {
     }
 }
 
+#[cfg(feature = "__test-internals")]
 #[test]
 fn release_not_started_with_foreign_token_is_noop() {
     let dir = tempfile::tempdir().unwrap();
     let store = store(dir.path(), &dir.path().join("state"));
     let key = key();
     let request = request();
+    let t0 = UNIX_EPOCH + Duration::from_millis(PINNED_PAST_MS);
+    let lease_for = Duration::from_millis(80);
     let old = acquired(
         store
-            .reserve_with_lease(&key, &request, Duration::from_millis(80))
+            .reserve_with_lease_at(&key, &request, lease_for, t0)
             .unwrap(),
     );
-    std::thread::sleep(Duration::from_millis(300));
     let owner = acquired(
         store
-            .reserve_with_lease(&key, &request, Duration::from_secs(30))
+            .reserve_with_lease_at(&key, &request, Duration::from_secs(30), t0 + lease_for)
             .unwrap(),
     );
     assert!(owner.took_over());

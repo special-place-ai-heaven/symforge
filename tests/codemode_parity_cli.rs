@@ -491,3 +491,257 @@ fn init_skill_only_writes_skill_md_without_touching_claude_settings_or_mcp_confi
         "CLAUDE.md must not be created under --skill-only"
     );
 }
+
+#[test]
+fn symbol_context_callers_report_enclosing_caller_identity_and_top_level_module() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("pkg")).expect("mkdir pkg");
+    std::fs::create_dir_all(root.join("tests")).expect("mkdir tests");
+
+    std::fs::write(
+        root.join("pkg/worker.py"),
+        "def run_job(x: int) -> int:\n    return x + 1\n",
+    )
+    .expect("write worker.py");
+    std::fs::write(
+        root.join("pkg/app.py"),
+        "from pkg.worker import run_job\n\ndef dispatch() -> int:\n    return run_job(5)\n\nBOOT = run_job(1)\n",
+    )
+    .expect("write app.py");
+    std::fs::write(
+        root.join("tests/test_worker.py"),
+        "from pkg.worker import run_job\n\ndef test_run_job() -> None:\n    assert run_job(2) == 3\n",
+    )
+    .expect("write test_worker.py");
+
+    let backend = LocalCodeBackend::open_read_only(root).expect("open local");
+    let runner = CodeModeRunner::default();
+
+    let prod_only = runner.execute(
+        r#"symbol_context(name="run_job", path="pkg/worker.py", include_tests=False)"#,
+        &backend,
+    );
+    assert_eq!(prod_only.status, ExecuteStatus::Ok, "{prod_only:?}");
+    let val = prod_only.value.expect("value");
+    assert_eq!(val["total_callers"], 2);
+    let callers = val["callers"].as_array().expect("callers array");
+    assert_eq!(callers.len(), 2);
+
+    let fn_caller = callers
+        .iter()
+        .find(|c| c["name"] == "dispatch")
+        .expect("dispatch caller");
+    assert_eq!(fn_caller["caller_kind"], "fn");
+    assert_eq!(fn_caller["caller_line"], 3);
+    assert_eq!(fn_caller["call_line"], 4);
+    assert_eq!(fn_caller["call_expr"], "run_job");
+    assert_eq!(fn_caller["confidence"], "exact");
+
+    let mod_caller = callers
+        .iter()
+        .find(|c| c["name"] == "<module>")
+        .expect("top-level module caller");
+    assert!(mod_caller["caller_kind"].is_null());
+    assert!(mod_caller["caller_line"].is_null());
+    assert_eq!(mod_caller["call_line"], 6);
+
+    let with_tests = runner.execute(
+        r#"symbol_context(name="run_job", path="pkg/worker.py", include_tests=True)"#,
+        &backend,
+    );
+    assert_eq!(with_tests.value.expect("val")["total_callers"], 3);
+}
+
+#[test]
+fn symbol_context_cross_file_callers_resolve_csharp_java_and_go_with_confidence() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("cs")).expect("mkdir cs");
+    std::fs::create_dir_all(root.join("java/com/acme")).expect("mkdir java");
+    std::fs::create_dir_all(root.join("go/pr")).expect("mkdir go");
+
+    // 1. C# fixture: namespace + partial class + explicit receiver + unknown lambda receiver
+    std::fs::write(
+        root.join("cs/ResiliencePipeline.Async.cs"),
+        "namespace Polly;\npublic partial class ResiliencePipeline {\n    public void ExecuteAsync() {}\n}\n",
+    )
+    .expect("write C# target");
+    std::fs::write(
+        root.join("cs/Bench.cs"),
+        "namespace Polly.Benchmarks;\npublic class Bench {\n    private ResiliencePipeline _pipeline;\n    public void RunExplicit() { _pipeline.ExecuteAsync(); }\n    public void RunHeuristic() { Invoke(s => s.ExecuteAsync()); }\n}\n",
+    )
+    .expect("write C# caller");
+
+    // 2. Java fixture: same package without explicit import
+    std::fs::write(
+        root.join("java/com/acme/Gson.java"),
+        "package com.acme;\npublic class Gson {\n    public void getDelegateAdapter() {}\n}\n",
+    )
+    .expect("write Java target");
+    std::fs::write(
+        root.join("java/com/acme/Factory.java"),
+        "package com.acme;\npublic class Factory {\n    public void create(Gson gson) { gson.getDelegateAdapter(); }\n}\n",
+    )
+    .expect("write Java caller");
+
+    // 3. Go fixture: same package directory without import
+    std::fs::write(
+        root.join("go/pr/create.go"),
+        "package pr\nfunc submitPR() error {\n    return nil\n}\n",
+    )
+    .expect("write Go target");
+    std::fs::write(
+        root.join("go/pr/run.go"),
+        "package pr\nfunc createRun() error {\n    return submitPR()\n}\n",
+    )
+    .expect("write Go caller");
+
+    let backend = LocalCodeBackend::open_read_only(root).expect("open local");
+    let runner = CodeModeRunner::default();
+
+    let cs = runner
+        .execute(
+            r#"symbol_context(name="ExecuteAsync", path="cs/ResiliencePipeline.Async.cs", symbol_line=3)"#,
+            &backend,
+        )
+        .value
+        .expect("cs value");
+    let cs_callers = cs["callers"].as_array().expect("cs callers");
+    assert_eq!(cs_callers.len(), 2, "got: {cs_callers:?}");
+    assert!(
+        cs_callers
+            .iter()
+            .any(|c| c["name"] == "RunExplicit" && c["confidence"] == "exact")
+    );
+    assert!(
+        cs_callers
+            .iter()
+            .any(|c| c["name"] == "RunHeuristic" && c["confidence"] == "heuristic_receiver")
+    );
+
+    let jv = runner
+        .execute(
+            r#"symbol_context(name="getDelegateAdapter", path="java/com/acme/Gson.java")"#,
+            &backend,
+        )
+        .value
+        .expect("java value");
+    let jv_callers = jv["callers"].as_array().expect("java callers");
+    assert_eq!(jv_callers.len(), 1, "got: {jv_callers:?}");
+    assert_eq!(jv_callers[0]["name"], "create");
+    assert_eq!(jv_callers[0]["confidence"], "exact");
+
+    let go = runner
+        .execute(
+            r#"symbol_context(name="submitPR", path="go/pr/create.go")"#,
+            &backend,
+        )
+        .value
+        .expect("go value");
+    let go_callers = go["callers"].as_array().expect("go callers");
+    assert_eq!(go_callers.len(), 1, "got: {go_callers:?}");
+    assert_eq!(go_callers[0]["name"], "createRun");
+    assert_eq!(go_callers[0]["confidence"], "exact");
+}
+
+#[test]
+fn symbol_context_excludes_same_name_method_on_unrelated_type() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+
+    std::fs::write(
+        root.join("src/ResiliencePipeline.Async.cs"),
+        "namespace Polly;\npublic partial class ResiliencePipeline {\n    public void ExecuteAsync() {}\n}\n",
+    )
+    .expect("write target");
+    std::fs::write(
+        root.join("src/AsyncPolicy.cs"),
+        "namespace Polly;\npublic class AsyncPolicy {\n    public void ExecuteAsync() {}\n}\n",
+    )
+    .expect("write unrelated type");
+    std::fs::write(
+        root.join("src/MixedCallers.cs"),
+        "namespace Polly.Benchmarks;\npublic class MixedCallers {\n    private AsyncPolicy _policy;\n    private ResiliencePipeline<string> _genericPipeline;\n    public void CallPolicy() { _policy.ExecuteAsync(); }\n    public void CallGeneric() { _genericPipeline.ExecuteAsync(); }\n    public void CallCast(object o) { ((AsyncPolicy)o).ExecuteAsync(); }\n}\n",
+    )
+    .expect("write unrelated callers");
+    std::fs::write(
+        root.join("src/UnrelatedLambda.cs"),
+        "namespace Polly.Benchmarks;\npublic class UnrelatedLambda {\n    public void CallUnknown() { Run(s => s.ExecuteAsync()); }\n}\n",
+    )
+    .expect("write unknown lambda without target type mention");
+
+    let backend = LocalCodeBackend::open_read_only(root).expect("open local");
+    let runner = CodeModeRunner::default();
+    let out = runner
+        .execute(
+            r#"symbol_context(name="ExecuteAsync", path="src/ResiliencePipeline.Async.cs", symbol_line=3)"#,
+            &backend,
+        )
+        .value
+        .expect("value");
+    let callers = out["callers"].as_array().expect("callers");
+    assert!(
+        callers.is_empty(),
+        "unrelated ExecuteAsync methods must not leak into callers: {callers:?}"
+    );
+}
+
+#[test]
+fn find_references_emits_enclosing_line_for_overloaded_method_chaining() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+
+    std::fs::write(
+        root.join("src/Adapter.java"),
+        "package com.acme;\npublic class Adapter {\n    public static void targetHook() {}\n}\n",
+    )
+    .expect("write Adapter.java");
+    std::fs::write(
+        root.join("src/Factory.java"),
+        "package com.acme;\npublic class Factory {\n    public void create(int a) {\n        return;\n    }\n    public void create(String b) {\n        Adapter.targetHook();\n    }\n}\n",
+    )
+    .expect("write overloaded Factory.java");
+
+    let backend = LocalCodeBackend::open_read_only(root).expect("open local");
+    let runner = CodeModeRunner::default();
+    let out = runner.execute(
+        r#"
+refs = find_references(name="targetHook")
+r0 = refs[0]
+sym = get_symbol(path=r0["path"], name=r0["enclosing_symbol"], symbol_line=r0["enclosing_line"])[0]
+{"enclosing_line": r0["enclosing_line"], "call_line": r0["line"], "source": sym["source"], "refusal": sym["refusal"]}
+"#,
+        &backend,
+    );
+    assert_eq!(out.status, ExecuteStatus::Ok, "{out:?}");
+    let val = out.value.expect("value");
+    assert_eq!(val["enclosing_line"], 6);
+    assert_eq!(val["call_line"], 7);
+    assert!(val["refusal"].is_null());
+    assert!(val["source"].as_str().unwrap_or("").contains("String b"));
+}
+
+#[test]
+fn search_text_group_by_count_returns_exact_per_file_totals() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+    let repeated = (0..65)
+        .map(|i| format!("pub fn f_{i}() {{ marker_tok(); }}\n"))
+        .collect::<String>();
+    std::fs::write(root.join("src/many.rs"), repeated).expect("write many.rs");
+
+    let backend = LocalCodeBackend::open_read_only(root).expect("open local");
+    let runner = CodeModeRunner::default();
+    let out = runner.execute(
+        r#"search_text(query="marker_tok", group_by="count")"#,
+        &backend,
+    );
+    assert_eq!(out.status, ExecuteStatus::Ok, "{out:?}");
+    let counts = out.value.expect("value");
+    assert_eq!(counts[0]["path"], "src/many.rs");
+    assert_eq!(counts[0]["count"], 65);
+}
