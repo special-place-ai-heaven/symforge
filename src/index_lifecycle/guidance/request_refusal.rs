@@ -853,6 +853,8 @@ pub(crate) static TOOL_ARGUMENTS: &[(&str, &[&str])] = &[
         ],
     ),
     ("checkpoint_now", &["export_artifact", "verify_after_write"]),
+    ("code_execute", &["code", "project", "timeout_ms"]),
+    ("code_search", &["limit", "query"]),
     ("context_inventory", &[]),
     ("conventions", &[]),
     (
@@ -1450,6 +1452,7 @@ pub(crate) static TOOL_REQUIRED: &[(&str, &[&str])] = &[
     ("ask", &["query"]),
     ("batch_insert", &["content", "position", "targets"]),
     ("batch_rename", &["path", "name", "new_name"]),
+    ("code_execute", &["code"]),
     (
         "curate_knowledge",
         &[

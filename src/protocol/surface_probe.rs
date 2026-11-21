@@ -30,6 +30,14 @@ pub fn set_tools_override(spec: String) {
     let _ = TOOLS_OVERRIDE.set(spec);
 }
 
+/// `serve --surface` value. Takes precedence over `SYMFORGE_SURFACE` for that process.
+static SURFACE_OVERRIDE: std::sync::OnceLock<SurfaceProfile> = std::sync::OnceLock::new();
+
+/// Install the `serve --surface` profile for this process. A second call is ignored.
+pub fn set_surface_override(profile: SurfaceProfile) {
+    let _ = SURFACE_OVERRIDE.set(profile);
+}
+
 /// The operator's per-process tool allow-list (issue #874): `serve --tools`,
 /// else [`TOOLS_ENV`]. Read per call like `SYMFORGE_SURFACE`.
 ///
@@ -129,7 +137,7 @@ pub fn allow_list_refusal(tool: &str, needed_by: Option<&str>) -> Option<String>
 pub fn surface_env_conflict() -> Option<String> {
     tool_allow_list()?;
     let surface = std::env::var("SYMFORGE_SURFACE").ok()?.to_ascii_lowercase();
-    matches!(surface.as_str(), "core" | "compact" | "meta")
+    matches!(surface.as_str(), "core" | "compact" | "meta" | "code")
         .then(|| format!("SYMFORGE_SURFACE={surface} is ignored because {TOOLS_ENV} is set"))
 }
 
@@ -193,20 +201,16 @@ pub fn surface_profile_from_env() -> SurfaceProfile {
     if tool_allow_list().is_some() {
         return SurfaceProfile::Full;
     }
-    // Default surface is FULL (spike-gate verdict 2026-07-03: no target harness
-    // rejected the then-36-tool full `tools/list`; see docs/reviews). The current
-    // full surface has 40 tools. `SYMFORGE_SURFACE=compact`
-    // is the documented opt-in escape hatch (the compact-3 facade) for token-
-    // sensitive setups; `core` (SF-TE-05) lists only `CORE_TOOL_NAMES` and
-    // refuses nothing; `meta` keeps its explicit measurement meaning. Unset and
-    // unrecognised values resolve to full, and the D23 connection-surface
-    // task-local still takes precedence over env.
+    if let Some(override_profile) = SURFACE_OVERRIDE.get() {
+        return *override_profile;
+    }
     match std::env::var("SYMFORGE_SURFACE")
         .ok()
         .map(|v| v.to_ascii_lowercase())
     {
         Some(ref s) if s == "core" => SurfaceProfile::Core,
         Some(ref s) if s == "compact" => SurfaceProfile::Compact,
+        Some(ref s) if s == "code" => SurfaceProfile::Code,
         Some(ref s) if s == "meta" => SurfaceProfile::Meta,
         _ => SurfaceProfile::Full,
     }
@@ -275,28 +279,30 @@ where
 /// is full, and the opt-in core profile only lists fewer tools, it does not
 /// refuse the unlisted ones.
 pub fn compact_surface_blocks(profile: SurfaceProfile, tool_name: &str) -> bool {
-    profile == SurfaceProfile::Compact
-        && !crate::stel::surface::COMPACT_TOOL_NAMES.contains(&tool_name)
+    match profile {
+        SurfaceProfile::Compact => !crate::stel::surface::COMPACT_TOOL_NAMES.contains(&tool_name),
+        SurfaceProfile::Code => !crate::stel::surface::CODE_TOOL_NAMES.contains(&tool_name),
+        SurfaceProfile::Core | SurfaceProfile::Full | SurfaceProfile::Meta => false,
+    }
 }
 
 /// Apply the surface gates: the operator tool allow-list ([`TOOLS_ENV`]), then
-/// the compact-surface gate using the live `SYMFORGE_SURFACE` env profile.
-///
-/// Returns `Err(InvalidRequest)` when the call must be rejected, else `Ok(())`.
-/// Used by the production `call_tool` (stdio front and the HTTP `/mcp` path)
-/// and asserted directly by the surface conformance test so the test exercises
-/// the real gate, not a copy.
+/// the compact/code surface gate using the live `SYMFORGE_SURFACE` profile.
 pub fn enforce_compact_surface(tool_name: &str) -> Result<(), rmcp::ErrorData> {
     if let Some(refusal) = allow_list_refusal(tool_name, None) {
         return Err(rmcp::ErrorData::invalid_request(refusal, None));
     }
-    if compact_surface_blocks(surface_profile_from_env(), tool_name) {
-        return Err(rmcp::ErrorData::invalid_request(
-            format!(
+    let profile = surface_profile_from_env();
+    if compact_surface_blocks(profile, tool_name) {
+        let msg = match profile {
+            SurfaceProfile::Code => format!(
+                "tool '{tool_name}' not available on code surface; discover stubs with code_search and run queries in code_execute (or set SYMFORGE_SURFACE=full)"
+            ),
+            _ => format!(
                 "tool '{tool_name}' not available on compact surface; unset SYMFORGE_SURFACE or set SYMFORGE_SURFACE=full for the full tool surface"
             ),
-            None,
-        ));
+        };
+        return Err(rmcp::ErrorData::invalid_request(msg, None));
     }
     Ok(())
 }
@@ -315,6 +321,9 @@ pub const COMPACT_SURFACE_INSTRUCTIONS: &str = "SymForge indexes this repository
 /// one sentence that more exist and how the operator lists them.
 pub const CORE_SURFACE_INSTRUCTIONS: &str = "SymForge indexes this repository. Start with search_symbols to find a function or type, get_symbol to read its body (pass targets[] to fetch several in one call), and find_references for callers and usages. Use search_text for code text. For exact literal match counts your own grep is fine. Read raw files with get_file_content only for docs, configs or exact bytes. The project/projects parameters select an open project by ID or alias, never a path. This is the core profile: tool text may name unlisted tools; the operator lists every tool with SYMFORGE_SURFACE=full.";
 
+/// Code-surface routing hint (`SYMFORGE_SURFACE=code`).
+pub const CODE_SURFACE_INSTRUCTIONS: &str = "SymForge Code Mode. Discover Python read stubs and TypedDict return types with code_search (omit query for 1-line index). Chain read/trace queries in one turn with code_execute (keyword-only Python 3.14 subset, zero disk/net egress; final expression returned as JSON). Mutate symbols explicitly with symforge_edit and check index state with status.";
+
 /// Instructions for the surface this process serves. The meta probe is a
 /// measurement surface and gets none.
 pub fn server_instructions(profile: SurfaceProfile) -> Option<&'static str> {
@@ -322,6 +331,7 @@ pub fn server_instructions(profile: SurfaceProfile) -> Option<&'static str> {
         SurfaceProfile::Core => Some(CORE_SURFACE_INSTRUCTIONS),
         SurfaceProfile::Full => Some(FULL_SURFACE_INSTRUCTIONS),
         SurfaceProfile::Compact => Some(COMPACT_SURFACE_INSTRUCTIONS),
+        SurfaceProfile::Code => Some(CODE_SURFACE_INSTRUCTIONS),
         SurfaceProfile::Meta => None,
     }
 }
@@ -388,6 +398,7 @@ pub fn advertised_tools() -> Vec<Tool> {
     let profile = surface_profile_from_env();
     let mut tools = match profile {
         SurfaceProfile::Compact => crate::stel::compact_surface_tools(),
+        SurfaceProfile::Code => crate::stel::code_surface_tools(),
         _ => list_tools_for_profile(profile),
     };
     if let Some(list) = tool_allow_list() {
@@ -426,7 +437,9 @@ pub fn with_output_schemas(mut tools: Vec<Tool>) -> Vec<Tool> {
 
 pub fn list_tools_for_profile(profile: SurfaceProfile) -> Vec<Tool> {
     match profile {
-        SurfaceProfile::Full => slimmed_router_tools(|name| name != "symforge"),
+        SurfaceProfile::Full => slimmed_router_tools(|name| {
+            !matches!(name, "symforge" | "code_search" | "code_execute")
+        }),
         SurfaceProfile::Core => {
             slimmed_router_tools(|name| crate::stel::surface::CORE_TOOL_NAMES.contains(&name))
                 .into_iter()
@@ -443,6 +456,7 @@ pub fn list_tools_for_profile(profile: SurfaceProfile) -> Vec<Tool> {
         }
         SurfaceProfile::Compact => compact_probe_tools(),
         SurfaceProfile::Meta => meta_probe_tools(),
+        SurfaceProfile::Code => crate::stel::code_surface_tools(),
     }
 }
 
@@ -954,18 +968,28 @@ mod tests {
             Some(CORE_SURFACE_INSTRUCTIONS)
         );
         assert!(CORE_SURFACE_INSTRUCTIONS.contains("SYMFORGE_SURFACE=full"));
+        assert_eq!(
+            server_instructions(SurfaceProfile::Code),
+            Some(CODE_SURFACE_INSTRUCTIONS)
+        );
 
-        let names = |tools: Vec<Tool>| -> Vec<String> {
+        let names = |tools: Vec<rmcp::model::Tool>| -> Vec<String> {
             tools.into_iter().map(|t| t.name.to_string()).collect()
         };
         let full = names(list_tools_for_profile(SurfaceProfile::Full));
         let core = names(list_tools_for_profile(SurfaceProfile::Core));
         let compact = names(crate::stel::compact_surface_tools());
-        let every: Vec<&String> = full.iter().chain(compact.iter()).collect();
+        let code = names(crate::stel::code_surface_tools());
+        let every: Vec<&String> = full
+            .iter()
+            .chain(compact.iter())
+            .chain(code.iter())
+            .collect();
         for (profile, served) in [
             (SurfaceProfile::Full, &full),
             (SurfaceProfile::Core, &core),
             (SurfaceProfile::Compact, &compact),
+            (SurfaceProfile::Code, &code),
         ] {
             let text = server_instructions(profile).unwrap();
             assert!(
@@ -1018,6 +1042,10 @@ mod tests {
     #[test]
     fn surface_profile_from_label_roundtrips_canonical_and_rejects_junk() {
         assert_eq!(
+            surface_profile_from_label("core"),
+            Some(SurfaceProfile::Core)
+        );
+        assert_eq!(
             surface_profile_from_label("full"),
             Some(SurfaceProfile::Full)
         );
@@ -1026,12 +1054,17 @@ mod tests {
             Some(SurfaceProfile::Compact)
         );
         assert_eq!(
+            surface_profile_from_label("code"),
+            Some(SurfaceProfile::Code)
+        );
+        assert_eq!(
             surface_profile_from_label("meta"),
             Some(SurfaceProfile::Meta)
         );
         // Non-canonical input (wrong case, arbitrary text, empty) must NOT resolve —
         // it falls back to the daemon's own env instead of trusting adapter garbage.
         assert_eq!(surface_profile_from_label("FULL"), None);
+        assert_eq!(surface_profile_from_label("CODE"), None);
         assert_eq!(surface_profile_from_label("nonsense"), None);
         assert_eq!(surface_profile_from_label(""), None);
     }

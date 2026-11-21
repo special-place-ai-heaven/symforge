@@ -102,12 +102,18 @@ fn listed_gate_tool(uri: &str) -> Option<&'static str> {
 }
 
 /// Whether a listed resource may be advertised on this connection: its tool,
-/// if any, passes the allow-list. Always true when no list is set.
+/// if any, passes the allow-list and is not blocked on `SurfaceProfile::Code`.
 fn listed_resource_allowed(uri: &str) -> bool {
-    listed_gate_tool(uri)
-        .is_none_or(|tool| crate::protocol::surface_probe::allow_list_refusal(tool, None).is_none())
+    listed_gate_tool(uri).is_none_or(|tool| {
+        crate::protocol::surface_probe::allow_list_refusal(tool, None).is_none()
+            && !(crate::protocol::surface_probe::surface_profile_from_env()
+                == crate::protocol::surface_probe::SurfaceProfile::Code
+                && crate::protocol::surface_probe::compact_surface_blocks(
+                    crate::protocol::surface_probe::SurfaceProfile::Code,
+                    tool,
+                ))
+    })
 }
-
 impl SymForgeServer {
     pub(crate) fn resource_definitions(&self) -> Vec<Resource> {
         vec![
@@ -199,19 +205,34 @@ impl SymForgeServer {
     ) -> Result<ReadResourceResult, McpError> {
         let request =
             parse_resource_uri(uri).map_err(|error| McpError::invalid_params(error, None))?;
-        // #874: a resource runs its tool's handler, so it obeys the allow-list.
-        if let Some(tool) = request.gate_tool()
-            && let Some(refusal) = crate::protocol::surface_probe::allow_list_refusal(
+        // #874 + Feature 037: a resource runs its tool's handler, so it obeys
+        // the allow-list and the `SYMFORGE_SURFACE=code` tool gate.
+        let tool = request.gate_tool();
+        if let Some(tool) = tool {
+            if let Some(refusal) = crate::protocol::surface_probe::allow_list_refusal(
                 tool,
                 Some(&format!("The resource '{uri}'")),
-            )
-        {
-            return Err(McpError::invalid_request(
-                refusal,
-                Some(serde_json::json!({ "uri": uri, "tool": tool })),
-            ));
+            ) {
+                return Err(McpError::invalid_request(
+                    refusal,
+                    Some(serde_json::json!({ "uri": uri, "tool": tool })),
+                ));
+            }
+            if crate::protocol::surface_probe::surface_profile_from_env()
+                == crate::protocol::surface_probe::SurfaceProfile::Code
+                && crate::protocol::surface_probe::compact_surface_blocks(
+                    crate::protocol::surface_probe::SurfaceProfile::Code,
+                    tool,
+                )
+            {
+                return Err(McpError::invalid_request(
+                    format!(
+                        "The resource '{uri}' needs tool '{tool}', which is not available on code surface; run queries in code_execute (or set SYMFORGE_SURFACE=full)."
+                    ),
+                    Some(serde_json::json!({ "uri": uri, "tool": tool })),
+                ));
+            }
         }
-        let tool = request.outcome_tool();
         let (text, recorded) = with_read_outcome_scope(self.render_resource_text(request)).await;
         let text = text.map_err(|error| McpError::invalid_params(error, None))?;
         if tool.is_some() {

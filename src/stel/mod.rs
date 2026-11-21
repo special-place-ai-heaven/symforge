@@ -120,11 +120,13 @@ pub use status::{
     render_proxy_owned_lines,
 };
 pub use surface::{
-    COMPACT_SURFACE_TOOL_COUNT, COMPACT_TOOL_NAMES, CORE_TOOL_NAMES, CompactSurfaceTool,
+    CODE_SURFACE_TOOL_COUNT, CODE_TOOL_NAMES, COMPACT_SURFACE_TOOL_COUNT, COMPACT_TOOL_NAMES,
+    CORE_TOOL_NAMES, CompactSurfaceTool,
 };
 #[cfg(feature = "server")]
 pub use surface_list::{
-    compact_surface_list_schema_bytes, compact_surface_tools, symforge_edit_schema_bytes,
+    code_surface_list_schema_bytes, code_surface_tools, compact_surface_list_schema_bytes,
+    compact_surface_tools, symforge_edit_schema_bytes,
 };
 pub use types::{
     AdmissionDecision, CalibrationState, CoreToolName, GoldenRouteRow, IndexRef, IntentBucket,

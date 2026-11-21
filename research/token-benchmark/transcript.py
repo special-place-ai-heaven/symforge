@@ -12,9 +12,15 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 from pathlib import Path
 from typing import Any
 
+
+SYMFORGE_CLI_RE = re.compile(
+    r"""(?:^|[;&|()\s])(?:"[^"]*[/\\]symforge(?:\.exe)?"|'[^']*[/\\]symforge(?:\.exe)?'|(?:\S*[/\\])?symforge(?:\.exe)?|"(?:symforge(?:\.exe)?)"|'(?:symforge(?:\.exe)?)')\s+(?:code|q|query)(?=$|\s)""",
+    re.IGNORECASE,
+)
 
 def _text_len(content: Any) -> int:
     if isinstance(content, str):
@@ -28,6 +34,7 @@ def parse_stream(lines: list[str], sentinel: str = "") -> dict[str, Any]:
     usage_by_msg: dict[str, dict] = {}
     tool_uses: dict[str, str] = {}
     tool_result_chars = 0
+    symforge_cli_calls = 0
     sentinel_hits = 0
     hook_events = 0
     model = None
@@ -62,7 +69,12 @@ def parse_stream(lines: list[str], sentinel: str = "") -> dict[str, Any]:
             usage_by_msg[mid] = msg.get("usage") or usage_by_msg.get(mid, {})
             for part in msg.get("content") or []:
                 if part.get("type") == "tool_use":
-                    tool_uses[part.get("id") or f"tu-{i}-{len(tool_uses)}"] = part.get("name", "?")
+                    tname = part.get("name", "?")
+                    tool_uses[part.get("id") or f"tu-{i}-{len(tool_uses)}"] = tname
+                    if tname == "Bash":
+                        cmd_str = str((part.get("input") or {}).get("command") or "")
+                        if SYMFORGE_CLI_RE.search(cmd_str):
+                            symforge_cli_calls += 1
                 elif part.get("type") == "text" and part.get("text", "").strip():
                     last_text = part["text"]
         elif etype == "user":
@@ -87,6 +99,7 @@ def parse_stream(lines: list[str], sentinel: str = "") -> dict[str, Any]:
         "round_trips": len(u),
         "tool_calls": len(tool_uses),
         "tools": tools,
+        "symforge_cli_calls": symforge_cli_calls,
         "tool_result_chars": tool_result_chars,
         "tool_result_tokens_est": tool_result_chars // 4,
         "input_tokens": inp,

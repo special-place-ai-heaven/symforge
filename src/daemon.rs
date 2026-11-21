@@ -3264,6 +3264,33 @@ impl DaemonSessionClient {
             .await
             .context("daemon close body")
     }
+
+    /// Execute one structured read-only `CodeReadOp` over `/v1/sessions/{id}/code-query`.
+    pub async fn call_code_query(
+        &self,
+        query: &crate::codemode::DaemonCodeQueryRequest,
+    ) -> anyhow::Result<Result<serde_json::Value, crate::codemode::CodeBackendError>> {
+        let request = self
+            .http_client
+            .post(format!(
+                "{}/v1/sessions/{}/code-query",
+                self.base_url, self.session_id
+            ))
+            .json(query);
+        let reply = apply_daemon_auth_header(request, self.auth_token.as_deref())
+            .send()
+            .await
+            .context("calling daemon code-query")?
+            .error_for_status()
+            .context("daemon code-query status")?
+            .json::<crate::codemode::DaemonCodeQueryResponse>()
+            .await
+            .context("decoding daemon code-query body")?;
+        Ok(match reply {
+            crate::codemode::DaemonCodeQueryResponse::Ok { value } => Ok(value),
+            crate::codemode::DaemonCodeQueryResponse::Error { error } => Err(error),
+        })
+    }
 }
 
 struct DaemonStartLock {
@@ -3343,6 +3370,101 @@ pub async fn connect_or_spawn_session(
 ) -> anyhow::Result<DaemonSessionClient> {
     let control_state_dir = process_control_state_dir()?;
     connect_or_spawn_session_at(project_root, client_name, pid, control_state_dir).await
+}
+
+/// Attach to an ALREADY-RUNNING compatible local daemon without spawning one.
+///
+/// Returns `Ok(None)` when no compatible daemon is recorded or reachable so
+/// `symforge code` / `symforge q` can fall back cleanly to read-only local
+/// snapshot load without leaving a background daemon behind.
+pub async fn connect_existing_session(
+    project_root: &Path,
+    client_name: &str,
+    pid: Option<u32>,
+) -> anyhow::Result<Option<DaemonSessionClient>> {
+    let Ok(control_state_dir) = process_control_state_dir() else {
+        return Ok(None);
+    };
+    connect_existing_session_at(project_root, client_name, pid, control_state_dir).await
+}
+
+#[doc(hidden)]
+pub async fn connect_existing_session_at(
+    project_root: &Path,
+    client_name: &str,
+    pid: Option<u32>,
+    control_state_dir: &ControlStateDir,
+) -> anyhow::Result<Option<DaemonSessionClient>> {
+    let canonical_project_root = project_root
+        .canonicalize()
+        .context("canonicalizing project root before daemon attach")?;
+    let project_root_text = canonical_project_root
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("canonical project root is not valid UTF-8"))?;
+    let identity = current_daemon_identity();
+    let Some(port) = daemon_port_if_compatible_at(control_state_dir, &identity).await? else {
+        return Ok(None);
+    };
+    let expected_project_id = project_key(&canonical_project_root);
+    let base_url = format!("http://{}:{port}", std::net::Ipv4Addr::LOCALHOST);
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("building reqwest client for connect_existing_session")?;
+    let auth_token = resolve_daemon_auth_token_at(control_state_dir);
+    let open_request = http_client
+        .post(format!("{base_url}/v1/sessions/open"))
+        .timeout(DAEMON_SESSION_OPEN_TIMEOUT)
+        .json(&OpenProjectRequest {
+            project_root: project_root_text.to_string(),
+            client_name: client_name.to_string(),
+            pid,
+        });
+    let opened = match apply_daemon_auth_header(open_request, auth_token.as_deref())
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.error_for_status() {
+            Ok(ok_resp) => ok_resp
+                .json::<OpenProjectResponse>()
+                .await
+                .context("daemon session open body")?,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    if opened.project_id != expected_project_id {
+        close_current_session(
+            DaemonSessionClient::new_with_auth_token(
+                base_url,
+                opened.project_id,
+                opened.session_id,
+                opened.project_name,
+                auth_token,
+                control_state_dir.clone(),
+            ),
+            None,
+            SESSION_CLOSE_TIMEOUT,
+        )
+        .await;
+        return Ok(None);
+    }
+    let daemon_started_at = daemon_health(port)
+        .await
+        .and_then(|h| h.started_at_unix_secs);
+    Ok(Some(
+        DaemonSessionClient::new_with_auth_token(
+            base_url,
+            opened.project_id,
+            opened.session_id,
+            opened.project_name,
+            auth_token,
+            control_state_dir.clone(),
+        )
+        .with_project_root(canonical_project_root)
+        .with_daemon_started_at(daemon_started_at),
+    ))
 }
 
 async fn connect_or_spawn_session_at(
@@ -5400,6 +5522,10 @@ pub fn build_router(state: SharedDaemonState) -> Router {
             post(call_tool_handler),
         )
         .route(
+            "/v1/sessions/{session_id}/code-query",
+            post(code_query_handler),
+        )
+        .route(
             "/v1/sessions/{session_id}/sidecar/health",
             get(sidecar_health_handler),
         )
@@ -6366,6 +6492,89 @@ async fn call_tool_handler(
             tracing::error!(tool = %tool_name_for_panic, "tool execution failed: {gov_err}");
             Ok(msg.into_response())
         }
+    }
+}
+
+async fn code_query_handler(
+    State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
+    AxumPath(session_id): AxumPath<String>,
+    Json(req): Json<crate::codemode::DaemonCodeQueryRequest>,
+) -> Result<Json<crate::codemode::DaemonCodeQueryResponse>, (StatusCode, String)> {
+    let _activity = authorize_daemon_request(&state, &headers).map_err(daemon_auth_error)?;
+    let selector = req
+        .project
+        .as_deref()
+        .or_else(|| {
+            req.kwargs
+                .get("project")
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|s| !s.trim().is_empty());
+    let runtime = match state.runtime_for_target(&session_id, selector) {
+        Ok(rt) => rt,
+        Err(msg) if msg.starts_with("unknown session") => {
+            return Err((StatusCode::NOT_FOUND, msg));
+        }
+        Err(msg) => {
+            return Ok(Json(crate::codemode::DaemonCodeQueryResponse::Error {
+                error: crate::codemode::CodeBackendError::refusal("project_routing", msg),
+            }));
+        }
+    };
+    let op = req.op;
+    let kwargs = req.kwargs;
+    let op_label = format!("code-query/{}", op.as_str());
+    let outcome = state
+        .governor
+        .execute_non_abortable(&op_label, async move {
+            let res = tokio::task::spawn_blocking(move || {
+                runtime.token_stats.record_tool_call(op.as_str());
+                let source_set = runtime.index.data_plane().published_source_set();
+                let generation = source_set.current_generation();
+                let project_name = runtime
+                    .canonical_root
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("project");
+                let server = &runtime.server;
+                crate::codemode::execute_op_on_generation(
+                    op,
+                    kwargs,
+                    &generation,
+                    &source_set,
+                    Some(&runtime.canonical_root),
+                    project_name,
+                    &|path| {
+                        if !op.descriptor().discovery_only {
+                            server.bump_frecency(&[PathBuf::from(path)]);
+                        }
+                    },
+                )
+            })
+            .await
+            .map_err(|join_err| anyhow::anyhow!("code-query task panicked: {join_err}"))?;
+            Ok::<Result<serde_json::Value, crate::codemode::CodeBackendError>, anyhow::Error>(res)
+        })
+        .await;
+
+    match outcome {
+        Ok(Ok(Ok(value))) => Ok(Json(crate::codemode::DaemonCodeQueryResponse::Ok { value })),
+        Ok(Ok(Err(error))) => Ok(Json(crate::codemode::DaemonCodeQueryResponse::Error {
+            error,
+        })),
+        Ok(Err(join_err)) => Ok(Json(crate::codemode::DaemonCodeQueryResponse::Error {
+            error: crate::codemode::CodeBackendError::refusal(
+                "internal_error",
+                join_err.to_string(),
+            ),
+        })),
+        Err(gov_err) => Ok(Json(crate::codemode::DaemonCodeQueryResponse::Error {
+            error: crate::codemode::CodeBackendError::refusal(
+                "governor_error",
+                gov_err.to_string(),
+            ),
+        })),
     }
 }
 

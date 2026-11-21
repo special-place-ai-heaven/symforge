@@ -593,11 +593,13 @@ pub fn loading_guard_message_for(state: &SnapshotVerifyState, cold_bootstrap: bo
 ///   callable, so the hint may name it directly.
 pub fn empty_index_recovery_hint(profile: SurfaceProfile) -> String {
     match profile {
-        SurfaceProfile::Compact => "Index not loaded. SymForge has no resolvable project \
+        SurfaceProfile::Compact | SurfaceProfile::Code => {
+            "Index not loaded. SymForge has no resolvable project \
              root. To recover, set SYMFORGE_WORKSPACE_ROOT to the project path in this client's \
              MCP config, or run `symforge init` for this harness, then reconnect. \
              (SYMFORGE_SURFACE=full exposes the full tool surface for manual indexing.)"
-            .to_string(),
+                .to_string()
+        }
         SurfaceProfile::Core | SurfaceProfile::Full | SurfaceProfile::Meta => {
             "Index not loaded. Call index_folder to index a directory.".to_string()
         }

@@ -7,6 +7,12 @@ pub const COMPACT_SURFACE_TOOL_COUNT: usize = 3;
 pub const COMPACT_TOOL_NAMES: [&str; COMPACT_SURFACE_TOOL_COUNT] =
     ["symforge", "symforge_edit", "status"];
 
+/// Number of tools advertised on the Code Mode MCP surface (`SYMFORGE_SURFACE=code`).
+pub const CODE_SURFACE_TOOL_COUNT: usize = 4;
+
+/// Canonical Code Mode surface tool names (`SYMFORGE_SURFACE=code`).
+pub const CODE_TOOL_NAMES: [&str; CODE_SURFACE_TOOL_COUNT] =
+    ["code_search", "code_execute", "symforge_edit", "status"];
 /// Tools advertised on the opt-in core profile (SF-TE-05). Every other
 /// registered tool stays callable there; it is only not listed.
 pub const CORE_TOOL_NAMES: [&str; 13] = [
@@ -136,6 +142,8 @@ impl ToolAllowList {
                 wanted.push(tool);
             } else if lower == "symforge" {
                 unknown.push(format!("{token} (compact-only, not on this surface)"));
+            } else if lower == "code_search" || lower == "code_execute" {
+                unknown.push(format!("{token} (code-surface-only, not on this surface)"));
             } else {
                 unknown.push(token.to_string());
             }
@@ -191,6 +199,9 @@ pub enum SurfaceProfile {
     Full,
     Compact,
     Meta,
+    /// Opt-in (`SYMFORGE_SURFACE=code` or `symforge serve --surface code`):
+    /// lists [`CODE_TOOL_NAMES`] and gates unlisted legacy read tools.
+    Code,
 }
 
 /// Canonical lowercase label (`full`/`compact`/`meta`) for a surface profile.
@@ -204,6 +215,7 @@ pub fn surface_profile_label(profile: SurfaceProfile) -> &'static str {
         SurfaceProfile::Full => "full",
         SurfaceProfile::Meta => "meta",
         SurfaceProfile::Compact => "compact",
+        SurfaceProfile::Code => "code",
     }
 }
 
@@ -231,6 +243,7 @@ pub fn surface_profile_from_label(value: &str) -> Option<SurfaceProfile> {
         "full" => Some(SurfaceProfile::Full),
         "meta" => Some(SurfaceProfile::Meta),
         "compact" => Some(SurfaceProfile::Compact),
+        "code" => Some(SurfaceProfile::Code),
         _ => None,
     }
 }

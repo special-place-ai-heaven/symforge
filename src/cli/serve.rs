@@ -5,10 +5,29 @@
 //! ([`crate::server::serve::run`]) is driven from `main.rs` on a multi-thread
 //! tokio runtime (mirroring `run_daemon` / `run_mcp_server`).
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 
 use crate::server::serve::{DEFAULT_LISTEN, ServeArgs};
 
+/// Supported `--surface` profiles for `symforge serve`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ServeSurfaceArg {
+    Full,
+    Core,
+    Compact,
+    Code,
+}
+
+impl ServeSurfaceArg {
+    pub const fn into_profile(self) -> crate::stel::surface::SurfaceProfile {
+        match self {
+            Self::Full => crate::stel::surface::SurfaceProfile::Full,
+            Self::Core => crate::stel::surface::SurfaceProfile::Core,
+            Self::Compact => crate::stel::surface::SurfaceProfile::Compact,
+            Self::Code => crate::stel::surface::SurfaceProfile::Code,
+        }
+    }
+}
 /// Flags for `symforge serve` (see `contracts/cli-serve.md`).
 #[derive(Args, Debug, Clone)]
 pub struct ServeCliArgs {
@@ -35,6 +54,10 @@ pub struct ServeCliArgs {
     #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub tools: Option<String>,
 
+    /// MCP tool surface profile to advertise (`full`, `core`, `compact`, `code`).
+    /// Overrides `SYMFORGE_SURFACE` for this server process.
+    #[arg(long, value_enum)]
+    pub surface: Option<ServeSurfaceArg>,
     /// Serve this repository under ALIAS; repeat for several. Clients pick one
     /// with the `project` parameter. Without it, serve indexes the working
     /// directory's repository as before.
@@ -81,6 +104,7 @@ mod tests {
             api_key: Some("k".to_string()),
             api_key_env: None,
             tools: None,
+            surface: None,
             project: Vec::new(),
             allow_index_folder: false,
         };
@@ -138,6 +162,7 @@ mod tests {
             api_key: None,
             api_key_env: None,
             tools: None,
+            surface: None,
             project: Vec::new(),
             allow_index_folder: false,
         };

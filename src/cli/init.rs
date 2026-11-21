@@ -181,14 +181,169 @@ const SYMFORGE_GUIDANCE_START: &str = "<!-- SYMFORGE START -->";
 const SYMFORGE_GUIDANCE_END: &str = "<!-- SYMFORGE END -->";
 
 /// Entry point called by main.rs for `symforge init`.
+fn resolve_init_home_dir() -> anyhow::Result<PathBuf> {
+    if let Some(val) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(val));
+    }
+    if let Some(val) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(val));
+    }
+    dirs::home_dir().context("cannot determine home directory")
+}
+
+/// Entry point called by main.rs for `symforge init`.
 pub fn run_init(client: InitClient) -> anyhow::Result<()> {
-    let home = dirs::home_dir().context("cannot determine home directory")?;
+    run_init_with_options(client, false, false)
+}
+
+/// Entry point for `symforge init` with opt-in `--code-skill` / `--skill-only` installation.
+pub fn run_init_with_options(
+    client: InitClient,
+    code_skill: bool,
+    skill_only: bool,
+) -> anyhow::Result<()> {
+    let home = resolve_init_home_dir()?;
+    let binary_path = discover_binary_path();
+
+    if skill_only {
+        let written = install_code_skill_for_client(client, &home, &binary_path)?;
+        if written.is_empty() {
+            anyhow::bail!(
+                "`--skill-only` wrote no SKILL.md for client {client:?} (supported skill targets: claude, codex, omp, or installed targets under `all`)"
+            );
+        }
+        for skill_path in written {
+            eprintln!("symforge-code skill written to {}", skill_path.display());
+        }
+        return Ok(());
+    }
+
     let working_dir =
         std::env::current_dir().context("cannot determine current working directory")?;
-    let binary_path = discover_binary_path();
     let paths = InitPaths::from_current_environment(&home, &working_dir);
 
-    run_init_with_paths(client, paths, &home, &working_dir, &binary_path)
+    run_init_with_paths(client, paths, &home, &working_dir, &binary_path)?;
+    if code_skill {
+        let written = install_code_skill_for_client(client, &home, &binary_path)?;
+        for skill_path in written {
+            eprintln!("symforge-code skill written to {}", skill_path.display());
+        }
+    }
+    Ok(())
+}
+
+/// Writes the opt-in `symforge-code/SKILL.md` for targeted shell-capable harnesses.
+pub fn install_code_skill_for_client(
+    client: InitClient,
+    home_dir: &std::path::Path,
+    binary_path: &std::path::Path,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let bin_display = binary_path.display().to_string().replace('\\', "/");
+    let body = render_symforge_code_skill_markdown(&bin_display);
+    let mut targets: Vec<PathBuf> = Vec::new();
+
+    let claude_installed =
+        home_dir.join(".claude").is_dir() || home_dir.join(".claude.json").exists();
+    if client == InitClient::Claude || (client == InitClient::All && claude_installed) {
+        targets.push(
+            home_dir
+                .join(".claude")
+                .join("skills")
+                .join("symforge-code")
+                .join("SKILL.md"),
+        );
+    }
+
+    let codex_installed = home_dir.join(".codex").is_dir();
+    if client == InitClient::Codex || (client == InitClient::All && codex_installed) {
+        targets.push(
+            home_dir
+                .join(".codex")
+                .join("skills")
+                .join("symforge-code")
+                .join("SKILL.md"),
+        );
+    }
+
+    let omp_present = home_dir.join(".omp").is_dir();
+    if client == InitClient::Omp || (client == InitClient::All && omp_present) {
+        targets.push(
+            home_dir
+                .join(".omp")
+                .join("agent")
+                .join("skills")
+                .join("symforge-code")
+                .join("SKILL.md"),
+        );
+    }
+
+    for skill_file in &targets {
+        if let Some(parent) = skill_file.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        crate::cli::harness_apply::atomic_write(skill_file, body.as_bytes())
+            .with_context(|| format!("writing {}", skill_file.display()))?;
+    }
+    Ok(targets)
+}
+
+fn sanitize_double_quoted_shell_cmd(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\r' | '\n' => {}
+            '"' | '$' | '`' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn render_symforge_code_skill_markdown(binary_cmd: &str) -> String {
+    let safe_cmd = sanitize_double_quoted_shell_cmd(binary_cmd);
+    format!(
+        "---\n\
+name: symforge-code\n\
+description: Zero-egress Python Code Mode and structured JSON CLI queries over SymForge's repository index (`symforge code` and `symforge q`). Use to chain multi-step symbol/reference/impact queries in one turn.\n\
+---\n\n\
+# SymForge Code Mode (`symforge code` & `symforge q`)\n\n\
+Binary: `{safe_cmd}`\n\n\
+## 1. Quick Single Query (`symforge q`)\n\
+Quote-free across PowerShell, `cmd.exe`, and bash using `-a` / `--arg KEY=VALUE` (parses JSON numbers/bools/arrays or falls back to string):\n\
+```bash\n\
+\"{safe_cmd}\" q search_symbols -a query=target_fn -a kind=fn -a limit=5\n\
+\"{safe_cmd}\" q get_symbol -a path=src/lib.rs -a name=target_fn\n\
+# Or raw JSON / --args-file:\n\
+\"{safe_cmd}\" q search_symbols '{{\"query\":\"target_fn\",\"kind\":\"fn\"}}'\n\
+```\n\n\
+## 2. Multi-Step Chained Script (`symforge code run`)\n\
+Chain discovery -> callers -> bodies/filtering in one turn inside a keyword-only Python 3.14-subset sandbox (pure JSON on stdout, zero disk/network egress).\n\
+Bash / POSIX:\n\
+```bash\n\
+\"{safe_cmd}\" code run -c '\n\
+hits = search_symbols(query=\"target_fn\", kind=\"fn\")\n\
+refs = find_references(name=\"target_fn\", kind=\"call\")\n\
+targets = [{{\"path\": r[\"path\"], \"name\": r[\"enclosing_symbol\"]}} for r in refs[:3] if r[\"enclosing_symbol\"]]\n\
+{{\"defined_in\": hits[0][\"path\"], \"callers\": get_symbol(targets=targets)}}\n\
+'\n\
+```\n\
+PowerShell (stdin here-string or script file — zero quote escaping):\n\
+```powershell\n\
+@'\n\
+hits = search_symbols(query=\"target_fn\", kind=\"fn\")\n\
+refs = find_references(name=\"target_fn\", kind=\"call\")\n\
+{{\"count\": len(hits), \"refs\": len(refs)}}\n\
+'@ | & \"{safe_cmd}\" code run -\n\
+```\n\n\
+## 3. Discover Stubs & Idioms\n\
+- Compact 1-line index of all 15 read functions: `\"{safe_cmd}\" code stubs`\n\
+- Full `TypedDict` return schemas for a topic: `\"{safe_cmd}\" code stubs references`\n\
+- Full Monty subset rules & examples: `\"{safe_cmd}\" code idioms`\n"
+    )
 }
 
 /// Entry point for `symforge init --scan [--apply --serve-url <url> [--serve-key <key>]]`.
@@ -758,6 +913,8 @@ pub(crate) const SYMFORGE_TOOL_NAMES: &[&str] = &[
     "mcp__symforge__symforge",
     "mcp__symforge__symforge_edit",
     "mcp__symforge__secret_remediate",
+    "mcp__symforge__code_search",
+    "mcp__symforge__code_execute",
 ];
 
 const CLAUDE_ALWAYS_ALLOW: &[&str] = &[
@@ -802,6 +959,8 @@ const CLAUDE_ALWAYS_ALLOW: &[&str] = &[
     "status",
     "symforge",
     "symforge_edit",
+    "code_search",
+    "code_execute",
 ];
 
 fn merge_allowed_tools(settings: &mut Value) {
