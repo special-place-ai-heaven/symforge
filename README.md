@@ -4,38 +4,42 @@
 
 # SymForge
 
-**Symbol-aware code intelligence and structural editing for AI coding agents — local-first, trust-labeled, token-efficient.**
+**Symbol-aware code intelligence, zero-egress Code Mode, and structural editing for AI coding agents — local-first, trust-labeled, token-efficient.**
 
 [![npm](https://img.shields.io/npm/v/symforge?label=npm&color=cb3837)](https://www.npmjs.com/package/symforge)
 [![CI](https://github.com/special-place-ai-heaven/symforge/actions/workflows/ci.yml/badge.svg)](https://github.com/special-place-ai-heaven/symforge/actions/workflows/ci.yml)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](./LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.96-orange?logo=rust)](./rust-toolchain.toml)
+[![Rust](https://img.shields.io/badge/rust-1.100-orange?logo=rust)](./rust-toolchain.toml)
 [![MCP](https://img.shields.io/badge/protocol-MCP%202026--07--28-8A2BE2)](https://modelcontextprotocol.io)
-[![Platforms](https://img.shields.io/badge/platforms-win--x64%20%7C%20linux--x64%20%7C%20mac--arm64%20%7C%20mac--x64-555)](#install-and-quick-start)
+[![Platforms](https://img.shields.io/badge/platforms-win--x64%20%7C%20linux--x64-555)](#install-and-quick-start)
 
-[Install](#install-and-quick-start) · [How it works](#how-it-works) · [Tools](#tools) · [Embed](#embedding) · [Wiki](https://github.com/special-place-ai-heaven/symforge/wiki)
+[Install](#install-and-quick-start) · [How it works](#how-it-works) · [Code Mode & CLI](#code-mode-and-cli) · [Tools & Surfaces](#tools-and-surfaces) · [Embed](#embedding) · [Wiki](https://github.com/special-place-ai-heaven/symforge/wiki)
 
 </div>
 
 ---
 
-SymForge is a local-first [MCP](https://modelcontextprotocol.io) server that gives an AI coding agent a symbol-level view of a repository, so it can ask precise questions instead of reading whole files, running broad greps, or editing code with blind string replacement. It is written in Rust, parses with tree-sitter, holds the active workspace in memory, and answers over stdio or Streamable HTTP. The same engine also compiles without the server, as a library.
+SymForge gives an AI coding agent a symbol-level view of a repository so it can ask structured questions instead of reading whole files, running broad greps, or editing code with blind string replacement. Written in Rust and parsed with tree-sitter, the 12.0.0 engine runs in three lanes:
 
-Every answer carries a machine-readable **trust envelope**: what kind of match it was, how authoritative the source was, whether the result was complete, and where the evidence lives. When SymForge cannot answer exhaustively, it says so rather than guessing confidently.
+- **MCP server** (`full`, `code`, `core`, or `compact` surface over stdio or Streamable HTTP), backed by an optional shared local daemon.
+- **Zero-egress CLI & `SKILL.md`** (`symforge code` and `symforge q`), for shell-capable agents that want typed symbol queries and multi-step Python chaining with zero upfront MCP schema tokens.
+- **In-process Rust library** (`symforge::embed`), compiling the indexing, search, git, and edit core without the server or CLI.
+
+Every MCP answer carries a machine-readable **trust envelope**: match type, source authority, completeness, and `file:line` evidence. When SymForge cannot answer exhaustively, it says so rather than guessing.
 
 > [!IMPORTANT]
-> SymForge is for **code intelligence and code editing**. Use it before raw file reads, broad text search, or manual string edits when the task is about source code. Use the shell for builds, tests, package managers, and process work, and exact file reads when literal docs or config text is the thing being inspected.
+> SymForge is for **code intelligence and structural code editing**. Prefer it to whole-file reads, broad text scans, or string-replace edits when inspecting or changing source code. Use the shell for builds, tests, package managers, and exact literal match counts (`rg -c` / `grep`), and use raw file reads when inspecting literal docs, config prose, or several nearby regions of one small file.
 
 ## Why SymForge
 
-Coding agents spend most of their context window *finding* code, not changing it. SymForge answers those questions from an in-memory, symbol-level index:
+Coding agents spend most of their context window *finding* code, not changing it. SymForge answers from an in-memory, symbol-level index:
 
-- **Read by symbol.** Outlines, imports, consumers, and symbol bodies, so a whole-file read becomes the exception.
-- **Search with structure.** Text matches arrive grouped by enclosing symbol; symbol, path, concept, and AST-pattern search come with bounded output and stated ranking reasons.
-- **Trace impact.** Call sites, dependents, symbol diffs, and blast radius seeded from the symbols that actually changed.
-- **Edit structurally.** Replace, insert, delete, and rename by indexed structure, validated before anything touches disk, with a pre-write snapshot and a receipt naming what was written where.
-- **Keep knowledge separate.** Docs, specs, ADRs, and safe configs are indexed as their own scope, so prose never contaminates code results.
-- **Fail closed on secrets.** One admission gate decides what may be read or disclosed; secret-bearing files drop to metadata-only.
+- **Read by symbol.** File outlines, imports, consumers, and individual or batched symbol bodies (`targets[]`), keeping whole-file reads rare.
+- **Chain in one turn.** Run multi-step discovery, caller lookup, and body filtering inside a zero-egress Python 3.14-subset sandbox (`code_execute` or `symforge code run`) instead of spending one model round trip per lookup.
+- **Search with structure.** Text matches grouped by enclosing symbol, plus symbol, path, concept, and AST-pattern search with bounded output and stated ranking reasons.
+- **Trace impact.** Call sites, file dependents, symbol diffs, and git blast radius seeded from changed symbols.
+- **Edit structurally.** Replace, insert, delete, and rename by indexed AST range, validated before disk write, with a pre-write `.symforge/tee/` snapshot and a receipt naming what landed on disk.
+- **Keep knowledge separate and fail closed on secrets.** Docs, specs, ADRs, and safe configs live in their own scope; one admission gate (`admit_disk_read`) withholds secret-bearing files across every MCP, CLI, and embed read lane.
 
 Details: [Home, Why SymForge](https://github.com/special-place-ai-heaven/symforge/wiki/Home#why-symforge) and [What it gives an agent](https://github.com/special-place-ai-heaven/symforge/wiki/Home#what-it-gives-an-agent).
 
@@ -44,42 +48,46 @@ Details: [Home, Why SymForge](https://github.com/special-place-ai-heaven/symforg
 ```mermaid
 %%{init: {"flowchart": {"htmlLabels": false, "wrappingWidth": 400}}}%%
 flowchart TD
-    accTitle: SymForge architecture
-    accDescr: MCP clients reach the server over stdio or HTTP, embedders call the engine in-process. Startup restores a current-format snapshot or treats an older file as an untrusted seed, then the preventive lifecycle and admission scout feed the live index, which backs the tool, read-gate, and edit lanes.
+    accTitle: SymForge 12.0.0 architecture
+    accDescr: MCP clients, shell-skill agents, and Rust embedders query one LiveIndex backed by ArcSwap lock-free reads. Startup restores a SHA-256-verified format-11 snapshot or treats older formats as untrusted seeds, while MCP surfaces, the Monty zero-egress Python sandbox, admit_disk_read, and the structural edit engine share the live index.
 
     subgraph Clients["Clients"]
-        MCP["MCP clients\nClaude · Codex · Gemini\nCursor · Grok · Kilo"]
+        MCP["MCP clients\nClaude · Codex · Gemini\nCursor · Grok · OMP"]
+        CLI["CLI & SKILL.md\nsymforge code · symforge q"]
         LIB["Embedding platforms\nsymforge::embed, no MCP"]
     end
 
-    subgraph Surfaces["Server surfaces"]
+    subgraph Surfaces["Server + daemon surfaces"]
         STDIO["stdio MCP server"]
-        HTTP["symforge serve\nStreamable HTTP\n/mcp + /admin"]
-        DAEMON["optional shared daemon\nloopback, token auth"]
+        HTTP["symforge serve HTTP\n/mcp + /admin"]
+        DAEMON["optional shared daemon\n/v1/sessions + /code-query"]
     end
 
     subgraph Startup["Index startup"]
-        SNAP["format-10 snapshot\nor untrusted older seed"]
+        SNAP["format-11 snapshot\nSHA-256 verified, or seed"]
         SCOUT["metadata-first scout\none disposition per file"]
-        PARSE["tree-sitter, 19 grammars\n+ 6 text/config parsers"]
+        PARSE["tree-sitter, 19 grammars\n+ 6 config/text parsers"]
         KNOW["knowledge lane\ndocs, specs, safe configs"]
         LIFE["preventive lifecycle\ncandidates, leases, verify"]
     end
 
     subgraph Core["Live index"]
-        IDX["LiveIndex\nsymbols, refs, content"]
+        IDX["LiveIndex (ArcSwap)\nlock-free concurrent reads"]
         SIG["ranking signals\nfrecency, co-change"]
         VERIFY["background verify\nreconcile vs disk"]
     end
 
     subgraph Lanes["Answer + write lanes"]
-        TOOLS["40 advertised tools\nresources + prompts\ntrust envelopes"]
+        SURF["MCP surfaces\n40 full · 13 core · 4 code · 3 compact"]
+        SANDBOX["Monty Python sandbox\n15 typed read ops, zero egress"]
         GATE["read_gate\nadmit_disk_read"]
         EDITS["structural edit engine"]
     end
 
     MCP --> STDIO
     MCP --> HTTP
+    CLI --> DAEMON
+    CLI --> IDX
     STDIO --> DAEMON
     DAEMON --> IDX
     HTTP --> IDX
@@ -93,50 +101,84 @@ flowchart TD
     IDX --> VERIFY --> IDX
     IDX --> SNAP
 
-    IDX --> TOOLS
-    TOOLS --> GATE
-    TOOLS --> EDITS
+    IDX --> SURF
+    IDX --> SANDBOX
+    SURF --> SANDBOX
+    SURF --> GATE
+    SANDBOX --> GATE
+    SURF --> EDITS
     EDITS --> IDX
 ```
 
-The read path is deliberately local: symbol spans depend on the exact bytes in the workspace, so SymForge serves from an in-process index whenever it can. Every lane that reopens a file from disk goes through one gate, `admit_disk_read`, which classifies the exact buffer it read and returns it only on a permit. A current-format snapshot lets startup skip the parse phase and reconcile against disk in the background; answers carry `SnapshotRestore` / `Pending` trust labels until that verification completes. After an edit, the index is rebuilt from the bytes that actually landed on disk, never from the in-memory buffer.
+`LiveIndex` publishes immutable index generations through `ArcSwap`, giving zero reader contention under concurrent tool calls while background reconciliation or file-watcher updates swap in new generations atomically. Every lane that reopens bytes from disk passes through `admit_disk_read`, which classifies the exact buffer read and returns content only on a permit. A format-11 snapshot lets startup skip cold parsing and reconcile against disk in the background (`SnapshotRestore` / `Pending` until verified). After any edit, the index rebuilds from the bytes that landed on disk, never from an in-memory buffer.
 
 Details: [Architecture, How it works](https://github.com/special-place-ai-heaven/symforge/wiki/Architecture-and-How-It-Works#how-it-works), [The life of an edit](https://github.com/special-place-ai-heaven/symforge/wiki/Architecture-and-How-It-Works#the-life-of-an-edit), and [What makes it different](https://github.com/special-place-ai-heaven/symforge/wiki/Architecture-and-How-It-Works#what-makes-it-different).
 
 ## Install and quick start
 
-Prerequisite: Node.js 18+ and npm.
+Prerequisite for prebuilt binaries: Node.js 18+ and npm on **Windows x64** (`symforge-windows-x64`) or **Linux x64** (`symforge-linux-x64`).
 
 ```bash
 npm install -g symforge
 symforge --version
-symforge init            # register every supported client already installed
+symforge init                            # register installed MCP clients
+symforge init --code-skill               # also write symforge-code/SKILL.md (Claude, Codex, OMP)
+symforge init --code-skill --skill-only  # zero-MCP setup: write SKILL.md only, touch no MCP config
 ```
 
-npm installs a JavaScript launcher plus the native binary for your platform: **Windows x64**, **Linux x64**, **macOS arm64**, **macOS x64**. There is no postinstall step; installing downloads nothing and configures no client. Update in place with `symforge update`. `cargo install symforge` builds from source instead; it needs a C compiler, because the tree-sitter grammars, the vendored libgit2, and the bundled SQLite are C code compiled through the `cc` crate. A `cargo install` build also lacks the vendored rmcp patch (`vendor/rmcp/SYMFORGE-PATCH.md`), because Cargo ignores `[patch]` for crates.io installs: a client that opens with `server/discover` and then falls back to `initialize` can be refused on later requests. The npm binaries carry the patch.
+npm installs a thin launcher plus the OS-native binary inside npm's global prefix (`~/.symforge/bin` is retired). There is no postinstall hook; installing downloads nothing extra and edits no client config until `symforge init`. Run `symforge update` to upgrade safely while MCP sessions are open: it stages `symforge@<ver>` and the platform package side by side, verifies `--version`, stops only the shared daemon, swaps atomically with rollback on failure, restarts the daemon, replays MCP `initialize`, refreshes registered clients without disturbing disabled or remote entries, and cleans retired `~/.symforge/bin` leftovers.
+
+**macOS and source builds.** Prebuilt macOS npm packages are not shipped; on macOS or other architectures, build from a git checkout (`cargo build --release`, requires Rust 1.100.0 and a C toolchain for tree-sitter, libgit2, and bundled SQLite) or run `cargo install symforge`. A git checkout keeps the `[patch.crates-io]` `rmcp 3.10.0` patch (`vendor/rmcp/SYMFORGE-PATCH.md`). Cargo ignores `[patch]` on crates.io installs, so `cargo install symforge` lacks two pre-handshake fixes (ignoring `notifications/cancelled` after a timed-out `server/discover` before `initialize`, and clearing the `OnceLock` inline protocol latch when a `2026-07-28` `_meta` request precedes `initialize`).
 
 > [!CAUTION]
-> **WSL:** if the shell inherits the Windows npm prefix, the install pulls the Windows binary and the launcher reports a missing `symforge-linux-x64` package. Give WSL its own Linux npm prefix ahead of any `/mnt/*` entries on `PATH`, then reinstall.
+> **WSL:** if the shell inherits the Windows npm prefix, `npm install -g` pulls `symforge-windows-x64` and Linux launches fail looking for `symforge-linux-x64`. Put a native Linux npm prefix ahead of `/mnt/*` entries on `PATH`, then reinstall.
 
-To teach your agent which tool to use when, paste the [Agent Setup Prompt](https://github.com/special-place-ai-heaven/symforge/wiki/Agent-Setup-Prompt#the-prompt) into its instructions.
+To steer MCP agents explicitly, add the [Agent Setup Prompt](https://github.com/special-place-ai-heaven/symforge/wiki/Agent-Setup-Prompt#the-prompt) to your client instructions.
 
 Details: [Install and Client Setup, Install](https://github.com/special-place-ai-heaven/symforge/wiki/Install-and-Client-Setup#install) and [Troubleshooting](https://github.com/special-place-ai-heaven/symforge/wiki/Install-and-Client-Setup#troubleshooting).
 
+## Code Mode and CLI
+
+Loading all 40 MCP schemas costs ~16.5k tokens up front (`66,181 B`), and chaining discovery -> references -> symbol bodies over individual MCP calls spends a full model turn per step. V12 eliminates both costs through two surfaces backed by the same `monty` pure-Rust Python 3.14-subset interpreter:
+
+1. **MCP `code` surface** (`SYMFORGE_SURFACE=code` or `symforge serve --surface code`): advertises 4 tools (`code_search`, `code_execute`, `symforge_edit`, `status`) in **3,980 B** (~995 tokens, **−94.0%** vs `full`).
+2. **Shell CLI + `SKILL.md`** (`symforge init --code-skill --skill-only`): zero MCP tools, invoking `symforge q` for single queries and `symforge code run` for multi-step scripts against the warm daemon (`/v1/sessions/{id}/code-query`, preserving `ProjectEvidence`) or read-only `.symforge/index.bin`.
+
+```bash
+# Single quote-free query (parses JSON scalars/arrays or falls back to string; works in bash, cmd, PowerShell)
+symforge q search_symbols -a query=execute_script -a kind=fn
+
+# Multi-step chain in one turn (prefer stdin `-` or `-f` on Windows so symforge.cmd never truncates newlines)
+symforge code run - <<'PY'
+hits = search_symbols(query="enforce_compact_surface", kind="fn")
+refs = find_references(name="enforce_compact_surface", kind="call", path=hits[0]["path"])
+targets = [{"path": r["path"], "name": r["enclosing_symbol"]} for r in refs[:3] if r["enclosing_symbol"]]
+{"defined_in": hits[0]["path"], "caller_bodies": get_symbol(targets=targets)}
+PY
+```
+
+Inspect signatures and `TypedDict` return shapes with `symforge code stubs [QUERY] [--limit N]` and chaining patterns with `symforge code idioms`. The sandbox exposes **15 keyword-only read operations** (`search_symbols`, `get_symbol`, `find_references`, `find_dependents`, `file_context`, `file_content`, `search_text`, `search_files`, `repo_map`, `symbol_context`, `inspect_match`, `what_changed`, `diff_symbols`, `detect_impact`, `search_knowledge`). It has **zero filesystem, network, environment, or subprocess access** (`import os` fails with `PermissionError`), enforces `10s` CPU/wall (`30s` ceiling), `64 MiB` memory (`256 MiB` ceiling), recursion depth `150` (`200` ceiling), `64` host calls (`256` ceiling), and `16,000` inline chars (spilling full JSON to a temp file locally; disabled on HTTP `serve`), passes every read through `admit_disk_read`, never bumps frecency on discovery ops, and emits single-line JSON on `stdout` with exit code `1` whenever `"status": "error"`.
+
+Details: [Tool Reference, Code Mode and CLI](https://github.com/special-place-ai-heaven/symforge/wiki/Tool-Reference#code-mode-and-cli).
+
 ## Clients
 
-`symforge init` knows 13 clients: `claude`, `claude-desktop`, `codex`, `gemini`, `grok`, `kilo-code`, `cursor`, `omp`, `cline`, `roo`, `vscode`, `copilot`, `continue`. Plain `init` means `--client all`: it registers the user-level clients already present, prints a `skipped:` line for each one it passes over, and always prints a `skipped: Kilo Code ...` line. Kilo Code, Roo, VS Code, and Continue are workspace-local: `all` never writes their project files, and it prints nothing at all for Roo, VS Code, and Continue, so run `symforge init --client <name>` from the repository. Naming a client always registers it. `symforge init --scan` reports attach status without writing anything.
+`symforge init` supports 13 MCP clients: `claude`, `claude-desktop`, `codex`, `gemini`, `grok`, `kilo-code`, `cursor`, `omp`, `cline`, `roo`, `vscode`, `copilot`, `continue`. Bare `symforge init` (`--client all`) configures installed user-scope clients, prints `skipped:` for absent ones (always including `skipped: Kilo Code ...`), and never writes workspace-local configs (`kilo-code`, `roo`, `vscode`, `continue`) unless you name `--client <name>` inside that repository. `symforge init --scan` previews HTTP attach state without writing (`--apply --serve-url <URL>` writes it). `--code-skill` writes `symforge-code/SKILL.md` into `~/.claude/skills/` (honoring `CLAUDE_CONFIG_DIR`), `~/.codex/skills/`, and `~/.omp/agent/skills/`.
 
-The same binary also runs `serve` (Streamable HTTP at `/mcp` plus an operator dashboard at `/admin`, default `127.0.0.1:8787`), a shared local `daemon`, `setup`, `admin`, `hook`, `trust`, `analytics`, and `update`.
+Top-level CLI subcommands: `init`, `code` (`run`, `stubs`, `idioms`), `q` (alias `query`), `serve` (Streamable HTTP `/mcp` + `/admin`, default `[IP_ADDRESS]:8787`), `daemon`, `setup`, `admin`, `hook`, `trust`, `analytics`, and `update`.
 
 Details: [Configure a client](https://github.com/special-place-ai-heaven/symforge/wiki/Install-and-Client-Setup#configure-a-client), [Workspace-local clients](https://github.com/special-place-ai-heaven/symforge/wiki/Install-and-Client-Setup#workspace-local-clients), and [Commands](https://github.com/special-place-ai-heaven/symforge/wiki/Install-and-Client-Setup#commands).
 
-## Tools
+## Tools and surfaces
 
-SymForge advertises **40 tools** over MCP `tools/list`; 41 are registered. The forty-first is the compact-surface `symforge` facade, which the full profile filters out because `symforge_retrieve` is its full-surface equivalent. A client reporting 40 is correct.
+`SymForgeServer` registers **43 tools** across four user-selectable `SYMFORGE_SURFACE` (`serve --surface`) profiles:
 
-**Opt-in core profile.** `SYMFORGE_SURFACE=core` lists a smaller set of 13 tools (about 27 KB of `tools/list` instead of 63 KB): `status`, `get_repo_map`, `get_file_context`, `get_file_content`, `search_text`, `search_symbols`, `get_symbol`, `find_references`, `replace_symbol_body`, `edit_within_symbol`, `batch_edit`, `index_folder`, `symforge_retrieve`. The other tools in the table below are not listed there but still answer a call by name (most clients only let the model call listed tools, so this mainly serves hooks and pinned clients); the compact-only `symforge` facade refuses outside `SYMFORGE_SURFACE=compact`.
+- **`full`** (default): **40 tools** (`66,181 B` `tools/list`, ~16.5k tokens), 6 resources, 4 resource templates, 8 prompts; filters out `symforge`, `code_search`, and `code_execute`.
+- **`code`**: **4 tools** (`code_search`, `code_execute`, `symforge_edit`, `status`; **3,980 B**, ~995 tokens), 2 resources (`symforge://tools/catalog`, `symforge://glossary`), 0 resource templates, 8 prompts; rejects calls to any other tool at dispatch.
+- **`core`**: **13 tools** (~28.2 KB: `status`, `get_repo_map`, `get_file_context`, `get_file_content`, `search_text`, `search_symbols`, `get_symbol`, `find_references`, `replace_symbol_body`, `edit_within_symbol`, `batch_edit`, `index_folder`, `symforge_retrieve`), 6 resources, 4 templates, 8 prompts; unlisted full-surface tools stay callable by name for hooks and pinned callers (`symforge` still refuses outside `compact`).
+- **`compact`**: **3 tools** (`symforge`, `symforge_edit`, `status`; **4,552 B**), 6 resources, 4 templates, 8 prompts; rejects calls to any other tool at dispatch.
 
-| Group | Tools |
+| Group | Full-surface tools (40) |
 |---|---|
 | **Orient** | `health` · `health_compact` · `status` · `get_repo_map` · `explore` · `ask` · `conventions` · `context_inventory` · `investigation_suggest` |
 | **Read** | `get_file_context` · `get_file_content` · `get_symbol` · `get_symbol_context` · `inspect_match` |
@@ -146,73 +188,77 @@ SymForge advertises **40 tools** over MCP `tools/list`; 41 are registered. The f
 | **Edit** | `edit_plan` · `replace_symbol_body` · `edit_within_symbol` · `insert_symbol` · `delete_symbol` · `batch_edit` · `batch_insert` · `batch_rename` · `symforge_edit` · `secret_remediate` |
 | **Index** | `index_folder` · `checkpoint_now` |
 
-Alongside the tools: six resources, four resource templates, and eight prompts. The protocol layer is rmcp 3.5.0, serving MCP 2026-07-28 plus every legacy revision back to 2024-11-05 from a frozen allow-list. `SYMFORGE_SURFACE=compact` collapses the surface to three tools (`symforge`, `symforge_edit`, `status`); it is an escape hatch for token-sensitive setups, not the default, and unlike core it refuses calls to any other tool.
+The protocol layer runs on vendored `rmcp 3.10.0`, serving MCP **2026-07-28** alongside `2025-11-25`, `2025-06-18`, `2025-03-26`, and `2024-11-05` from a frozen allow-list.
 
-The seven structural edit tools (`replace_symbol_body`, `edit_within_symbol`, `insert_symbol`, `delete_symbol`, `batch_edit`, `batch_insert`, `batch_rename`) accept an optional `working_directory` naming a sibling git worktree; `symforge_edit` accepts and forwards it without advertising it in its schema. Passing it is explicit routing consent: SymForge validates the worktree, writes there, and reports `wrote_to`, `indexed_path`, and `rerouted`, so parallel agents can each edit their own worktree against one index.
+The seven structural edit tools (`replace_symbol_body`, `edit_within_symbol`, `insert_symbol`, `delete_symbol`, `batch_edit`, `batch_insert`, `batch_rename`) accept an optional `working_directory` naming a sibling git worktree (`symforge_edit` accepts and forwards it unadvertised), e.g. `{"path": "src/lib.rs", "symbol_name": "hello", "new_body": "fn hello() {}", "working_directory": "../feature-wt"}`. Passing `working_directory` is explicit call-time routing consent: SymForge validates the git worktree, writes there without polluting the primary index entry, and reports `wrote_to`, `indexed_path`, and `rerouted` so parallel agents can edit isolated worktrees against one shared index.
 
 Details: [Tool Reference](https://github.com/special-place-ai-heaven/symforge/wiki/Tool-Reference#the-tool-surface), [Protocol](https://github.com/special-place-ai-heaven/symforge/wiki/Tool-Reference#protocol), [Compact surface](https://github.com/special-place-ai-heaven/symforge/wiki/Tool-Reference#compact-surface), and [Runtime Model, Worktree-aware editing](https://github.com/special-place-ai-heaven/symforge/wiki/Runtime-Model#worktree-aware-editing).
 
 ## Embedding
 
-Building with `--no-default-features --features embed` compiles the parsing, indexing, search, editing, and git core without the daemon, sidecar, protocol server, or CLI, so server-side breakage cannot reach an embedder.
+Building with `--no-default-features --features embed` compiles the parsing, indexing, search, editing, and git core without the daemon, sidecar, protocol server, Monty sandbox, or CLI:
 
 ```toml
-symforge = { version = "11", default-features = false, features = ["embed"] }
+symforge = { version = "12", default-features = false, features = ["embed"] }
 ```
 
-Open one `EmbeddedSourceHandle` through `ProcessIndexRuntime`: search returns claims with provenance, refresh returns a receipt, and refusals are a typed `SourceRefusalKind`. `symforge::embed` is semver-public and pinned by a compile-time contract test. `symforge::embed::parity` (versioned by its own `API_VERSION`) serves every MCP tool, resource, and prompt natively; known differences are in the [parity census](./docs/reviews/2026-10-10-embed-parity-gap-matrix.md). Moving from 10.x: [docs/migrations/v11-index-lifecycle.md](./docs/migrations/v11-index-lifecycle.md).
+Open an `EmbeddedSourceHandle` via `ProcessIndexRuntime`: search returns claims with provenance, refresh returns a receipt, and refusals use `SourceRefusalKind`. `symforge::embed` is semver-public and pinned by compile-time contract tests; `symforge::embed::parity` (versioned by `API_VERSION`) exposes the MCP tool, resource, and prompt contracts in-process (known gaps in the [parity census](./docs/reviews/2026-10-10-embed-parity-gap-matrix.md); V11 lifecycle migration notes in [docs/migrations/v11-index-lifecycle.md](./docs/migrations/v11-index-lifecycle.md)).
 
 Details: [Embedding the Engine, Build and dependency](https://github.com/special-place-ai-heaven/symforge/wiki/Embedding-the-Engine#build-and-dependency) and [MCP parity](https://github.com/special-place-ai-heaven/symforge/wiki/Embedding-the-Engine#mcp-parity-embedparity).
 
 ## Index lifecycle and recovery
 
-The 11.x binary runs the **preventive index lifecycle**: incomplete observations cannot publish as current, candidates promote only when complete, and an answer that is not current says so. Snapshot format 10 is current. A snapshot written by 10.x (format 7), or any older format, is an untrusted seed and is never restored as current. On load a copy lands under `.symforge/v11/quarantine/index-snapshots/`; the first snapshot write after that moves the original into `.symforge/quarantine/index-snapshots/` and refuses that one write. Rolling back to 10.x means copying a preserved `.bin` back to `.symforge/index.bin`.
+The 12.x engine runs the **preventive index lifecycle** introduced in V11: incomplete observations never publish as current, candidates promote only when complete, and unverified answers declare their state. **Snapshot format 11** is current (`SNAPSHOT_FORMAT_VERSION = 11`: format 10 bound the secret-dismissal store digest; format 11 appends a SHA-256 checksum over every serialized snapshot field). Snapshots below format 11 are refused before full decode and never restored as current; V10 format-7 seeds preserve rollback copies under `.symforge/v11/quarantine/index-snapshots/`. Source files that merely name credential identifiers are indexed normally, while files withheld for secret values report rule IDs and line numbers in `_meta["symforge/withheld"]` and text notices without exposing secret bytes.
 
-**When a snapshot goes wrong:** `checkpoint_now(verify_after_write=true)` forces a byte-exact write and verification; `health` or `health_compact` report the load source, verification state, and mismatch paths; corrupt or version-incompatible snapshots are preserved under `.symforge/quarantine/index-snapshots/` with metadata rather than served. Rebuilding from source is deliberately explicit: run the serving process with `SYMFORGE_INDEX_FOLDER_RESET=1`, then call `index_folder`; while the variable is set every `index_folder` call resets, so unset it afterwards. Use `index_folder` reset when health, verification, or quarantine evidence shows the snapshot is not a valid recovery source. `repair_index` is intentionally retired; `get_index_run` and `cancel_index_run` remain retired. No durable run IDs are exposed: recovery is a sequence you drive, not a job you poll.
+**Recovery:** `checkpoint_now(verify_after_write=true)` writes and verifies byte-for-byte; `health` and `health_compact` report load source, verification state, and mismatch paths; corrupt or incompatible snapshots move to `.symforge/quarantine/index-snapshots/`. To force a cold rebuild from source, start the server with `SYMFORGE_INDEX_FOLDER_RESET=1`, call `index_folder`, and unset the variable afterwards (`repair_index`, `get_index_run`, and `cancel_index_run` are retired).
 
 Details: [Runtime Model, Index lifecycle (V11)](https://github.com/special-place-ai-heaven/symforge/wiki/Runtime-Model#index-lifecycle-v11) and [Recovery](https://github.com/special-place-ai-heaven/symforge/wiki/Runtime-Model#recovery).
 
 ## Configuration
 
-Workspace state lives under `.symforge/`: the snapshot and its quarantine, pre-write `tee/` copies, idempotency records, and the optional frecency and coupling databases. The 11.7.0 server records no analytics and creates no analytics database. Nothing leaves the machine. The variables you are most likely to want:
+Workspace state lives under `.symforge/`: `index.bin` and `quarantine/`, pre-write `tee/` copies, `idempotency/` records, and optional `frecency.db` and `coupling.db` stores. The 12.0.0 server records no analytics and creates no `analytics.db`. Nothing leaves the machine.
 
 | Variable | Effect |
 |---|---|
-| `SYMFORGE_HOME` | Home for the installed binary and daemon metadata (default `~/.symforge`) |
-| `SYMFORGE_SURFACE` | `compact` collapses `tools/list` to three tools and `core` lists 13; default `full`. `symforge init` writes it into each client's `env` block, which wins over the shell |
-| `SYMFORGE_TOOLS` | Per-process tool allow-list: comma-separated tool names or groups (`read`, `edit`, `knowledge`, `impact`, `service`). Only those are listed and callable (resources and `ask` routes included), with full descriptions. Groups are by topic, to cut context cost, not a permission boundary: `secret_remediate`, `index_folder` and `curate_knowledge` write outside `edit`; `serve --tools <list>` does the same and overrides it. It filters the full surface, so `SYMFORGE_SURFACE=core`/`compact` beside it is reported as a conflict. Unknown names make `serve` refuse to start and appear in `status` on stdio. It governs MCP tools and resources only; the hook and sidecar routes that feed client hooks (outline, repo map, impact data) are not covered. Not used by the embed lane |
-| `SYMFORGE_NO_DAEMON` | Any value other than empty or `0` forces local in-process mode; `symforge init` sets it to `1` for Codex on Linux |
-| `SYMFORGE_DAEMON_AUTH_TOKEN` | Bearer token the daemon requires on every route except `/health`; generated at daemon start when unset |
-| `SYMFORGE_INDEXING_THREADS` | Worker count of each of the two thread pools (indexing and query), so up to twice this many workers exist; for tight-RAM hosts and PID-1 embedders; default is rayon's |
-| `SYMFORGE_WORKTREE_AWARE` | Worktree routing for edit calls that pass `working_directory`; enabled when unset, and any value other than empty, `1`, `true`, `yes`, `on`, or `explicit` turns it off |
+| `SYMFORGE_HOME` | Control-plane home for daemon metadata and locks (default `~/.symforge`) |
+| `SYMFORGE_SURFACE` | MCP surface profile: `full` (40 tools, default), `code` (4 tools), `core` (13 tools), or `compact` (3 tools). `serve --surface` overrides it for that process; `symforge init` records any active value in the client's `env` block |
+| `SYMFORGE_TOOLS` | Per-process allow-list of comma-separated full-surface tool names or topic groups (`read`, `edit`, `knowledge`, `impact`, `service`); `serve --tools <list>` overrides it. Filters `full` (not a read-only sandbox: `secret_remediate`, `index_folder`, and `curate_knowledge` write outside `edit`), conflicts with `SYMFORGE_SURFACE=code`/`core`/`compact`, fails startup on `serve` when empty/unknown, and does not govern hooks, CLI, or `embed` |
+| `SYMFORGE_NO_DAEMON` | Any value other than empty, `0`, or `false` forces local in-process mode (`symforge init` sets `1` for Codex on Linux) |
+| `SYMFORGE_DAEMON_AUTH_TOKEN` | Bearer token required by the daemon on every route except `/health` (generated at daemon start when unset) |
+| `SYMFORGE_INDEXING_THREADS` | Worker count for each of the two rayon pools (indexing and query, up to 2× workers total); useful on tight-RAM hosts and PID-1 containers |
+| `SYMFORGE_WORKTREE_AWARE` | Controls `working_directory` edit routing; enabled when unset, disabled by any value other than empty, `1`, `true`, `yes`, `on`, or `explicit` |
 
-`symforge serve --project ALIAS=PATH` (repeatable) serves several repositories from one process; a client picks one with `project: ALIAS` (case-insensitive) and searches several with `projects` on `search_symbols`, `search_text`, `find_references` and `search_files` (each repository is named in its own section header; the answer carries no single-repository evidence). Resource URIs take `?project=ALIAS`. With more than one listed, a call without `project` is refused with the list of aliases, except `status`, `health` and `health_compact`, which then list every repository's state; prompts are not served. Roots must not be equal or nested, and edit tools do not reroute into a worktree outside the listed roots. Without `--project`, serve indexes the working directory's repository as before. The set is fixed by the operator: a client `index_folder` is refused unless `--allow-index-folder` is passed, which is accepted for one repository only. Each repository gets its own file watcher at startup, and `health` with its `project` reports that watcher's state.
+`symforge serve --project ALIAS=PATH` (repeatable) serves multiple non-nested repositories from one HTTP process. Clients pass `project: ALIAS` (or `projects` on `search_symbols`, `search_text`, `find_references`, and `search_files`; `?project=ALIAS` on resources). With multiple projects configured, omitting `project` is refused except on `status`, `health`, and `health_compact`; prompts and `index_folder` are disabled (`--allow-index-folder` enables `index_folder` for single-project `serve` only), and worktree edits cannot route outside listed roots.
 
 > [!WARNING]
-> The daemon and `serve` HTTP are local coordination surfaces, not remote production APIs. The daemon binds loopback only unless `SYMFORGE_DAEMON_ALLOW_NON_LOOPBACK` is set, and that opt-in warns.
+> The daemon and `serve` HTTP are local coordination surfaces, not public internet APIs. The daemon binds loopback only unless `SYMFORGE_DAEMON_ALLOW_NON_LOOPBACK` is set, which logs an explicit warning.
 
 Details: [Environment Setup Scripts, Variable reference](https://github.com/special-place-ai-heaven/symforge/wiki/Environment-Setup-Scripts#variable-reference), [Network exposure](https://github.com/special-place-ai-heaven/symforge/wiki/Environment-Setup-Scripts#network-exposure), and [Runtime Model, Serving modes](https://github.com/special-place-ai-heaven/symforge/wiki/Runtime-Model#serving-modes).
 
 ## Benchmarks
 
-The recorded evidence is thin, and the wiki says so. The only token measurement from the 11.x line, a five-pair cohort dated 2026-10-05, during the 11.x line, is inconclusive: in total the SymForge-available sessions used 603,609 fewer tokens (3,198,434 against 2,594,825), but the paired median was -40,011 and three of five pairs cost more, so the predeclared rule (positive total and positive median) returns `NO_WIN`. The one positive end-to-end result, 24.8% fewer tokens, was measured on 8.14.1, and its own report limits what it proves. No general percentage is claimed.
+SymForge reports both wins and losses rather than claiming a blanket percentage:
+
+- **2026-11-09 Product Audit** ([`docs/reviews/2026-11-09-product-audit/AUDIT.md`](./docs/reviews/2026-11-09-product-audit/AUDIT.md), 36 paired runs across Sonnet and Haiku on 11.x): measured **17,300 tokens (`69,295 B`)** of upfront schema overhead on the 40-tool `full` surface (`66,181 B` / ~16.5k tokens in 12.0.0). SymForge retrieved **39–76% less content in up to 4× fewer calls** on caller/reference tracing and symbol lookup, but **32–535% more content** on literal counting and nearby single-file reads, yielding a confound-adjusted **2–12% net difference** on mixed read tasks with no round-trip reduction. Those findings directly drove V12's `code` surface (**3,980 B / ~995 tokens**, −94.0% schema overhead) and single-turn `code_execute` / `symforge q` chaining.
+- **Earlier cohorts:** the 2026-10-05 five-pair 11.x cohort returned `NO_WIN` (−603,609 total tokens, −40,011 paired median where three of five pairs cost more); the 8.14.1 two-pair benchmark measured −24.8% tokens within a narrow scope.
+- **Standing 5-arm benchmark** ([`research/token-benchmark/`](./research/token-benchmark), CI-tested): compares native tools, steered/unsteered `full` MCP, `SYMFORGE_SURFACE=code`, and zero-MCP `symforge-code` CLI skill across repositories with path-scoped rule confounds tracked. Live 5-arm V12 cohort runs have not yet been published, so no general V12 net percentage is claimed.
 
 Details: [Benchmarks and Token Savings, What is recorded](https://github.com/special-place-ai-heaven/symforge/wiki/Benchmarks-and-Token-Savings#what-is-recorded) and [Where the evidence says it does not help](https://github.com/special-place-ai-heaven/symforge/wiki/Benchmarks-and-Token-Savings#where-the-evidence-says-it-does-not-help).
 
 ## Development
 
-SymForge parses 19 languages with tree-sitter grammars plus 6 text and config formats with native parsers. The toolchain is pinned by [`rust-toolchain.toml`](./rust-toolchain.toml) (Rust 1.100.0, edition 2024).
+SymForge parses 19 languages with tree-sitter grammars plus 6 configuration and text formats with native parsers (25 `LanguageId`s). The toolchain is pinned in [`rust-toolchain.toml`](./rust-toolchain.toml) to **Rust 1.100.0** (edition 2024, `rustfmt`, `clippy`).
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --lib --bins --tests -- --test-threads=1
+cargo test --no-default-features --features embed --lib --tests -- --test-threads=1
 cargo bench --bench observed_refresh_gate_v1 -- --test
-cargo build --release
 cd npm && npm test
 ```
 
-Do not pass `--all-targets` to `cargo test` with `--test-threads=1`; the criterion bench rejects the flag. Run the embed-feature suite in its own pass. PR CI also runs version sync, the embed build for glibc and musl, a macOS serve-port test, a `windows-native` job, npm tests, and the tool-correctness harness against the release binary. Releases are driven by Release Please on `main`.
+Do not combine `--all-targets` with `--test-threads=1` on `cargo test`; the Criterion benchmark target rejects that flag. Pull-request CI runs on Linux custom runners (`lint`, `conventional-commits`, `release-version` including version sync, V11 refreeze, `test_release_please.cjs`, and `research/token-benchmark` tests, `test-build` / `serial-suite`, `bench`, `release-build`, `embed-build`, `embed-musl`, `server-embed-parity`, `performance-smoke`, `advisories`, `npm`) plus sharded `windows-native` jobs on GitHub-hosted Windows runners. Releases on `main` are automated via Release Please.
 
 Details: [Supported Languages, Language table](https://github.com/special-place-ai-heaven/symforge/wiki/Supported-Languages-and-Config-Formats#language-table), [Development, Test](https://github.com/special-place-ai-heaven/symforge/wiki/Development#test), [CI gates on pull requests](https://github.com/special-place-ai-heaven/symforge/wiki/Development#ci-gates-on-pull-requests), and [Releases](https://github.com/special-place-ai-heaven/symforge/wiki/Development#releases).
 
