@@ -582,6 +582,12 @@ pub fn execute_op_on_generation(
                     .into_iter()
                     .take(cap)
                     .map(|entry| {
+                        let enc_line = generation.live.get_file(&entry.file_path).and_then(|f| {
+                            f.symbols
+                                .iter()
+                                .find(|s| s.name == entry.implementor)
+                                .map(|s| s.line_range.0.saturating_add(1))
+                        });
                         json!({
                             "path": entry.file_path,
                             "line": entry.line,

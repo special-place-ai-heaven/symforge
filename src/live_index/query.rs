@@ -236,7 +236,12 @@ fn declared_scope(file: &IndexedFile) -> Option<String> {
 
 fn parse_declared_scope(content: &str, keyword: &str) -> Option<String> {
     content.lines().find_map(|line| {
-        let trimmed = line.split("//").next().unwrap_or("").trim();
+        let trimmed = line
+            .trim_start_matches('\u{feff}')
+            .split("//")
+            .next()
+            .unwrap_or("")
+            .trim();
         let rest = trimmed.strip_prefix(keyword)?.trim_start();
         let scope: String = rest
             .chars()
@@ -299,6 +304,556 @@ fn can_match_type_dependents(
         }
         _ => false,
     }
+}
+
+fn same_parent_dir(a: &str, b: &str) -> bool {
+    let norm_a = a.replace('\\', "/");
+    let norm_b = b.replace('\\', "/");
+    let dir_a = norm_a.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let dir_b = norm_b.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    dir_a == dir_b
+}
+
+fn csharp_namespace_in_scope(
+    ref_file: &IndexedFile,
+    target_ns: Option<&str>,
+    global_usings: &HashSet<String>,
+) -> bool {
+    let Some(ns) = target_ns else {
+        return true;
+    };
+    if let Some(decl) = declared_scope(ref_file)
+        && (decl == ns || decl.starts_with(&format!("{ns}.")))
+    {
+        return true;
+    }
+    if global_usings.contains(ns) {
+        return true;
+    }
+    ref_file
+        .references
+        .iter()
+        .filter_map(|r| imported_scope(&LanguageId::CSharp, r))
+        .any(|s| s == ns)
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn skip_ws_inline(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
+/// Inspect whether `container`'s header declares generic type parameters (`<...>` or `[...]`)
+/// immediately after `type_name`.
+fn container_has_generic_params(
+    file: &IndexedFile,
+    container: &SymbolRecord,
+    type_name: &str,
+) -> bool {
+    let start = (container.byte_range.0 as usize).min(file.content.len());
+    let end = (container.byte_range.1 as usize)
+        .min(file.content.len())
+        .min(start.saturating_add(240));
+    let header = String::from_utf8_lossy(&file.content[start..end]);
+    let bytes = header.as_bytes();
+    let needle = type_name.as_bytes();
+    let mut pos = 0usize;
+    while pos + needle.len() <= bytes.len() {
+        if &bytes[pos..pos + needle.len()] == needle {
+            let prev_ok = pos == 0 || !is_ident_byte(bytes[pos - 1]);
+            let after = pos + needle.len();
+            let next_ok = after == bytes.len() || !is_ident_byte(bytes[after]);
+            if prev_ok && next_ok {
+                let k = skip_ws_inline(bytes, after);
+                return k < bytes.len() && bytes[k] == b'<';
+            }
+        }
+        pos += 1;
+    }
+    false
+}
+
+/// Return `(type_name, has_generic_params)` for the innermost type/impl container
+/// enclosing `symbol` (including Go method receivers `func (r *Type) Name`).
+fn enclosing_container_type(file: &IndexedFile, symbol: &SymbolRecord) -> Option<(String, bool)> {
+    if file.language == LanguageId::Go && symbol.kind == SymbolKind::Method {
+        let start = (symbol.byte_range.0 as usize).min(file.content.len());
+        let end = (symbol.byte_range.1 as usize)
+            .min(file.content.len())
+            .min(start.saturating_add(200));
+        let sig = String::from_utf8_lossy(&file.content[start..end]);
+        if let Some(after_func) = sig.strip_prefix("func") {
+            let trimmed = after_func.trim_start();
+            if let Some(rest) = trimmed.strip_prefix('(')
+                && let Some((recv_spec, _)) = rest.split_once(')')
+            {
+                let ty_part = recv_spec
+                    .split_whitespace()
+                    .last()
+                    .unwrap_or("")
+                    .trim_start_matches('*');
+                let (base, has_gen) = match ty_part.split_once('[') {
+                    Some((b, _)) => (b.trim(), true),
+                    None => (ty_part.trim(), false),
+                };
+                if !base.is_empty() {
+                    return Some((base.to_string(), has_gen));
+                }
+            }
+        }
+    }
+
+    let mut best: Option<&SymbolRecord> = None;
+    for cand in &file.symbols {
+        if cand.byte_range == symbol.byte_range {
+            continue;
+        }
+        if cand.line_range.0 <= symbol.line_range.0
+            && symbol.line_range.1 <= cand.line_range.1
+            && super::disambiguation::container_target_type(cand).is_some()
+            && best.is_none_or(|prev| cand.line_range.0 >= prev.line_range.0)
+        {
+            best = Some(cand);
+        }
+    }
+    let container = best?;
+    let ty = super::disambiguation::container_target_type(container)?.to_string();
+    let is_gen = container_has_generic_params(file, container, &ty);
+    Some((ty, is_gen))
+}
+
+fn is_non_type_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "var"
+            | "let"
+            | "const"
+            | "val"
+            | "def"
+            | "fn"
+            | "func"
+            | "return"
+            | "await"
+            | "new"
+            | "public"
+            | "private"
+            | "protected"
+            | "internal"
+            | "static"
+            | "readonly"
+            | "async"
+            | "sealed"
+            | "override"
+            | "virtual"
+            | "abstract"
+            | "partial"
+            | "class"
+            | "struct"
+            | "interface"
+            | "enum"
+            | "using"
+            | "import"
+            | "package"
+            | "namespace"
+            | "if"
+            | "else"
+            | "for"
+            | "foreach"
+            | "while"
+            | "switch"
+            | "case"
+            | "yield"
+            | "throw"
+            | "in"
+            | "out"
+            | "ref"
+            | "params"
+    )
+}
+
+/// Check whether `file.content` mentions `target_ty` as a whole identifier token,
+/// honoring `target_is_generic` (`Type<...>` vs non-generic `Type`) in C#/Java.
+fn file_mentions_type_token(file: &IndexedFile, target_ty: &str, target_is_generic: bool) -> bool {
+    let bytes = &file.content;
+    let needle = target_ty.as_bytes();
+    if needle.is_empty() || bytes.len() < needle.len() {
+        return false;
+    }
+    let check_arity = matches!(file.language, LanguageId::CSharp | LanguageId::Java);
+    let mut pos = 0usize;
+    while pos + needle.len() <= bytes.len() {
+        if &bytes[pos..pos + needle.len()] == needle {
+            let prev_ok = pos == 0 || !is_ident_byte(bytes[pos - 1]);
+            let after = pos + needle.len();
+            let next_ok = after == bytes.len() || !is_ident_byte(bytes[after]);
+            if prev_ok && next_ok {
+                if !check_arity {
+                    return true;
+                }
+                let k = skip_ws_inline(bytes, after);
+                let has_angle = k < bytes.len() && bytes[k] == b'<';
+                if has_angle == target_is_generic {
+                    return true;
+                }
+            }
+        }
+        pos += 1;
+    }
+    false
+}
+
+/// Resolve explicit type declaration for `ident` in `file` (field, parameter, or local).
+/// Returns `Some((base_type_name, has_generic_args))` when an explicit declaration is present.
+fn find_explicit_decl_type_in_file(file: &IndexedFile, ident: &str) -> Option<(String, bool)> {
+    let text = String::from_utf8_lossy(&file.content);
+    for raw_line in text.lines() {
+        let line = raw_line.split("//").next().unwrap_or("");
+        if !line.contains(ident) {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        let needle = ident.as_bytes();
+        let mut pos = 0usize;
+        while pos + needle.len() <= bytes.len() {
+            if &bytes[pos..pos + needle.len()] == needle {
+                let prev_ok = pos == 0 || !is_ident_byte(bytes[pos - 1]);
+                let after = pos + needle.len();
+                let next_ok = after == bytes.len() || !is_ident_byte(bytes[after]);
+                if prev_ok && next_ok {
+                    match file.language {
+                        LanguageId::Rust
+                        | LanguageId::TypeScript
+                        | LanguageId::JavaScript
+                        | LanguageId::Python
+                        | LanguageId::Kotlin => {
+                            // `ident: [&mut ]Type<...>`
+                            let k = skip_ws_inline(bytes, after);
+                            if k < bytes.len()
+                                && bytes[k] == b':'
+                                && bytes.get(k + 1) != Some(&b':')
+                            {
+                                let mut t = line[k + 1..].trim_start();
+                                for pfx in ["&mut ", "&", "readonly "] {
+                                    if let Some(rest) = t.strip_prefix(pfx) {
+                                        t = rest.trim_start();
+                                    }
+                                }
+                                let ty_ident: String = t
+                                    .chars()
+                                    .take_while(|c| {
+                                        c.is_ascii_alphanumeric() || *c == '_' || *c == ':'
+                                    })
+                                    .collect();
+                                let base = ty_ident.rsplit("::").next().unwrap_or(&ty_ident);
+                                if !base.is_empty() && !is_non_type_keyword(base) {
+                                    let rem = t[ty_ident.len()..].trim_start();
+                                    return Some((base.to_string(), rem.starts_with('<')));
+                                }
+                            }
+                        }
+                        LanguageId::Go => {
+                            // `ident *Type` or `ident Type` in parameter/var list
+                            let k = skip_ws_inline(bytes, after);
+                            if k > after && k < bytes.len() {
+                                let t = line[k..].trim_start_matches('*');
+                                let ty_ident: String = t
+                                    .chars()
+                                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                                    .collect();
+                                if !ty_ident.is_empty()
+                                    && ty_ident.as_bytes()[0].is_ascii_uppercase()
+                                    && !is_non_type_keyword(&ty_ident)
+                                {
+                                    let rem = t[ty_ident.len()..].trim_start();
+                                    return Some((ty_ident, rem.starts_with('[')));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    if matches!(file.language, LanguageId::CSharp | LanguageId::Java) && pos > 0 {
+                        // Walk left of `ident`: `TypeName(<...>)?[?] ident`
+                        let left = line[..pos].trim_end();
+                        if !left.ends_with('.') && !left.ends_with("::") {
+                            let left = left.strip_suffix('?').unwrap_or(left).trim_end();
+                            let (before_gen, has_gen) = if left.ends_with('>') {
+                                let mut depth = 0i32;
+                                let mut open_idx = None;
+                                for (idx, ch) in left.char_indices().rev() {
+                                    if ch == '>' {
+                                        depth += 1;
+                                    } else if ch == '<' {
+                                        depth -= 1;
+                                        if depth == 0 {
+                                            open_idx = Some(idx);
+                                            break;
+                                        }
+                                    }
+                                }
+                                match open_idx {
+                                    Some(idx) => (left[..idx].trim_end(), true),
+                                    None => ("", false),
+                                }
+                            } else {
+                                (left, false)
+                            };
+                            let ty_ident: String = before_gen
+                                .chars()
+                                .rev()
+                                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                                .collect::<String>()
+                                .chars()
+                                .rev()
+                                .collect();
+                            if !ty_ident.is_empty()
+                                && ty_ident.as_bytes()[0].is_ascii_uppercase()
+                                && !is_non_type_keyword(&ty_ident)
+                            {
+                                return Some((ty_ident, has_gen));
+                            }
+                        }
+                    }
+                }
+            }
+            pos += 1;
+        }
+    }
+    None
+}
+
+enum ReceiverCheck {
+    Exact,
+    Contradicted,
+    Unknown,
+}
+
+/// Inspect the receiver expression immediately preceding `reference` in `ref_file`.
+fn classify_call_receiver(
+    ref_file: &IndexedFile,
+    reference: &ReferenceRecord,
+    target_ty: &str,
+    target_is_generic: bool,
+) -> ReceiverCheck {
+    if ref_file.content.is_empty() {
+        return ReceiverCheck::Unknown;
+    }
+    let call_start = (reference.byte_range.0 as usize).min(ref_file.content.len());
+    let line_start = ref_file.content[..call_start]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let prefix = String::from_utf8_lossy(&ref_file.content[line_start..call_start]);
+    let trimmed = prefix.trim_end();
+    let check_arity = matches!(ref_file.language, LanguageId::CSharp | LanguageId::Java);
+    let matches_target = |ty: &str, has_gen: bool| -> bool {
+        ty == target_ty && (!check_arity || has_gen == target_is_generic)
+    };
+
+    // `Type::method(...)`
+    if let Some(before_colons) = trimmed.strip_suffix("::") {
+        let seg: String = before_colons
+            .trim_end()
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if seg.is_empty() || seg == "Self" || seg == "self" {
+            return ReceiverCheck::Unknown;
+        }
+        return if seg == target_ty {
+            ReceiverCheck::Exact
+        } else {
+            ReceiverCheck::Contradicted
+        };
+    }
+
+    // Unqualified `Method(...)` (no `.` before call)
+    let Some(before_dot) = trimmed.strip_suffix('.') else {
+        let enc = reference
+            .enclosing_symbol_index
+            .and_then(|idx| ref_file.symbols.get(idx as usize))
+            .and_then(|sym| enclosing_container_type(ref_file, sym));
+        if let Some((enc_ty, enc_gen)) = enc {
+            if matches_target(&enc_ty, enc_gen) {
+                return ReceiverCheck::Exact;
+            }
+            let derives = ref_file.references.iter().any(|r| {
+                r.kind == ReferenceKind::Implements
+                    && r.name == target_ty
+                    && r.qualified_name.as_deref() == Some(enc_ty.as_str())
+            });
+            return if derives {
+                ReceiverCheck::Exact
+            } else {
+                ReceiverCheck::Contradicted
+            };
+        }
+        return ReceiverCheck::Contradicted;
+    };
+
+    let recv = before_dot
+        .trim_end()
+        .trim_end_matches(['!', '?'])
+        .trim_end();
+
+    let trailing_ident: String = recv
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    let before_trailing = recv[..recv.len() - trailing_ident.len()].trim_end();
+    let is_standalone_ident =
+        !trailing_ident.is_empty() && !before_trailing.ends_with(['.', ':', ')', '>', ']']);
+
+    // 1. `this` / `self` / `base` / `super`
+    if is_standalone_ident && matches!(trailing_ident.as_str(), "this" | "self" | "base" | "super")
+    {
+        let enc = reference
+            .enclosing_symbol_index
+            .and_then(|idx| ref_file.symbols.get(idx as usize))
+            .and_then(|sym| enclosing_container_type(ref_file, sym));
+        if let Some((enc_ty, enc_gen)) = enc {
+            if matches_target(&enc_ty, enc_gen) {
+                return ReceiverCheck::Exact;
+            }
+            let derives = ref_file.references.iter().any(|r| {
+                r.kind == ReferenceKind::Implements
+                    && r.name == target_ty
+                    && r.qualified_name.as_deref() == Some(enc_ty.as_str())
+            });
+            return if derives {
+                ReceiverCheck::Exact
+            } else {
+                ReceiverCheck::Contradicted
+            };
+        }
+        return ReceiverCheck::Unknown;
+    }
+
+    // 2. Explicit cast `((Type<...>?)expr)`
+    if recv.ends_with(')')
+        && let Some(open_outer) = recv.rfind("((")
+    {
+        let inner = &recv[open_outer + 2..];
+        if let Some((cast_ty_raw, _)) = inner.split_once(')') {
+            let cast_trimmed = cast_ty_raw.trim().trim_end_matches('?');
+            let (base, has_gen) = match cast_trimmed.split_once('<') {
+                Some((b, _)) => (b.trim(), true),
+                None => (cast_trimmed, false),
+            };
+            if !base.is_empty() && base.as_bytes()[0].is_ascii_uppercase() {
+                return if matches_target(base, has_gen) {
+                    ReceiverCheck::Exact
+                } else {
+                    ReceiverCheck::Contradicted
+                };
+            }
+        }
+    }
+    if recv.ends_with(')')
+        && let Some(open_p) = recv.rfind('(')
+    {
+        let fn_tok: String = recv[..open_p]
+            .trim_end()
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if let Some(conv_ty) = fn_tok.strip_prefix("As")
+            && !conv_ty.is_empty()
+            && conv_ty.as_bytes()[0].is_ascii_uppercase()
+            && conv_ty != target_ty
+            && conv_ty != "Pipeline"
+        {
+            return ReceiverCheck::Contradicted;
+        }
+    }
+
+    // 3. `Type.StaticProp` chain (e.g. `ResiliencePipeline.Empty` vs `ResiliencePipeline<string>.Empty`)
+    if let Some((head, prop)) = recv.rsplit_once('.') {
+        let prop_trimmed = prop.trim();
+        if !prop_trimmed.is_empty()
+            && prop_trimmed
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            let head_trimmed = head.trim();
+            let (base_raw, has_gen) = if head_trimmed.ends_with('>') {
+                match head_trimmed.rsplit_once('<') {
+                    Some((b, _)) => (b.trim(), true),
+                    None => (head_trimmed, false),
+                }
+            } else {
+                (head_trimmed, false)
+            };
+            let ty_ident: String = base_raw
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            if !ty_ident.is_empty() && ty_ident.as_bytes()[0].is_ascii_uppercase() {
+                if matches_target(&ty_ident, has_gen) {
+                    return ReceiverCheck::Exact;
+                }
+                if let Some((decl_ty, decl_gen)) =
+                    find_explicit_decl_type_in_file(ref_file, &ty_ident)
+                {
+                    return if matches_target(&decl_ty, decl_gen) {
+                        ReceiverCheck::Exact
+                    } else {
+                        ReceiverCheck::Contradicted
+                    };
+                }
+                if ty_ident == target_ty {
+                    return ReceiverCheck::Contradicted;
+                }
+            }
+        }
+    }
+
+    // 4. Direct identifier receiver `ident.Method(...)` (field, parameter, local, or static class)
+    if is_standalone_ident {
+        let ident = &trailing_ident;
+        if let Some((decl_ty, decl_gen)) = find_explicit_decl_type_in_file(ref_file, ident) {
+            if matches_target(&decl_ty, decl_gen) {
+                return ReceiverCheck::Exact;
+            }
+            let derives = ref_file.references.iter().any(|r| {
+                r.kind == ReferenceKind::Implements
+                    && r.name == target_ty
+                    && r.qualified_name.as_deref() == Some(decl_ty.as_str())
+            });
+            return if derives {
+                ReceiverCheck::Exact
+            } else {
+                ReceiverCheck::Contradicted
+            };
+        }
+        if ident.as_bytes()[0].is_ascii_uppercase() && matches_target(ident, false) {
+            return ReceiverCheck::Exact;
+        }
+    }
+
+    ReceiverCheck::Unknown
 }
 
 fn matches_target_stem(text: &str, stem: &str) -> bool {
@@ -2262,14 +2817,32 @@ impl LiveIndex {
         let target_scope = declared_scope(file);
         let target_container = enclosing_container_type(file, target_symbol);
 
-        // Index of the target symbol within its own file's symbol list. Used to
-        // suppress the SF-002 self-member-call false positive: a method whose
-        // body calls a same-named member on another object (e.g. TS
-        // `this.service.foo()` from `Controller.foo`) must not be reported as
-        // its own caller. We reject a same-file `Call` ref only when it is
-        // BOTH enclosed by the target itself AND a receiver method call. Bare
-        // intra-body recursion (`foo()`) and same-named `this.foo()` calls from
-        // OTHER methods are deliberately preserved as legitimate callers.
+        let csharp_global_usings: HashSet<String> = if file.language == LanguageId::CSharp {
+            let mut set = HashSet::new();
+            for f in self.files.values() {
+                if f.language == LanguageId::CSharp
+                    && f.content.windows(12).any(|w| w == b"global using")
+                {
+                    for line in String::from_utf8_lossy(&f.content).lines() {
+                        let trimmed = line.split("//").next().unwrap_or("").trim();
+                        if let Some(rest) = trimmed.strip_prefix("global using ") {
+                            let ns: String = rest
+                                .trim_start()
+                                .chars()
+                                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+                                .collect();
+                            if !ns.is_empty() {
+                                set.insert(ns);
+                            }
+                        }
+                    }
+                }
+            }
+            set
+        } else {
+            HashSet::new()
+        };
+
         let target_symbol_index = file
             .symbols
             .iter()
@@ -2312,20 +2885,105 @@ impl LiveIndex {
         let dependent_refs = self.find_dependents_for_file(path);
         let dependent_paths: HashSet<&str> = dependent_refs.iter().map(|(fp, _)| *fp).collect();
 
-        refs.extend(dependent_refs.into_iter().filter(|(file_path, reference)| {
-            let reference_file = self.get_file(file_path);
-            matches_exact_symbol_reference(
-                reference,
-                target_name,
-                &file.language,
-                target_symbol.kind,
-                module_path.as_deref(),
-                reference_file,
-                kind_filter,
-            )
-        }));
+        let evaluate_cross_file =
+            |ref_path: &'a str, ref_record: &'a ReferenceRecord| -> Option<&'static str> {
+                let ref_file = self.get_file(ref_path)?;
+                if !import_languages_compatible(&ref_file.language, &file.language) {
+                    return None;
+                }
+                if !matches_exact_symbol_reference(
+                    ref_record,
+                    target_name,
+                    &file.language,
+                    target_symbol.kind,
+                    module_path.as_deref(),
+                    Some(ref_file),
+                    kind_filter,
+                ) {
+                    return None;
+                }
 
-        // Also check the reverse index for the target name.
+                let is_dep = dependent_paths.contains(ref_path);
+                let is_qual_exact = ref_record.qualified_name.as_deref().is_some_and(|qn| {
+                    matches_qualified_name_from(
+                        Some((ref_file, ref_record)),
+                        &file.language,
+                        qn,
+                        target_name,
+                        module_path.as_deref(),
+                    )
+                });
+                let same_go_pkg = file.language == LanguageId::Go
+                    && ref_file.language == LanguageId::Go
+                    && same_parent_dir(path, ref_path);
+
+                if ref_record.kind != ReferenceKind::Call {
+                    return if is_dep || is_qual_exact || same_go_pkg {
+                        Some("exact")
+                    } else {
+                        None
+                    };
+                }
+
+                // Free / module-level callable (not enclosed by a type/impl container)
+                let Some((ref target_ty, target_gen)) = target_container else {
+                    if is_dep || is_qual_exact {
+                        return Some("exact");
+                    }
+                    if same_go_pkg && !is_receiver_method_call(ref_file, ref_record) {
+                        return Some("exact");
+                    }
+                    return None;
+                };
+
+                // Method / associated callable on `target_ty`
+                let same_partial_type = ref_file.symbols.iter().any(|s| {
+                    super::disambiguation::container_target_type(s) == Some(target_ty.as_str())
+                        && (!matches!(ref_file.language, LanguageId::CSharp | LanguageId::Java)
+                            || container_has_generic_params(ref_file, s, target_ty) == target_gen)
+                });
+                let scope_in_reach = is_dep
+                    || is_qual_exact
+                    || same_go_pkg
+                    || same_partial_type
+                    || (file.language == LanguageId::Java
+                        && can_match_type_dependents(
+                            ref_file,
+                            &LanguageId::Java,
+                            target_scope.as_deref(),
+                        ))
+                    || (file.language == LanguageId::CSharp
+                        && csharp_namespace_in_scope(
+                            ref_file,
+                            target_scope.as_deref(),
+                            &csharp_global_usings,
+                        ));
+
+                match classify_call_receiver(ref_file, ref_record, target_ty, target_gen) {
+                    ReceiverCheck::Exact => Some("exact"),
+                    ReceiverCheck::Contradicted => None,
+                    ReceiverCheck::Unknown => {
+                        if ref_file.content.is_empty() && (is_dep || is_qual_exact) {
+                            return Some("exact");
+                        }
+                        if scope_in_reach
+                            && (same_partial_type
+                                || file_mentions_type_token(ref_file, target_ty, target_gen))
+                        {
+                            Some("heuristic_receiver")
+                        } else {
+                            None
+                        }
+                    }
+                }
+            };
+
+        for (file_path, reference) in dependent_refs {
+            if let Some(conf) = evaluate_cross_file(file_path, reference) {
+                refs.push((file_path, reference, conf));
+            }
+        }
+
         for (ref_path, ref_record) in self.find_references_for_name(target_name, kind_filter, false)
         {
             if ref_path == path {

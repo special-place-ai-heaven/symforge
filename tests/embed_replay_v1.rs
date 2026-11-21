@@ -631,7 +631,7 @@ fn stale_owner_token_rejected_after_takeover() {
     );
     let new = acquired(
         store
-            .reserve_with_lease(&key, &request, Duration::from_secs(30))
+            .reserve_with_lease_at(&key, &request, Duration::from_secs(30), t0 + lease_for)
             .unwrap(),
     );
     assert!(new.took_over());
@@ -765,7 +765,7 @@ fn release_not_started_with_foreign_token_is_noop() {
     );
     let owner = acquired(
         store
-            .reserve_with_lease(&key, &request, Duration::from_secs(30))
+            .reserve_with_lease_at(&key, &request, Duration::from_secs(30), t0 + lease_for)
             .unwrap(),
     );
     assert!(owner.took_over());
