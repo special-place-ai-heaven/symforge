@@ -1,100 +1,100 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 530" width="1080" height="530" role="img" aria-labelledby="bTitle bDesc">
-  <title id="bTitle">SymForge Measured Benchmark Breakdown (2026-11-09 Audit, 36 Paired Runs)</title>
-  <desc id="bDesc">Paired horizontal bar chart from the 2026-11-09 Product Audit showing retrieved characters and tool calls on Sonnet across 6 tasks: large savings on caller tracing (-76%), symbol lookup (-51%), and function understanding (-39%), alongside honest overhead on nearby single-file reads (+32%, +57%) and literal string counting (+535%), plus V12 Code Mode summary metrics.</desc>
-  <rect x="0" y="0" width="1080" height="530" rx="14" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 584" width="1080" height="584" role="img" aria-labelledby="bTitle bDesc">
+  <title id="bTitle">SymForge Measured Benchmark Breakdown (2026-11-09 Audit, 36 Paired Runs on v11.11.0)</title>
+  <desc id="bDesc">Color-coded benchmark chart: overall green win banner (-32% total retrieved chars across 36 runs; -8% Sonnet, -52% Haiku), green bars where SymForge saves big on caller tracing (-12,664 ch / -76%), understanding (-8,559 ch / -39%), and lookup (-2,162 ch / -51%), orange warnings for multi-region single-file reads, and red for forcing literal string counting through AST search instead of rg -c.</desc>
+  <rect x="0" y="0" width="1080" height="584" rx="14" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
 
-  <text x="32" y="34" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="17" font-weight="700" fill="#0f172a">Measured Retrieval Breakdown — Where SymForge Wins &amp; Where rg / Read Wins</text>
-  <text x="1048" y="34" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#475569">Source: 2026-11-09 Audit (36 paired runs)</text>
+  <text x="28" y="34" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="17" font-weight="700" fill="#0f172a">Measured Benchmark Breakdown (36 Paired Runs on v11.11.0 — Lower Chars Is Better)</text>
 
-  <rect x="32" y="50" width="12" height="12" rx="3" fill="#94a3b8"/>
-  <text x="50" y="60" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#475569">Native (Read / Grep / Glob)</text>
-  <rect x="250" y="50" width="12" height="12" rx="3" fill="#16a34a"/>
-  <text x="268" y="60" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#475569">SymForge wins (symbol &amp; caller queries)</text>
-  <rect x="525" y="50" width="12" height="12" rx="3" fill="#d97706"/>
-  <text x="543" y="60" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#475569">Use rg -c or windowed Read instead (honest trade-off)</text>
-  <line x1="24" y1="74" x2="1056" y2="74" stroke="#cbd5e1" stroke-width="1"/>
+  <!-- OVERALL VERDICT BANNER (GREEN = NET WIN ACROSS ALL 36 RUNS!) -->
+  <rect x="24" y="48" width="1032" height="50" rx="9" fill="#dcfce7" stroke="#2ea043" stroke-width="1.4"/>
+  <text x="42" y="70" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12.5" font-weight="700" fill="#2ea043">✓ OVERALL NET RESULT (ALL 36 RUNS): -32% FEWER RETRIEVED CHARS WITH SYMFORGE</text>
+  <text x="42" y="88" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#0f172a">Sonnet total: 134,448 → 123,648 ch (-8% chars, -12% cost)  ·  Haiku total: 155,761 → 74,376 ch (-52% chars, -2% cost)</text>
+
+  <!-- Traffic-light Legend -->
+  <circle cx="34" cy="121" r="5" fill="#2ea043"/>
+  <text x="45" y="125" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" font-weight="600" fill="#2ea043">Good: SymForge wins big (use SymForge)</text>
+  <circle cx="295" cy="121" r="5" fill="#d97706"/>
+  <text x="306" y="125" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" font-weight="600" fill="#d97706">Warning: 1file nearby lines (windowed Read is fine)</text>
+  <circle cx="622" cy="121" r="5" fill="#dc2626"/>
+  <text x="633" y="125" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" font-weight="600" fill="#dc2626">Bad misuse: rg was forbidden in test — use rg -c in real life!</text>
+  <line x1="24" y1="136" x2="1056" y2="136" stroke="#cbd5e1" stroke-width="1"/>
 
   
-  <rect x="24" y="92" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
-  <text x="38" y="114" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a">T2 · Find all callers</text>
-  <text x="38" y="132" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">find_references vs grep+read</text>
+  <rect x="24" y="148" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="38" y="170" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a">T2 · Find all callers</text>
+  <text x="38" y="188" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">find_references (8.5 → 2.0 calls)</text>
 
-  <rect x="280" y="103" width="282" height="12" rx="4" fill="#94a3b8"/>
-  <text x="568" y="113" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">Native: 16,636 ch</text>
+  <rect x="288" y="159" width="253" height="12" rx="4" fill="#94a3b8"/>
+  <text x="547" y="169" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">Native: 16,636 ch</text>
 
-  <rect x="280" y="122" width="67" height="12" rx="4" fill="#16a34a"/>
-  <text x="353" y="132" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#16a34a">SymForge: 3,972 ch</text>
+  <rect x="288" y="178" width="60" height="12" rx="4" fill="#2ea043"/>
+  <text x="354" y="188" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#2ea043">SymForge: 3,972 ch</text>
 
-  <text x="885" y="123" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#475569">8.5 → 2.0 calls</text>
-  <rect x="902" y="105" width="136" height="28" rx="14" fill="#dcfce7"/>
-  <text x="970" y="123" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#16a34a">-76% chars</text>
-  <rect x="24" y="153" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
-  <text x="38" y="175" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a">T5 · Locate &amp; read fn</text>
-  <text x="38" y="193" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">get_symbol vs grep+read</text>
+  <rect x="808" y="161" width="234" height="28" rx="14" fill="#dcfce7"/>
+  <text x="925" y="179" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#2ea043">✓ GOOD · -12,664 ch (-76%)</text>
+  <rect x="24" y="208" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="38" y="230" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a">T1 · Understand one fn</text>
+  <text x="38" y="248" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">symbol_context (8.0 → 5.0 calls)</text>
 
-  <rect x="280" y="164" width="72" height="12" rx="4" fill="#94a3b8"/>
-  <text x="358" y="174" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">Native: 4,247 ch</text>
+  <rect x="288" y="219" width="331" height="12" rx="4" fill="#94a3b8"/>
+  <text x="625" y="229" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">Native: 21,759 ch</text>
 
-  <rect x="280" y="183" width="35" height="12" rx="4" fill="#16a34a"/>
-  <text x="321" y="193" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#16a34a">SymForge: 2,085 ch</text>
+  <rect x="288" y="238" width="201" height="12" rx="4" fill="#2ea043"/>
+  <text x="495" y="248" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#2ea043">SymForge: 13,200 ch</text>
 
-  <text x="885" y="184" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#475569">2.0 → 2.0 calls</text>
-  <rect x="902" y="166" width="136" height="28" rx="14" fill="#dcfce7"/>
-  <text x="970" y="184" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#16a34a">-51% chars</text>
-  <rect x="24" y="214" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
-  <text x="38" y="236" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a">T1 · Understand one fn</text>
-  <text x="38" y="254" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">symbol_context vs Read</text>
+  <rect x="808" y="221" width="234" height="28" rx="14" fill="#dcfce7"/>
+  <text x="925" y="239" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#2ea043">✓ GOOD · -8,559 ch (-39%)</text>
+  <rect x="24" y="268" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="38" y="290" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a">T5 · Locate &amp; read fn</text>
+  <text x="38" y="308" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">get_symbol (exact body slice)</text>
 
-  <rect x="280" y="225" width="369" height="12" rx="4" fill="#94a3b8"/>
-  <text x="655" y="235" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">Native: 21,759 ch</text>
+  <rect x="288" y="279" width="65" height="12" rx="4" fill="#94a3b8"/>
+  <text x="359" y="289" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">Native: 4,247 ch</text>
 
-  <rect x="280" y="244" width="224" height="12" rx="4" fill="#16a34a"/>
-  <text x="510" y="254" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#16a34a">SymForge: 13,200 ch</text>
+  <rect x="288" y="298" width="32" height="12" rx="4" fill="#2ea043"/>
+  <text x="326" y="308" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#2ea043">SymForge: 2,085 ch</text>
 
-  <text x="885" y="245" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#475569">8.0 → 5.0 calls</text>
-  <rect x="902" y="227" width="136" height="28" rx="14" fill="#dcfce7"/>
-  <text x="970" y="245" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#16a34a">-39% chars</text>
-  <rect x="24" y="275" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
-  <text x="38" y="297" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a">T3 · Module-wide facts</text>
-  <text x="38" y="315" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">1 windowed Read beats 4 calls</text>
+  <rect x="808" y="281" width="234" height="28" rx="14" fill="#dcfce7"/>
+  <text x="925" y="299" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#2ea043">✓ GOOD · -2,162 ch (-51%)</text>
+  <rect x="24" y="328" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="38" y="350" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a">T3 · Module-wide facts</text>
+  <text x="38" y="368" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">pre-#857 map bug; 1 Read is simpler</text>
 
-  <rect x="280" y="286" width="149" height="12" rx="4" fill="#94a3b8"/>
-  <text x="435" y="296" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">Native: 8,766 ch</text>
+  <rect x="288" y="339" width="133" height="12" rx="4" fill="#94a3b8"/>
+  <text x="427" y="349" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">Native: 8,766 ch</text>
 
-  <rect x="280" y="305" width="196" height="12" rx="4" fill="#d97706"/>
-  <text x="482" y="315" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#d97706">SymForge: 11,546 ch</text>
+  <rect x="288" y="358" width="176" height="12" rx="4" fill="#d97706"/>
+  <text x="470" y="368" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#d97706">SymForge: 11,546 ch</text>
 
-  <text x="885" y="306" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#475569">3.5 → 7.0 calls</text>
-  <rect x="902" y="288" width="136" height="28" rx="14" fill="#fef3c7"/>
-  <text x="970" y="306" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#d97706">+32% chars</text>
-  <rect x="24" y="336" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
-  <text x="38" y="358" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a">T6 · Multi-region debug</text>
-  <text x="38" y="376" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">nearby lines in 1 file</text>
+  <rect x="808" y="341" width="234" height="28" rx="14" fill="#fef3c7"/>
+  <text x="925" y="359" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#d97706">⚠ WARN · +2,780 ch (+32%)</text>
+  <rect x="24" y="388" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="38" y="410" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a">T6 · Multi-region debug</text>
+  <text x="38" y="428" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">nearby lines in 1 file; use Read</text>
 
-  <rect x="280" y="347" width="246" height="12" rx="4" fill="#94a3b8"/>
-  <text x="532" y="357" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">Native: 14,534 ch</text>
+  <rect x="288" y="399" width="221" height="12" rx="4" fill="#94a3b8"/>
+  <text x="515" y="409" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">Native: 14,534 ch</text>
 
-  <rect x="280" y="366" width="388" height="12" rx="4" fill="#d97706"/>
-  <text x="674" y="376" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#d97706">SymForge: 22,882 ch</text>
+  <rect x="288" y="418" width="348" height="12" rx="4" fill="#d97706"/>
+  <text x="642" y="428" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#d97706">SymForge: 22,882 ch</text>
 
-  <text x="885" y="367" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#475569">6.5 → 10.5 calls</text>
-  <rect x="902" y="349" width="136" height="28" rx="14" fill="#fef3c7"/>
-  <text x="970" y="367" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#d97706">+57% chars</text>
-  <rect x="24" y="397" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
-  <text x="38" y="419" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a">T4 · Literal string count</text>
-  <text x="38" y="437" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">use rg -c (160 chars)!</text>
+  <rect x="808" y="401" width="234" height="28" rx="14" fill="#fef3c7"/>
+  <text x="925" y="419" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#d97706">⚠ WARN · +8,348 ch (+57%)</text>
+  <rect x="24" y="448" width="1032" height="54" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="38" y="470" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a">T4 · Literal string count</text>
+  <text x="38" y="488" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">misuse (rg forbidden); use rg -c!</text>
 
-  <rect x="280" y="408" width="22" height="12" rx="4" fill="#94a3b8"/>
-  <text x="308" y="418" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">Native: 1,281 ch</text>
+  <rect x="288" y="459" width="19" height="12" rx="4" fill="#94a3b8"/>
+  <text x="313" y="469" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10" fill="#475569">Native: 1,281 ch</text>
 
-  <rect x="280" y="427" width="138" height="12" rx="4" fill="#d97706"/>
-  <text x="424" y="437" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#d97706">SymForge: 8,139 ch</text>
+  <rect x="288" y="478" width="124" height="12" rx="4" fill="#dc2626"/>
+  <text x="418" y="488" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="700" fill="#dc2626">SymForge: 8,139 ch</text>
 
-  <text x="885" y="428" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" fill="#475569">2.0 → 2.5 calls</text>
-  <rect x="902" y="410" width="136" height="28" rx="14" fill="#fef3c7"/>
-  <text x="970" y="428" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#d97706">+535% chars</text>
+  <rect x="808" y="461" width="234" height="28" rx="14" fill="#fee2e2"/>
+  <text x="925" y="479" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" fill="#dc2626">✕ BAD · +6,858 ch (use rg -c)</text>
 
-  <rect x="24" y="464" width="1032" height="48" rx="8" fill="#e0f2fe" stroke="#0284c7" stroke-width="1.2"/>
-  <text x="42" y="493" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#0284c7">How V12 Directly Targets Audit Bottlenecks:</text>
-  <text x="336" y="493" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" fill="#0f172a">Upfront schema: 66,181 B → 3,980 B (-94.0%) or 0 B (CLI)  |  Chained lookups: N turns → 1 Monty VM turn</text>
+  <!-- Bottom Strip: What v12.0.0 Fixed Since v11.11.0 -->
+  <rect x="24" y="516" width="1032" height="50" rx="8" fill="#dcfce7" stroke="#2ea043" stroke-width="1.2"/>
+  <text x="42" y="537" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11.5" font-weight="700" fill="#2ea043">✓ FIXED SINCE v11.11.0 AUDIT (PR #857 + v12.0.0):</text>
+  <text x="42" y="555" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" fill="#0f172a">Removed 9,300-char repo_map hex dump · added search_text(group_by=&quot;count&quot;) · cut schema -94.0% (code) / -100% (CLI) · 1-turn Monty VM</text>
 </svg>

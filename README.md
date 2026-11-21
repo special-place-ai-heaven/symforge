@@ -366,7 +366,15 @@ Details: [Environment Setup Scripts, Variable reference](https://github.com/spec
 
 ## Benchmarks
 
-SymForge reports both wins and losses rather than claiming a blanket percentage:
+SymForge is built for large repositories and large source files—saving context bytes and model turns on symbol/caller navigation while reporting honest trade-offs where plain shell tools win:
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/diagrams/symforge-v12-token-savings-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="./docs/diagrams/symforge-v12-token-savings-light.svg">
+    <img alt="SymForge 12.0.0 Measured Context and Token Savings" src="./docs/diagrams/symforge-v12-token-savings-dark.svg" width="100%">
+  </picture>
+</p>
 
 <p align="center">
   <picture>
