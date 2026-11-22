@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 472" width="1080" height="472" role="img" aria-labelledby="t d">
+  <title id="t">SymForge Architecture</title>
+  <desc id="d">MCP clients, CLI agents, and Rust embedders query one lock-free ArcSwap LiveIndex backed by format-11 snapshots, Monty bytecode VM, admit_disk_read, and tree-sitter structural edits.</desc>
+  <defs>
+    <marker id="arrLine" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#4a6282"/>
+    </marker>
+    <marker id="arrGood" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#3fb950"/>
+    </marker>
+    <marker id="arrBlue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#58a6ff"/>
+    </marker>
+    <marker id="arrWarn" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#f0883e"/>
+    </marker>
+    <marker id="arrBad" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#f85149"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1080" height="472" rx="14" fill="#0c101a" stroke="#263850" stroke-width="1.5"/>
+  <text x="28" y="34" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="17" font-weight="700" fill="#e6edf3">SymForge Architecture — One Lock-Free LiveIndex Across MCP, CLI &amp; Rust Embed</text>
+  <line x1="24" y1="48" x2="1056" y2="48" stroke="#263850" stroke-width="1"/>
+  <rect x="24" y="62" width="212" height="366" rx="10" fill="#0d1522" stroke="#263850" stroke-width="1.2"/>
+  <text x="130" y="84" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" text-anchor="middle" fill="#8b9bb4">1. CLIENTS &amp; CALLERS</text>
+  <rect x="266" y="62" width="232" height="366" rx="10" fill="#0d1522" stroke="#263850" stroke-width="1.2"/>
+  <text x="382" y="84" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" text-anchor="middle" fill="#8b9bb4">2. SURFACES &amp; STARTUP</text>
+  <rect x="528" y="62" width="232" height="366" rx="10" fill="#0d2818" stroke="#2ea043" stroke-width="1.6"/>
+  <text x="644" y="84" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" text-anchor="middle" fill="#3fb950">3. LIVEINDEX CORE (RAM)</text>
+  <rect x="790" y="62" width="266" height="366" rx="10" fill="#0d1522" stroke="#263850" stroke-width="1.2"/>
+  <text x="923" y="84" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="700" text-anchor="middle" fill="#8b9bb4">4. ANSWER &amp; WRITE LANES</text>
+  <rect x="38" y="100" width="184" height="88" rx="8" fill="#111927" stroke="#388bfd" stroke-width="1.2"/>
+  <text x="50" y="122" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#e6edf3">MCP Clients</text>
+  <text x="50" y="142" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b9bb4">Claude · Codex · Gemini</text>
+  <text x="50" y="160" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b9bb4">Cursor · Grok · OMP (+7)</text>
+  <rect x="38" y="206" width="184" height="88" rx="8" fill="#111927" stroke="#2ea043" stroke-width="1.2"/>
+  <text x="50" y="228" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#e6edf3">Zero-MCP CLI + Skill</text>
+  <text x="50" y="248" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="600" fill="#3fb950">symforge code run</text>
+  <text x="50" y="266" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#8b9bb4">symforge q (0 B schema)</text>
+  <rect x="38" y="312" width="184" height="88" rx="8" fill="#111927" stroke="#263850" stroke-width="1.2"/>
+  <text x="50" y="334" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" font-weight="700" fill="#e6edf3">Rust Embedders</text>
+  <text x="50" y="354" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11" font-weight="600" fill="#58a6ff">symforge::embed</text>
+  <text x="50" y="372" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11" fill="#8b9bb4">In-process, no MCP/CLI</text>
+  <rect x="280" y="100" width="204" height="66" rx="8" fill="#111927" stroke="#263850" stroke-width="1.2"/>
+  <text x="292" y="121" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="700" fill="#e6edf3">stdio &amp; HTTP (:8787)</text>
+  <text x="292" y="140" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#8b9bb4">/mcp + /admin Streamable HTTP</text>
+  <rect x="280" y="178" width="204" height="66" rx="8" fill="#111927" stroke="#263850" stroke-width="1.2"/>
+  <text x="292" y="199" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="700" fill="#e6edf3">Optional Shared Daemon</text>
+  <text x="292" y="218" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" fill="#8b9bb4">/v1/sessions + /code-query</text>
+  <rect x="280" y="260" width="204" height="72" rx="8" fill="#111927" stroke="#2ea043" stroke-width="1.2"/>
+  <text x="292" y="281" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="700" fill="#e6edf3">Format-11 Snapshot</text>
+  <text x="292" y="300" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" font-weight="600" fill="#3fb950">SHA-256 + dismissal digest</text>
+  <text x="292" y="317" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#8b9bb4">Instant warm restore or seed</text>
+  <rect x="280" y="344" width="204" height="72" rx="8" fill="#111927" stroke="#263850" stroke-width="1.2"/>
+  <text x="292" y="365" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="700" fill="#e6edf3">Scout &amp; tree-sitter</text>
+  <text x="292" y="384" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#8b9bb4">19 AST + 6 config parsers</text>
+  <text x="292" y="401" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#8b9bb4">+ Knowledge docs/specs lane</text>
+  <rect x="542" y="100" width="204" height="96" rx="8" fill="#111927" stroke="#2ea043" stroke-width="1.4"/>
+  <text x="554" y="122" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="13" font-weight="700" fill="#3fb950">LiveIndex (ArcSwap)</text>
+  <text x="554" y="143" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11.5" font-weight="600" fill="#e6edf3">Immutable generations</text>
+  <text x="554" y="162" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#8b9bb4">Zero reader lock contention</text>
+  <text x="554" y="180" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#8b9bb4">Atomic swap on edit/watch</text>
+  <rect x="542" y="212" width="204" height="88" rx="8" fill="#111927" stroke="#263850" stroke-width="1.2"/>
+  <text x="554" y="234" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="700" fill="#e6edf3">Preventive Lifecycle</text>
+  <text x="554" y="253" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#8b9bb4">Candidates · leases · verify</text>
+  <text x="554" y="271" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#8b9bb4">Background disk reconcile</text>
+  <text x="554" y="288" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="10.5" font-weight="600" fill="#3fb950">SnapshotRestore -&gt; Ready</text>
+  <rect x="542" y="316" width="204" height="96" rx="8" fill="#111927" stroke="#263850" stroke-width="1.2"/>
+  <text x="554" y="338" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="700" fill="#e6edf3">Ranking &amp; Provenance</text>
+  <text x="554" y="357" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#8b9bb4">Frecency + git co-change</text>
+  <text x="554" y="375" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#8b9bb4">Exact byte spans &amp; hashes</text>
+  <text x="554" y="393" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" font-weight="600" fill="#58a6ff">STEL trust envelope</text>
+  <rect x="804" y="100" width="238" height="74" rx="8" fill="#111927" stroke="#388bfd" stroke-width="1.2"/>
+  <text x="816" y="121" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="700" fill="#e6edf3">MCP Surface Router</text>
+  <text x="816" y="140" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#8b9bb4">40 full · 13 core · 4 code · 3 compact</text>
+  <text x="816" y="158" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#8b9bb4">Resources + prompts + dispatch</text>
+  <rect x="804" y="186" width="238" height="76" rx="8" fill="#0d2818" stroke="#2ea043" stroke-width="1.4"/>
+  <text x="816" y="207" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="700" fill="#3fb950">Monty Bytecode VM (100% Rust)</text>
+  <text x="816" y="226" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" font-weight="600" fill="#e6edf3">15 typed read ops · NoOs sandbox</text>
+  <text x="816" y="244" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#8b9bb4">Zero filesystem/network egress</text>
+  <rect x="804" y="274" width="238" height="66" rx="8" fill="#111927" stroke="#d29922" stroke-width="1.2"/>
+  <text x="816" y="295" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="700" fill="#f0883e">admit_disk_read Gate</text>
+  <text x="816" y="314" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#8b9bb4">Classifies exact bytes · shields secrets</text>
+  <text x="816" y="330" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10" fill="#8b9bb4">MetadataOnly + _meta rule/lines</text>
+  <rect x="804" y="352" width="238" height="66" rx="8" fill="#111927" stroke="#2ea043" stroke-width="1.2"/>
+  <text x="816" y="373" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="700" fill="#e6edf3">Structural Edit Engine</text>
+  <text x="816" y="392" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" fill="#8b9bb4">.symforge/tee/ + tree-sitter check</text>
+  <text x="816" y="408" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10" fill="#8b9bb4">Primary or sibling git worktree</text>
+  <line x1="222" y1="133" x2="278" y2="133" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrBlue)"/>
+  <path d="M 222 155 L 250 155 L 250 205 L 278 205" fill="none" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrBlue)"/>
+  <line x1="222" y1="232" x2="278" y2="218" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arrGood)"/>
+  <path d="M 222 356 L 512 356 L 512 165 L 540 165" fill="none" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrBlue)"/>
+  <line x1="484" y1="133" x2="540" y2="133" stroke="#4a6282" stroke-width="1.6" marker-end="url(#arrLine)"/>
+  <line x1="484" y1="210" x2="540" y2="150" stroke="#4a6282" stroke-width="1.6" marker-end="url(#arrLine)"/>
+  <line x1="484" y1="296" x2="540" y2="256" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arrGood)"/>
+  <line x1="484" y1="380" x2="540" y2="275" stroke="#4a6282" stroke-width="1.6" marker-end="url(#arrLine)"/>
+  <line x1="746" y1="135" x2="802" y2="135" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrBlue)"/>
+  <line x1="746" y1="160" x2="802" y2="218" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arrGood)"/>
+  <path d="M 746 180 L 774 180 L 774 305 L 802 305" fill="none" stroke="#f0883e" stroke-width="1.6" marker-end="url(#arrWarn)"/>
+  <path d="M 923 418 L 923 452 L 644 452 L 644 414" fill="none" stroke="#3fb950" stroke-width="1.6" stroke-dasharray="5,3" marker-end="url(#arrGood)"/>
+  <text x="784" y="446" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5" font-weight="600" text-anchor="middle" fill="#3fb950">Atomic disk write -&gt; re-parse landed disk bytes -&gt; publish new ArcSwap generation</text>
+</svg>

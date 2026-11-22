@@ -54,70 +54,13 @@ Details: [Home, Why SymForge](https://github.com/special-place-ai-heaven/symforg
 
 ## How it works
 
-```mermaid
-%%{init: {"flowchart": {"htmlLabels": false, "wrappingWidth": 400}}}%%
-flowchart TD
-    accTitle: SymForge 12.0.0 architecture
-    accDescr: MCP clients, shell-skill agents, and Rust embedders query one LiveIndex backed by ArcSwap lock-free reads. Startup restores a SHA-256-verified format-11 snapshot or treats older formats as untrusted seeds, while MCP surfaces, the pure-Rust Monty bytecode VM, admit_disk_read, and the structural edit engine share the live index.
-
-    subgraph Clients["Clients"]
-        MCP["MCP clients\nClaude · Codex · Gemini\nCursor · Grok · OMP"]
-        CLI["CLI & SKILL.md\nsymforge code · symforge q"]
-        LIB["Embedding platforms\nsymforge::embed, no MCP"]
-    end
-
-    subgraph Surfaces["Server + daemon surfaces"]
-        STDIO["stdio MCP server"]
-        HTTP["symforge serve HTTP\n/mcp + /admin"]
-        DAEMON["optional shared daemon\n/v1/sessions + /code-query"]
-    end
-
-    subgraph Startup["Index startup"]
-        SNAP["format-11 snapshot\nSHA-256 verified, or seed"]
-        SCOUT["metadata-first scout\none disposition per file"]
-        PARSE["tree-sitter, 19 grammars\n+ 6 config/text parsers"]
-        KNOW["knowledge lane\ndocs, specs, safe configs"]
-        LIFE["preventive lifecycle\ncandidates, leases, verify"]
-    end
-
-    subgraph Core["Live index"]
-        IDX["LiveIndex (ArcSwap)\nlock-free concurrent reads"]
-        SIG["ranking signals\nfrecency, co-change"]
-        VERIFY["background verify\nreconcile vs disk"]
-    end
-
-    subgraph Lanes["Answer + write lanes"]
-        SURF["MCP surfaces\n40 full · 13 core · 4 code · 3 compact"]
-        SANDBOX["Monty VM (100% Rust)\n15 typed read ops, zero egress"]
-        GATE["read_gate\nadmit_disk_read"]
-        EDITS["structural edit engine"]
-    end
-
-    MCP --> STDIO
-    MCP --> HTTP
-    CLI --> DAEMON
-    CLI --> IDX
-    STDIO --> DAEMON
-    DAEMON --> IDX
-    HTTP --> IDX
-    STDIO --> IDX
-    LIB --> IDX
-
-    SNAP --> LIFE --> IDX
-    SCOUT --> PARSE --> IDX
-    SCOUT --> KNOW --> IDX
-    SIG --> IDX
-    IDX --> VERIFY --> IDX
-    IDX --> SNAP
-
-    IDX --> SURF
-    IDX --> SANDBOX
-    SURF --> SANDBOX
-    SURF --> GATE
-    SANDBOX --> GATE
-    SURF --> EDITS
-    EDITS --> IDX
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/diagrams/symforge-architecture-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="./docs/diagrams/symforge-architecture-light.svg">
+    <img alt="SymForge Architecture — LiveIndex, Monty VM, admit_disk_read, and Structural Edits" src="./docs/diagrams/symforge-architecture-dark.svg" width="100%">
+  </picture>
+</p>
 
 `LiveIndex` publishes immutable index generations through `ArcSwap`, giving zero reader contention under concurrent tool calls while background reconciliation or file-watcher updates swap in new generations atomically. Every lane that reopens bytes from disk passes through `admit_disk_read`, which classifies the exact buffer read and returns content only on a permit. A format-11 snapshot lets startup skip cold parsing and reconcile against disk in the background (`SnapshotRestore` / `Pending` until verified). After any edit, the index rebuilds from the bytes that landed on disk, never from an in-memory buffer.
 
@@ -137,21 +80,13 @@ symforge init --code-skill --skill-only  # zero-MCP setup: write SKILL.md only, 
 
 npm installs a thin launcher plus the OS-native binary inside npm's global prefix (`~/.symforge/bin` is retired), with no postinstall hook and no config edits until `symforge init`. Run `symforge update` to upgrade safely while MCP sessions remain open (cleaning retired `~/.symforge/bin` leftovers only after confirmed client re-registration):
 
-```mermaid
-%%{init: {"flowchart": {"htmlLabels": false, "wrappingWidth": 260}}}%%
-flowchart LR
-    accTitle: Live zero-downtime symforge update flow
-    accDescr: symforge update stages the npm wrapper and OS-native binary beside the live prefix, verifies the staged --version, stops only the shared daemon while open stdio sessions keep running, swaps files atomically with journaled backups, restarts the warm daemon and replays MCP initialize, and refreshes registered clients, rolling back from the journal if any step fails.
-
-    STAGE["1. Stage new npm +\nnative pkg"] --> VER["2. Verify staged\n--version"]
-    VER --> STOP["3. Stop shared\ndaemon only"]
-    STOP --> SWAP["4. Atomic rename\n(open stdio sessions\nkeep running)"]
-    SWAP --> WARM["5. Restart warm daemon\n& replay initialize"]
-    WARM --> REG["6. Re-register\nactive clients"]
-
-    SWAP -. "Any step fails" .-> ROLL["Journal rollback\nrestores previous binary"]
-    WARM -. "Verify fails" .-> ROLL
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/diagrams/symforge-update-flow-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="./docs/diagrams/symforge-update-flow-light.svg">
+    <img alt="Live Zero-Downtime symforge update Flow" src="./docs/diagrams/symforge-update-flow-dark.svg" width="100%">
+  </picture>
+</p>
 
 **macOS and source builds.** Prebuilt macOS npm packages are not shipped; on macOS or other architectures, build from a git checkout (`cargo build --release`, requires Rust 1.100.0 and a C toolchain for tree-sitter, libgit2, and bundled SQLite) or run `cargo install symforge`. A git checkout keeps the `[patch.crates-io]` `rmcp 3.10.0` patch (`vendor/rmcp/SYMFORGE-PATCH.md`). Cargo ignores `[patch]` on crates.io installs, so `cargo install symforge` lacks two pre-handshake fixes (ignoring `notifications/cancelled` after a timed-out `server/discover` before `initialize`, and clearing the `OnceLock` inline protocol latch when a `2026-07-28` `_meta` request precedes `initialize`).
 
@@ -169,23 +104,13 @@ Loading all 40 MCP schemas costs ~16.5k tokens up front (`66,181 B`), and chaini
 1. **MCP `code` surface** (`SYMFORGE_SURFACE=code` or `symforge serve --surface code`): advertises 4 tools (`code_search`, `code_execute`, `symforge_edit`, `status`) in **3,980 B** (~995 tokens, **−94.0%** vs `full`).
 2. **Shell CLI + `SKILL.md`** (`symforge init --code-skill --skill-only`): zero MCP tools, invoking `symforge q` for single queries and `symforge code run` for multi-step scripts against the warm daemon (`/v1/sessions/{id}/code-query`, preserving `ProjectEvidence`) or read-only `.symforge/index.bin`.
 
-```mermaid
-sequenceDiagram
-    accTitle: Single-turn Code Mode execution inside pure-Rust SymForge
-    accDescr: Instead of multiple LLM turns transferring large intermediate tool outputs, the agent sends one short query script to symforge, where the embedded pure-Rust Monty VM chains search_symbols, find_references, and get_symbol in memory through admit_disk_read and returns only the final compact JSON.
-    participant Agent as AI Agent (LLM)
-    participant VM as Monty Bytecode VM (100% Rust, NoOs)
-    participant Index as LiveIndex + admit_disk_read (Rust RAM)
-
-    Agent->>VM: code_execute / symforge code run (4-line query script)
-    VM->>Index: 1. search_symbols(query="enforce_compact_surface", kind="fn")
-    Index-->>VM: symbol span + path (stays in Rust RAM)
-    VM->>Index: 2. find_references(name=..., kind="call")
-    Index-->>VM: 40 call sites filtered to top 3 in VM (stays in Rust RAM)
-    VM->>Index: 3. get_symbol(targets=top_3) via admit_disk_read
-    Index-->>VM: permitted symbol bodies (secret files withheld)
-    VM-->>Agent: 1 compact JSON result (~600 B, 1 LLM turn)
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/diagrams/symforge-codemode-sequence-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="./docs/diagrams/symforge-codemode-sequence-light.svg">
+    <img alt="Single-Turn Code Mode Execution Inside Pure-Rust SymForge" src="./docs/diagrams/symforge-codemode-sequence-dark.svg" width="100%">
+  </picture>
+</p>
 
 ```bash
 # Single quote-free query (parses JSON scalars/arrays or falls back to string; works in bash, cmd, PowerShell)
@@ -216,23 +141,6 @@ Details: [Configure a client](https://github.com/special-place-ai-heaven/symforg
 
 `SymForgeServer` registers **43 tools** across four `SYMFORGE_SURFACE` (`serve --surface`) profiles, alongside the zero-MCP CLI skill:
 
-```mermaid
-%%{init: {"flowchart": {"htmlLabels": false, "wrappingWidth": 320}}}%%
-flowchart TD
-    accTitle: SymForge surface selection and upfront schema cost
-    accDescr: Decision tree comparing the five agent integration choices: zero-MCP CLI skill at 0 schema bytes, SYMFORGE_SURFACE=code at 4 tools and 3,980 bytes, compact at 3 tools and 4,552 bytes, core at 13 tools and ~28.2 KB or SYMFORGE_TOOLS topic groups, and full default at 40 tools and 66,181 bytes.
-
-    START["Choose agent integration\n& upfront schema budget"] --> SHELL{"Shell-capable agent\nwanting 0 MCP schema bytes?"}
-    SHELL -- "Yes" --> SKILL["symforge init --code-skill --skill-only\nsymforge code + symforge q · 0 B upfront"]
-    SHELL -- "No (MCP client)" --> CHAIN{"Multi-step chaining\n+ minimal schema?"}
-    CHAIN -- "Yes (Monty VM, 100% Rust)" --> CODE["SYMFORGE_SURFACE=code\n4 tools · 3,980 B · ~995 tok (-94%)"]
-    CHAIN -- "No" --> TIGHT{"Tight context without\ncode execution?"}
-    TIGHT -- "Yes (e.g. Claude Desktop)" --> COMPACT["SYMFORGE_SURFACE=compact\n3 tools · 4,552 B"]
-    TIGHT -- "No" --> SUBSET{"Curated everyday subset\nvs every tool eager?"}
-    SUBSET -- "Everyday subset" --> CORE["SYMFORGE_SURFACE=core (13 tools · ~28.2 KB)\nor SYMFORGE_TOOLS=read,edit,..."]
-    SUBSET -- "Every tool listed" --> FULL["SYMFORGE_SURFACE=full (default)\n40 tools · 66,181 B · ~16.5k tok"]
-```
-
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./docs/diagrams/symforge-surface-scale-dark.svg">
@@ -241,6 +149,7 @@ flowchart TD
   </picture>
 </p>
 
+- **CLI + `SKILL.md`** (`symforge init --code-skill --skill-only`, **0 MCP tools**, `0 B` upfront): shell `symforge code run` and `symforge q` with zero MCP schema tokens.
 - **`full`** (default, **40 tools**, `66,181 B` / ~16.5k tok): 6 resources, 4 resource templates, 8 prompts; omits `symforge`, `code_search`, and `code_execute`.
 - **`code`** (**4 tools**: `code_search`, `code_execute`, `symforge_edit`, `status`; **3,980 B** / ~995 tok): 2 resources (`symforge://tools/catalog`, `symforge://glossary`), 0 templates, 8 prompts; dispatch-rejects unlisted tools.
 - **`core`** (**13 tools**, ~28.2 KB: `status`, `get_repo_map`, `get_file_context`, `get_file_content`, `search_text`, `search_symbols`, `get_symbol`, `find_references`, `replace_symbol_body`, `edit_within_symbol`, `batch_edit`, `index_folder`, `symforge_retrieve`): 6 resources, 4 templates, 8 prompts; unlisted full-surface tools stay callable by name (`symforge` still refuses outside `compact`).
@@ -258,25 +167,13 @@ flowchart TD
 
 The protocol layer runs on vendored `rmcp 3.10.0`, serving MCP **2026-07-28** alongside `2025-11-25`, `2025-06-18`, `2025-03-26`, and `2024-11-05` from a frozen allow-list.
 
-```mermaid
-%%{init: {"flowchart": {"htmlLabels": false, "wrappingWidth": 300}}}%%
-flowchart TD
-    accTitle: Structural edit safety pipeline and sibling git worktree routing
-    accDescr: Every structural edit resolves the AST byte span, runs admit_disk_read drift and secret checks, saves a .symforge/tee/ backup, validates syntax with tree-sitter, and either writes atomically to the primary workspace and swaps a new re-parsed LiveIndex generation, or validates and writes into a sibling git worktree while keeping the primary LiveIndex clean.
-
-    SPAN["1. Resolve AST byte span"] --> GATE["2. admit_disk_read\ndrift & secret gate"]
-    GATE --> TEE["3. Pre-write backup\n.symforge/tee/"]
-    TEE --> PARSE["4. tree-sitter\nsyntax check"]
-    PARSE --> ROUTE{"working_directory\nsupplied?"}
-
-    ROUTE -- "Default (no working_directory)" --> W1["5a. Atomic write to\nprimary workspace"]
-    W1 --> R1["6a. Re-parse actual\ndisk bytes"]
-    R1 --> S1["7a. ArcSwap publish new\ngeneration + receipt"]
-
-    ROUTE -- "Sibling worktree (../feature-wt)" --> W2["5b. Validate sibling\ngit worktree"]
-    W2 --> R2["6b. Atomic write inside\nsibling worktree"]
-    R2 --> S2["7b. Primary LiveIndex stays clean\nreceipt: wrote_to + rerouted: true"]
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/diagrams/symforge-edit-pipeline-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="./docs/diagrams/symforge-edit-pipeline-light.svg">
+    <img alt="Structural Edit Safety Pipeline and Sibling Git Worktree Routing" src="./docs/diagrams/symforge-edit-pipeline-dark.svg" width="100%">
+  </picture>
+</p>
 
 The seven structural edit tools (`replace_symbol_body`, `edit_within_symbol`, `insert_symbol`, `delete_symbol`, `batch_edit`, `batch_insert`, `batch_rename`) accept an optional `working_directory` naming a sibling git worktree (`symforge_edit` accepts and forwards it unadvertised), e.g. `{"path": "src/lib.rs", "symbol_name": "hello", "new_body": "fn hello() {}", "working_directory": "../feature-wt"}`. SymForge requires explicit call-time consent (`SYMFORGE_WORKTREE_AWARE`), rebase-splices single-symbol edits onto the worktree file, leaves the primary index untouched, and reports `wrote_to`, `indexed_path`, and `rerouted`.
 
@@ -296,27 +193,13 @@ Details: [Embedding the Engine, Build and dependency](https://github.com/special
 
 ## Index lifecycle and recovery
 
-```mermaid
-%%{init: {"flowchart": {"htmlLabels": false, "wrappingWidth": 300}}}%%
-flowchart TD
-    accTitle: Preventive index lifecycle, format-11 snapshot, and secret admission gate
-    accDescr: Startup checks .symforge/index.bin for format-11 version, SHA-256 checksum, and dismissal-store digest, either restoring immediately as SnapshotRestore / Pending while background verify reconciles against disk into a Ready ArcSwap generation, or quarantining older/corrupt files before a cold tree-sitter parse. Every disk read passes admit_disk_read, serving clean or identifier-only code and withholding secret values as MetadataOnly with rule and line metadata.
-
-    subgraph Lifecycle["Startup & format-11 snapshot publication"]
-        BIN[".symforge/index.bin"] --> VALID{"Format-11 + SHA-256 +\ndismissal digest valid?"}
-        VALID -- "Yes" --> RESTORE["Restore immediately\n(SnapshotRestore / Pending)"]
-        RESTORE --> RECON["Background reconcile\nvs disk"]
-        VALID -- "No (older seed or corrupt)" --> COLD["Preserve in .symforge/quarantine/\n& cold tree-sitter parse"]
-        RECON --> READY["Promote complete candidate\nvia ArcSwap (Ready)"]
-        COLD --> READY
-    end
-
-    subgraph Admission["Secret admission gate (admit_disk_read)"]
-        READ["Disk bytes read"] --> SEC{"Secret value\ndetected?"}
-        SEC -- "Clean (or identifier name only)" --> SERVE["Serve source /\nAST symbols"]
-        SEC -- "Secret value found" --> HOLD["Withhold content (MetadataOnly)\n+ report rule & lines in _meta"]
-    end
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/diagrams/symforge-lifecycle-gate-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="./docs/diagrams/symforge-lifecycle-gate-light.svg">
+    <img alt="Preventive Index Lifecycle, Format-11 Snapshot, and Secret Admission Gate" src="./docs/diagrams/symforge-lifecycle-gate-dark.svg" width="100%">
+  </picture>
+</p>
 
 Under V11's **preventive index lifecycle**, incomplete observations never publish as current and unverified answers declare their state. **Snapshot format 11** (`SNAPSHOT_FORMAT_VERSION = 11`) binds the secret-dismissal store digest (format 10) plus a full-payload SHA-256 checksum; snapshots below format 11 are refused before decode (V10 format-7 seeds keep rollback copies under `.symforge/v11/quarantine/index-snapshots/`), and secret-withheld files report rule IDs and line numbers in `_meta["symforge/withheld"]` without exposing secret bytes.
 
@@ -326,24 +209,13 @@ Details: [Runtime Model, Index lifecycle (V11)](https://github.com/special-place
 
 ## Configuration
 
-```mermaid
-%%{init: {"flowchart": {"htmlLabels": false, "wrappingWidth": 280}}}%%
-flowchart LR
-    accTitle: SymForge three serving topologies
-    accDescr: SymForge runs as a shared loopback daemon behind stdio proxies and CLI calls, as a single-process local stdio server when SYMFORGE_NO_DAEMON=1 is set, or as a multi-repository Streamable HTTP server via symforge serve with repeatable --project flags.
-
-    subgraph Mode1["1. Shared Daemon (default stdio)"]
-        M1C["Claude + Codex + CLI"] --> M1P["stdio proxy / CLI"] --> M1D["1 loopback daemon\n(Bearer token)"] --> M1I["Shared warm\nLiveIndex"]
-    end
-
-    subgraph Mode2["2. Local In-Process (SYMFORGE_NO_DAEMON=1)"]
-        M2C["Single MCP client"] --> M2S["stdio server + embedded\nLiveIndex in one process"]
-    end
-
-    subgraph Mode3["3. Multi-Repo HTTP (symforge serve)"]
-        M3C["HTTP MCP clients\n+ /admin"] --> M3S["symforge serve (:8787)"] --> M3P["--project repoA\n--project repoB"]
-    end
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/diagrams/symforge-serving-topologies-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="./docs/diagrams/symforge-serving-topologies-light.svg">
+    <img alt="SymForge Three Local-First Serving Topologies" src="./docs/diagrams/symforge-serving-topologies-dark.svg" width="100%">
+  </picture>
+</p>
 
 Workspace state lives under `.symforge/`: `index.bin` and `quarantine/`, pre-write `tee/` copies, `idempotency/` records, and optional `frecency.db` and `coupling.db` stores. The 12.0.0 server records no analytics and creates no `analytics.db`. Nothing leaves the machine.
 
