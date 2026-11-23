@@ -2856,6 +2856,12 @@ mod resource_outcome_table_tests {
 
     #[test]
     fn resource_read_outcomes_match_the_shared_table() {
+        // protocol is server-gated; the embed-only cell has no surface to pin.
+        #[cfg(feature = "server")]
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let repository = fixture();
         let room = open_room(repository.path(), "table-room");
         let control = room.control().unwrap();

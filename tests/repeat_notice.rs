@@ -39,6 +39,9 @@ use symforge::sidecar::governor::RequestGovernor;
 use symforge::watcher::WatcherInfo;
 use tempfile::TempDir;
 
+#[path = "support/stel_surface_env.rs"]
+mod stel_surface_env;
+
 const EVIDENCE_KEY: &str = "symforge/project_evidence";
 const NOTICE_KEY: &str = "symforge/repeat_notice";
 const NOTICE_PREFIX: &str = "Repeat notice:";
@@ -725,6 +728,8 @@ async fn http_call_tool(
 
 #[tokio::test]
 async fn sessions_never_share_runs() {
+    // The in-process HTTP lane serves `search_symbols`, a granular (full-surface) tool.
+    let _surface = stel_surface_env::set_symforge_surface("full");
     // Positive control FIRST (blocking subprocess I/O, before any server task
     // shares this runtime): the identical 3x sequence over stdio notices.
     let stdio_workspace = Workspace::seed();

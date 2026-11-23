@@ -53,20 +53,29 @@ pub fn run_main(args: Vec<OsString>) -> anyhow::Result<MainExit> {
             serve_key,
             code_skill,
             skill_only,
+            surface,
         }) => {
             if scan {
                 cli::init::run_scan(apply, serve_url, serve_key)
             } else {
-                cli::init::run_init_with_options(client, code_skill, skill_only)
+                cli::init::run_init_with_options(client, code_skill, skill_only, surface)
             }
         }
         Some(cli::Commands::Daemon) => run_daemon(),
         Some(cli::Commands::Serve(args)) => return run_serve(args),
         Some(cli::Commands::Setup(args)) => cli::setup::run(args),
         Some(cli::Commands::Admin(args)) => cli::admin::run(args),
-        Some(cli::Commands::Hook { subcommand }) => cli::hook::run_hook(subcommand.as_ref()),
+        Some(cli::Commands::Hook {
+            surface,
+            subcommand,
+        }) => {
+            if let Some(surface) = surface {
+                cli::hook::set_hook_surface(surface);
+            }
+            cli::hook::run_hook(subcommand.as_ref())
+        }
         Some(cli::Commands::Trust { subcommand }) => cli::trust::run_trust(&subcommand),
-        Some(cli::Commands::Update) => cli::update::run_update(),
+        Some(cli::Commands::Update { surface }) => cli::update::run_update(surface),
         Some(cli::Commands::Code(args)) => return cli::code::run_code_cli(args),
         Some(cli::Commands::Query(args)) => return cli::code::run_query_cli(args),
         None => run_mcp_server(),

@@ -206,8 +206,8 @@ fn test_init_registers_mcp_server() {
     assert_eq!(tok["disabled"], false, "disabled must be false");
     assert_eq!(
         tok["env"]["SYMFORGE_SURFACE"].as_str(),
-        Some("full"),
-        "Claude init must pin the full surface"
+        Some("code"),
+        "Claude init must pin the code surface"
     );
     assert!(
         tok["alwaysAllow"].is_array(),
@@ -604,8 +604,8 @@ fn test_init_registers_kilo_mcp_server() {
     assert!(symforge.get("alwaysAllow").is_none(), "{symforge}");
     assert_eq!(
         symforge["environment"]["SYMFORGE_SURFACE"].as_str(),
-        Some("full"),
-        "Kilo environment must make the full surface explicit"
+        Some("code"),
+        "Kilo environment must make the code surface explicit"
     );
     assert!(config.get("mcpServers").is_none(), "{config}");
 }
@@ -946,15 +946,15 @@ fn test_run_init_codex_writes_symforge_agents_guidance() {
         "Codex AGENTS guidance must mention SymForge MCP: {raw}"
     );
     assert!(
-        raw.contains("get_file_context"),
+        raw.contains("file_context"),
         "Codex AGENTS guidance must include tool guidance: {raw}"
     );
     assert!(
-        raw.contains("validate_file_syntax"),
-        "Codex AGENTS guidance must include config validation guidance: {raw}"
+        raw.contains("code_execute"),
+        "Codex AGENTS guidance must include code-mode guidance: {raw}"
     );
     assert!(
-        raw.contains("| Task | Call |"),
+        raw.contains("| Task | Operation inside `code_execute` |"),
         "Codex AGENTS guidance must carry the task-to-tool map: {raw}"
     );
     assert!(
@@ -1040,16 +1040,16 @@ fn test_run_init_claude_writes_symforge_memory_guidance() {
         "Claude memory guidance must mention SymForge MCP: {raw}"
     );
     assert!(
-        raw.contains("get_file_context"),
+        raw.contains("file_context"),
         "Claude memory guidance must include tool guidance: {raw}"
     );
     assert!(
-        raw.contains("| Task | Call |"),
+        raw.contains("| Task | Operation inside `code_execute` |"),
         "Claude memory guidance must carry the task-to-tool map: {raw}"
     );
     assert!(
-        raw.contains("validate_file_syntax"),
-        "Claude memory guidance must include config validation guidance: {raw}"
+        raw.contains("code_execute"),
+        "Claude memory guidance must include code-mode guidance: {raw}"
     );
     assert!(
         !raw.contains("## Agent Directives: Mechanical Overrides")
@@ -1153,15 +1153,15 @@ fn test_run_init_gemini_writes_full_symforge_guidance() {
     let raw = read_text(&guidance_path);
 
     assert!(
-        raw.contains("| Task | Call |"),
+        raw.contains("| Task | Operation inside `code_execute` |"),
         "Gemini guidance must carry the task-to-tool map: {raw}"
     );
     assert!(
-        raw.contains("validate_file_syntax"),
-        "Gemini guidance must include config validation guidance: {raw}"
+        raw.contains("code_execute"),
+        "Gemini guidance must include code-mode guidance: {raw}"
     );
     assert!(
-        raw.contains("Raw reads (`get_file_content`/Read) remain correct"),
+        raw.contains("Raw reads (`file_content`/Read) remain correct"),
         "Gemini guidance must keep the raw-read fallback rule: {raw}"
     );
     assert!(
@@ -1230,12 +1230,12 @@ fn test_run_init_kilo_writes_symforge_rules_guidance() {
         "Kilo rules guidance must mention SymForge MCP: {raw}"
     );
     assert!(
-        raw.contains("| Task | Call |"),
+        raw.contains("| Task | Operation inside `code_execute` |"),
         "Kilo rules guidance must carry the task-to-tool map: {raw}"
     );
     assert!(
-        raw.contains("validate_file_syntax"),
-        "Kilo rules guidance must include config validation guidance: {raw}"
+        raw.contains("code_execute"),
+        "Kilo rules guidance must include code-mode guidance: {raw}"
     );
     assert!(
         !raw.contains("## Agent Directives: Mechanical Overrides"),
@@ -1478,6 +1478,7 @@ fn drive_stdio_mcp(name: &str, command: &str, args: &[String]) {
         .args(args)
         .current_dir(cwd.path())
         .env("SYMFORGE_AUTO_INDEX", "false")
+        .env("SYMFORGE_SURFACE", "full")
         .env_remove("SYMFORGE_WORKSPACE_ROOT")
         .env_remove("CLAUDE_PROJECT_DIR")
         .stdin(Stdio::piped())

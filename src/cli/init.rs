@@ -23,8 +23,8 @@ use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 use crate::paths;
 
-use crate::cli::InitClient;
 use crate::cli::harness::{self, HarnessId};
+use crate::cli::{InitClient, InitSurface};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -191,9 +191,256 @@ fn resolve_init_home_dir() -> anyhow::Result<PathBuf> {
     dirs::home_dir().context("cannot determine home directory")
 }
 
+const SURFACE_ENV: &str = "SYMFORGE_SURFACE";
+
+thread_local! {
+    // ponytail: thread-local pick keeps every `register_*` signature stable; pass it
+    // explicitly if init ever runs harness writers on worker threads.
+    static SURFACE_PICK: std::cell::Cell<Option<InitSurface>> = const { std::cell::Cell::new(None) };
+}
+
+/// The surface the user explicitly picked for this init run, if any.
+fn surface_pick() -> Option<InitSurface> {
+    SURFACE_PICK.with(std::cell::Cell::get)
+}
+
+/// Restores the previous pick on drop, so a pick never outlives its run.
+struct SurfacePickGuard(Option<InitSurface>);
+
+impl SurfacePickGuard {
+    fn set(pick: Option<InitSurface>) -> Self {
+        Self(SURFACE_PICK.with(|cell| cell.replace(pick)))
+    }
+}
+
+impl Drop for SurfacePickGuard {
+    fn drop(&mut self) {
+        SURFACE_PICK.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Read the menu answer. Enter (or EOF) selects Code Mode; unknown input re-asks.
+fn read_surface_choice(
+    input: &mut impl std::io::BufRead,
+    out: &mut impl std::io::Write,
+) -> InitSurface {
+    loop {
+        let _ = writeln!(
+            out,
+            "Choose the SymForge surface:\n  1) Code mode (default)  2) MCP full  3) MCP compact\n[1-3, Enter = 1]: "
+        );
+        let mut line = String::new();
+        if input.read_line(&mut line).unwrap_or(0) == 0 {
+            return InitSurface::Code;
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "" | "1" | "code" => return InitSurface::Code,
+            "2" | "full" => return InitSurface::Full,
+            "3" | "compact" => return InitSurface::Compact,
+            _ => {
+                let _ = writeln!(out, "Unrecognised choice; enter 1, 2 or 3.");
+            }
+        }
+    }
+}
+
+/// `--surface` wins; otherwise ask when both stdin and stdout are terminals;
+/// otherwise `None` (keep what each harness entry already has, else Code).
+pub fn resolve_surface_pick(flag: Option<InitSurface>) -> Option<InitSurface> {
+    use std::io::IsTerminal;
+    if flag.is_some() {
+        return flag;
+    }
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        return None;
+    }
+    Some(read_surface_choice(
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr(),
+    ))
+}
+
+/// First `symforge` entry under `value` (any nesting) that records a surface.
+fn find_json_surface(value: &Value) -> Option<InitSurface> {
+    match value {
+        Value::Object(map) => {
+            let own = map
+                .get("symforge")
+                .and_then(Value::as_object)
+                .and_then(|entry| {
+                    ["env", "environment"].iter().find_map(|key| {
+                        entry
+                            .get(*key)?
+                            .get(SURFACE_ENV)?
+                            .as_str()
+                            .and_then(InitSurface::from_env_value)
+                    })
+                });
+            own.or_else(|| map.values().find_map(find_json_surface))
+        }
+        Value::Array(items) => items.iter().find_map(find_json_surface),
+        _ => None,
+    }
+}
+
+/// The surface recorded in a harness config's `symforge` entry, if any.
+fn configured_surface(path: &std::path::Path) -> Option<InitSurface> {
+    let text = read_config_text(path).ok()?;
+    if path.extension().is_some_and(|ext| ext == "toml") {
+        let doc = text.parse::<DocumentMut>().ok()?;
+        let raw = doc
+            .get("mcp_servers")?
+            .get("symforge")?
+            .get("env")?
+            .get(SURFACE_ENV)?
+            .as_str()?;
+        return InitSurface::from_env_value(raw);
+    }
+    find_json_surface(&serde_json::from_str::<Value>(&text).ok()?)
+}
+
+/// Surface to render guidance and hooks for: the explicit pick, else what the
+/// harness entry holds after registration, else Code.
+fn effective_surface(config_path: &std::path::Path) -> InitSurface {
+    surface_pick()
+        .or_else(|| configured_surface(config_path))
+        .unwrap_or_default()
+}
+
+/// `mcp__symforge__*` names a surface exposes.
+fn exposed_symforge_tools(surface: InitSurface) -> Vec<&'static str> {
+    match surface {
+        InitSurface::Code => vec![
+            "mcp__symforge__code_search",
+            "mcp__symforge__code_execute",
+            "mcp__symforge__symforge_edit",
+            "mcp__symforge__status",
+        ],
+        InitSurface::Compact => vec![
+            "mcp__symforge__symforge",
+            "mcp__symforge__symforge_edit",
+            "mcp__symforge__status",
+        ],
+        InitSurface::Full => SYMFORGE_TOOL_NAMES.to_vec(),
+    }
+}
+
+/// One warning per agent file whose frontmatter `tools:` line lists a
+/// `mcp__symforge__*` tool the active surface does not expose.
+fn unexposed_agent_tool_warnings(
+    agents_dir: &std::path::Path,
+    surface: InitSurface,
+) -> Vec<String> {
+    let exposed = exposed_symforge_tools(surface);
+    let Ok(read_dir) = std::fs::read_dir(agents_dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = read_dir
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .collect();
+    files.sort();
+    let mut warnings = Vec::new();
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let mut lines = text.lines();
+        if lines.next().map(str::trim) != Some("---") {
+            continue;
+        }
+        let mut missing: Vec<String> = Vec::new();
+        for line in lines.take_while(|line| line.trim() != "---") {
+            let Some(list) = line.trim_start().strip_prefix("tools:") else {
+                continue;
+            };
+            for raw in list.split([',', ' ', '\t']) {
+                let name = raw.trim_matches(['"', '\'', '[', ']']);
+                if name.starts_with("mcp__symforge__")
+                    && !exposed.contains(&name)
+                    && !missing.iter().any(|m| m == name)
+                {
+                    missing.push(name.to_string());
+                }
+            }
+        }
+        if !missing.is_empty() {
+            warnings.push(format!(
+                "warning: agent {} lists {}, not exposed by the {} surface (exposed: {})",
+                file.display(),
+                missing.join(", "),
+                surface.as_str(),
+                exposed
+                    .iter()
+                    .filter_map(|name| name.strip_prefix("mcp__symforge__"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    warnings
+}
+
+/// A CLAUDE.md that `@`-imports an AGENTS.md already carries its content.
+fn imports_agents_md(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with('@') && line.ends_with("AGENTS.md")
+    })
+}
+
+/// Drop the managed START..END block and the blank line it leaves behind.
+fn remove_markdown_block(existing: &str) -> String {
+    let Some(start) = existing.find(SYMFORGE_GUIDANCE_START) else {
+        return existing.to_string();
+    };
+    let Some(end_offset) = existing[start..].find(SYMFORGE_GUIDANCE_END) else {
+        return existing.to_string();
+    };
+    let end = start + end_offset + SYMFORGE_GUIDANCE_END.len();
+    let nl = if uses_crlf(existing) { "\r\n" } else { "\n" };
+    let before = existing[..start].trim_end_matches(['\r', '\n']);
+    let after = existing[end..].trim_start_matches(['\r', '\n']);
+    match (before.is_empty(), after.is_empty()) {
+        (true, _) => after.to_string(),
+        (false, true) => format!("{before}{nl}"),
+        (false, false) => format!("{before}{nl}{nl}{after}"),
+    }
+}
+
+fn remove_guidance_markdown(path: &std::path::Path) -> anyhow::Result<()> {
+    let existing =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let merged = remove_markdown_block(&existing);
+    if merged == existing {
+        return Ok(());
+    }
+    crate::cli::harness_apply::atomic_write(path, merged.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// Write the Claude guidance, keeping one copy: when CLAUDE.md imports
+/// AGENTS.md the block lives in `agents_md` only.
+fn write_claude_guidance(
+    claude_md: &std::path::Path,
+    agents_md: &std::path::Path,
+    surface: InitSurface,
+) -> anyhow::Result<std::path::PathBuf> {
+    let imports = std::fs::read_to_string(claude_md)
+        .map(|text| imports_agents_md(&text))
+        .unwrap_or(false);
+    if !imports {
+        upsert_guidance_markdown(claude_md, &guidance_block(surface))?;
+        return Ok(claude_md.to_path_buf());
+    }
+    remove_guidance_markdown(claude_md)?;
+    upsert_guidance_markdown(agents_md, &guidance_block(surface))?;
+    Ok(agents_md.to_path_buf())
+}
+
 /// Entry point called by main.rs for `symforge init`.
 pub fn run_init(client: InitClient) -> anyhow::Result<()> {
-    run_init_with_options(client, false, false)
+    run_init_with_options(client, false, false, None)
 }
 
 /// Entry point for `symforge init` with opt-in `--code-skill` / `--skill-only` installation.
@@ -201,6 +448,7 @@ pub fn run_init_with_options(
     client: InitClient,
     code_skill: bool,
     skill_only: bool,
+    surface: Option<InitSurface>,
 ) -> anyhow::Result<()> {
     let home = resolve_init_home_dir()?;
     let binary_path = discover_binary_path();
@@ -222,6 +470,7 @@ pub fn run_init_with_options(
         std::env::current_dir().context("cannot determine current working directory")?;
     let paths = InitPaths::from_current_environment(&home, &working_dir);
 
+    let _pick = SurfacePickGuard::set(resolve_surface_pick(surface));
     run_init_with_paths(client, paths, &home, &working_dir, &binary_path)?;
     if code_skill {
         let written = install_code_skill_for_client(client, &home, &binary_path)?;
@@ -542,23 +791,28 @@ fn run_init_with_paths(
         &paths.claude_settings,
         harness::harness_installed(HarnessId::ClaudeCode, &paths.claude_config),
     ) {
-        merge_hooks_into_settings(&paths.claude_settings, &registration_binary_path)?;
-        eprintln!(
-            "Claude hooks installed in {}",
-            paths.claude_settings.display()
-        );
-
         register_mcp_server(&paths.claude_config, &binary_path_str)?;
         eprintln!(
             "Claude MCP server registered in {}",
             paths.claude_config.display()
         );
+        let surface = effective_surface(&paths.claude_config);
 
-        upsert_guidance_markdown(&paths.claude_memory, &claude_guidance_block())?;
+        merge_hooks_into_settings_for(&paths.claude_settings, &registration_binary_path, surface)?;
         eprintln!(
-            "Claude guidance written to {}",
-            paths.claude_memory.display()
+            "Claude hooks installed in {}",
+            paths.claude_settings.display()
         );
+
+        let guidance_path =
+            write_claude_guidance(&paths.claude_memory, &paths.codex_agents, surface)?;
+        eprintln!("Claude guidance written to {}", guidance_path.display());
+
+        if let Some(config_dir) = paths.claude_settings.parent() {
+            for warning in unexposed_agent_tool_warnings(&config_dir.join("agents"), surface) {
+                eprintln!("{warning}");
+            }
+        }
     }
 
     if targeted(
@@ -594,7 +848,10 @@ fn run_init_with_paths(
             paths.codex_config.display()
         );
 
-        upsert_guidance_markdown(&paths.codex_agents, &codex_guidance_block())?;
+        upsert_guidance_markdown(
+            &paths.codex_agents,
+            &guidance_block(effective_surface(&paths.codex_config)),
+        )?;
         eprintln!("Codex guidance written to {}", paths.codex_agents.display());
         eprintln!(
             "note: Codex gets MCP tools only. Codex CLI does ship SessionStart and pre-tool hooks, but symforge does not register them yet, so transparent enrichment remains Claude-only for now."
@@ -630,7 +887,10 @@ fn run_init_with_paths(
             paths.gemini_settings.display()
         );
 
-        upsert_guidance_markdown(&paths.gemini_memory, &gemini_guidance_block())?;
+        upsert_guidance_markdown(
+            &paths.gemini_memory,
+            &guidance_block(effective_surface(&paths.gemini_settings)),
+        )?;
         eprintln!(
             "Gemini guidance written to {}",
             paths.gemini_memory.display()
@@ -667,7 +927,10 @@ fn run_init_with_paths(
             paths.kilo_user_config.display()
         );
 
-        upsert_guidance_markdown(&paths.kilo_rules_guidance, &kilo_guidance_block())?;
+        upsert_guidance_markdown(
+            &paths.kilo_rules_guidance,
+            &guidance_block(effective_surface(&paths.kilo_project_config)),
+        )?;
         eprintln!(
             "Kilo Code guidance written to {}",
             paths.kilo_rules_guidance.display()
@@ -840,6 +1103,15 @@ pub fn merge_hooks_into_settings(
     settings_path: &std::path::Path,
     binary_path: &std::path::Path,
 ) -> anyhow::Result<()> {
+    merge_hooks_into_settings_for(settings_path, binary_path, InitSurface::Code)
+}
+
+/// [`merge_hooks_into_settings`] with the hook nudges rendered for `surface`.
+pub fn merge_hooks_into_settings_for(
+    settings_path: &std::path::Path,
+    binary_path: &std::path::Path,
+    surface: InitSurface,
+) -> anyhow::Result<()> {
     // Ensure parent dir exists.
     if let Some(parent) = settings_path.parent() {
         std::fs::create_dir_all(parent)
@@ -859,7 +1131,7 @@ pub fn merge_hooks_into_settings(
     let binary_str = binary_path.display().to_string().replace('\\', "/");
 
     // Merge hooks in-place.
-    merge_symforge_hooks(&mut settings, &binary_str);
+    merge_symforge_hooks_for(&mut settings, &binary_str, surface);
 
     // Write back.
     let pretty = serde_json::to_string_pretty(&settings)?;
@@ -987,6 +1259,11 @@ fn merge_allowed_tools(settings: &mut Value) {
 /// `binary_path` is the absolute path of the symforge binary (already
 /// normalised to forward-slash on Windows).
 pub fn merge_symforge_hooks(settings: &mut Value, binary_path: &str) {
+    merge_symforge_hooks_for(settings, binary_path, InitSurface::Code);
+}
+
+/// [`merge_symforge_hooks`] with the pre-tool nudge rendered for `surface`.
+pub fn merge_symforge_hooks_for(settings: &mut Value, binary_path: &str, surface: InitSurface) {
     // Ensure `hooks` key is an object.
     if !settings["hooks"].is_object() {
         settings["hooks"] = json!({});
@@ -994,7 +1271,7 @@ pub fn merge_symforge_hooks(settings: &mut Value, binary_path: &str) {
 
     // Build fresh symforge entries.
     let post_tool_use_entries = build_post_tool_use_entries(binary_path);
-    let pre_tool_use_entries = build_pre_tool_use_entries(binary_path);
+    let pre_tool_use_entries = build_pre_tool_use_entries(binary_path, surface);
     let session_start_entries = build_session_start_entries(binary_path);
     let user_prompt_submit_entries = build_user_prompt_submit_entries(binary_path);
 
@@ -1022,14 +1299,20 @@ fn build_post_tool_use_entries(binary_path: &str) -> Vec<Value> {
     })]
 }
 
-fn build_pre_tool_use_entries(binary_path: &str) -> Vec<Value> {
+fn build_pre_tool_use_entries(binary_path: &str, surface: InitSurface) -> Vec<Value> {
     // Single entry matching all tools where SymForge can help.
     // The pre-tool handler reads tool_name from stdin and outputs a suggestion.
     // When the SymForge sidecar is already running (agent actively using MCP
     // tools), the hint is suppressed to avoid noise — see run_hook() in hook.rs.
+    // The hook process does not see the MCP env, so the surface rides on the
+    // command line; absent means Code.
+    let surface_arg = match surface {
+        InitSurface::Code => String::new(),
+        other => format!(" --surface {}", other.as_str()),
+    };
     vec![json!({
         "matcher": "Grep|Read|Glob|Edit",
-        "hooks": [{"type": "command", "command": format!("{binary_path} hook pre-tool"), "timeout": 2}]
+        "hooks": [{"type": "command", "command": format!("{binary_path} hook pre-tool{surface_arg}"), "timeout": 2}]
     })]
 }
 
@@ -1499,9 +1782,21 @@ fn insert_string_map_defaults(
         .get_mut(field)
         .and_then(Value::as_object_mut)
         .expect("string map is an object");
+    let pick = surface_pick();
     for (key, val) in defaults {
-        map.entry((*key).to_string())
-            .or_insert_with(|| Value::String((*val).to_string()));
+        match pick {
+            // An explicit surface pick overwrites; no pick preserves (G-036).
+            Some(surface) if *key == SURFACE_ENV => {
+                map.insert(
+                    (*key).to_string(),
+                    Value::String(surface.as_str().to_string()),
+                );
+            }
+            _ => {
+                map.entry((*key).to_string())
+                    .or_insert_with(|| Value::String((*val).to_string()));
+            }
+        }
     }
 }
 
@@ -1552,10 +1847,9 @@ pub fn register_mcp_server(
     entry
         .entry("disabled".to_string())
         .or_insert_with(|| Value::Bool(false));
-    // Claude Code has native deferred tool loading, so pin the full surface —
-    // this makes the 39-name allowlist coherent (spec §4). Never clobber a
-    // user-set value (the 8.10.1 SYMFORGE_SURFACE=full wipe).
-    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
+    // Pin the surface (default Code Mode). Never clobber a user-set value
+    // without an explicit pick (the 8.10.1 SYMFORGE_SURFACE=full wipe).
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "code")]);
     union_allow_names(entry, "alwaysAllow", CLAUDE_ALWAYS_ALLOW);
 
     let pretty = serde_json::to_string_pretty(&config)?;
@@ -1616,14 +1910,14 @@ fn register_claude_desktop_mcp_server_with_home(
     let workspace_root_str = workspace_root.as_ref().map(|r| r.display().to_string());
 
     // Write a proven env instead of `{}` (TR-03 / FR-013):
-    //  - SYMFORGE_SURFACE=compact pins the compact surface explicitly in the
-    //    registered config (the token-sensitive escape hatch; the server default
-    //    is now full), keeping the opt-in visible to operators.
+    //  - SYMFORGE_SURFACE=code pins Code Mode (the token-lightest surface and
+    //    the server default) explicitly in the registered config, so the
+    //    choice stays visible to operators.
     //  - SYMFORGE_WORKSPACE_ROOT carries the discovered workspace so cold start
     //    populates the index even when the launcher CWD is unusable. Only set
     //    when a real root was discovered (the server validates it again at
     //    startup via the same trust-boundary guard).
-    let mut env_defaults: Vec<(&str, &str)> = vec![("SYMFORGE_SURFACE", "compact")];
+    let mut env_defaults: Vec<(&str, &str)> = vec![("SYMFORGE_SURFACE", "code")];
     if let Some(root) = workspace_root_str.as_deref() {
         env_defaults.push((crate::discovery::WORKSPACE_ROOT_ENV, root));
     }
@@ -1989,11 +2283,12 @@ fn merge_codex_mcp_env_overrides(symforge: &mut Table, target_os: &str) {
         .as_table_like_mut()
         .expect("symforge env must be a table or inline table");
 
-    // Codex defers schema loading (undocumented `tool_search` layer, measured
-    // 2026-07-03), so serve the full surface. Never clobber a user-set value
-    // (G-036: the 8.10.1 update wiped SYMFORGE_SURFACE=full).
-    if env.get("SYMFORGE_SURFACE").is_none() {
-        env.insert("SYMFORGE_SURFACE", value("full"));
+    // Default is Code Mode. Never clobber a user-set value without an explicit
+    // pick (G-036: the 8.10.1 update wiped SYMFORGE_SURFACE=full).
+    if let Some(surface) = surface_pick() {
+        env.insert(SURFACE_ENV, value(surface.as_str()));
+    } else if env.get(SURFACE_ENV).is_none() {
+        env.insert(SURFACE_ENV, value("code"));
     }
 
     for (name, env_value) in codex_mcp_env_overrides_for_target_os(target_os) {
@@ -2069,7 +2364,7 @@ pub fn register_gemini_mcp_server(
     // Gemini CLI full-injects (~16k tokens/turn) but accepts all 36 tools
     // (measured 2026-07-03); operator flipped init to full 2026-07-06.
     // `SYMFORGE_SURFACE=compact` stays the documented escape hatch.
-    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "code")]);
 
     let pretty = serde_json::to_string_pretty(&config)?;
     crate::cli::harness_apply::atomic_write(gemini_settings_path, pretty.as_bytes())
@@ -2130,7 +2425,7 @@ pub fn register_kilo_mcp_server(
         entry
             .entry("enabled".to_string())
             .or_insert_with(|| Value::Bool(true));
-        insert_string_map_defaults(entry, "environment", &[("SYMFORGE_SURFACE", "full")]);
+        insert_string_map_defaults(entry, "environment", &[("SYMFORGE_SURFACE", "code")]);
     }
 
     let pretty = serde_json::to_string_pretty(&config)?;
@@ -2216,7 +2511,7 @@ pub fn register_classic_mcp_servers(
     };
     let entry = symforge_json_entry_mut(&mut config);
     refresh_json_stdio_launch(entry, binary_path)?;
-    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "code")]);
     let pretty = serde_json::to_string_pretty(&config)?;
     crate::cli::harness_apply::atomic_write(config_path, pretty.as_bytes())
         .with_context(|| format!("writing {}", config_path.display()))?;
@@ -2247,7 +2542,7 @@ pub fn register_vscode_mcp_server(
             .or_insert_with(|| json!("stdio"));
     }
     refresh_json_stdio_launch(entry, binary_path)?;
-    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "code")]);
     let pretty = serde_json::to_string_pretty(&config)?;
     crate::cli::harness_apply::atomic_write(config_path, pretty.as_bytes())
         .with_context(|| format!("writing {}", config_path.display()))?;
@@ -2273,7 +2568,7 @@ pub fn register_zed_context_server(
     };
     let entry = json_server_entry_mut(&mut config, "context_servers");
     refresh_json_stdio_launch(entry, binary_path)?;
-    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "code")]);
     let pretty = serde_json::to_string_pretty(&config)?;
     crate::cli::harness_apply::atomic_write(config_path, pretty.as_bytes())
         .with_context(|| format!("writing {}", config_path.display()))?;
@@ -2328,7 +2623,7 @@ pub fn register_cursor_mcp_server(
     // Refresh the managed launch pair; preserve every other user-set field.
     refresh_json_stdio_launch(entry, binary_path)?;
     remove_legacy_pinned_workspace(entry);
-    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "code")]);
 
     let pretty = serde_json::to_string_pretty(&config)?;
     crate::cli::harness_apply::atomic_write(cursor_config_path, pretty.as_bytes())
@@ -2363,7 +2658,7 @@ pub fn register_omp_mcp_server(
 
     let entry = symforge_json_entry_mut(&mut config);
     refresh_json_stdio_launch(entry, binary_path)?;
-    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "code")]);
 
     let pretty = serde_json::to_string_pretty(&config)?;
     crate::cli::harness_apply::atomic_write(omp_config_path, pretty.as_bytes())
@@ -2539,35 +2834,78 @@ fn gemini_is_within_root(location: &str, root: &str) -> bool {
     suffix.starts_with('\\') || suffix.starts_with('/')
 }
 
+/// True when most line breaks in `text` are CRLF.
+fn uses_crlf(text: &str) -> bool {
+    text.matches("\r\n").count() * 2 > text.matches('\n').count()
+}
+
 fn upsert_markdown_block(existing: &str, guidance_block: &str) -> String {
+    let crlf = uses_crlf(existing);
+    let nl = if crlf { "\r\n" } else { "\n" };
+    // Never mix line endings: the block follows the file it lands in.
+    let block = if crlf {
+        guidance_block.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        guidance_block.to_string()
+    };
     if let Some(start) = existing.find(SYMFORGE_GUIDANCE_START)
         && let Some(end_marker_start) = existing[start..].find(SYMFORGE_GUIDANCE_END)
     {
         let end = start + end_marker_start + SYMFORGE_GUIDANCE_END.len();
         let mut merged = String::new();
         merged.push_str(&existing[..start]);
-        merged.push_str(guidance_block);
+        merged.push_str(&block);
         merged.push_str(&existing[end..]);
         return merged;
     }
 
     if existing.trim().is_empty() {
-        return format!("{guidance_block}\n");
+        return format!("{block}\n");
     }
 
     let mut merged = existing.trim_end_matches(['\r', '\n']).to_string();
-    merged.push_str("\n\n");
-    merged.push_str(guidance_block);
-    merged.push('\n');
+    merged.push_str(nl);
+    merged.push_str(nl);
+    merged.push_str(&block);
+    merged.push_str(nl);
     merged
 }
 
-/// Body of the managed guidance block, exactly as injected between the
-/// markers. Standalone by design: it must read correctly in any user's
-/// memory file, so it references no host-file section numbers.
-const SHARED_GUIDANCE_BODY: &str = r#"## SymForge MCP — task-to-tool map
+const CODE_GUIDANCE_BODY: &str = r##"## SymForge MCP — code mode
 
-The granular tools and the 3-tool facade are both live — use whichever answers in one call.
+SymForge runs in code mode: every read operation is a function inside `code_execute`.
+
+- `code_search` — exact signatures; omit `query` to list all operations.
+- `code_execute` — a Python script; every read operation is a pre-bound global called with keyword arguments only; end with the value to return.
+- `symforge_edit` — structural edits (`op=replace|insert_before|insert_after|edit_within`).
+- `status` — index health.
+
+```python
+ctx = file_context(path="src/lib.rs")
+refs = find_references(name="parse_config")
+{"ctx": ctx, "refs": refs}
+```
+
+| Task | Operation inside `code_execute` |
+|---|---|
+| Repo overview | `repo_map` (low detail first on large repos) |
+| Before reading a file | `file_context` — outline/imports/consumers; `file_content` only when exact text is needed |
+| Before grepping | `search_text(group_by="symbol")` |
+| Find a function/class/type | `search_symbols`; exact source via `get_symbol` |
+| Callers / usage | `find_references`, `find_dependents`; deep dive via `symbol_context` |
+| Editing a symbol | `symforge_edit` (a tool, not `code_execute`) |
+| Change impact | `detect_impact` / `diff_symbols` |
+| Resuming work | `what_changed` |
+| Docs / knowledge | `search_knowledge` |
+
+Raw reads (`file_content`/Read) remain correct for docs/configs where literal wording matters, unindexed files, and SymForge errors — say so when falling back."##;
+
+/// Body of the managed guidance block for the full MCP surface. Standalone by
+/// design: it must read correctly in any user's memory file, so it references
+/// no host-file section numbers.
+const FULL_GUIDANCE_BODY: &str = r#"## SymForge MCP — task-to-tool map
+
+Direct tools:
 
 | Task | Call |
 |---|---|
@@ -2585,24 +2923,24 @@ The granular tools and the 3-tool facade are both live — use whichever answers
 
 Raw reads (`get_file_content`/Read) remain correct for docs/configs where literal wording matters, unindexed files, and SymForge errors — say so when falling back."#;
 
-fn shared_guidance_block() -> String {
-    format!("{SYMFORGE_GUIDANCE_START}\n{SHARED_GUIDANCE_BODY}\n{SYMFORGE_GUIDANCE_END}")
-}
+const COMPACT_GUIDANCE_BODY: &str = r#"## SymForge MCP — compact surface
 
-fn claude_guidance_block() -> String {
-    shared_guidance_block()
-}
+Three tools:
 
-fn codex_guidance_block() -> String {
-    shared_guidance_block()
-}
+- `symforge` — one entry point with the intents `ask`, `find`, `read`, `trace`, `impact`.
+- `symforge_edit` — structural edits (`op=replace|insert_before|insert_after|edit_within`).
+- `status` — index health.
 
-fn gemini_guidance_block() -> String {
-    shared_guidance_block()
-}
+Raw reads (`symforge` read/Read) remain correct for docs/configs where literal wording matters, unindexed files, and SymForge errors — say so when falling back."#;
 
-fn kilo_guidance_block() -> String {
-    shared_guidance_block()
+/// The managed guidance block (markers included) for `surface`.
+fn guidance_block(surface: InitSurface) -> String {
+    let body = match surface {
+        InitSurface::Code => CODE_GUIDANCE_BODY,
+        InitSurface::Full => FULL_GUIDANCE_BODY,
+        InitSurface::Compact => COMPACT_GUIDANCE_BODY,
+    };
+    format!("{SYMFORGE_GUIDANCE_START}\n{body}\n{SYMFORGE_GUIDANCE_END}")
 }
 
 /// Returns the binary path of the currently running symforge executable.
@@ -3069,8 +3407,8 @@ mod tests {
             "Codex entry must not write a dead allowlist or a tool-hiding one: {content}"
         );
         assert!(
-            content.contains("SYMFORGE_SURFACE = \"full\""),
-            "Codex env must make the full surface explicit: {content}"
+            content.contains("SYMFORGE_SURFACE = \"code\""),
+            "Codex env must make the code surface explicit: {content}"
         );
         assert!(
             content.contains("project_doc_fallback_filenames = [\"AGENTS.md\", \"CLAUDE.md\"]"),
@@ -3089,8 +3427,8 @@ mod tests {
         let entry = &config["mcpServers"]["symforge"];
         assert_eq!(
             entry["env"]["SYMFORGE_SURFACE"].as_str(),
-            Some("full"),
-            "fresh Claude Code registration must pin the full surface: {entry}"
+            Some("code"),
+            "fresh Claude Code registration must pin the code surface: {entry}"
         );
         let allow = entry["alwaysAllow"].as_array().unwrap();
         assert_eq!(
@@ -3348,8 +3686,8 @@ mod tests {
         let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             config["mcpServers"]["symforge"]["env"]["SYMFORGE_SURFACE"].as_str(),
-            Some("full"),
-            "fresh Gemini registration must make the full surface explicit"
+            Some("code"),
+            "fresh Gemini registration must make the code surface explicit"
         );
     }
 
@@ -3369,7 +3707,7 @@ mod tests {
         assert!(entry.get("alwaysAllow").is_none(), "{entry}");
         assert_eq!(
             entry["environment"]["SYMFORGE_SURFACE"].as_str(),
-            Some("full")
+            Some("code")
         );
         assert!(config.get("mcpServers").is_none(), "{config}");
     }
@@ -3540,8 +3878,8 @@ mod tests {
             );
         }
         assert!(
-            content.contains("SYMFORGE_SURFACE = \"full\""),
-            "fresh Codex env must pin the full surface on every OS: {content}"
+            content.contains("SYMFORGE_SURFACE = \"code\""),
+            "fresh Codex env must pin the code surface on every OS: {content}"
         );
     }
 
@@ -4307,7 +4645,7 @@ url = 'http://127.0.0.1:9/mcp'
 
     #[test]
     fn test_codex_guidance_is_task_map_block() {
-        let block = codex_guidance_block();
+        let block = guidance_block(InitSurface::Full);
         assert!(
             block.contains("| Task | Call |"),
             "codex guidance should carry the task-to-tool map: {block}"
@@ -4325,7 +4663,7 @@ url = 'http://127.0.0.1:9/mcp'
 
     #[test]
     fn test_guidance_block_markers_are_bare_lines() {
-        let block = shared_guidance_block();
+        let block = guidance_block(InitSurface::Code);
         assert!(
             block.starts_with("<!-- SYMFORGE START -->\n"),
             "start marker must be alone on the first line: {block}"
@@ -4342,7 +4680,7 @@ url = 'http://127.0.0.1:9/mcp'
 
     #[test]
     fn test_upsert_markdown_block_is_idempotent() {
-        let block = shared_guidance_block();
+        let block = guidance_block(InitSurface::Code);
         let existing = format!("# Host file\n\nHost sections stay untouched.\n\n{block}\n");
         assert_eq!(
             upsert_markdown_block(&existing, &block),
@@ -4504,8 +4842,8 @@ url = 'http://127.0.0.1:9/mcp'
             .expect("cursor env must be a proven object, not absent");
         assert_eq!(
             env.get("SYMFORGE_SURFACE").and_then(Value::as_str),
-            Some("full"),
-            "cursor env must pin the full surface: {server}"
+            Some("code"),
+            "cursor env must pin the code surface: {server}"
         );
         assert!(
             !env.contains_key(crate::discovery::WORKSPACE_ROOT_ENV),
@@ -4606,8 +4944,8 @@ url = 'http://127.0.0.1:9/mcp'
 
         assert_eq!(
             env.get("SYMFORGE_SURFACE").and_then(Value::as_str),
-            Some("compact"),
-            "registered env must pin the compact surface explicitly: {env:?}"
+            Some("code"),
+            "registered env must pin the code surface explicitly: {env:?}"
         );
 
         // The test binary runs from the symforge repo (a git repo), so init
@@ -4626,7 +4964,7 @@ url = 'http://127.0.0.1:9/mcp'
 
     #[test]
     fn test_gemini_guidance_is_task_map_block() {
-        let block = gemini_guidance_block();
+        let block = guidance_block(InitSurface::Full);
         assert!(
             block.contains("| Task | Call |"),
             "gemini guidance should carry the task-to-tool map: {block}"
@@ -4639,7 +4977,7 @@ url = 'http://127.0.0.1:9/mcp'
 
     #[test]
     fn test_kilo_guidance_is_task_map_block() {
-        let block = kilo_guidance_block();
+        let block = guidance_block(InitSurface::Full);
         assert!(
             block.contains("| Task | Call |"),
             "kilo guidance should carry the task-to-tool map: {block}"
@@ -4917,6 +5255,243 @@ url = 'http://127.0.0.1:9/mcp'
                 .unwrap()
                 .is_none(),
             "trusted workspaces should not produce a Gemini trust warning"
+        );
+    }
+
+    // ---- surface picker, per-surface guidance, one-copy rule, doctor ----
+
+    fn init_claude(home: &std::path::Path, pick: Option<InitSurface>) -> std::path::PathBuf {
+        let cwd = tempfile::tempdir().unwrap();
+        let _guard = SurfacePickGuard::set(pick);
+        run_init_with_context(
+            InitClient::Claude,
+            home,
+            cwd.path(),
+            std::path::Path::new("/usr/local/bin/symforge"),
+        )
+        .unwrap();
+        home.join(".claude.json")
+    }
+
+    fn claude_surface_env(config: &std::path::Path) -> String {
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(config).unwrap()).unwrap();
+        v["mcpServers"]["symforge"]["env"]["SYMFORGE_SURFACE"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn guidance_block_is_rendered_per_surface() {
+        let code = guidance_block(InitSurface::Code);
+        assert!(code.contains("## SymForge MCP — code mode"));
+        for name in [
+            "code_search",
+            "code_execute",
+            "symforge_edit",
+            "repo_map",
+            "file_context",
+            "symbol_context",
+            "search_knowledge",
+        ] {
+            assert!(code.contains(name), "code block must name {name}: {code}");
+        }
+        assert!(!code.contains("get_repo_map") && !code.contains("both live"));
+
+        let full = guidance_block(InitSurface::Full);
+        assert!(full.contains("Direct tools:") && !full.contains("both live"));
+        // Every tool the full table names must be a registered tool.
+        for name in [
+            "get_repo_map",
+            "get_file_context",
+            "search_text",
+            "search_symbols",
+            "get_symbol",
+            "find_references",
+            "get_symbol_context",
+            "conventions",
+            "edit_plan",
+            "replace_symbol_body",
+            "edit_within_symbol",
+            "batch_edit",
+            "analyze_file_impact",
+            "what_changed",
+            "validate_file_syntax",
+            "ask",
+            "get_file_content",
+        ] {
+            assert!(
+                SYMFORGE_TOOL_NAMES.contains(&format!("mcp__symforge__{name}").as_str()),
+                "{name} missing from SYMFORGE_TOOL_NAMES"
+            );
+            assert!(full.contains(name), "full block must name {name}");
+        }
+
+        let compact = guidance_block(InitSurface::Compact);
+        assert!(compact.contains("`symforge`") && !compact.contains("code_execute"));
+    }
+
+    #[test]
+    fn upsert_is_byte_stable_and_preserves_crlf() {
+        let block = guidance_block(InitSurface::Code);
+        let lf = upsert_markdown_block("# Host\n", &block);
+        assert_eq!(upsert_markdown_block(&lf, &block), lf);
+
+        let crlf_existing = "# Host\r\n\r\nmine\r\n";
+        let crlf = upsert_markdown_block(crlf_existing, &block);
+        assert!(crlf.starts_with(crlf_existing.trim_end()));
+        assert_eq!(crlf.matches('\n').count(), crlf.matches("\r\n").count());
+        assert_eq!(upsert_markdown_block(&crlf, &block), crlf);
+        // Switching surface keeps the file CRLF-only.
+        let switched = upsert_markdown_block(&crlf, &guidance_block(InitSurface::Full));
+        assert_eq!(
+            switched.matches('\n').count(),
+            switched.matches("\r\n").count()
+        );
+    }
+
+    #[test]
+    fn unchanged_guidance_is_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        let block = guidance_block(InitSurface::Code);
+        upsert_guidance_markdown(&path, &block).unwrap();
+        let first = std::fs::read(&path).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        upsert_guidance_markdown(&path, &block).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    }
+
+    #[test]
+    fn claude_md_importing_agents_md_carries_no_copy() {
+        let home = tempfile::tempdir().unwrap();
+        let claude_md = home.path().join(".claude").join("CLAUDE.md");
+        std::fs::create_dir_all(claude_md.parent().unwrap()).unwrap();
+        let stale =
+            upsert_markdown_block("@~/.codex/AGENTS.md\n", &guidance_block(InitSurface::Full));
+        std::fs::write(&claude_md, &stale).unwrap();
+
+        init_claude(home.path(), None);
+
+        assert_eq!(
+            std::fs::read_to_string(&claude_md).unwrap(),
+            "@~/.codex/AGENTS.md\n"
+        );
+        let agents = std::fs::read_to_string(home.path().join(".codex").join("AGENTS.md")).unwrap();
+        assert_eq!(agents.matches(SYMFORGE_GUIDANCE_START).count(), 1);
+        assert!(agents.contains("code mode"));
+    }
+
+    #[test]
+    fn claude_md_without_import_keeps_its_own_block() {
+        let home = tempfile::tempdir().unwrap();
+        init_claude(home.path(), None);
+        let claude_md =
+            std::fs::read_to_string(home.path().join(".claude").join("CLAUDE.md")).unwrap();
+        assert!(claude_md.contains("## SymForge MCP — code mode"));
+    }
+
+    #[test]
+    fn surface_menu_reads_choices() {
+        let ask = |input: &str| read_surface_choice(&mut input.as_bytes(), &mut Vec::new());
+        assert_eq!(ask("\n"), InitSurface::Code);
+        assert_eq!(ask(""), InitSurface::Code);
+        assert_eq!(ask("2\n"), InitSurface::Full);
+        assert_eq!(ask("nope\n3\n"), InitSurface::Compact);
+    }
+
+    #[test]
+    fn non_interactive_keeps_existing_surface_else_code() {
+        let fresh = tempfile::tempdir().unwrap();
+        let config = init_claude(fresh.path(), None);
+        assert_eq!(claude_surface_env(&config), "code");
+
+        let kept = tempfile::tempdir().unwrap();
+        std::fs::write(
+            kept.path().join(".claude.json"),
+            r#"{"mcpServers":{"symforge":{"env":{"SYMFORGE_SURFACE":"full"}}}}"#,
+        )
+        .unwrap();
+        let config = init_claude(kept.path(), None);
+        assert_eq!(claude_surface_env(&config), "full");
+        let md = std::fs::read_to_string(kept.path().join(".claude").join("CLAUDE.md")).unwrap();
+        assert!(
+            md.contains("Direct tools:"),
+            "guidance must follow the kept surface"
+        );
+        let settings =
+            std::fs::read_to_string(kept.path().join(".claude").join("settings.json")).unwrap();
+        assert!(settings.contains("hook pre-tool --surface full"));
+    }
+
+    #[test]
+    fn explicit_pick_overwrites_every_surface_env() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".claude.json"),
+            r#"{"mcpServers":{"symforge":{"env":{"SYMFORGE_SURFACE":"full"}}}}"#,
+        )
+        .unwrap();
+        let config = init_claude(home.path(), Some(InitSurface::Compact));
+        assert_eq!(claude_surface_env(&config), "compact");
+        let md = std::fs::read_to_string(home.path().join(".claude").join("CLAUDE.md")).unwrap();
+        assert!(md.contains("compact surface"));
+        // And back to Code, which restores the bare hook command.
+        let config = init_claude(home.path(), Some(InitSurface::Code));
+        assert_eq!(claude_surface_env(&config), "code");
+        let settings =
+            std::fs::read_to_string(home.path().join(".claude").join("settings.json")).unwrap();
+        assert!(!settings.contains("--surface"));
+
+        let codex = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        for pick in [None, Some(InitSurface::Full)] {
+            let _guard = SurfacePickGuard::set(pick);
+            run_init_with_context(
+                InitClient::Codex,
+                codex.path(),
+                cwd.path(),
+                std::path::Path::new("/usr/local/bin/symforge"),
+            )
+            .unwrap();
+            let doc = std::fs::read_to_string(codex.path().join(".codex").join("config.toml"))
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap();
+            let expected = if pick.is_some() { "full" } else { "code" };
+            assert_eq!(
+                doc["mcp_servers"]["symforge"]["env"]["SYMFORGE_SURFACE"].as_str(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_warns_for_agent_tools_the_surface_hides() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("reader.md"),
+            "---\nname: reader\ntools: Read, mcp__symforge__search_text, mcp__symforge__code_execute\n---\nbody mentions mcp__symforge__ask\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("ok.md"),
+            "---\ntools: mcp__symforge__code_search\n---\n",
+        )
+        .unwrap();
+        let code = unexposed_agent_tool_warnings(dir.path(), InitSurface::Code);
+        assert_eq!(code.len(), 1, "{code:?}");
+        assert!(code[0].contains("reader.md") && code[0].contains("mcp__symforge__search_text"));
+        assert!(!code[0].contains("lists mcp__symforge__code_execute"));
+        assert!(
+            unexposed_agent_tool_warnings(dir.path(), InitSurface::Full)
+                .iter()
+                .all(|w| !w.contains("search_text"))
+        );
+        assert!(
+            unexposed_agent_tool_warnings(&dir.path().join("missing"), InitSurface::Code)
+                .is_empty()
         );
     }
 }

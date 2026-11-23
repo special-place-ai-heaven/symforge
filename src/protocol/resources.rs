@@ -739,6 +739,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_static_repo_map_resource() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let server = make_server();
         let result = server
             .read_resource_uri(REPO_MAP_URI)
@@ -763,6 +767,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_templated_file_context_resource() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let server = make_server();
         let uri = build_uri(
             "symforge://file/context",
@@ -778,6 +786,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_templated_file_content_resource_with_ordinary_read_flags() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let server = make_server();
         let uri = build_uri(
             "symforge://file/content",
@@ -797,6 +809,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_templated_file_content_resource_with_around_line_context() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let server =
             make_server_with_file("src/main.rs", b"line 1\nline 2\nline 3\nline 4\nline 5");
         let uri = build_uri(
@@ -817,6 +833,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_templated_file_content_resource_with_around_match_context() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let server = make_server_with_file(
             "src/main.rs",
             b"line 1\nTODO first\nline 3\nTODO second\nline 5",
@@ -839,6 +859,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_templated_resource_for_missing_target_is_resource_not_found() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let server = make_server();
         let uris = [
             build_uri(
@@ -887,6 +911,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_existing_file_whose_content_looks_like_a_miss_is_success() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let server = make_server_with_file("src/main.rs", b"File not found: decoy");
         let uri = build_uri(
             "symforge://file/content",
@@ -909,6 +937,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_existing_symbol_whose_body_looks_like_a_miss_is_success() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         // The fixture symbol `main` spans bytes 0..10, so its body is `No symbol `.
         let server = make_server_with_file("src/main.rs", b"No symbol here");
         let uri = build_uri(
@@ -931,6 +963,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_existing_unreferenced_symbol_context_is_success() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let server = make_server();
         let uri = build_uri(
             "symforge://symbol/context",
@@ -952,6 +988,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_invalid_request_resource_is_invalid_params() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let server = make_server();
         let uri = build_uri(
             "symforge://file/content",
@@ -971,6 +1011,10 @@ mod tests {
 
     #[tokio::test]
     async fn project_selectors_are_rejected_by_project_bound_resource_templates() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let server = make_server();
         let invalid_uris = [
             "symforge://file/context?path=src%2Fmain.rs&project=not-an-open-project",
@@ -1012,6 +1056,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_resource_while_index_loads_is_retryable_internal_error() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let server = make_server_with_file_in_state(
             "src/main.rs",
             b"fn main() {}",
@@ -1042,6 +1090,10 @@ mod tests {
     /// resource alike. A name defined nowhere is the miss.
     #[tokio::test]
     async fn test_symbol_context_file_filter_misses_only_a_symbol_defined_nowhere() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let server = make_server_with_files(
             &[
                 ("src/a.rs", b"fn helper() {}", "helper"),
@@ -1099,6 +1151,10 @@ mod tests {
     /// tool outcome and the resource; an existing unreferenced symbol is not.
     #[tokio::test]
     async fn test_name_only_symbol_context_misses_only_a_symbol_defined_nowhere() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let server = make_server();
         let input = |name: &str| GetSymbolContextInput {
             project: None,
@@ -1271,6 +1327,10 @@ mod tests {
     /// is under test, not only the tool handler.
     #[tokio::test]
     async fn resource_read_outcomes_match_the_shared_table() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         use crate::protocol::result_status::read_outcome_cases::{CASES, FILES, Read};
 
         let root = tempfile::tempdir().unwrap();
@@ -1503,7 +1563,7 @@ mod tests {
     async fn resources_obey_the_tool_allow_list() {
         use crate::protocol::surface_probe::SurfaceEnvVarGuard;
         let server = make_server();
-        let _surface = SurfaceEnvVarGuard::set("SYMFORGE_SURFACE", None);
+        let _surface = SurfaceEnvVarGuard::set("SYMFORGE_SURFACE", Some("full"));
         let unset_resources;
         let unset_templates;
         {

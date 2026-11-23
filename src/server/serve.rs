@@ -1461,6 +1461,10 @@ mod tests {
     /// with text unchanged and legacy revisions still text-only.
     #[tokio::test]
     async fn multi_repo_server_view_returns_structured_content_where_schema_listed() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let loaded = |alias: &str| LoadedRepo {
             alias: alias.to_string(),
             index: LiveIndex::empty(),

@@ -212,7 +212,9 @@ pub fn surface_profile_from_env() -> SurfaceProfile {
         Some(ref s) if s == "compact" => SurfaceProfile::Compact,
         Some(ref s) if s == "code" => SurfaceProfile::Code,
         Some(ref s) if s == "meta" => SurfaceProfile::Meta,
-        _ => SurfaceProfile::Full,
+        Some(ref s) if s == "full" => SurfaceProfile::Full,
+        // Unset (or unrecognised) is Code Mode; only an explicit "full" serves granular tools.
+        _ => SurfaceProfile::Code,
     }
 }
 

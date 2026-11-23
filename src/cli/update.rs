@@ -621,6 +621,8 @@ struct RealUpdateOps {
     journal: Vec<(PathBuf, Option<PathBuf>)>,
     /// Set by `run_update` when `npm_prefix` is not npm's own global prefix.
     mismatch: Option<PrefixMismatch>,
+    /// Explicit surface pick forwarded to every `init` child (`None`: keep each harness's).
+    surface: Option<crate::cli::InitSurface>,
 }
 
 impl RealUpdateOps {
@@ -641,6 +643,7 @@ impl RealUpdateOps {
             home,
             journal: Vec::new(),
             mismatch: None,
+            surface: None,
         }
     }
 }
@@ -857,6 +860,12 @@ impl UpdateOps for RealUpdateOps {
         // captured as a workspace root.
         let status = crate::process_util::hidden_command(&self.live_binary)
             .args(["init", "--client", target.slug])
+            .args(
+                self.surface
+                    .map(|s| ["--surface", s.as_str()])
+                    .into_iter()
+                    .flatten(),
+            )
             .current_dir(&self.home)
             .env_remove(crate::discovery::WORKSPACE_ROOT_ENV)
             .stdin(Stdio::null())
@@ -1469,7 +1478,9 @@ fn launcher_path_in_prefix(prefix: &std::path::Path, os: &str) -> std::path::Pat
     }
 }
 
-pub fn run_update() -> anyhow::Result<()> {
+pub fn run_update(surface: Option<crate::cli::InitSurface>) -> anyhow::Result<()> {
+    // Asked once, here: the per-harness `init` children run with a null stdin.
+    let surface = crate::cli::init::resolve_surface_pick(surface);
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     let platform_package = platform_package_for(os, arch).with_context(|| {
@@ -1488,6 +1499,7 @@ pub fn run_update() -> anyhow::Result<()> {
     let _lock = lock_update(&npm_prefix)?;
     let mut ops = RealUpdateOps::new(os, platform_package, npm_prefix, home);
     ops.mismatch = mismatch;
+    ops.surface = surface;
     orchestrate_update(os, arch, &mut ops)
 }
 
