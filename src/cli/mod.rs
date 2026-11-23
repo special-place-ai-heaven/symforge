@@ -85,7 +85,7 @@ pub enum Commands {
         #[arg(long, conflicts_with = "scan")]
         skill_only: bool,
 
-        /// Surface to configure: `code` (default), `full`, or `compact`. Without it,
+        /// Surface to configure: `code` (default), `mcp-full`, or `mcp-compact`. Without it,
         /// an interactive terminal is asked; otherwise each harness keeps its current
         /// surface (new entries get `code`).
         #[arg(long, value_enum, conflicts_with = "scan")]
@@ -115,7 +115,7 @@ pub enum Commands {
     },
     /// Update the npm-managed SymForge install
     Update {
-        /// Surface to configure for re-registered harnesses: `code`, `full`, or `compact`.
+        /// Surface to configure for re-registered harnesses: `code`, `mcp-full`, or `mcp-compact`.
         /// Without it, an interactive terminal is asked; otherwise each keeps its current surface.
         #[arg(long, value_enum)]
         surface: Option<InitSurface>,
@@ -167,8 +167,10 @@ pub enum InitSurface {
     #[default]
     Code,
     /// Every granular MCP tool.
+    #[value(name = "mcp-full", alias = "full")]
     Full,
     /// The 3-tool facade: `symforge`, `symforge_edit`, `status`.
+    #[value(name = "mcp-compact", alias = "compact")]
     Compact,
 }
 
@@ -477,6 +479,15 @@ mod tests {
             _ => panic!("expected hook command"),
         }
         assert!(Cli::try_parse_from(["symforge", "init", "--surface", "bogus"]).is_err());
+        // The documented names; `full`/`compact` stay accepted for existing hook commands.
+        match Cli::parse_from(["symforge", "update", "--surface", "mcp-full"]).command {
+            Some(Commands::Update { surface }) => assert_eq!(surface, Some(InitSurface::Full)),
+            _ => panic!("expected update command"),
+        }
+        match Cli::parse_from(["symforge", "init", "--surface", "mcp-compact"]).command {
+            Some(Commands::Init { surface, .. }) => assert_eq!(surface, Some(InitSurface::Compact)),
+            _ => panic!("expected init command"),
+        }
     }
 
     #[test]
