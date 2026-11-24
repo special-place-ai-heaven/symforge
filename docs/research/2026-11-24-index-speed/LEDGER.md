@@ -43,6 +43,14 @@ flowchart LR
 
 Preparing match strings once per target and shortlisting qualified calls with existing name postings remain possible performance follow-ups after the visible counts are correct. Measure that pass separately before proposing another PR. [Peer comparison](REPORT.md#projects-that-build-repository-maps-for-coding-agents)
 
+## Fix #1 controls and timeout replay
+
+A standalone probe used the budget helper and both truncation footers from Git revision `3a4fb63d`. It exercised prefix costs from 3,930 through 4,020 UTF-8 bytes, one- and two-row layouts, multibyte text, scoped and unscoped footers, and 0, 1, 14, 15 and 16 type tuples. In **2,730 comparisons**, replacing an entirely hidden section with the same number of placeholder rows exercised 504 skips and changed zero rendered bytes. A deliberately premature cutoff at 3,999 bytes changed 24 responses. Replay on the benchmark host with `uv run --no-project python map-prefix-risk-control.py` from the report’s private replay directory. Terminal Commander job `job_01a20d71085c7799b8b7812ced0747fb` exited 0. The probe supplies the rows directly. Candidate discovery, ranking, and transport still need product-level proof.
+
+1. **Prove the intended work disappeared.** On the pinned SymForge and AAP roots, explicitly request the unscoped compact map with default depth. Record the footer, full rendered digest, eligible type count and number of dependent lookups. Require eligible types and positive lookups on the baseline, identical rendered bytes and zero lookups on the candidate. Also run a scope with a visible annotated type, require a positive lookup count on both versions and compare its complete bytes. Keep diagnostic counters out of the timed release binaries.
+2. **Replay the original failure.** Give each matched binary its own daemon and verify client and daemon identities. On an already ready AAP publication, bracket the same default compact-map request with known code hits over persistent stdio. Keep the original transport deadline. Record the first and repeated call wall times, map bytes or exact error, and the surrounding hits. A timeout counts as a failed attempt. Wait for the server-side operation to finish or use a fresh isolated daemon before the next sample so an expired request cannot consume the next run’s worker time.
+3. **Locate any remaining delay.** If a hidden-section request still takes 2 s or more with zero lookups, capture the time from request admission to formatter entry, inside the formatter, and from formatter exit to client receipt. Compare with the no-daemon path on the same source tree. Use the longest measured interval to scope the follow-up. Keep the latency target open even if byte equivalence passes.
+
 ## When an outcome is complete
 
 | Outcome | Acceptance on the real client |
