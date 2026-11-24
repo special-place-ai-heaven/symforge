@@ -12,6 +12,8 @@ Keep all four targets. Measure request to first correct hit, first complete answ
 
 ## Independent review reconciliation
 
+The first implementation is on `perf/compact-map-hidden-ranking` at `d53e429f`. On AAP the packaged CLI exceeded its 60 s deadline. The candidate returned the expected 4,345-file map in 69 ms wall time, with working code searches immediately before and after. Its rendered SHA-256 matches the completed baseline run on the pinned tree. Persistent code mode returned the first map in 11 ms. On moldwright the ranking is visible and the first candidate map still took 8.556 s. [Per-surface results and limits](LEDGER.md#measured-results-for-fix-1)
+
 Gemini and Fable independently reviewed revision `806d762a`. Fable supplied its findings in chat. The timing in Fable’s review is its measurement; the replay below is ours. Both reviewers kept **#1 first** and identified the risk in predicting a visible row’s size before ranking. We adopt the narrower directory-prefix cutoff. A fixed directory count (roughly 60 in some examples) cannot replace the actual UTF-8 byte budget. Gemini supplied the exact separator, tuple-count and ellipsis traps; Fable supplied a real slow map where the key types were visible.
 
 | Finding | Adjudication and effect on the plan |
@@ -294,6 +296,29 @@ These source checks establish how the projects work. None supplies a comparable 
 | MCP | Request progress belongs to an active request token. Background indexing after a tool returns still needs pollable status. The 2026-07-28 specification deprecates client roots and recommends explicit parameters or configuration. Treat the chosen root as a request subject to server policy. [Progress](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/progress) · [Roots](https://modelcontextprotocol.io/specification/2026-07-28/client/roots) |
 
 ## Acceptance on the real client
+
+### When does targeted retrieval save context?
+
+For a question about one named symbol, let `D` be the tokens to request and read the file directly, `T` the tokens spent trying the targeted route, and `p` the probability that its result answers the question without a fallback. If a failed attempt requires a complete direct read, expected savings are `p × D − T`. Include discovery in `T` when the name or calling convention is unknown. Charge a session-wide schema once when it is newly needed. For a question about the whole file, a shorter response that omits necessary evidence cannot be counted as a saving.
+
+The corresponding decision for a *default map hint* is stricter. Sum the actual cost of the routes a model would take without hints, subtract the cost with hints, then subtract the extra map tokens on every request, including map-only requests. Compare against a model that already chooses direct reads for small files. Report both model-visible context and transport size separately. Code mode can return a projection containing just the evidence the model needs.
+
+The initial pilot used `o200k_base`, observed code-mode request and reply bytes, and a modeled direct-read envelope containing the Git file. Four returned source spans matched their respective Git line ranges after trimming outer whitespace. The question in each row required only that symbol's local implementation. The symbol call excludes discovery when its name is already known.
+
+| File on pinned tree | File bytes | Direct read, tokens | Known symbol, tokens | Additional discovery, tokens |
+|---|---:|---:|---:|---:|
+| SymForge `src/embed/parity/read_context.rs` | 2,141 | 663 | 409 | 527 |
+| SymForge `src/parsing/languages/elixir.rs` | 6,301 | 1,676 | 333 | 532 |
+| SymForge `src/index_lifecycle/embed_remediation.rs` | 37,780 | 9,132 | 344 | 2,074 |
+| AAP `07_app/crates/aap-core/src/identity.rs` | 16,423 | 5,148 | 339 | 1,712 |
+
+For the 2,141-byte file, a known name saved 254 tokens at the wire. Discovering the name first cost 273 tokens more than a direct read. The 37,780-byte case saved 6,714 tokens even with discovery. The four-tool schema was another 894 visible tokens when charged to a new session. A fifth probe on `src/live_index/persist.rs` returned no exact file hit from the selected discovery call. File size alone would have given that probe unjustified confidence. Raw pilot receipts are in `direct-vs-symbol-20261124-144138` in the private replay directory, with `direct-vs-symbol-cost.py` as the driver. These observations establish route costs for named tasks. Default-map utility also depends on whether the hint changes the next action.
+
+A cheap directory estimate can group files by vote using their admitted, indexed byte lengths and usable symbol spans. For a known target, the avoided bytes are the file size minus the requested span. Overlapping spans cannot be counted twice. Each file gets one vote and a directory containing many small files and one large file retains that distinction. A mixed or uncertain result lets the model decide. A byte estimate is appropriate in the serving path only after calibration against real tokenized responses. Token counts vary with the language and encoding. Fixed-bucket counts can be added across directories without retaining the file list. [tiktoken](https://github.com/openai/tiktoken) · [Aggregating histogram buckets](https://prometheus.io/docs/practices/histograms/)
+
+SymForge already uses indexed character counts and estimated invocation cost in its compact STEL facade. That facade's manual-read baseline is capped at 50 lines on larger files. The code-mode experiment compares a complete direct read with a sufficient targeted read, so its break-even point requires separate measurement. Admission must precede collecting any cost signal, and a rendered hint must stay within the authority of its source generation. [Existing cost calculation](../../../src/stel/controller.rs) · [Manual-read baseline](../../../src/index_lifecycle/guidance/file_read.rs)
+
+### Benchmark protocol
 
 Freeze source revisions and input trees, binary and flags, accepted query scopes and independent expected hits. Compare a baseline and **one** candidate in alternation. Keep the same host, power policy, worker limits and source placement. For cold passes, clone tracked bytes into distinct normal roots with no snapshot; record OS cache state as uncontrolled unless explicitly measured. For restore, restart the process on the *same* root with the snapshot present. For resident tests, check canonical root, generation, load source, trust and corpus counts before and after. Record peak bytes, timeout/error count and result evidence alongside elapsed time. Never subtract a nominal CLI startup constant.
 
