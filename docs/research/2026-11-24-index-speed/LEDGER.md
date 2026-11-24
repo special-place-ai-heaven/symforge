@@ -60,4 +60,14 @@ A standalone probe used the budget helper and both truncation footers from Git r
 | Progress | A waiting client sees the correct phase, counts and retry guidance through completion or failure. Record what the client saw and which reads actually worked. |
 | Unbound session | One roots-less session binds an approved repository and finds independently verified code and doc hits. Repeating the operation preserves the project identity. |
 
+### Embedded consumers
+
+For each change that reaches the embedded engine, run both persistent MCP and a Rust consumer linked with `default-features = false, features = ["embed"]`. Confirm the resolved dependency features. Use the consumer's public source handle, on the same pinned inputs, with the same deadlines for useful results. Report each surface separately. Process startup, admission and cache hits can otherwise hide the time taken by the actual query. [Public consumer example](../../../examples/embed_query.rs)
+
+| Change | Embedded proof |
+|---|---|
+| Map generation and ranking (#1, #2, #12) | Time the first `QueryRequest::RepoMap` on a current publication and repeated calls. Retrieve the full result and compare rendered bytes and metadata against the previous embedded binary. Also exercise a capped request and its truncation receipt. Check a visible scoped map and the default root. |
+| Discovery, restore, and code or document publication (#3, #6–#11 where applicable) | Start the clock before `open_embedded_source`. Use `SymbolSearch` and `SearchKnowledge` for distinct independently known hits. Record publication identity, coverage, refusals and first complete results. Check source edits and reopened snapshots through the same public handle lifecycle. |
+| Progress and root selection (#4, #5) | Observe the host's `runtime_view()` while opening an explicitly selected source. Check which operations actually succeed at each reported phase and that selecting a second source preserves isolation. Measure stdio binding separately, since the embedder already supplies its root. |
+
 Use the pinned revisions, inputs and replay commands in the report. Alternate baseline and one candidate, run at least five fresh starts and twenty warm calls per shape, include failures, and check a held-out repository. Record the binary, root, generation, load source, result fingerprint, wall time and Terminal Commander receipt. Stop a branch of the hierarchy once its outcome holds and its functionality checks pass. [Real-client acceptance protocol](REPORT.md#acceptance-on-the-real-client)
