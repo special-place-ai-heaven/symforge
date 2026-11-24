@@ -848,6 +848,23 @@ pub fn event_name_for(subcommand: &HookSubcommand) -> &'static str {
 /// This is the core of the PreToolUse interception: it tells the model which
 /// SymForge tool to use instead of the built-in tool it's about to call.
 fn pre_tool_suggestion(input: &HookInput) -> String {
+    pre_tool_suggestion_for(input, hook_surface())
+}
+
+/// Surface named on the hook command line (`hook --surface X`); the hook
+/// process does not see the MCP env. Unset means Code.
+static HOOK_SURFACE: std::sync::OnceLock<crate::cli::InitSurface> = std::sync::OnceLock::new();
+
+pub fn set_hook_surface(surface: crate::cli::InitSurface) {
+    let _ = HOOK_SURFACE.set(surface);
+}
+
+fn hook_surface() -> crate::cli::InitSurface {
+    HOOK_SURFACE.get().copied().unwrap_or_default()
+}
+
+/// Tool-preference text for `surface`: each surface names only tools it serves.
+fn pre_tool_suggestion_for(input: &HookInput, surface: crate::cli::InitSurface) -> String {
     let tool = input.tool_name.as_deref().unwrap_or("");
     let cwd = input.cwd.as_deref().unwrap_or("");
 
@@ -870,7 +887,16 @@ fn pre_tool_suggestion(input: &HookInput) -> String {
         .and_then(|ti| ti.pattern.as_deref().or(ti.path.as_deref()))
         .unwrap_or("");
 
-    match pre_tool_workflow(input) {
+    let workflow = pre_tool_workflow(input);
+    match surface {
+        crate::cli::InitSurface::Full => full_pre_tool_text(workflow, tool, pattern, &file),
+        crate::cli::InitSurface::Code => code_pre_tool_text(workflow, tool, pattern, &file),
+        crate::cli::InitSurface::Compact => compact_pre_tool_text(workflow, tool, pattern, &file),
+    }
+}
+
+fn full_pre_tool_text(workflow: HookWorkflow, tool: &str, pattern: &str, file: &str) -> String {
+    match workflow {
         HookWorkflow::SourceSearch if !pattern.is_empty() => format!(
             "SymForge can answer this more directly. Start with search_text(query=\"{pattern}\") for symbol-aware source matches, or search_symbols(query=\"{pattern}\") if this is likely a symbol name."
         ),
@@ -884,6 +910,41 @@ fn pre_tool_suggestion(input: &HookInput) -> String {
             "SymForge can narrow this faster. Prefer search_files(query=\"{pattern}\") for ranked path discovery, or get_repo_map if you need a project overview first."
         ),
         HookWorkflow::PassThrough if tool == "Glob" => "SymForge can narrow this faster. Prefer search_files for ranked path discovery, or get_repo_map for repository overview.".to_string(),
+        _ => String::new(),
+    }
+}
+
+fn code_pre_tool_text(workflow: HookWorkflow, tool: &str, pattern: &str, file: &str) -> String {
+    match workflow {
+        HookWorkflow::SourceSearch if !pattern.is_empty() => format!(
+            "SymForge can answer this more directly. Use code_execute with search_text(query=\"{pattern}\") for symbol-aware source matches, or search_symbols(query=\"{pattern}\") if this is likely a symbol name."
+        ),
+        HookWorkflow::SourceSearch => "SymForge can answer this more directly. Use code_execute with search_text for source-code search with enclosing symbol context, or search_symbols when you are searching by name/kind.".to_string(),
+        HookWorkflow::SourceRead if !file.is_empty() => format!(
+            "SymForge can answer this more efficiently. Use code_execute with file_context(path=\"{file}\") for structure and key references, or get_symbol/symbol_context if you only need a specific symbol."
+        ),
+        HookWorkflow::SourceRead => "SymForge can answer this more efficiently. Use code_execute with file_context for source-file structure and get_symbol/symbol_context for targeted symbol reads.".to_string(),
+        HookWorkflow::CodeEdit => "SymForge MCP is connected. Prefer symforge_edit (op=replace|insert_before|insert_after|edit_within) over Edit for source code modifications — it resolves by symbol name, auto-indents, and re-indexes atomically.".to_string(),
+        HookWorkflow::PassThrough if tool == "Glob" && !pattern.is_empty() => format!(
+            "SymForge can narrow this faster. Use code_execute with search_files(query=\"{pattern}\") for ranked path discovery, or repo_map if you need a project overview first."
+        ),
+        HookWorkflow::PassThrough if tool == "Glob" => "SymForge can narrow this faster. Use code_execute with search_files for ranked path discovery, or repo_map for repository overview.".to_string(),
+        _ => String::new(),
+    }
+}
+
+fn compact_pre_tool_text(workflow: HookWorkflow, tool: &str, pattern: &str, file: &str) -> String {
+    match workflow {
+        HookWorkflow::SourceSearch if !pattern.is_empty() => format!(
+            "SymForge can answer this more directly. Use symforge to find \"{pattern}\" with symbol-aware source matches."
+        ),
+        HookWorkflow::SourceSearch => "SymForge can answer this more directly. Use symforge (find) for source-code search with enclosing symbol context.".to_string(),
+        HookWorkflow::SourceRead if !file.is_empty() => format!(
+            "SymForge can answer this more efficiently. Use symforge (read) on \"{file}\" for structure and key references."
+        ),
+        HookWorkflow::SourceRead => "SymForge can answer this more efficiently. Use symforge (read) for source-file structure and targeted symbol reads.".to_string(),
+        HookWorkflow::CodeEdit => "SymForge MCP is connected. Prefer symforge_edit over Edit for source code modifications — it resolves by symbol name, auto-indents, and re-indexes atomically.".to_string(),
+        HookWorkflow::PassThrough if tool == "Glob" => "SymForge can narrow this faster. Use symforge (find) for ranked path discovery.".to_string(),
         _ => String::new(),
     }
 }
@@ -2613,7 +2674,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let s = pre_tool_suggestion(&input);
+        let s = pre_tool_suggestion_for(&input, crate::cli::InitSurface::Full);
         assert!(s.contains("search_text"), "should suggest search_text: {s}");
         assert!(
             s.contains("helper"),
@@ -2632,7 +2693,7 @@ mod tests {
             cwd: Some("/repo".to_string()),
             ..Default::default()
         };
-        let s = pre_tool_suggestion(&input);
+        let s = pre_tool_suggestion_for(&input, crate::cli::InitSurface::Full);
         assert!(
             s.contains("get_file_context"),
             "should suggest get_file_context for source: {s}"
@@ -2654,7 +2715,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let s = pre_tool_suggestion(&input);
+        let s = pre_tool_suggestion_for(&input, crate::cli::InitSurface::Full);
         assert!(
             s.is_empty(),
             "should stay pass-through for markdown reads: {s}"
@@ -2672,7 +2733,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let s = pre_tool_suggestion(&input);
+        let s = pre_tool_suggestion_for(&input, crate::cli::InitSurface::Full);
         assert!(s.is_empty(), "should not suggest for .csv files: {s}");
     }
 
@@ -2682,11 +2743,38 @@ mod tests {
             tool_name: Some("Glob".to_string()),
             ..Default::default()
         };
-        let s = pre_tool_suggestion(&input);
+        let s = pre_tool_suggestion_for(&input, crate::cli::InitSurface::Full);
         assert!(
             s.contains("search_files"),
             "should suggest search_files: {s}"
         );
+    }
+
+    #[test]
+    fn test_pre_tool_suggestion_names_only_tools_the_surface_serves() {
+        use crate::cli::InitSurface::{Code, Compact, Full};
+        let grep = HookInput {
+            tool_name: Some("Grep".to_string()),
+            tool_input: Some(HookToolInput {
+                pattern: Some("helper".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let edit = HookInput {
+            tool_name: Some("Edit".to_string()),
+            ..Default::default()
+        };
+        let code = pre_tool_suggestion_for(&grep, Code);
+        assert!(
+            code.contains("code_execute with search_text(query=\"helper\")"),
+            "{code}"
+        );
+        assert!(pre_tool_suggestion_for(&edit, Code).contains("symforge_edit"));
+        assert!(!pre_tool_suggestion_for(&edit, Code).contains("replace_symbol_body"));
+        assert!(pre_tool_suggestion_for(&grep, Compact).contains("symforge"));
+        assert!(!pre_tool_suggestion_for(&grep, Compact).contains("code_execute"));
+        assert!(pre_tool_suggestion_for(&edit, Full).contains("replace_symbol_body"));
     }
 
     #[test]
@@ -2695,7 +2783,7 @@ mod tests {
             tool_name: Some("Edit".to_string()),
             ..Default::default()
         };
-        let s = pre_tool_suggestion(&input);
+        let s = pre_tool_suggestion_for(&input, crate::cli::InitSurface::Full);
         assert!(
             s.contains("replace_symbol_body"),
             "should suggest replace_symbol_body: {s}"
@@ -2719,7 +2807,7 @@ mod tests {
             cwd: Some("/repo".to_string()),
             ..Default::default()
         };
-        let s = pre_tool_suggestion(&input);
+        let s = pre_tool_suggestion_for(&input, crate::cli::InitSurface::Full);
         assert!(s.is_empty(), "should not hint outside the workspace: {s}");
     }
 
@@ -2738,7 +2826,7 @@ mod tests {
             cwd: Some(cwd.to_string_lossy().into_owned()),
             ..Default::default()
         };
-        let s = pre_tool_suggestion(&input);
+        let s = pre_tool_suggestion_for(&input, crate::cli::InitSurface::Full);
         assert!(
             s.contains("get_file_context"),
             "in-repo absolute read should still hint: {s}"
@@ -2759,7 +2847,7 @@ mod tests {
             cwd: Some("/repo".to_string()),
             ..Default::default()
         };
-        let s = pre_tool_suggestion(&input);
+        let s = pre_tool_suggestion_for(&input, crate::cli::InitSurface::Full);
         assert!(
             s.is_empty(),
             "should not hint for grep outside the workspace: {s}"
@@ -2823,7 +2911,7 @@ mod tests {
             tool_name: Some("Bash".to_string()),
             ..Default::default()
         };
-        let s = pre_tool_suggestion(&input);
+        let s = pre_tool_suggestion_for(&input, crate::cli::InitSurface::Full);
         assert!(s.is_empty(), "should not suggest for unknown tools: {s}");
     }
 

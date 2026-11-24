@@ -924,6 +924,10 @@ mod tests {
 
     #[test]
     fn surface_view_lists_active_surface() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let view = SurfaceView::from_env();
         assert!(!view.tools.is_empty());
         assert_eq!(view.tool_count, view.tools.len());

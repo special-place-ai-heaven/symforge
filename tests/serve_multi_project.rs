@@ -13,6 +13,9 @@ use std::time::Duration;
 
 use symforge::server::serve::{ServeArgs, ServeError, run};
 
+#[path = "support/stel_surface_env.rs"]
+mod stel_surface_env;
+
 const WAIT: Duration = Duration::from_secs(120);
 
 /// A fixture repository with one uniquely named file and symbol.
@@ -41,6 +44,8 @@ fn args(projects: Vec<String>, allow_index_folder: bool) -> ServeArgs {
 struct Served {
     url: String,
     task: tokio::task::JoinHandle<Result<(), ServeError>>,
+    /// These tests drive the granular tools, which only the full surface serves.
+    _surface: stel_surface_env::EnvVarGuard,
 }
 
 impl Drop for Served {
@@ -50,6 +55,7 @@ impl Drop for Served {
 }
 
 async fn start(mut serve_args: ServeArgs) -> Served {
+    let surface = stel_surface_env::set_symforge_surface("full");
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     serve_args.bound_addr_tx = Some(tx);
     let task = tokio::spawn(run(serve_args));
@@ -68,6 +74,7 @@ async fn start(mut serve_args: ServeArgs) -> Served {
     Served {
         url: format!("http://{addr}/mcp"),
         task,
+        _surface: surface,
     }
 }
 

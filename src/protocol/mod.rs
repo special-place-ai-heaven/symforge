@@ -3609,6 +3609,10 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_proxy_facade_calls_fail_closed_on_missing_or_malformed_outcome_header() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         for (header, body) in [
             (
                 None,

@@ -84,6 +84,12 @@ pub enum Commands {
         /// Write ONLY `SKILL.md` for `--client` without modifying MCP configs, hooks, or guidance files.
         #[arg(long, conflicts_with = "scan")]
         skill_only: bool,
+
+        /// Surface to configure: `code` (default), `mcp-full`, or `mcp-compact`. Without it,
+        /// an interactive terminal is asked; otherwise each harness keeps its current
+        /// surface (new entries get `code`).
+        #[arg(long, value_enum, conflicts_with = "scan")]
+        surface: Option<InitSurface>,
     },
     /// Run the shared local daemon that tracks project and session state
     Daemon,
@@ -95,6 +101,10 @@ pub enum Commands {
     Admin(admin::AdminCliArgs),
     /// Hook subcommands called by Claude Code (PostToolUse / SessionStart / UserPromptSubmit)
     Hook {
+        /// Surface the hook nudges name tools for (absent = `code`).
+        #[arg(long, value_enum, global = true)]
+        surface: Option<InitSurface>,
+
         #[command(subcommand)]
         subcommand: Option<HookSubcommand>,
     },
@@ -104,7 +114,12 @@ pub enum Commands {
         subcommand: trust::TrustSubcommand,
     },
     /// Update the npm-managed SymForge install
-    Update,
+    Update {
+        /// Surface to configure for re-registered harnesses: `code`, `mcp-full`, or `mcp-compact`.
+        /// Without it, an interactive terminal is asked; otherwise each keeps its current surface.
+        #[arg(long, value_enum)]
+        surface: Option<InitSurface>,
+    },
     /// Execute zero-egress Python 3.14-subset Code Mode scripts or inspect typed stubs/idioms
     Code(code::CodeCliArgs),
     /// Run a single structured read-only query and print pure JSON to stdout (alias `query`)
@@ -143,6 +158,40 @@ pub enum InitClient {
     #[value(name = "continue")]
     Continue,
     All,
+}
+
+/// Which SymForge surface a harness serves (`SYMFORGE_SURFACE`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum InitSurface {
+    /// Code Mode: `code_search`, `code_execute`, `symforge_edit`, `status`.
+    #[default]
+    Code,
+    /// Every granular MCP tool.
+    #[value(name = "mcp-full", alias = "full")]
+    Full,
+    /// The 3-tool facade: `symforge`, `symforge_edit`, `status`.
+    #[value(name = "mcp-compact", alias = "compact")]
+    Compact,
+}
+
+impl InitSurface {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Full => "full",
+            Self::Compact => "compact",
+        }
+    }
+
+    /// Parse a `SYMFORGE_SURFACE` value; other profiles (`core`, `meta`) are not pickable.
+    pub fn from_env_value(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "code" => Some(Self::Code),
+            "full" => Some(Self::Full),
+            "compact" => Some(Self::Compact),
+            _ => None,
+        }
+    }
 }
 
 /// Hook subcommands — one per Claude Code tool event type.
@@ -340,6 +389,7 @@ mod tests {
         match cli.command {
             Some(Commands::Hook {
                 subcommand: Some(HookSubcommand::PromptSubmit),
+                ..
             }) => {}
             _ => panic!("expected prompt-submit hook command"),
         }
@@ -352,6 +402,7 @@ mod tests {
         match cli.command {
             Some(Commands::Hook {
                 subcommand: Some(HookSubcommand::PreTool),
+                ..
             }) => {}
             _ => panic!("expected pre-tool hook command"),
         }
@@ -412,11 +463,39 @@ mod tests {
     }
 
     #[test]
+    fn test_surface_flag_parses_for_init_update_and_hook() {
+        match Cli::parse_from(["symforge", "init", "--surface", "full"]).command {
+            Some(Commands::Init { surface, .. }) => assert_eq!(surface, Some(InitSurface::Full)),
+            _ => panic!("expected init command"),
+        }
+        match Cli::parse_from(["symforge", "update", "--surface", "code"]).command {
+            Some(Commands::Update { surface }) => assert_eq!(surface, Some(InitSurface::Code)),
+            _ => panic!("expected update command"),
+        }
+        match Cli::parse_from(["symforge", "hook", "pre-tool", "--surface", "compact"]).command {
+            Some(Commands::Hook { surface, .. }) => {
+                assert_eq!(surface, Some(InitSurface::Compact));
+            }
+            _ => panic!("expected hook command"),
+        }
+        assert!(Cli::try_parse_from(["symforge", "init", "--surface", "bogus"]).is_err());
+        // The documented names; `full`/`compact` stay accepted for existing hook commands.
+        match Cli::parse_from(["symforge", "update", "--surface", "mcp-full"]).command {
+            Some(Commands::Update { surface }) => assert_eq!(surface, Some(InitSurface::Full)),
+            _ => panic!("expected update command"),
+        }
+        match Cli::parse_from(["symforge", "init", "--surface", "mcp-compact"]).command {
+            Some(Commands::Init { surface, .. }) => assert_eq!(surface, Some(InitSurface::Compact)),
+            _ => panic!("expected init command"),
+        }
+    }
+
+    #[test]
     fn test_update_command_parses() {
         let cli = Cli::parse_from(["symforge", "update"]);
 
         match cli.command {
-            Some(Commands::Update) => {}
+            Some(Commands::Update { surface: None }) => {}
             _ => panic!("expected update command"),
         }
     }

@@ -626,6 +626,10 @@ mod tests {
     /// answer; `status` answers at once with the same notice.
     #[tokio::test]
     async fn handshake_is_answered_while_the_project_runtime_is_still_starting() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let (front, _startup) = DeferredStdioServer::new(Path::new("/work/large-repo"));
         let mut client = connect(front.with_readiness_wait(Duration::from_millis(300)));
         client.initialize().await;
@@ -671,6 +675,10 @@ mod tests {
     /// served by it, so a quick startup never surfaces the condition.
     #[tokio::test]
     async fn a_tool_call_waits_for_the_runtime_and_is_then_served() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let (front, startup) = DeferredStdioServer::new(Path::new("/work/medium-repo"));
         let mut client = connect(front.with_readiness_wait(Duration::from_secs(8)));
         client.initialize().await;
@@ -707,6 +715,10 @@ mod tests {
     /// leads with the notice; a plain-String guard refusal is typed.
     #[tokio::test]
     async fn a_loading_index_behind_a_ready_runtime_gets_the_same_notice() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let (front, startup) = DeferredStdioServer::new(Path::new("/work/large-repo"));
         startup.send_replace(StdioStartup::Ready(loading_server()));
         let mut client = connect(front.with_readiness_wait(Duration::from_millis(600)));
@@ -733,6 +745,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_startup_is_reported_instead_of_loading_forever() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let (front, startup) = DeferredStdioServer::new(Path::new("/work/large-repo"));
         let mut client = connect(front.with_readiness_wait(Duration::from_secs(8)));
         client.initialize().await;
@@ -773,6 +789,10 @@ mod tests {
     /// The adapter must use attached status metadata, not classify source bytes.
     #[tokio::test]
     async fn file_content_starting_with_loading_notice_is_served() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let root = tempfile::tempdir().unwrap();
         let notes = root.path().join("notes");
         std::fs::create_dir_all(&notes).unwrap();
@@ -981,6 +1001,10 @@ mod tests {
     /// runtime that is never coming.
     #[tokio::test]
     async fn a_startup_task_that_panics_is_reported_as_failed() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let (front, startup) = DeferredStdioServer::new(Path::new("/work/large-repo"));
         let (_client_present, shutdown) = watch::channel(false);
         let guard = StartupGuard(Arc::new(startup), shutdown);
@@ -1008,6 +1032,10 @@ mod tests {
     /// must still make it wait and get the notice, without dispatching it.
     #[tokio::test]
     async fn a_facade_call_waits_for_a_loading_index_without_dispatching() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let (front, startup) = DeferredStdioServer::new(Path::new("/work/large-repo"));
         startup.send_replace(StdioStartup::Ready(loading_server()));
         let mut client = connect(front.with_readiness_wait(Duration::from_millis(600)));
@@ -1258,7 +1286,7 @@ mod tests {
     async fn structured_output_is_served_only_to_revisions_that_define_it() {
         use crate::protocol::surface_probe::{STRUCTURED_OUTPUT_TOOLS, SurfaceEnvVarGuard};
         let _tools = SurfaceEnvVarGuard::set("SYMFORGE_TOOLS", None);
-        let _surface = SurfaceEnvVarGuard::set("SYMFORGE_SURFACE", None);
+        let _surface = SurfaceEnvVarGuard::set("SYMFORGE_SURFACE", Some("full"));
         let mut status_texts = Vec::new();
         for revision in REVISIONS {
             let defines = revision >= "2025-06-18";

@@ -115,7 +115,7 @@ async fn code_surface_advertises_four_tools_under_4800_bytes_and_gates_legacy_to
 
     // Also verify Full surface never advertises code_search or code_execute.
     drop(_surface);
-    let _full = stel_surface_env::clear_symforge_surface();
+    let _full = stel_surface_env::set_symforge_surface("full");
     let full_names: BTreeSet<String> = advertised_tools()
         .into_iter()
         .map(|t| t.name.to_string())

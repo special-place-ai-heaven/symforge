@@ -70,18 +70,22 @@ fn assert_full_surface(names: &BTreeSet<String>) {
 }
 
 #[tokio::test]
-async fn unset_surface_resolves_full_and_advertises_full_surface() {
+async fn unset_surface_resolves_code_and_advertises_code_surface() {
     let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::clear_symforge_surface();
 
     let profile = surface_profile_from_env();
     assert_eq!(
         profile,
-        SurfaceProfile::Full,
-        "unset SYMFORGE_SURFACE must resolve to the full default (spike-gate flip)"
+        SurfaceProfile::Code,
+        "unset SYMFORGE_SURFACE must resolve to Code Mode; only an explicit `full` serves granular tools"
     );
 
-    assert_full_surface(&advertised_names(profile));
+    let expected: BTreeSet<String> = ["code_search", "code_execute", "symforge_edit", "status"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    assert_eq!(advertised_names(profile), expected);
 }
 
 #[tokio::test]
@@ -166,7 +170,7 @@ async fn compact_surface_rejects_legacy_tool_call_at_dispatch() {
 #[tokio::test]
 async fn full_default_allows_legacy_tool_call_at_dispatch() {
     let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
-    let _surface = stel_surface_env::clear_symforge_surface();
+    let _surface = stel_surface_env::set_symforge_surface("full");
 
     assert_eq!(
         surface_profile_from_env(),
@@ -199,7 +203,7 @@ async fn full_default_allows_legacy_tool_call_at_dispatch() {
 #[tokio::test]
 async fn full_surface_advertises_exactly_40_tools() {
     let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
-    let _surface = stel_surface_env::clear_symforge_surface();
+    let _surface = stel_surface_env::set_symforge_surface("full");
 
     assert_eq!(
         surface_profile_from_env(),
@@ -254,10 +258,10 @@ async fn surface_core_resolves_core_and_advertises_core_tools() {
 }
 
 #[tokio::test]
-async fn unknown_surface_value_resolves_full() {
+async fn unknown_surface_value_resolves_code() {
     let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("everything");
-    assert_eq!(surface_profile_from_env(), SurfaceProfile::Full);
+    assert_eq!(surface_profile_from_env(), SurfaceProfile::Code);
 }
 
 /// Every core name is a registered tool, and core is a strict subset of full.
@@ -373,7 +377,7 @@ async fn unset_or_blank_allow_list_changes_nothing() {
             Some(v) => EnvVarGuard::set("SYMFORGE_TOOLS", v),
             None => EnvVarGuard::unset("SYMFORGE_TOOLS"),
         };
-        let _surface = EnvVarGuard::unset("SYMFORGE_SURFACE");
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "full");
         let names: BTreeSet<String> = advertised_now().into_iter().collect();
         assert_eq!(names, advertised_names(SurfaceProfile::Full));
         assert_eq!(names.len(), 40);

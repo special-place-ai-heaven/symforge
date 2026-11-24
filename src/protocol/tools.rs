@@ -15314,6 +15314,10 @@ mod tests {
 
     #[test]
     fn status_matches_embed_parity_golden() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let repo = TempDir::new().expect("temp repo");
         fs::create_dir_all(repo.path().join("src")).expect("src dir");
         fs::write(
@@ -15785,6 +15789,10 @@ mod tests {
     /// answers are written to `target/query-parity.observed.json`.
     #[tokio::test]
     async fn change_queries_match_embed_parity_golden() {
+        let _surface = crate::protocol::surface_probe::SurfaceEnvVarGuard::set(
+            "SYMFORGE_SURFACE",
+            Some("full"),
+        ); // these tests exercise the granular tools
         let fixture_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/query_parity/changes.json");
         let mut fixture: serde_json::Value =

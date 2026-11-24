@@ -442,6 +442,8 @@ async fn binding_rung_env_override() {
 /// path — a modern client that never sent `notifications/initialized`.
 #[tokio::test]
 async fn binding_rung_index_folder_over_modern_dispatch() {
+    let _lock = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("full"); // granular tools
     let dir = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(dir.path().join("lib.rs"), "pub fn seeded() {}\n").expect("seed file");
 
@@ -501,6 +503,8 @@ async fn binding_rung_index_folder_over_modern_dispatch() {
 /// `_meta` alone cannot carry this contract.
 #[tokio::test]
 async fn mutation_no_apply_is_error_over_http_transport() {
+    let _lock = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("full"); // granular tools
     let dir = tempfile::TempDir::new().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("src")).expect("src dir");
     std::fs::write(
@@ -895,6 +899,8 @@ async fn admitted_facade_measurement_preserves_error_prefixed_source_at_wire() {
 
 #[tokio::test]
 async fn evidence_disclosed_on_statused_plain_and_resource_results() {
+    let _lock = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("full"); // granular tools
     let server = start_server(test_runtime()).await;
     let mut client = McpHttpClient::new(server.mcp_url());
 
@@ -951,6 +957,8 @@ async fn evidence_disclosed_on_statused_plain_and_resource_results() {
 /// than results passing silently.
 #[tokio::test]
 async fn evidence_discloses_foreign_binding() {
+    let _lock = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("full"); // granular tools
     let repo_a = tempfile::TempDir::new().expect("repo A");
     std::fs::write(repo_a.path().join("a.rs"), "pub fn a() {}\n").expect("seed A");
     let repo_b = tempfile::TempDir::new().expect("repo B");
@@ -1002,6 +1010,8 @@ async fn evidence_discloses_foreign_binding() {
 
 #[tokio::test]
 async fn foreign_selector_early_errors_never_attach_home_evidence() {
+    let _lock = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("full"); // granular tools
     let repo_a = tempfile::TempDir::new().expect("repo A");
     std::fs::write(repo_a.path().join("a.rs"), "pub fn a() {}\n").expect("seed A");
     let server = start_server(test_runtime()).await;
