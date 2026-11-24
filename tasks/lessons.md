@@ -1,5 +1,7 @@
 # Lessons
 
+- 2026-11-24: When the owner asks the lead to orchestrate an agreed fix, dispatch implementation and verification and follow the measured result through review.
+
 - 2026-10-23: The owner requires fail-fast CI operation: as soon as any job or step turns red, cancel all unfinished related workflow runs immediately, diagnose the failure with the smallest relevant check, then retry. Apply this even when other gates are still running; waiting for the entire red workflow wastes the correction cycle.
 
 - 2026-10-23: Before retrying an expensive CI build after a dependency-network failure, isolate the exact registry request and dependency fetch on the same hosted runner class. A fresh Cargo-home probe with retries disabled confirmed automod connectivity in six seconds; this is network evidence, not a substitute for the failed build gate. Preserve completed evidence, and follow the owner's fail-fast cancellation rule for unfinished jobs.
@@ -10,7 +12,7 @@
 
 - 2026-10-22: Before pushing additive embed APIs, run the complete lifecycle traceability gate as well as Rust integrity tests. The V11 phase classifier compares exact public-export sets, so new versioned API contracts must be recognized explicitly without rewriting the historical migration baseline or allowing arbitrary exports.
 
-- 2026-10-22: SymForge is public; use standard GitHub-hosted CI runners unless a concrete requirement justifies self-hosting. The owner authorizes normal hosted runs. Check actual runner availability and workflow events: a push filter with only tags/tags-ignore does not trigger branch pushes. Verify a run was created instead of treating a successful push as CI evidence. Audit release workflows as well as CI when replacing runners. Complete the PR and release handoff within explicit authorization; a green feature branch still needs merging and publication before downstream users can consume its version. Delete the feature branch only after verifying its work is on main.
+- 2026-10-22, updated 2026-10-24: SymForge is public; use standard GitHub-hosted CI runners unless a concrete requirement justifies self-hosting. The owner authorizes normal hosted runs. Check actual runner availability and workflow events: a push filter with only tags/tags-ignore does not trigger branch pushes. Verify a run was created instead of treating a successful push as CI evidence. Audit release workflows as well as CI when replacing runners. Route release fixes through a conventional-commit PR against protected main. After an authorized merge, verify that the Release workflow on main starts release-please, then check the published artifact before calling it released. Delete the feature branch only after verifying its work is on main.
 
 - 2026-10-20: Use Terminal Commander for all terminal work. On Windows, run native argv with the checkout as `cwd` or choose an explicit PowerShell shell; the default Bash route may be WSL and reject Windows paths, which is shell selection rather than a Terminal Commander access limit. Dogfood SymForge for code intelligence and structural edits, then record concrete tool failures or recovery limits instead of silently switching tools.
 
