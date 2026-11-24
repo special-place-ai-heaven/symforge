@@ -60,6 +60,10 @@ A standalone probe used the budget helper and both truncation footers from Git r
 | Progress | A waiting client sees the correct phase, counts and retry guidance through completion or failure. Record what the client saw and which reads actually worked. |
 | Unbound session | One roots-less session binds an approved repository and finds independently verified code and doc hits. Repeating the operation preserves the project identity. |
 
+### Model context
+
+Measure context savings on a concrete question that a model can answer from a smaller response. For example, to establish how a scoped map groups paths, the candidate's real MCP `get_symbol` returned `map_dir_key` from lines 401–417 of `src/index_lifecycle/guidance/read_context.rs` at `3a4fb63d`. The returned source matched the Git bytes. With `o200k_base`, the entire JSON-RPC response took **538 tokens** and the raw full file took **12,714**, a saving of **12,176 tokens (95.8%)** for that lookup. This measures targeted retrieval. Fix #1 preserves map bytes, so its measured benefit is latency. Terminal Commander job `job_01a20dbc92607426bec4105ee11cc18c`.
+
 ### Embedded consumers
 
 For each change that reaches the embedded engine, run both persistent MCP and a Rust consumer linked with `default-features = false, features = ["embed"]`. Confirm the resolved dependency features. Use the consumer's public source handle, on the same pinned inputs, with the same deadlines for useful results. Report each surface separately. Process startup, admission and cache hits can otherwise hide the time taken by the actual query. [Public consumer example](../../../examples/embed_query.rs)

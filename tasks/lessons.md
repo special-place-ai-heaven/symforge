@@ -1,5 +1,7 @@
 # Lessons
 
+- 2026-11-24: Measure LLM context savings against the full files a model would otherwise read to answer the same question. Include the tool response overhead and verify the returned evidence against the pinned source.
+
 - 2026-11-24: When the owner asks the lead to orchestrate an agreed fix, dispatch implementation and verification and follow the measured result through review.
 
 - 2026-10-23: The owner requires fail-fast CI operation: as soon as any job or step turns red, cancel all unfinished related workflow runs immediately, diagnose the failure with the smallest relevant check, then retry. Apply this even when other gates are still running; waiting for the entire red workflow wastes the correction cycle.
