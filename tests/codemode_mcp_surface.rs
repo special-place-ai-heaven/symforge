@@ -134,10 +134,10 @@ async fn code_execute_json_opt_out_restores_the_full_outcome_text() {
 }
 
 const OVER_CAP_ROWS_SCRIPT: &str =
-    "[{'kind': 'fn', 'name': 'n' + str(i), 'path': 'src/x.rs'} for i in range(400)]";
+    "[{'kind': 'fn', 'name': 'n' + str(i), 'path': 'src/x.rs'} for i in range(1000)]";
 
 fn over_cap_rows_lean_text() -> String {
-    let rows: Vec<String> = (0..400).map(|i| format!("fn\tn{i}")).collect();
+    let rows: Vec<String> = (0..1000).map(|i| format!("fn\tn{i}")).collect();
     format!("kind\tname\n@ src/x.rs\n{}", rows.join("\n"))
 }
 

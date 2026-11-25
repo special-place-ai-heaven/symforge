@@ -76,7 +76,7 @@ A prompt-injected file comment or buggy model script attempts to read `.env` via
 2. **Given** a script containing `while True: pass`, **When** executed with `max_feed_duration = 10s` (or test override `50ms`), **Then** execution aborts with `TimeoutError` within budget + poll granularity without wedging the Tokio worker or daemon.
 3. **Given** a script allocating past `max_memory = 64 MiB` or recursing past `max_recursion_depth = 150` or making more than `max_calls = 64` host calls, **When** executed, **Then** execution terminates cleanly with a structured error naming the tripped limit and the calls completed so far.
 4. **Given** a repository file withheld by SymForge's secret detector (`#927` / `#929`), **When** a script calls `file_content(path=...)` or `search_text(...)`, **Then** the host binding routes through `embed::parity` and withholds the secret bytes with the exact rule/line diagnostic—never raw disk I/O.
-5. **Given** a script whose return value or `print()` output exceeds `max_output_chars = 16_000`, **When** serialized, **Then** inline output is capped at a UTF-8 char boundary and the full output is written to a session/temp spill file named in `spill_path` (with `total_bytes`), never silently truncated.
+5. **Given** a script whose return value or `print()` output exceeds `max_output_chars = 32_000`, **When** serialized, **Then** inline output is capped at a UTF-8 char boundary and the full output is written to a session/temp spill file named in `spill_path` (with `total_bytes`), never silently truncated.
 
 ---
 
@@ -113,7 +113,7 @@ Before promoting `code` or `symforge code` in default `symforge init` skill inst
   - `DEFAULT_MAX_MEMORY_BYTES`: `64 MiB` (hard ceiling `256 MiB`)
   - `DEFAULT_MAX_RECURSION_DEPTH`: `150` (safe on standard worker thread stacks without `stacker` C/asm)
   - `DEFAULT_MAX_HOST_CALLS`: `64`
-  - `DEFAULT_MAX_OUTPUT_CHARS`: `16_000` (with full payload spill file when exceeded)
+  - `DEFAULT_MAX_OUTPUT_CHARS`: `32_000` (with full payload spill file when exceeded; raised from `16_000` on 2026-11-25 so a function of up to about 400 lines returns inline instead of a preview plus a spill-file reread)
 - **FR-006 (Stateless Isolation by Default)**: Each `code_execute` call and `symforge code run` invocation MUST start a fresh `MontyRepl` with `OsPolicy { sleep: SleepMode::Zero, ..Default::default() }` so state/globals cannot leak across unrelated requests or projects.
 - **FR-007 (CLI Subcommands)**:
   - `symforge code run [FILE | -] [-c <CODE>] [--project <ID>] [--timeout-ms <N>]` — executes Python script against the sandbox, printing structured JSON `{ status, value, stdout, calls, duration_ms, spill_path? }` to stdout.

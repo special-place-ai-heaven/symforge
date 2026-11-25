@@ -39,7 +39,7 @@ pub const DEFAULT_MAX_HOST_CALLS: usize = 64;
 /// Hard ceiling on host query invocations per script execution.
 pub const MAX_HOST_CALLS_CEILING: usize = 256;
 /// Default maximum inline UTF-8 characters before spilling full output to disk.
-pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 16_000;
+pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 32_000;
 /// Hard ceiling on inline UTF-8 characters (256 Ki chars).
 pub const MAX_OUTPUT_CHARS_CEILING: usize = 256 * 1024;
 
