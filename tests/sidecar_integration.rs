@@ -334,7 +334,7 @@ async fn test_outline_endpoint() {
         .expect("GET /outline must succeed");
 
     assert!(
-        body.contains("file_context(path=\"src/foo.rs\")"),
+        body.contains("the SymForge file outline for src/foo.rs,"),
         "a large whole-file read should name the cheaper reads: {body}"
     );
     assert!(
@@ -438,7 +438,7 @@ async fn test_shared_index_mutation() {
         .await
         .expect("GET /outline for new file must succeed");
     assert!(
-        outline.contains("file_context(path=\"src/b.rs\")"),
+        outline.contains("the SymForge file outline for src/b.rs,"),
         "the new file must be visible through sidecar: {outline}"
     );
 

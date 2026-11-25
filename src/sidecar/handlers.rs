@@ -674,7 +674,7 @@ fn outline_hook_text(
     state.token_stats.record_read(file_bytes, file_bytes);
     let path = &params.path;
     Ok(format!(
-        "~{} tokens read. Cheaper: file_context(path=\"{path}\") for the outline, get_symbol(path=\"{path}\", name=...) for one symbol.",
+        "~{} tokens read. Cheaper: the SymForge file outline for {path}, or get_symbol(path=\"{path}\", name=...) for one symbol.",
         crate::stel::handler::estimate_tokens_from_bytes(file_bytes)
     ))
 }
@@ -2448,7 +2448,7 @@ mod tests {
             "got:\n{text}"
         );
         assert!(
-            text.contains("file_context(path=\"main.rs\")"),
+            text.contains("the SymForge file outline for main.rs,"),
             "got:\n{text}"
         );
     }
@@ -2497,7 +2497,7 @@ mod tests {
         );
         assert!(text.contains("could not be read"), "got:\n{text}");
         assert!(
-            text.contains("file_context(path=\"src/foo.rs\")"),
+            text.contains("the SymForge file outline for src/foo.rs,"),
             "enrichment body must follow; got:\n{text}"
         );
 
@@ -2962,7 +2962,7 @@ mod tests {
         assert!(result.len() / 4 <= 42, "about 40 tokens at most: {result}");
         assert!(result.contains("~17648 tokens"), "got: {result}");
         assert!(
-            result.contains("file_context(path=\"src/sidecar/handlers.rs\")"),
+            result.contains("the SymForge file outline for src/sidecar/handlers.rs,"),
             "got: {result}"
         );
         assert!(
@@ -3017,7 +3017,7 @@ mod tests {
         let result = outline_handler(State(state), Query(params)).await.unwrap();
 
         assert!(
-            result.contains("file_context(path=\"src/main.rs\")"),
+            result.contains("the SymForge file outline for src/main.rs,"),
             "the refreshed size crosses the threshold; got: {result}"
         );
     }

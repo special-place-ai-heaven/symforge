@@ -1,1 +1,1 @@
-~10000 tokens read. Cheaper: file_context(path="src/lib.rs") for the outline, get_symbol(path="src/lib.rs", name=...) for one symbol.
+~10000 tokens read. Cheaper: the SymForge file outline for src/lib.rs, or get_symbol(path="src/lib.rs", name=...) for one symbol.

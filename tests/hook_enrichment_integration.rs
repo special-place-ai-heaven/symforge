@@ -433,7 +433,7 @@ async fn test_read_hook_large_file_names_cheaper_reads() {
 
     assert_eq!(
         body,
-        "~10000 tokens read. Cheaper: file_context(path=\"src/service.rs\") for the outline, get_symbol(path=\"src/service.rs\", name=...) for one symbol."
+        "~10000 tokens read. Cheaper: the SymForge file outline for src/service.rs, or get_symbol(path=\"src/service.rs\", name=...) for one symbol."
     );
     assert!(!has_savings_footer(&body), "no savings footer: {body}");
 
