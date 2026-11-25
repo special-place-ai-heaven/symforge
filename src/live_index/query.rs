@@ -857,17 +857,37 @@ fn classify_call_receiver(
     ReceiverCheck::Unknown
 }
 
+fn ends_with_separated(text: &str, sep: &str, needle: &str) -> bool {
+    text.strip_suffix(needle)
+        .is_some_and(|head| head.ends_with(sep))
+}
+
+fn starts_with_separated(text: &str, needle: &str, sep: &str) -> bool {
+    text.strip_prefix(needle)
+        .is_some_and(|rest| rest.starts_with(sep))
+}
+
+fn contains_wrapped(text: &str, sep: &str, needle: &str) -> bool {
+    text.contains(needle)
+        && text.char_indices().any(|(start, _)| {
+            text[start..]
+                .strip_prefix(sep)
+                .and_then(|rest| rest.strip_prefix(needle))
+                .is_some_and(|rest| rest.starts_with(sep))
+        })
+}
+
 fn matches_target_stem(text: &str, stem: &str) -> bool {
     text == stem
-        || text.ends_with(&format!("/{stem}"))
-        || text.ends_with(&format!("::{stem}"))
-        || text.ends_with(&format!(".{stem}"))
-        || text.contains(&format!("/{stem}/"))
-        || text.contains(&format!("::{stem}::"))
+        || ends_with_separated(text, "/", stem)
+        || ends_with_separated(text, "::", stem)
+        || ends_with_separated(text, ".", stem)
+        || contains_wrapped(text, "/", stem)
+        || contains_wrapped(text, "::", stem)
         // Relative imports: `index::Thing` matches stem "index"
-        || text.starts_with(&format!("{stem}::"))
-        || text.starts_with(&format!("{stem}/"))
-        || text.starts_with(&format!("{stem}."))
+        || starts_with_separated(text, stem, "::")
+        || starts_with_separated(text, stem, "/")
+        || starts_with_separated(text, stem, ".")
 }
 
 fn matches_target_module(language: &LanguageId, text: &str, module_path: Option<&str>) -> bool {
@@ -881,7 +901,7 @@ fn matches_target_module(language: &LanguageId, text: &str, module_path: Option<
         _ => "::",
     };
 
-    if text == module_path || text.starts_with(&format!("{module_path}{module_sep}")) {
+    if text == module_path || starts_with_separated(text, module_path, module_sep) {
         return true;
     }
 
@@ -889,8 +909,8 @@ fn matches_target_module(language: &LanguageId, text: &str, module_path: Option<
         && let Some(tail) = module_path.strip_prefix("crate::")
     {
         return text == tail
-            || text.ends_with(&format!("::{tail}"))
-            || text.contains(&format!("::{tail}::"));
+            || ends_with_separated(text, "::", tail)
+            || contains_wrapped(text, "::", tail);
     }
 
     false
@@ -9585,5 +9605,128 @@ public class PacketsController {
             "Should find caller in optimization.rs, got refs from: {:?}",
             refs.iter().map(|(p, _)| p).collect::<Vec<_>>()
         );
+    }
+
+    fn matches_target_stem_reference(text: &str, stem: &str) -> bool {
+        text == stem
+            || text.ends_with(&format!("/{stem}"))
+            || text.ends_with(&format!("::{stem}"))
+            || text.ends_with(&format!(".{stem}"))
+            || text.contains(&format!("/{stem}/"))
+            || text.contains(&format!("::{stem}::"))
+            || text.starts_with(&format!("{stem}::"))
+            || text.starts_with(&format!("{stem}/"))
+            || text.starts_with(&format!("{stem}."))
+    }
+
+    fn matches_target_module_reference(
+        language: &LanguageId,
+        text: &str,
+        module_path: Option<&str>,
+    ) -> bool {
+        let Some(module_path) = module_path else {
+            return false;
+        };
+        let module_sep = match language {
+            LanguageId::Python => ".",
+            LanguageId::JavaScript | LanguageId::TypeScript => "/",
+            _ => "::",
+        };
+        if text == module_path || text.starts_with(&format!("{module_path}{module_sep}")) {
+            return true;
+        }
+        if *language == LanguageId::Rust
+            && let Some(tail) = module_path.strip_prefix("crate::")
+        {
+            return text == tail
+                || text.ends_with(&format!("::{tail}"))
+                || text.contains(&format!("::{tail}::"));
+        }
+        false
+    }
+
+    #[test]
+    fn matches_target_matchers_agree_with_allocating_reference() {
+        let atoms = [
+            "",
+            "a",
+            "ab",
+            "b",
+            "db",
+            "mod",
+            "index",
+            "live_index",
+            "crate",
+            "pkg",
+            "sub",
+            "x",
+        ];
+        let seps = ["", "/", "::", ".", ":"];
+        let mut texts: Vec<String> = vec![
+            "a/a/a/".into(),
+            ":::x::".into(),
+            "x::::".into(),
+            "::::".into(),
+            "//".into(),
+            "/".into(),
+            "a.a.a.".into(),
+            "src/utils/index/x".into(),
+            "pkg.sub.mod.Thing".into(),
+            "crate::a::b::c".into(),
+        ];
+        for a in atoms {
+            for s1 in seps {
+                for b in atoms {
+                    texts.push(format!("{a}{s1}{b}"));
+                    for s2 in seps {
+                        for c in atoms {
+                            texts.push(format!("{a}{s1}{b}{s2}{c}"));
+                        }
+                    }
+                }
+            }
+        }
+        texts.sort();
+        texts.dedup();
+        let mut stems: Vec<&str> = atoms.to_vec();
+        stems.extend(["a/a", "a::a", "a.a", "index.test", "::", "/"]);
+        let module_paths = [
+            None,
+            Some(""),
+            Some("a"),
+            Some("db"),
+            Some("crate::"),
+            Some("crate::a"),
+            Some("crate::a::b"),
+            Some("crate::live_index"),
+            Some("pkg.sub.mod"),
+            Some("src/utils/index"),
+            Some("live_index"),
+        ];
+        let languages = [
+            LanguageId::Rust,
+            LanguageId::Python,
+            LanguageId::TypeScript,
+            LanguageId::JavaScript,
+            LanguageId::Go,
+        ];
+        for text in &texts {
+            for stem in &stems {
+                assert_eq!(
+                    super::matches_target_stem(text, stem),
+                    matches_target_stem_reference(text, stem),
+                    "stem text={text:?} stem={stem:?}"
+                );
+            }
+            for module_path in module_paths {
+                for language in &languages {
+                    assert_eq!(
+                        super::matches_target_module(language, text, module_path),
+                        matches_target_module_reference(language, text, module_path),
+                        "module text={text:?} module_path={module_path:?} language={language:?}"
+                    );
+                }
+            }
+        }
     }
 }
