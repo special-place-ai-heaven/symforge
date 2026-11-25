@@ -1048,7 +1048,7 @@ pub fn render_idioms() -> String {
 1. **Keyword arguments ONLY**: Every host function requires `fn(key=value)` — positional arguments raise `TypeError`.\n\
 2. **Final expression = JSON `value`**: The last top-level expression of the script becomes `\"value\"` in stdout JSON (`print(...)` goes to `\"stdout\"`).\n\
 3. **Pure-Rust Monty subset**: List/dict comprehensions, `for`/`if`/`while`, `def`, slicing, `json`, `re`, `math` work normally. Avoid `yield` generators, `del`, `open()`, `os.*`, network I/O, or third-party imports (zero-egress sandbox raises `PermissionError` / `ModuleNotFoundError`).\n\
-4. **Bounds**: 10s feed CPU/wall budget (30s ceiling), 64 MiB heap (256 MiB ceiling), 150 recursion depth, 64 host calls, 16,000 inline chars (larger outputs write a lossless JSON spill file reported in `spill_path`).\n\
+4. **Bounds**: 10s feed CPU/wall budget (30s ceiling), 64 MiB heap (256 MiB ceiling), 150 recursion depth, 64 host calls, 32,000 inline chars (larger outputs write a lossless JSON spill file reported in `spill_path`).\n\
 \n\
 ## Registered read-only functions ({count})\n\
 {fn_list}\n\
