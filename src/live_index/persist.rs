@@ -2500,19 +2500,34 @@ fn run_snapshot_store_restore_proof(
     project_root: &Path,
     wire_bytes: Option<&[u8]>,
 ) -> SnapshotRestoreProof {
-    run_snapshot_store_restore_proof_with(snapshot, project_root, wire_bytes, |path, file| {
-        let abs_path = project_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        std::fs::read(abs_path)
-            .is_ok_and(|bytes| crate::hash::digest_hex(&bytes) == file.content_hash)
+    run_snapshot_store_restore_proof_with(snapshot, project_root, wire_bytes, |entries| {
+        crate::live_index::store::ordered_parallel_map(entries, |(path, file)| {
+            let abs_path = project_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            if std::fs::read(abs_path)
+                .is_ok_and(|bytes| crate::hash::digest_hex(&bytes) == file.content_hash)
+            {
+                RestoreFileProof::Matches
+            } else {
+                RestoreFileProof::Differs
+            }
+        })
     })
+    .0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreFileProof {
+    Matches,
+    Differs,
+    Refused,
 }
 
 fn run_snapshot_store_restore_proof_with(
     snapshot: &IndexSnapshot,
     project_root: &Path,
     wire_bytes: Option<&[u8]>,
-    prove_file: impl Fn(&str, &IndexedFileSnapshot) -> bool,
-) -> SnapshotRestoreProof {
+    prove_files: impl Fn(&[(&str, &IndexedFileSnapshot)]) -> Vec<RestoreFileProof>,
+) -> (SnapshotRestoreProof, bool) {
     let owned_wire_bytes;
     let wire_bytes = match wire_bytes {
         Some(bytes) => Some(bytes),
@@ -2536,16 +2551,39 @@ fn run_snapshot_store_restore_proof_with(
             );
         }
         let unproven = snapshot.files.len();
-        return SnapshotRestoreProof {
-            outcome: Ok(RestoreOutcome::SeedRejected { unproven }),
-            rebuild_required: unproven > 0,
-        };
+        return (
+            SnapshotRestoreProof {
+                outcome: Ok(RestoreOutcome::SeedRejected { unproven }),
+                rebuild_required: unproven > 0,
+            },
+            false,
+        );
     }
 
     let declared_len = snapshot_restore_wire_declared_len(wire_bytes);
     let (seed, source_to_path) = build_snapshot_seed_from_index(snapshot, declared_len);
     let limit = snapshot_restore_decode_capacity(snapshot, declared_len);
     let files = &snapshot.files;
+    let proofs = std::cell::OnceCell::new();
+    let prove_all = || -> HashMap<&str, RestoreFileProof> {
+        let phase = Instant::now();
+        let entries: Vec<(&str, &IndexedFileSnapshot)> = files
+            .iter()
+            .map(|(path, file)| (path.as_str(), file))
+            .collect();
+        let proven = entries
+            .iter()
+            .map(|(path, _)| *path)
+            .zip(prove_files(&entries))
+            .collect();
+        info!(
+            "warm restore: {} source files read and hashed in {:?}",
+            entries.len(),
+            phase.elapsed()
+        );
+        proven
+    };
+    let read_refused = std::cell::Cell::new(false);
     let mut store = SnapshotStore::new();
     let outcome = store.restore(
         seed,
@@ -2558,7 +2596,15 @@ fn run_snapshot_store_restore_proof_with(
             let Some(file) = files.get(path.as_str()) else {
                 return false;
             };
-            snapshot_entry_stamp(&file.content_hash) == stamp && prove_file(path, file)
+            snapshot_entry_stamp(&file.content_hash) == stamp
+                && match proofs.get_or_init(&prove_all).get(path.as_str()) {
+                    Some(RestoreFileProof::Matches) => true,
+                    Some(RestoreFileProof::Refused) => {
+                        read_refused.set(true);
+                        false
+                    }
+                    Some(RestoreFileProof::Differs) | None => false,
+                }
         },
     );
     let rebuild_required = store.rebuild_required() || outcome.is_err();
@@ -2585,10 +2631,13 @@ fn run_snapshot_store_restore_proof_with(
             "snapshot restore proof latched rebuild fallback; hydrated seed kept for background_verify"
         );
     }
-    SnapshotRestoreProof {
-        outcome,
-        rebuild_required,
-    }
+    (
+        SnapshotRestoreProof {
+            outcome,
+            rebuild_required,
+        },
+        read_refused.get(),
+    )
 }
 
 #[cfg(any(feature = "server", feature = "embed"))]
@@ -2640,24 +2689,38 @@ fn run_snapshot_store_restore_proof_bound(
     authority
         .verify_physical_root_anchor()
         .map_err(|_| BoundRestoreRefusal::SourceMoved)?;
-    let read_refused = std::cell::Cell::new(false);
-    let proof =
-        run_snapshot_store_restore_proof_with(snapshot, project_root, None, |path, file| {
-            match authority.with_source_anchor_read(|lease| {
-                read_restore_candidate(lease, Path::new(path), file.content.len())
-            }) {
-                Ok(Some(bytes)) => crate::hash::digest_hex(&bytes) == file.content_hash,
-                Ok(None) => false,
-                Err(_) => {
-                    read_refused.set(true);
-                    false
-                }
-            }
+    let (proof, read_refused) =
+        run_snapshot_store_restore_proof_with(snapshot, project_root, None, |entries| {
+            entries
+                .chunks(SOURCE_ANCHOR_READ_BATCH)
+                .flat_map(|chunk| {
+                    authority
+                        .with_source_anchor_read(|lease| {
+                            Ok(crate::live_index::store::ordered_parallel_map(
+                                chunk,
+                                |(path, file)| match read_restore_candidate(
+                                    lease,
+                                    Path::new(path),
+                                    file.content.len(),
+                                ) {
+                                    Ok(Some(bytes))
+                                        if crate::hash::digest_hex(&bytes) == file.content_hash =>
+                                    {
+                                        RestoreFileProof::Matches
+                                    }
+                                    Ok(_) => RestoreFileProof::Differs,
+                                    Err(_) => RestoreFileProof::Refused,
+                                },
+                            ))
+                        })
+                        .unwrap_or_else(|_| vec![RestoreFileProof::Refused; chunk.len()])
+                })
+                .collect()
         });
     authority
         .verify_physical_root_anchor()
         .map_err(|_| BoundRestoreRefusal::SourceMoved)?;
-    if read_refused.get() {
+    if read_refused {
         return Err(BoundRestoreRefusal::SourceReadRefused);
     }
     Ok(proof)
@@ -2845,17 +2908,19 @@ fn stat_check_files_from_view(
         verify_view,
         snapshot_mtimes,
         stop,
-        |relative| {
-            let absolute = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
-            Ok(std::fs::metadata(absolute).ok().map(|metadata| {
-                let mtime = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_secs())
-                    .unwrap_or(0);
-                (metadata.len(), mtime)
-            }))
+        |paths| {
+            crate::live_index::store::ordered_parallel_map(paths, |relative| {
+                let absolute = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+                Ok(std::fs::metadata(absolute).ok().map(|metadata| {
+                    let mtime = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_secs())
+                        .unwrap_or(0);
+                    (metadata.len(), mtime)
+                }))
+            })
         },
         || {
             let discovered = crate::discovery::discover_files(root);
@@ -2890,7 +2955,7 @@ fn stat_check_files_from_view_with(
     verify_view: &VerifyIndexView,
     snapshot_mtimes: &HashMap<String, u64>,
     stop: &dyn Fn() -> bool,
-    mut observe: impl FnMut(&str) -> Result<Option<(u64, u64)>, String>,
+    mut observe: impl FnMut(&[&str]) -> Vec<Result<Option<(u64, u64)>, String>>,
     mut discover: impl FnMut() -> Result<Vec<String>, AnchoredDiscoveryError>,
 ) -> Option<StatCheckResult> {
     let known_paths: std::collections::HashSet<&str> = verify_view
@@ -2909,34 +2974,52 @@ fn stat_check_files_from_view_with(
     let mut observation_error = None;
 
     // Check each indexed file against disk
-    for (position, file) in verify_view.files.iter().enumerate() {
-        if position % SNAPSHOT_VERIFY_STOP_EVERY == 0 && stop() {
+    let phase = Instant::now();
+    for chunk in verify_view.files.chunks(SNAPSHOT_VERIFY_STOP_EVERY) {
+        if stop() {
             return None;
         }
-        match observe(&file.relative_path) {
-            Ok(Some((on_disk_size, on_disk_mtime))) => {
-                let stored_mtime = snapshot_mtimes
-                    .get(&file.relative_path)
-                    .copied()
-                    .unwrap_or(0);
+        let paths: Vec<&str> = chunk
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        for (file, observed) in chunk.iter().zip(observe(&paths)) {
+            match observed {
+                Ok(Some((on_disk_size, on_disk_mtime))) => {
+                    let stored_mtime = snapshot_mtimes
+                        .get(&file.relative_path)
+                        .copied()
+                        .unwrap_or(0);
 
-                if on_disk_size != file.byte_len || on_disk_mtime != stored_mtime {
-                    changed.push(file.relative_path.clone());
+                    if on_disk_size != file.byte_len || on_disk_mtime != stored_mtime {
+                        changed.push(file.relative_path.clone());
+                    }
                 }
-            }
-            Ok(None) => {
-                // File gone
-                deleted.push(file.relative_path.clone());
-            }
-            Err(error) => {
-                changed.push(file.relative_path.clone());
-                observation_error.get_or_insert(error);
+                Ok(None) => {
+                    // File gone
+                    deleted.push(file.relative_path.clone());
+                }
+                Err(error) => {
+                    changed.push(file.relative_path.clone());
+                    observation_error.get_or_insert(error);
+                }
             }
         }
     }
+    info!(
+        "snapshot verify: stat pass observed {} files in {:?}",
+        verify_view.files.len(),
+        phase.elapsed()
+    );
 
     // Find new files (on disk but not in index)
-    let (new_files, discovery_error) = match discover() {
+    let phase = Instant::now();
+    let discovered = discover();
+    info!(
+        "snapshot verify: new-file discovery finished in {:?}",
+        phase.elapsed()
+    );
+    let (new_files, discovery_error) = match discovered {
         Ok(discovered) => (
             discovered
                 .into_iter()
@@ -3232,6 +3315,9 @@ fn test_discovery_failure_root() -> &'static parking_lot::Mutex<Option<PathBuf>>
 /// Files a stat pass or spot check handles between two stop checks.
 const SNAPSHOT_VERIFY_STOP_EVERY: usize = 1024;
 
+/// Restore-proof files read in parallel under one source-anchor lease.
+const SOURCE_ANCHOR_READ_BATCH: usize = 256;
+
 /// Select approximately `sample_pct` of files and check their content hashes.
 ///
 /// Returns the paths whose on-disk content hash differs from the index, and
@@ -3246,9 +3332,13 @@ fn spot_verify_sample_from_view(
     progress: Option<&SnapshotVerifyProgress>,
     stop: &dyn Fn() -> bool,
 ) -> Option<(Vec<String>, Vec<String>)> {
-    spot_verify_sample_from_view_with(verify_view, sample_pct, progress, stop, |relative| {
-        let absolute = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
-        std::fs::read(absolute).ok()
+    spot_verify_sample_from_view_with(verify_view, sample_pct, progress, stop, |paths| {
+        crate::live_index::store::ordered_parallel_map(paths, |relative| {
+            let absolute = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+            std::fs::read(absolute)
+                .ok()
+                .map(|bytes| crate::hash::digest_hex(&bytes))
+        })
     })
 }
 
@@ -3257,7 +3347,7 @@ fn spot_verify_sample_from_view_with(
     sample_pct: f64,
     progress: Option<&SnapshotVerifyProgress>,
     stop: &dyn Fn() -> bool,
-    mut read: impl FnMut(&str) -> Option<Vec<u8>>,
+    mut read_digests: impl FnMut(&[&str]) -> Vec<Option<String>>,
 ) -> Option<(Vec<String>, Vec<String>)> {
     if verify_view.files.is_empty() {
         return Some((Vec::new(), Vec::new()));
@@ -3277,26 +3367,33 @@ fn spot_verify_sample_from_view_with(
     let mut mismatches = Vec::new();
     let mut unreadable = Vec::new();
 
-    for (position, file) in verify_view.files.iter().step_by(step).enumerate() {
-        if position % SNAPSHOT_VERIFY_STOP_EVERY == 0 && stop() {
+    let sampled: Vec<&VerifyFileView> = verify_view.files.iter().step_by(step).collect();
+    let phase = Instant::now();
+    for chunk in sampled.chunks(SNAPSHOT_VERIFY_STOP_EVERY) {
+        if stop() {
             return None;
         }
+        let paths: Vec<&str> = chunk
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        let digests = read_digests(&paths);
         if let Some(progress) = progress {
-            progress.add_processed(1);
+            progress.add_processed(chunk.len());
         }
-        let bytes = match read(&file.relative_path) {
-            Some(bytes) => bytes,
-            None => {
-                unreadable.push(file.relative_path.clone());
-                continue;
+        for (file, digest) in chunk.iter().zip(digests) {
+            match digest {
+                Some(on_disk_hash) if on_disk_hash == file.content_hash => {}
+                Some(_) => mismatches.push(file.relative_path.clone()),
+                None => unreadable.push(file.relative_path.clone()),
             }
-        };
-
-        let on_disk_hash = crate::hash::digest_hex(&bytes);
-        if on_disk_hash != file.content_hash {
-            mismatches.push(file.relative_path.clone());
         }
     }
+    info!(
+        "snapshot verify: spot check read {} files in {:?}",
+        sampled.len(),
+        phase.elapsed()
+    );
 
     Some((mismatches, unreadable))
 }
@@ -3969,16 +4066,25 @@ fn run_background_verify<F, C>(
         &verify_view,
         snapshot_mtimes,
         &|| stopped("the stat pass"),
-        |relative| {
+        |paths| {
+            let unobserved = || "the admitted source could not be observed".to_string();
             authority
                 .with_source_anchor_read(|lease| {
-                    crate::index_lifecycle::physical_root::entry_metadata_beneath(
-                        lease,
-                        Path::new(relative),
-                    )
+                    Ok(crate::live_index::store::ordered_parallel_map(
+                        paths,
+                        |relative| {
+                            crate::index_lifecycle::physical_root::entry_metadata_beneath(
+                                lease,
+                                Path::new(relative),
+                            )
+                            .map_err(|_| unobserved())
+                            .map(|observed| {
+                                observed.map(|metadata| (metadata.len, metadata.modified_secs))
+                            })
+                        },
+                    ))
                 })
-                .map_err(|_| "the admitted source could not be observed".to_string())
-                .map(|observed| observed.map(|metadata| (metadata.len, metadata.modified_secs)))
+                .unwrap_or_else(|_| paths.iter().map(|_| Err(unobserved())).collect())
         },
         || discover_files_from_source_anchor(root, index, authority, &|| stopped("discovery")),
     );
@@ -4032,18 +4138,25 @@ fn run_background_verify<F, C>(
                 0.10,
                 Some(&progress),
                 &|| stopped("the spot check"),
-                |relative| {
-                    let limit = lengths.get(relative).copied()?;
+                |paths| {
                     authority
                         .with_source_anchor_read(|lease| {
-                            crate::index_lifecycle::physical_root::read_regular_beneath(
-                                lease,
-                                Path::new(relative),
-                                limit,
-                            )
+                            Ok(crate::live_index::store::ordered_parallel_map(
+                                paths,
+                                |relative| {
+                                    let limit = lengths.get(relative).copied()?;
+                                    crate::index_lifecycle::physical_root::read_regular_beneath(
+                                        lease,
+                                        Path::new(relative),
+                                        limit,
+                                    )
+                                    .ok()
+                                    .flatten()
+                                    .map(|bytes| crate::hash::digest_hex(&bytes))
+                                },
+                            ))
                         })
-                        .ok()
-                        .flatten()
+                        .unwrap_or_else(|_| vec![None; paths.len()])
                 },
             )
         };
@@ -6472,6 +6585,225 @@ mod tests {
         );
 
         assert_eq!(outcome, crate::watcher::ReindexResult::HashSkip);
+    }
+
+    fn serial_reference_unproven(snapshot: &IndexSnapshot, root: &Path) -> usize {
+        snapshot
+            .files
+            .iter()
+            .filter(|(path, file)| {
+                !std::fs::read(root.join(path))
+                    .is_ok_and(|bytes| crate::hash::digest_hex(&bytes) == file.content_hash)
+            })
+            .count()
+    }
+
+    fn restore_fixture(root: &Path, count: usize) -> IndexSnapshot {
+        let names: Vec<String> = (0..count).map(|i| format!("src/f{i}.rs")).collect();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for name in &names {
+            std::fs::write(root.join(name), b"fn f() {}\n").unwrap();
+        }
+        let index = make_live_index_with_files(
+            names
+                .iter()
+                .map(|name| (name.as_str(), b"fn f() {}\n".as_slice()))
+                .collect(),
+        );
+        serialize_index(&index, root).unwrap();
+        load_snapshot(root).unwrap()
+    }
+
+    #[test]
+    fn parallel_restore_proof_equals_serial_reference_for_later_changed_or_missing_file() {
+        use crate::index_lifecycle::snapshot::RestoreOutcome;
+
+        for missing in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let snapshot = restore_fixture(tmp.path(), 600);
+            let target = tmp.path().join("src/f437.rs");
+            if missing {
+                std::fs::remove_file(&target).unwrap();
+            } else {
+                std::fs::write(&target, b"fn g() {}\n").unwrap();
+            }
+
+            let parallel = snapshot_store_restore_proof_for_test(&snapshot, tmp.path(), None);
+            let serial = crate::live_index::store::with_serial_oracle(|| {
+                snapshot_store_restore_proof_for_test(&snapshot, tmp.path(), None)
+            });
+            assert_eq!(parallel, serial);
+            assert_eq!(serial_reference_unproven(&snapshot, tmp.path()), 1);
+            assert_eq!(
+                parallel.outcome,
+                Ok(RestoreOutcome::SeedRejected { unproven: 1 })
+            );
+            assert!(parallel.rebuild_required);
+        }
+    }
+
+    #[test]
+    fn parallel_bound_restore_proof_equals_serial_reference() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("source");
+        let snapshot = restore_fixture(&root, 600);
+        let authority =
+            crate::live_index::index_lifecycle::activation::project_source_authority(&root);
+        let bound = || run_snapshot_store_restore_proof_bound(&snapshot, &root, &authority);
+        let unchanged = bound().expect("unchanged source proves");
+        assert!(!unchanged.rebuild_required);
+
+        std::fs::write(root.join("src/f437.rs"), b"fn g() {}\n").unwrap();
+        let changed = bound().expect("changed content is not a read refusal");
+        assert_eq!(
+            changed,
+            crate::live_index::store::with_serial_oracle(bound).unwrap()
+        );
+        assert_eq!(
+            changed.outcome,
+            Ok(crate::index_lifecycle::snapshot::RestoreOutcome::SeedRejected { unproven: 1 })
+        );
+
+        std::fs::remove_file(root.join("src/f437.rs")).unwrap();
+        let missing = bound().expect("a missing source is not a read refusal");
+        assert_eq!(
+            missing.outcome,
+            Ok(crate::index_lifecycle::snapshot::RestoreOutcome::SeedRejected { unproven: 1 })
+        );
+
+        std::fs::create_dir(root.join("src/f437.rs")).unwrap();
+        assert_eq!(bound(), Err(BoundRestoreRefusal::SourceReadRefused));
+        assert_eq!(
+            crate::live_index::store::with_serial_oracle(bound),
+            Err(BoundRestoreRefusal::SourceReadRefused)
+        );
+    }
+
+    #[test]
+    fn batched_stat_pass_keeps_index_order_and_first_observation_error() {
+        let names: Vec<String> = (0..2 * SNAPSHOT_VERIFY_STOP_EVERY + 7)
+            .map(|i| format!("f{i:05}.rs"))
+            .collect();
+        let index = make_live_index_with_files(
+            names
+                .iter()
+                .map(|name| (name.as_str(), b"fn f() {}\n".as_slice()))
+                .collect(),
+        );
+        let view = capture_verify_view(&index);
+        let verdict = |position: usize| -> Result<Option<(u64, u64)>, String> {
+            match position % 7 {
+                0 => Ok(None),
+                3 => Err(format!("error at {position}")),
+                5 => Ok(Some((u64::MAX, 0))),
+                _ => Ok(Some((view.files[position].byte_len, 0))),
+            }
+        };
+        let positions: HashMap<&str, usize> = view
+            .files
+            .iter()
+            .enumerate()
+            .map(|(position, file)| (file.relative_path.as_str(), position))
+            .collect();
+        let mut expected_changed = Vec::new();
+        let mut expected_deleted = Vec::new();
+        let mut expected_error = None;
+        for (position, file) in view.files.iter().enumerate() {
+            match verdict(position) {
+                Ok(None) => expected_deleted.push(file.relative_path.clone()),
+                Err(error) => {
+                    expected_changed.push(file.relative_path.clone());
+                    expected_error.get_or_insert(error);
+                }
+                Ok(Some((len, _))) if len != file.byte_len => {
+                    expected_changed.push(file.relative_path.clone())
+                }
+                Ok(Some(_)) => {}
+            }
+        }
+        let batches = std::cell::Cell::new(0usize);
+        let result = stat_check_files_from_view_with(
+            &view,
+            &HashMap::new(),
+            &|| false,
+            |paths| {
+                assert!(paths.len() <= SNAPSHOT_VERIFY_STOP_EVERY);
+                batches.set(batches.get() + 1);
+                crate::live_index::store::ordered_parallel_map(paths, |path| {
+                    verdict(positions[path])
+                })
+            },
+            || Ok(Vec::new()),
+        )
+        .expect("not stopped");
+        assert_eq!(batches.get(), 3);
+        assert_eq!(result.changed, expected_changed);
+        assert_eq!(result.deleted, expected_deleted);
+        assert_eq!(result.discovery_error, expected_error);
+        assert_eq!(expected_error.as_deref(), Some("error at 3"));
+
+        let observed = std::cell::Cell::new(false);
+        assert!(
+            stat_check_files_from_view_with(
+                &view,
+                &HashMap::new(),
+                &|| true,
+                |paths| {
+                    observed.set(true);
+                    paths.iter().map(|_| Ok(None)).collect()
+                },
+                || Ok(Vec::new()),
+            )
+            .is_none()
+        );
+        assert!(!observed.get(), "a stopped pass observes nothing");
+    }
+
+    #[test]
+    fn batched_spot_check_keeps_sample_order() {
+        let names: Vec<String> = (0..SNAPSHOT_VERIFY_STOP_EVERY + 9)
+            .map(|i| format!("f{i:05}.rs"))
+            .collect();
+        let index = make_live_index_with_files(
+            names
+                .iter()
+                .map(|name| (name.as_str(), b"fn f() {}\n".as_slice()))
+                .collect(),
+        );
+        let view = capture_verify_view(&index);
+        let hashes: HashMap<&str, (usize, &str)> = view
+            .files
+            .iter()
+            .enumerate()
+            .map(|(position, file)| {
+                (
+                    file.relative_path.as_str(),
+                    (position, file.content_hash.as_str()),
+                )
+            })
+            .collect();
+        let (mismatches, unreadable) =
+            spot_verify_sample_from_view_with(&view, 1.0, None, &|| false, |paths| {
+                crate::live_index::store::ordered_parallel_map(paths, |path| {
+                    let (position, hash) = hashes[path];
+                    match position % 5 {
+                        1 => None,
+                        2 => Some("different".to_string()),
+                        _ => Some(hash.to_string()),
+                    }
+                })
+            })
+            .expect("not stopped");
+        let pick = |remainder: usize| -> Vec<String> {
+            view.files
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| position % 5 == remainder)
+                .map(|(_, file)| file.relative_path.clone())
+                .collect()
+        };
+        assert_eq!(unreadable, pick(1));
+        assert_eq!(mismatches, pick(2));
     }
 
     /// The stat pass and the spot check poll their stop check inside their

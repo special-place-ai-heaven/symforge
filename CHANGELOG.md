@@ -46,6 +46,14 @@ Embedders keep their own response bytes and check them with `ReplayOutcome::resp
 
 AAP S14-S16 add opt-in refresh-safe snapshot reads for Graph, File, SymbolSearch, and References via `EmbeddedSourceHandle::query_allowing_refresh`; the claim keeps the prior publication identity and reports `Refreshing`. Strict `query` remains Current-only, and mutating/mixed-disk variants are refused before freshening. `change_version` plus blocking `wait_for_change` provide lossless phase/publication event waits. `begin_graph_publication_lease` pins one Graph snapshot across pages for at most 30 seconds; no more than eight leases are live per source, and expired leases return `GraphPublicationLeaseExpired`.
 
+## [12.1.1](https://github.com/special-place-ai-heaven/symforge/compare/v12.1.0...v12.1.1) (2026-11-25)
+
+
+### Performance Improvements
+
+* **map:** count key-type importers in parallel ([#946](https://github.com/special-place-ai-heaven/symforge/issues/946)) ([49cff2d](https://github.com/special-place-ai-heaven/symforge/commit/49cff2dbbba6d93ab36f40274e201c8fdb59ebdb))
+* **map:** skip ranking when compact map hides all key types ([#945](https://github.com/special-place-ai-heaven/symforge/issues/945)) ([f2e97d6](https://github.com/special-place-ai-heaven/symforge/commit/f2e97d64d025352b11d9ecd11fb787606b3a821c))
+
 ## [12.1.0](https://github.com/special-place-ai-heaven/symforge/compare/v12.0.1...v12.1.0) (2026-11-24)
 
 
