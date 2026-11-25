@@ -1173,9 +1173,7 @@ pub(crate) fn outline_text_for_generation_with(
     Some((text, file_bytes, output_bytes))
 }
 
-use super::file_read::{
-    COMPETENT_READ_WINDOW_LINES, SMALL_FILE_CHAR_THRESHOLD, competent_manual_baseline_chars,
-};
+use super::file_read::{SMALL_FILE_CHAR_THRESHOLD, competent_manual_baseline_chars};
 
 pub const SMALL_FILE_LINE_THRESHOLD: usize = 50;
 
@@ -1210,25 +1208,10 @@ pub fn compact_savings_footer(response_chars: usize, raw_chars: usize) -> String
         return String::new();
     }
     let whole_saved = saved_tokens_whole_file(response_chars, raw_chars);
-    let window_saved = saved_tokens_vs_competent_manual(response_chars, raw_chars);
-    if whole_saved < 50 && window_saved < 10 {
+    if whole_saved < 50 {
         return String::new();
     }
-    let mut parts = Vec::new();
-    if whole_saved >= 50 {
-        parts.push(format!(
-            "~{whole_saved} tokens estimated vs whole-file read"
-        ));
-    }
-    if window_saved >= 10 {
-        parts.push(format!(
-            "~{window_saved} tokens estimated vs ~{COMPETENT_READ_WINDOW_LINES}-line windowed read (assumed baseline, not measured)"
-        ));
-    }
-    if parts.is_empty() {
-        return String::new();
-    }
-    format!("\n\n{}", parts.join("; "))
+    format!("\n\n~{whole_saved} tokens estimated vs whole-file read")
 }
 
 pub fn collapse_large_test_modules(

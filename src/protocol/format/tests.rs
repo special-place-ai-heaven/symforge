@@ -4655,8 +4655,8 @@ fn test_compact_savings_footer_shows_savings() {
     let footer = compact_savings_footer(200, 2000);
     assert!(footer.contains("whole-file read"), "got: {footer}");
     assert!(
-        footer.contains("windowed read"),
-        "should show competent-manual baseline: {footer}"
+        !footer.contains("windowed read"),
+        "an unmeasured windowed-read baseline must not appear: {footer}"
     );
 }
 
