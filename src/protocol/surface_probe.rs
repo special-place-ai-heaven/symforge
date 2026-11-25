@@ -324,7 +324,7 @@ pub const COMPACT_SURFACE_INSTRUCTIONS: &str = "SymForge indexes this repository
 pub const CORE_SURFACE_INSTRUCTIONS: &str = "SymForge indexes this repository. Start with search_symbols to find a function or type, get_symbol to read its body (pass targets[] to fetch several in one call), and find_references for callers and usages. Use search_text for code text. For exact literal match counts your own grep is fine. Read raw files with get_file_content only for docs, configs or exact bytes. The project/projects parameters select an open project by ID or alias, never a path. This is the core profile: tool text may name unlisted tools; the operator lists every tool with SYMFORGE_SURFACE=full.";
 
 /// Code-surface routing hint (`SYMFORGE_SURFACE=code`).
-pub const CODE_SURFACE_INSTRUCTIONS: &str = "SymForge Code Mode. Discover Python read stubs and TypedDict return types with code_search (omit query for 1-line index). Chain read/trace queries in one turn with code_execute (keyword-only Python 3.14 subset, zero disk/net egress; final expression returned as JSON). Mutate symbols explicitly with symforge_edit and check index state with status.";
+pub const CODE_SURFACE_INSTRUCTIONS: &str = "SymForge Code Mode. Discover Python read stubs and TypedDict return types with code_search (omit query for 1-line index). Chain read/trace queries in one turn with code_execute (keyword-only Python 3.14 subset, zero disk/net egress; final value returned as lean text). Mutate symbols explicitly with symforge_edit and check index state with status.";
 
 /// Instructions for the surface this process serves. The meta probe is a
 /// measurement surface and gets none.

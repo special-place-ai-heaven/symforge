@@ -166,7 +166,7 @@ pub fn code_surface_tools() -> Vec<rmcp::model::Tool> {
 
     let mut execute = surface_tool(
         "code_execute",
-        "Run one zero-egress Python script chaining read-only index queries; returns only the final JSON value.",
+        "Run one zero-egress Python script chaining read-only index queries; returns the final value as lean text (tables, raw strings).",
         schema_object::<crate::protocol::code_mode_tools::CodeExecuteInput>(),
     );
     execute.annotations = read_only();

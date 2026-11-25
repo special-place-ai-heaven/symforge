@@ -48,11 +48,13 @@ bdea61b7cb74d36733690b39bf7779a65ea9693241cfae8e8aab903578628744  cli/mod.rs
 
 6b5ebddfb76c15316c1ca393ba63fbf138c66556dbc04e5f2319d50fb6729e54  cli/version.rs
 
-00ab1ca52bd59e24d093255869ca22288413c5bc1cdf2cbdad59ab3913193548  codemode/backend.rs
+f64ffa9d367c355a99267f8f5ed83fd00f1dedf2ec48fa4b2473f3d2b5c0fd70  codemode/backend.rs
 
-968f9793fcd7c3fb78c29d0b8807c85cb5b722d78f54c15b108c35da8c8314aa  codemode/catalog.rs
+6a4c8c288358400fb8f935df633a39f9a94c8137753860da4a6f13fa6f4c0da6  codemode/catalog.rs
 
-a8885ac2cadf2d7dae351189dbb686f43bbddbf7f2abd1259d3a9e67337a62ec  codemode/mod.rs
+03884f665bae73db31c60b6826a00a4dfaedbb1042e26aa8331fd3580b7bf363  codemode/lean.rs
+
+7e54f41b9be2b74d3881b704e1540a34f7f66aa5320feb5c96232e03442dab86  codemode/mod.rs
 
 2a82eb509a47ce2ff220c2208ee7ba17fbc1aa8e2d08266766d08d7335db5764  codemode/runner.rs
 
@@ -496,7 +498,7 @@ b3a33c9e3fe095810aaa6ffb6ba477dbe68811593ae687c28219078d1e2de0ff  protocol/ccr.r
 
 0f188f34cfe1bd81085893403ba646b994c1e29e5c3c514b737a33bd7c8aa3b2  protocol/claim_provenance.rs
 
-28177125cc17295974700be4f14fd7e84fd8eac87afce3cccaaede8e174c8dfb  protocol/code_mode_tools.rs
+3b1d6ae544f0b317a29c9587aed00f5ba18847d3a6601f165be17e52c8931291  protocol/code_mode_tools.rs
 
 c0e9d9801b08df63b39366eb24fb8d0c69ee329f796c7a8c2c468b088b8785cd  protocol/conventions.rs
 
@@ -554,7 +556,7 @@ f2a81ae06d5917fc2efc8545d3bffc289370092ea77cc4f93cbdf685c866d274  protocol/sessi
 
 5f4007ba696412247b0d00880e6dec1b7687a12a5eaa44e31becc7327861e48b  protocol/smart_query.rs
 
-e8db7e7b302e1fda1a074035301459ac59c948b9706870b172cb2be5a9223c9a  protocol/surface_probe.rs
+bcc519ab243cc36c18e16e870fa4ceb62b1528d07744770ed8718a3436b0abfc  protocol/surface_probe.rs
 
 71b2e138709a6c5b2c07f9990335eea66d9dd68885f61c6daa998a44b5af4b1c  protocol/tool_contract.rs
 
@@ -634,7 +636,7 @@ d9175ca0ab9f9a3afcb3d3f037b3ebfa116ff135908c9c382476fda420a38be6  stel/ledger.rs
 
 f0c95f094109da5bfc9a9f5e30a0053baa943a854909eeedaf963cdfbcee06e2  stel/surface.rs
 
-ac88b42e6fbe238775d9f184df417b627c63ed6711142bef6b1e1e87dfd1055d  stel/surface_list.rs
+d3883abe35acb8b8857bb6d59992f630215b33a80214c6ab9960383a93d3e9ef  stel/surface_list.rs
 
 6939025d17ccfeaf992bd41f22948ac19509c83ed08edee2c22ae06462285eb2  stel_core/calibration.rs
 

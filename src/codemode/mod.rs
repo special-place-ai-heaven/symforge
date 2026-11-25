@@ -6,6 +6,7 @@
 
 pub mod backend;
 pub mod catalog;
+pub mod lean;
 pub mod runner;
 pub mod value;
 
