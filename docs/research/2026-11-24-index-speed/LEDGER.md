@@ -51,6 +51,24 @@ On the clean `d53e429f` checkout, code mode served the depth-one compact map fro
 
 The public `find_dependents(limit=1000)` returned 384 reference rows in 100 files for the fixture. Code mode caps the result at 100 files and, by default, 10 lines per file. It also applies the normal admission checks. A public witness can disprove an arrow, but counting those rows cannot establish the total for a large target. Use an independently enumerated graph for exact counts, and record both source and target for every disputed edge. [Public limits and admission](../../../src/codemode/backend.rs)
 
+**One keyword reproduced the watcher error.** An eight-file control contains an outer crate with a watcher, a vendored crate declaring `mod service`, and an unrelated `tests/fixtures/rust/service.rs`. The vendored root imports `Svc` from its own module. With `use service::Svc`, code mode incorrectly lists the vendored root as a dependent of the test fixture. Changing just that declaration to `pub use service::Svc` also makes the outer crate's watcher consumer a dependent of **both** service files. Its only import is `use crate::watcher::WatcherInfo;`. The correct fixture set is empty in both cases and the genuine vendored module has exactly one importing file. The real repository contains the corresponding module declaration and public re-exports. Replay `fix2-wire/vendor-seed-control.py <d53-binary> <label>` in the private evidence directory. Job `01a211b2de4b703da128633f72cdd898` captured both variants through stdio. [Vendored crate root](../../../vendor/rmcp/src/lib.rs)
+
+All 15 displayed rows belong to seven physical files. Source inspection found the following distinct importing files. The six lower bounds include only verified import, re-export or qualified-use witnesses. Their upper bounds remain open.
+
+| Target file | Displayed rows | Arrow on each row | Independently supported count |
+|---|---:|---:|---:|
+| `tests/fixtures/compression_ratio/rust/service.rs` | 2 | 487 | 0 |
+| `src/sidecar/server.rs` | 1 | 479 | ≥7 |
+| `src/server/mod.rs` | 1 | 479 | ≥15 |
+| `src/stel/handler.rs` | 1 | 475 | ≥4 |
+| `src/parsing/mod.rs` | 2 | 465 | ≥23 |
+| `src/cli/mod.rs` | 5 | 465 | ≥9 |
+| `src/git.rs` | 3 | 460 | ≥12 |
+
+For example, the private `SidecarListenerKind` enum shares its file with the public function `spawn_sidecar`. The parent module re-exports that function and integration tests import it. Those are genuine file-level dependents. Private replay files `fix2-oracle/pinned-top15.csv` and `fix2-oracle/confirmed-groups.csv` identify the rows and witnesses. Source scan job `01a211b03753756c9199834e33bc8987`. [Sidecar re-export](../../../src/sidecar/mod.rs) · [Integration consumer](../../../tests/hook_root_guard.rs)
+
+The positive out-of-tree control declares `#[path = "fixtures/rust/service.rs"] mod service;` in an integration test and imports `service::OrderSnapshot`. The baseline correctly returns that test for the fixture. Preserve it when correcting the false watcher relationship. Job `01a211b3fa0371ffbfa6486e6a97d2b2`. A second, compiler-checked graph distinguishes eight genuine importer files on the left from five on the right. At `d53e429f` the API returned five and four respectively, including false edges on both sides. Plain `self::` and `super::` imports work on the left. Alias, glob and re-export omissions must be measured independently from removing false positives. Rust compiler job `01a211a9c39e77c6a3dc25c6611cacec`; stdio job `01a211b30bf3720da9026af47b38b00a`.
+
 ## Fix #1 controls and timeout replay
 
 A standalone probe used the budget helper and both truncation footers from Git revision `3a4fb63d`. It exercised prefix costs from 3,930 through 4,020 UTF-8 bytes, one- and two-row layouts, multibyte text, scoped and unscoped footers, and 0, 1, 14, 15 and 16 type tuples. In **2,730 comparisons**, replacing an entirely hidden section with the same number of placeholder rows exercised 504 skips and changed zero rendered bytes. A deliberately premature cutoff at 3,999 bytes changed 24 responses. Replay on the benchmark host with `uv run --no-project python map-prefix-risk-control.py` from the report’s private replay directory. Terminal Commander job `job_01a20d71085c7799b8b7812ced0747fb` exited 0. The probe supplies the rows directly. Candidate discovery, ranking, and transport still need product-level proof.
