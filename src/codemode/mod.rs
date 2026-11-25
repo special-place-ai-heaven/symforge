@@ -54,6 +54,7 @@ pub struct CodeModeLimits {
     /// Whether oversized outputs may spill full JSON payloads to local temp files.
     /// True for CLI and local stdio MCP; false on shared/HTTP MCP transports.
     pub allow_spill_files: bool,
+    pub lean_output: bool,
 }
 
 impl Default for CodeModeLimits {
@@ -65,6 +66,7 @@ impl Default for CodeModeLimits {
             max_host_calls: DEFAULT_MAX_HOST_CALLS,
             max_output_chars: DEFAULT_MAX_OUTPUT_CHARS,
             allow_spill_files: true,
+            lean_output: false,
         }
     }
 }
@@ -86,6 +88,7 @@ impl CodeModeLimits {
             max_host_calls: self.max_host_calls.clamp(1, MAX_HOST_CALLS_CEILING),
             max_output_chars: self.max_output_chars.clamp(256, MAX_OUTPUT_CHARS_CEILING),
             allow_spill_files: self.allow_spill_files,
+            lean_output: self.lean_output,
         }
     }
 }
@@ -146,4 +149,6 @@ pub struct ExecuteOutcome {
     pub total_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ExecuteErrorInfo>,
+    #[serde(skip)]
+    pub lean_text: Option<String>,
 }

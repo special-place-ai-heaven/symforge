@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 
 use super::backend::CodeReadBackend;
 use super::catalog::CodeReadOp;
+use super::lean::render_lean_with_stdout;
 use super::value::{drop_json_iteratively, json_to_monty, kwargs_to_json_object, monty_to_json};
 use super::{CodeModeLimits, ExecuteErrorInfo, ExecuteOutcome, ExecuteRequest, ExecuteStatus};
 
@@ -567,6 +568,7 @@ fn finalize_error_with_stdout(
         total_bytes,
         spill_path,
         error: Some(error_info),
+        lean_text: None,
     }
 }
 
@@ -582,12 +584,18 @@ fn finalize_ok_outcome(
     // never serialize it a second time or risk stack overflow on Drop.
     let value_json_str = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_owned());
     let total_bytes = value_json_str.len().saturating_add(stdout_buf.len());
-    let total_chars = value_json_str
-        .chars()
-        .count()
-        .saturating_add(stdout_buf.chars().count());
+    let lean_text = limits
+        .lean_output
+        .then(|| render_lean_with_stdout(&value, &stdout_buf));
+    let inline_chars = match &lean_text {
+        Some(text) => text.chars().count(),
+        None => value_json_str
+            .chars()
+            .count()
+            .saturating_add(stdout_buf.chars().count()),
+    };
 
-    if total_chars <= limits.max_output_chars {
+    if inline_chars <= limits.max_output_chars {
         return ExecuteOutcome {
             status: ExecuteStatus::Ok,
             value: Some(value),
@@ -599,6 +607,7 @@ fn finalize_ok_outcome(
             spill_path: None,
             total_bytes: None,
             error: None,
+            lean_text,
         };
     }
 
@@ -655,6 +664,7 @@ fn finalize_ok_outcome(
         spill_path,
         total_bytes: Some(total_bytes),
         error: None,
+        lean_text: None,
     }
 }
 

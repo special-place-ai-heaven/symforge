@@ -18,6 +18,15 @@ pub fn render_lean(value: &Value) -> String {
     }
 }
 
+pub fn render_lean_with_stdout(value: &Value, stdout: &str) -> String {
+    let text = render_lean(value);
+    if stdout.is_empty() {
+        text
+    } else {
+        format!("{text}\nstdout:\n{stdout}")
+    }
+}
+
 fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned())
 }

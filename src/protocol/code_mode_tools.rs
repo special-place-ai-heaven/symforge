@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use super::SymForgeServer;
 use super::result_status::{OutcomeClass, ResultStatus};
 use crate::codemode::{
-    CodeModeLimits, DaemonCodeBackend, ExecuteOutcome, ExecuteRequest, ExecuteStatus,
-    LocalCodeBackend, execute_script, lean::render_lean, render_stubs,
+    CodeModeLimits, DaemonCodeBackend, ExecuteRequest, ExecuteStatus, LocalCodeBackend,
+    execute_script, render_stubs,
 };
 
 pub const CODE_OUTPUT_ENV: &str = "SYMFORGE_CODE_OUTPUT";
@@ -87,6 +87,8 @@ impl SymForgeServer {
 
         let mut limits = CodeModeLimits {
             allow_spill_files: matches!(self.transport_lane, super::repeat::TransportLane::Stdio),
+            lean_output: !std::env::var(CODE_OUTPUT_ENV)
+                .is_ok_and(|v| v.eq_ignore_ascii_case("json")),
             ..CodeModeLimits::default()
         };
         if let Some(ms) = input.timeout_ms {
@@ -312,7 +314,7 @@ impl SymForgeServer {
 }
 
 fn render_execute_call_result(
-    outcome: crate::codemode::ExecuteOutcome,
+    mut outcome: crate::codemode::ExecuteOutcome,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     let class = match outcome.status {
         ExecuteStatus::Ok => OutcomeClass::Found,
@@ -336,9 +338,11 @@ fn render_execute_call_result(
             }
         }
     };
-    let json_mode = std::env::var(CODE_OUTPUT_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("json"));
-    let mut result =
-        ResultStatus::new(class).into_call_tool_result(execute_result_text(&outcome, json_mode));
+    let text = outcome.lean_text.take().unwrap_or_else(|| {
+        serde_json::to_string(&outcome)
+            .unwrap_or_else(|e| format!("{{\"status\":\"error\",\"message\":\"{e}\"}}"))
+    });
+    let mut result = ResultStatus::new(class).into_call_tool_result(text);
     if let Some(meta) = result.meta.as_mut() {
         meta.0.insert(
             CODE_EXECUTE_META_KEY.to_string(),
@@ -350,21 +354,4 @@ fn render_execute_call_result(
         );
     }
     Ok(result)
-}
-
-fn execute_result_text(outcome: &ExecuteOutcome, json_mode: bool) -> String {
-    let lean_value =
-        (!json_mode && outcome.status == ExecuteStatus::Ok && outcome.truncated.is_none())
-            .then_some(outcome.value.as_ref())
-            .flatten();
-    let Some(value) = lean_value else {
-        return serde_json::to_string(outcome)
-            .unwrap_or_else(|e| format!("{{\"status\":\"error\",\"message\":\"{e}\"}}"));
-    };
-    let text = render_lean(value);
-    if outcome.stdout.is_empty() {
-        text
-    } else {
-        format!("{text}\nstdout:\n{}", outcome.stdout)
-    }
 }

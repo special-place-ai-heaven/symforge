@@ -133,6 +133,39 @@ async fn code_execute_json_opt_out_restores_the_full_outcome_text() {
     assert_eq!(code_execute_meta(&res)["calls"], 1);
 }
 
+const OVER_CAP_ROWS_SCRIPT: &str =
+    "[{'kind': 'fn', 'name': 'n' + str(i), 'path': 'src/x.rs'} for i in range(400)]";
+
+fn over_cap_rows_lean_text() -> String {
+    let rows: Vec<String> = (0..400).map(|i| format!("fn\tn{i}")).collect();
+    format!("kind\tname\n@ src/x.rs\n{}", rows.join("\n"))
+}
+
+#[tokio::test]
+async fn code_execute_inlines_lean_text_when_only_the_json_form_is_over_the_cap() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let (_dir, server) = build_server_fixture();
+
+    let res = server
+        .dispatch_tool_result_for_tests("code_execute", json!({"code": OVER_CAP_ROWS_SCRIPT}))
+        .await
+        .expect("code_execute");
+    assert_eq!(first_text_block(&res), over_cap_rows_lean_text());
+    assert!(
+        code_execute_meta(&res)["output_bytes"].as_u64().unwrap()
+            > symforge::codemode::DEFAULT_MAX_OUTPUT_CHARS as u64
+    );
+
+    let _json = stel_surface_env::EnvVarGuard::set("SYMFORGE_CODE_OUTPUT", "json");
+    let res = server
+        .dispatch_tool_result_for_tests("code_execute", json!({"code": OVER_CAP_ROWS_SCRIPT}))
+        .await
+        .expect("code_execute");
+    let parsed: Value = serde_json::from_str(first_text_block(&res)).expect("json result");
+    assert_eq!(parsed["truncated"], true);
+    assert_eq!(parsed["value"]["_truncated"], true);
+}
+
 #[tokio::test]
 async fn code_execute_errors_keep_the_json_outcome_text() {
     let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
@@ -391,6 +424,15 @@ async fn daemon_proxied_code_execute_preserves_session_across_multiple_calls_and
             "expected verified daemon project_id receipt on _meta, got: {ev}"
         );
     }
+
+    let res = symforge::protocol::result_status::with_project_evidence_scope(
+        None,
+        server
+            .dispatch_tool_result_for_tests("code_execute", json!({"code": OVER_CAP_ROWS_SCRIPT})),
+    )
+    .await
+    .expect("over-cap code_execute over daemon");
+    assert_eq!(first_text_block(&res), over_cap_rows_lean_text());
 
     // Verify the underlying daemon session is still alive and healthy (not degraded or closed).
     let status_res = server

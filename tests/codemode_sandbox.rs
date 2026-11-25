@@ -263,6 +263,87 @@ fn oversized_output_spills_losslessly_to_disk_and_caps_inline_preview() {
 }
 
 #[test]
+fn lean_output_inlines_values_whose_lean_text_fits_although_their_json_does_not() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let code = "[{'kind': 'fn', 'name': 'n' + str(i), 'path': 'src/x.rs'} for i in range(100)]";
+    let request = |lean_output| ExecuteRequest {
+        code: code.to_owned(),
+        limits: CodeModeLimits {
+            max_output_chars: 2000,
+            lean_output,
+            ..CodeModeLimits::default()
+        },
+        spill_dir: Some(temp.path().to_path_buf()),
+    };
+
+    let lean = execute_script(&request(true), &mock_backend);
+    assert_eq!(lean.status, ExecuteStatus::Ok);
+    assert_eq!(lean.truncated, None);
+    assert_eq!(lean.spill_path, None);
+    let value = lean.value.as_ref().expect("inline value");
+    assert!(serde_json::to_string(value).unwrap().len() > 2000);
+    let text = lean.lean_text.as_deref().expect("lean text");
+    assert_eq!(text, symforge::codemode::lean::render_lean(value));
+    assert!(text.chars().count() <= 2000);
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+
+    let json = execute_script(&request(false), &mock_backend);
+    assert_eq!(json.truncated, Some(true));
+    assert_eq!(json.lean_text, None);
+    assert!(json.spill_path.is_some());
+}
+
+#[test]
+fn lean_output_spills_exactly_like_json_when_the_lean_text_is_over_the_cap() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let run = |lean_output| {
+        execute_script(
+            &ExecuteRequest {
+                code: "print('p' * 50)\n{'big': 'z' * 2000}".to_owned(),
+                limits: CodeModeLimits {
+                    max_output_chars: 256,
+                    lean_output,
+                    ..CodeModeLimits::default()
+                },
+                spill_dir: Some(temp.path().to_path_buf()),
+            },
+            &mock_backend,
+        )
+    };
+    let spilled = |out: &symforge::codemode::ExecuteOutcome| {
+        let mut saved: Value = serde_json::from_str(
+            &std::fs::read_to_string(out.spill_path.as_ref().expect("spill_path")).unwrap(),
+        )
+        .unwrap();
+        saved.as_object_mut().unwrap().remove("duration_ms");
+        saved
+    };
+    let envelope = |out: &symforge::codemode::ExecuteOutcome| {
+        let mut value = out.value.clone().expect("preview envelope");
+        value.as_object_mut().unwrap().remove("spill_path");
+        (
+            value,
+            out.stdout.clone(),
+            out.truncated,
+            out.total_bytes,
+            out.output_bytes,
+            out.calls,
+        )
+    };
+
+    let lean = run(true);
+    let json = run(false);
+    assert_eq!(lean.lean_text, None);
+    assert_eq!(lean.truncated, Some(true));
+    assert_eq!(envelope(&lean), envelope(&json));
+    assert_eq!(spilled(&lean), spilled(&json));
+    assert_eq!(
+        lean.value.as_ref().unwrap()["spill_path"].as_str(),
+        lean.spill_path.as_deref()
+    );
+}
+
+#[test]
 fn stubs_and_idioms_stay_in_exact_lockstep_with_registered_ops() {
     assert_eq!(CODE_READ_OPS.len(), 15);
     let index = render_stubs(None, None);
