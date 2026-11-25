@@ -317,7 +317,7 @@ pub fn execute_op_on_generation(
                     crate::live_index::search::SymbolMatchTier::Prefix => "prefix",
                     crate::live_index::search::SymbolMatchTier::Substring => "substring",
                 };
-                let (end_line, identity) = generation
+                let end_line = generation
                     .live
                     .get_file(&hit.path)
                     .and_then(|f| {
@@ -325,14 +325,7 @@ pub fn execute_op_on_generation(
                             s.name == hit.name && s.line_range.0.saturating_add(1) == hit.line
                         })
                     })
-                    .map(|s| {
-                        let id = format!(
-                            "{}:{}:{}:{}-{}",
-                            hit.path, s.kind, s.name, s.byte_range.0, s.byte_range.1
-                        );
-                        (s.line_range.1.saturating_add(1), id)
-                    })
-                    .unwrap_or((hit.line, format!("{}:{}:{}", hit.path, hit.kind, hit.name)));
+                    .map_or(hit.line, |s| s.line_range.1.saturating_add(1));
                 out.push(json!({
                     "path": hit.path,
                     "name": hit.name,
@@ -340,7 +333,6 @@ pub fn execute_op_on_generation(
                     "start_line": hit.line,
                     "end_line": end_line,
                     "tier": tier,
-                    "identity": identity,
                 }));
             }
             Ok(Value::Array(out))

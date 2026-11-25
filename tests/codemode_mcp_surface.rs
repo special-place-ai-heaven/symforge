@@ -65,6 +65,82 @@ fn first_text_block(res: &rmcp::model::CallToolResult) -> &str {
         .expect("expected text content block")
 }
 
+fn code_execute_meta(res: &rmcp::model::CallToolResult) -> &Value {
+    res.meta
+        .as_ref()
+        .and_then(|m| m.0.get("symforge/code_execute"))
+        .expect("code_execute counters in _meta")
+}
+
+async fn code_execute_text(server: &SymForgeServer, code: &str) -> String {
+    let res = server
+        .dispatch_tool_result_for_tests("code_execute", json!({"code": code}))
+        .await
+        .expect("code_execute");
+    assert_ne!(res.is_error, Some(true), "{}", first_text_block(&res));
+    first_text_block(&res).to_owned()
+}
+
+#[tokio::test]
+async fn code_execute_renders_search_references_and_symbol_reads_as_lean_text() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let (_dir, server) = build_server_fixture();
+
+    assert_eq!(
+        code_execute_text(&server, r#"search_symbols(query="add_pair")"#).await,
+        "end_line\tkind\tname\tstart_line\ttier\n@ src/math.rs\n3\tfn\tadd_pair\t1\texact"
+    );
+    assert_eq!(
+        code_execute_text(&server, r#"find_references(name="add_pair")"#).await,
+        "caller_kind\tenclosing_line\tenclosing_symbol\tline\ttext\n@ src/math.rs\nfn\t5\tsum_triple\t6\t    add_pair(add_pair(x, y), z)\nfn\t5\tsum_triple\t6\t    add_pair(add_pair(x, y), z)"
+    );
+    assert_eq!(
+        code_execute_text(
+            &server,
+            r#"get_symbol(path="src/math.rs", name="add_pair")"#
+        )
+        .await,
+        "@ end_line=3\tkind=fn\tname=add_pair\tpath=src/math.rs\trefusal=\tstart_line=1\twithheld_reason=\nsource:\npub fn add_pair(a: i32, b: i32) -> i32 {\n    a + b\n}"
+    );
+    assert_eq!(
+        code_execute_text(&server, "print(\"hi\")\n\"done\"").await,
+        "done\nstdout:\nhi\n"
+    );
+}
+
+#[tokio::test]
+async fn code_execute_json_opt_out_restores_the_full_outcome_text() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _json = stel_surface_env::EnvVarGuard::set("SYMFORGE_CODE_OUTPUT", "json");
+    let (_dir, server) = build_server_fixture();
+
+    let res = server
+        .dispatch_tool_result_for_tests(
+            "code_execute",
+            json!({"code": r#"len(search_symbols(query="add_pair"))"#}),
+        )
+        .await
+        .expect("code_execute");
+    let parsed: Value = serde_json::from_str(first_text_block(&res)).expect("json result");
+    assert_eq!(parsed["status"], "ok");
+    assert_eq!(parsed["value"], 1);
+    assert_eq!(parsed["calls"], 1);
+    assert_eq!(parsed["stdout"], "");
+    assert_eq!(code_execute_meta(&res)["calls"], 1);
+}
+
+#[tokio::test]
+async fn code_execute_errors_keep_the_json_outcome_text() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let (_dir, server) = build_server_fixture();
+    let res = server
+        .dispatch_tool_result_for_tests("code_execute", json!({"code": "1/0"}))
+        .await
+        .expect("code_execute");
+    let parsed: Value = serde_json::from_str(first_text_block(&res)).expect("json error outcome");
+    assert_eq!(parsed["status"], "error");
+}
+
 #[tokio::test]
 async fn code_surface_advertises_four_tools_under_4800_bytes_and_gates_legacy_tools() {
     let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
@@ -127,6 +203,7 @@ async fn code_surface_advertises_four_tools_under_4800_bytes_and_gates_legacy_to
 
 #[tokio::test]
 async fn code_search_and_code_execute_and_symforge_edit_and_status_chain_e2e() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let (_dir, server) = build_server_fixture();
 
     // 1. `code_search` with empty query -> 1-line index
@@ -165,17 +242,11 @@ bodies = get_symbol(targets=caller_targets)
         .await
         .expect("code_execute");
     assert_ne!(exec_res.is_error, Some(true));
-    let parsed: Value = serde_json::from_str(first_text_block(&exec_res)).expect("json result");
-    assert_eq!(parsed["status"], "ok");
-    assert_eq!(parsed["calls"], 3);
     assert_eq!(
-        parsed["value"],
-        json!({
-            "def_line": 1,
-            "caller": "sum_triple",
-            "call_sites": 2,
-        })
+        first_text_block(&exec_res),
+        "call_sites: 2\ncaller: sum_triple\ndef_line: 1"
     );
+    assert_eq!(code_execute_meta(&exec_res)["calls"], 3);
 
     // 4. `symforge_edit` preview works cleanly alongside Code Mode
     let edit_res = server
@@ -195,7 +266,6 @@ bodies = get_symbol(targets=caller_targets)
     assert!(first_text_block(&edit_res).contains("saturating_add"));
 
     // 5. `status` reports surface=code when SYMFORGE_SURFACE=code
-    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("code");
     let status_res = server
         .dispatch_tool_result_for_tests("status", json!({}))
@@ -249,6 +319,7 @@ fn serve_surface_flag_and_init_code_skill_install_cleanly() {
 
 #[tokio::test]
 async fn daemon_proxied_code_execute_preserves_session_across_multiple_calls_and_status() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let dir = TempDir::new().expect("tempdir");
     let root = dir.path();
     std::fs::create_dir_all(root.join("src")).expect("mkdir src");
@@ -297,11 +368,12 @@ async fn daemon_proxied_code_execute_preserves_session_across_multiple_calls_and
             "round {round} failed: {}",
             first_text_block(&res)
         );
-        let parsed: Value =
-            serde_json::from_str(first_text_block(&res)).expect("parse code_execute json");
-        assert_eq!(parsed["status"], "ok", "round {round} outcome: {parsed}");
-        assert_eq!(parsed["value"]["round"], round);
-        assert_eq!(parsed["value"]["name"], "add_pair");
+        assert_eq!(
+            first_text_block(&res),
+            format!("name: add_pair\nround: {round}"),
+            "daemon-proxied code_execute renders the same lean text as the local path"
+        );
+        assert_eq!(code_execute_meta(&res)["calls"], 1);
         // Verify daemon ProjectEvidence receipt was attached to `_meta` (never degraded/unavailable).
         let meta = res.meta.as_ref().expect("result _meta present");
         let ev = meta

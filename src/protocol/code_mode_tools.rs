@@ -16,9 +16,12 @@ use serde::{Deserialize, Serialize};
 use super::SymForgeServer;
 use super::result_status::{OutcomeClass, ResultStatus};
 use crate::codemode::{
-    CodeModeLimits, DaemonCodeBackend, ExecuteRequest, ExecuteStatus, LocalCodeBackend,
-    execute_script, render_stubs,
+    CodeModeLimits, DaemonCodeBackend, ExecuteOutcome, ExecuteRequest, ExecuteStatus,
+    LocalCodeBackend, execute_script, lean::render_lean, render_stubs,
 };
+
+pub const CODE_OUTPUT_ENV: &str = "SYMFORGE_CODE_OUTPUT";
+pub const CODE_EXECUTE_META_KEY: &str = "symforge/code_execute";
 
 /// Input for `code_search` on `SYMFORGE_SURFACE=code`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -34,7 +37,7 @@ pub struct CodeSearchInput {
 /// Input for `code_execute` on `SYMFORGE_SURFACE=code`.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct CodeExecuteInput {
-    /// Python 3.14-subset script calling keyword-only host read functions; final expression is returned as JSON.
+    /// Python 3.14-subset script calling keyword-only host read functions; final expression is returned as lean text.
     pub code: String,
     /// Project ID/alias (not a path); omit for the active or only project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,7 +65,7 @@ impl SymForgeServer {
 
     #[tool(
         name = "code_execute",
-        description = "Run one zero-egress Python script chaining read-only index queries; returns only the final JSON value.",
+        description = "Run one zero-egress Python script chaining read-only index queries; returns the final value as lean text (tables, raw strings).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn code_execute_tool(
@@ -333,7 +336,35 @@ fn render_execute_call_result(
             }
         }
     };
-    let json_text = serde_json::to_string(&outcome)
-        .unwrap_or_else(|e| format!("{{\"status\":\"error\",\"message\":\"{e}\"}}"));
-    Ok(ResultStatus::new(class).into_call_tool_result(json_text))
+    let json_mode = std::env::var(CODE_OUTPUT_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("json"));
+    let mut result =
+        ResultStatus::new(class).into_call_tool_result(execute_result_text(&outcome, json_mode));
+    if let Some(meta) = result.meta.as_mut() {
+        meta.0.insert(
+            CODE_EXECUTE_META_KEY.to_string(),
+            serde_json::json!({
+                "calls": outcome.calls,
+                "duration_ms": outcome.duration_ms,
+                "output_bytes": outcome.output_bytes,
+            }),
+        );
+    }
+    Ok(result)
+}
+
+fn execute_result_text(outcome: &ExecuteOutcome, json_mode: bool) -> String {
+    let lean_value =
+        (!json_mode && outcome.status == ExecuteStatus::Ok && outcome.truncated.is_none())
+            .then_some(outcome.value.as_ref())
+            .flatten();
+    let Some(value) = lean_value else {
+        return serde_json::to_string(outcome)
+            .unwrap_or_else(|e| format!("{{\"status\":\"error\",\"message\":\"{e}\"}}"));
+    };
+    let text = render_lean(value);
+    if outcome.stdout.is_empty() {
+        text
+    } else {
+        format!("{text}\nstdout:\n{}", outcome.stdout)
+    }
 }

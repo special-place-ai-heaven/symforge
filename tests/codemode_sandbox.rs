@@ -23,8 +23,7 @@ fn mock_backend(op: CodeReadOp, kwargs: Map<String, Value>) -> Result<Value, Cod
                     "kind": "fn",
                     "start_line": 42,
                     "end_line": 68,
-                    "tier": "exact",
-                    "identity": "sym-1"
+                    "tier": "exact"
                 }
             ]))
         }

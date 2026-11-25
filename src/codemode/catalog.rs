@@ -172,7 +172,7 @@ pub const CODE_READ_OPS: &[CodeOpDescriptor] = &[
             },
         ],
         return_type: "list[SymbolHit]",
-        typed_dicts: "class SymbolHit(TypedDict):\n    path: str\n    name: str\n    kind: str\n    start_line: int\n    end_line: int\n    tier: str\n    identity: str",
+        typed_dicts: "class SymbolHit(TypedDict):\n    path: str\n    name: str\n    kind: str\n    start_line: int\n    end_line: int\n    tier: str",
         keywords: &[
             "symbol",
             "symbols",
