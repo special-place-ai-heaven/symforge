@@ -32,6 +32,7 @@ use super::search::{NoiseClass, NoisePolicy, PathScope};
 use super::store::{IndexLoadSource, IndexedFile, LiveIndex, SnapshotVerifyState};
 
 const MAX_REFERENCE_METADATA_HEADERS: usize = 32;
+pub(crate) const REFERENCE_CONTEXT_LINES: usize = 1;
 const MAX_REFERENCE_METADATA_HEADER_BYTES: usize = 8 * 1024;
 const MAX_REFERENCE_TARGET_CANDIDATES: usize = 32;
 const MAX_REFERENCE_TARGET_BYTES: usize = 6 * 1024;
@@ -2688,9 +2689,24 @@ impl LiveIndex {
         kind_filter: Option<&str>,
         total_limit: usize,
     ) -> FindReferencesView {
+        self.capture_find_references_view_with_context(
+            name,
+            kind_filter,
+            total_limit,
+            REFERENCE_CONTEXT_LINES,
+        )
+    }
+
+    pub fn capture_find_references_view_with_context(
+        &self,
+        name: &str,
+        kind_filter: Option<&str>,
+        total_limit: usize,
+        context_lines: usize,
+    ) -> FindReferencesView {
         let kind_enum = parse_reference_kind_filter(kind_filter);
         let refs = self.find_references_for_name(name, kind_enum, false);
-        self.build_find_references_view(&refs, total_limit, name)
+        self.build_find_references_view(&refs, total_limit, name, context_lines)
     }
 
     /// Find all implementations of a trait/interface, or all traits a type implements.
@@ -2753,10 +2769,32 @@ impl LiveIndex {
         kind_filter: Option<&str>,
         total_limit: usize,
     ) -> Result<FindReferencesView, String> {
+        self.capture_find_references_view_for_symbol_with_context(
+            path,
+            name,
+            symbol_kind,
+            symbol_line,
+            kind_filter,
+            total_limit,
+            REFERENCE_CONTEXT_LINES,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_find_references_view_for_symbol_with_context(
+        &self,
+        path: &str,
+        name: &str,
+        symbol_kind: Option<&str>,
+        symbol_line: Option<u32>,
+        kind_filter: Option<&str>,
+        total_limit: usize,
+        context_lines: usize,
+    ) -> Result<FindReferencesView, String> {
         let kind_enum = parse_reference_kind_filter(kind_filter);
         let refs =
             self.find_exact_references_for_symbol(path, name, symbol_kind, symbol_line, kind_enum)?;
-        Ok(self.build_find_references_view(&refs, total_limit, name))
+        Ok(self.build_find_references_view(&refs, total_limit, name, context_lines))
     }
 
     pub fn find_exact_references_for_symbol<'a>(
@@ -3050,6 +3088,7 @@ impl LiveIndex {
         refs: &[(&str, &ReferenceRecord)],
         total_limit: usize,
         target_name: &str,
+        context_lines: usize,
     ) -> FindReferencesView {
         let mut by_file: HashMap<String, Vec<&ReferenceRecord>> = HashMap::new();
         for (file_path, reference) in refs {
@@ -3097,11 +3136,11 @@ impl LiveIndex {
                     break;
                 }
                 let ref_line_0 = reference.line_range.0 as usize;
-                let ctx_start = ref_line_0.saturating_sub(1);
+                let ctx_start = ref_line_0.saturating_sub(context_lines);
                 let ctx_end = if content_lines.is_empty() {
                     0
                 } else {
-                    (ref_line_0 + 1).min(content_lines.len() - 1)
+                    (ref_line_0 + context_lines).min(content_lines.len() - 1)
                 };
                 let evidence = evidence_index
                     .as_ref()
