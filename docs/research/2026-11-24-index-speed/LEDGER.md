@@ -195,3 +195,40 @@ The final focused native checks passed at feature tip `799b8007`. The code-mode 
 An existing compact-mode metadata discrepancy remains a separate correctness item. On moldwright `apps/ui` the embedded compact result reported 5,127 total and zero shown while its text described 2,441 files. On terminal-commander root it reported 1,039 total and zero shown. The common compact text matched code mode on both, and embed added its existing 228-byte doctrine suffix. A separate PR should establish and fix the meaning of compact `total_files` and `shown_files` under path, renderer and public query limits, with an explicit compatibility decision for integrations. The new routing view derives those counts from admitted files and complete emitted rows.
 
 Use the pinned revisions, inputs and replay commands in the report. Alternate baseline and one candidate, run at least five fresh starts and twenty warm calls per shape, include failures, and check a held-out repository. Record the binary, root, generation, load source, result fingerprint, wall time and Terminal Commander receipt. Stop a branch of the hierarchy once its outcome holds and its functionality checks pass. [Real-client acceptance protocol](REPORT.md#acceptance-on-the-real-client)
+
+## 25 November campaign results (merged to main)
+
+Recorded by the session that took the campaign over on 25 November. Each row is a squash-merged pull request with green CI and a pre-merge review. Timings were taken on the same Windows host as the rest of this ledger, interleaved against the previous build with a matched build profile (opt-level 3, 8 codegen units, no LTO); the host was under memory pressure with other builds running, so single calls vary and medians are quoted.
+
+| PR | Change | Measured before | Measured after | How measured |
+|---|---|---|---|---|
+| #945 | Fix #1: skip ranking when the compact map hides every key type | See [fix #1 results](#measured-results-for-fix-1) | | |
+| #946 | Count key-type importers on the bounded query pool (`ordered_parallel_map`) | Depth-one compact map median 9.2 s on Moldwright (5,127 files), 35.7 s on SymForge (1,765 files) | 1.25 s and 3.75 s, identical rendered bytes | `stdio-map-replay.py`, 3 calls per run, base/cand/cand/base |
+| #952 | Importer matchers (`matches_target_stem`, `matches_target_module`) no longer allocate per reference | 0.59 s and 2.4 s on top of #946 | 0.15 s and 0.50 s; importer counts identical on every row | Same harness; old and new matchers compared on 21,138,600 real checks with 0 mismatches |
+| #947 | Snapshot restore proves files in parallel; the stat pass and spot check run in parallel chunks. Every file is still read and hashed | Launch to first correct stdio hit 62.6 s and 34.5 s on the 5,127-file Moldwright snapshot | 13.4 s and 11.3 s, first attempt, no loading refusal | `fix7-clocks/restore_measure.py`, base/cand/cand/base |
+| #949 | `code_execute` returns lean text by default (tables grouped by path, raw source); `SYMFORGE_CODE_OUTPUT=json` restores the JSON text | 1,318 / 921 / 560 o200k_base tokens for 20 symbol hits / 16 reference rows / a 49-line function | 436 / 448 / 463; the 24-token wrapper per call is gone | tiktoken on real replies |
+| #951 | `context=N` on `find_references` and `search_text`; unknown-keyword refusal carries the signature; lean record lines omit null fields | Two round trips to see the code around a call site | One | Contract tests; `context=0` rows byte-identical |
+| #950, #953 | Hooks speak only when the text pays for itself: no output without an identifier-shaped or backticked cue, none for windowed or small reads, one line after a large whole-file read, none for task notifications or prompts over 2,000 characters; the assumed windowed-read savings figure is removed | About 300 tokens after each windowed read, a line on every prompt, false hints for ordinary words | 0, 0, and about 40 tokens only after a whole-file read of 8,000 bytes or more | Session transcript audit, then handler tests |
+
+Phase clocks of the restored index after #947, one run on a busy host: 5,127 files read and hashed in 5.17 s; stat pass 2.63 s; new-file discovery 2.73 s; spot check of 570 files 0.39 s; verification publication 0.53 s; first hit at 14.4 s. The second pass re-observes, about a second later, files the first pass has just proven by full hash. That is the next restore opportunity under #7 and it needs a decision about what detects an edit between the two passes.
+
+### Read-cost gradient after lean replies
+
+Token cost (o200k_base, request plus reply) of fetching a file's main symbol through Code Mode against reading the whole file, on Moldwright TypeScript files:
+
+| File size | Direct read | Code Mode, JSON text | Code Mode, lean text |
+|---:|---:|---:|---:|
+| 400 B | 121 | 183 | 141 |
+| 999 B | 267 | 329 | 266 |
+| 3,007 B | 646 | 569 | 438 |
+| 12,053 B | 2,866 | 2,650 | 2,256 |
+
+The small-file penalty that motivated `repo_map(detail="routing")` fell from about 60 tokens to about 20 at 400 bytes and to zero at 1 KB. The routing view on `feat/map-read-cost` therefore stays unmerged: per-directory hints in every map would cost more than they can save, and an opt-in view was ruled out by the owner on the same day ("ONLY INTERESTED in NET win"; features that are off by default do not count).
+
+### Still open, found on 25 November
+
+- Equal-count rows in the compact map are ordered by git churn, which reads as 0 until git history statistics have loaded, so the order of tied rows depends on when the map is requested. The counts do not change.
+- For an importer reached through a re-export, `find_dependents_for_file` reports a reference row that depends on hash-map iteration order. The set of importing files is stable; the row lists are not repeatable run to run.
+- #2 is unchanged: the directory-module edge is still missed and the 56 false fixture importers remain.
+- Every change under `src/` must refresh its line in `tests/darkness_baseline/full_source.pins`; #945 went red on exactly this after local verification had passed.
+- The host showed 48.1 GB committed of a 51.4 GB limit with about 20 GB in kernel pools. Optimized builds only completed at `-j 1`; treat allocation failures in builds on that host as environmental until it has been rebooted.
