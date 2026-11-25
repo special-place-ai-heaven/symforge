@@ -232,3 +232,7 @@ The small-file penalty that motivated `repo_map(detail="routing")` fell from abo
 - #2 is unchanged: the directory-module edge is still missed and the 56 false fixture importers remain.
 - Every change under `src/` must refresh its line in `tests/darkness_baseline/full_source.pins`; #945 went red on exactly this after local verification had passed.
 - The host showed 48.1 GB committed of a 51.4 GB limit with about 20 GB in kernel pools. Optimized builds only completed at `-j 1`; treat allocation failures in builds on that host as environmental until it has been rebooted.
+
+| #954 | `code_execute` decides inline-or-spill on the lean text it sends, and the default inline limit is 32,000 characters (was 16,000) | A 1,000-row list (about 10K as lean text) and three functions of 340 to 382 lines (16.4K to 17.6K characters) each came back as a truncated preview plus a spill file | All four return inline in one call | Sandbox and MCP surface tests; sizes from a throwaway measurement test |
+
+The row above belongs to the 25 November results table; it merged after the table was written.
