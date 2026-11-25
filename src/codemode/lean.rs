@@ -125,6 +125,7 @@ fn render_records(rows: &[&Map<String, Value>]) -> String {
         let mut bodies = Vec::new();
         for (key, value) in *row {
             match value {
+                Value::Null => {}
                 Value::String(s) if s.contains('\n') || s.contains('\t') => bodies.push((key, s)),
                 scalar if is_scalar(scalar) => header.push(format!("{key}={}", cell(scalar))),
                 composite => header.push(format!("{key}={}", compact_json(composite))),
@@ -194,7 +195,7 @@ mod tests {
         }]);
         assert_eq!(
             render_lean(&value),
-            "@ name=f\tpath=src/a.rs\trefusal=\tstart_line=1\nsource:\nfn f() {\n    \"q\"\n}"
+            "@ name=f\tpath=src/a.rs\tstart_line=1\nsource:\nfn f() {\n    \"q\"\n}"
         );
     }
 

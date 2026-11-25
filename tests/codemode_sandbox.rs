@@ -428,6 +428,16 @@ fn local_backend_rejects_unknown_kwargs_and_invalid_enum_or_range_values() {
             r#"search_symbols(query="sample", limit=0)"#,
             "Valid range: 1",
         ),
+        (
+            "context_above_maximum_find_references",
+            r#"find_references(name="sample_target", context=21)"#,
+            "\"context\" = 21. Valid range: 0 to 20.",
+        ),
+        (
+            "context_above_maximum_search_text",
+            r#"search_text(query="sample_target", context=21)"#,
+            "\"context\" = 21. Valid range: 0 to 20.",
+        ),
     ] {
         let out = runner.execute(snippet, &backend);
         assert_eq!(
@@ -441,5 +451,90 @@ fn local_backend_rejects_unknown_kwargs_and_invalid_enum_or_range_values() {
             "case `{label}` expected `{expected_substr}` in `{}`",
             err.message
         );
+    }
+
+    let out = runner.execute(
+        r#"find_references(name="sample_target", file="src/lib.rs")"#,
+        &backend,
+    );
+    let message = out.error.expect("error info").message;
+    let signature = CodeReadOp::FindReferences.signature_one_liner();
+    assert!(
+        message.contains(&signature),
+        "unknown-keyword refusal must end with the signature `{signature}`, got `{message}`"
+    );
+}
+
+#[test]
+fn local_backend_returns_numbered_source_windows_around_reference_and_text_hits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/target.rs"),
+        "pub fn hit_target() -> usize {\n    7\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn a() -> usize { hit_target() }\npub fn b() -> usize {\n    1\n}\npub fn c() -> usize { hit_target() }\npub fn d() -> usize {\n    2\n}\npub fn e() -> usize { hit_target() }\n",
+    )
+    .unwrap();
+    let backend =
+        symforge::codemode::LocalCodeBackend::open_read_only(dir.path()).expect("open backend");
+    let runner = CodeModeRunner::default();
+    let run = |snippet: &str| {
+        let out = runner.execute(snippet, &backend);
+        assert_eq!(out.status, ExecuteStatus::Ok, "{snippet}: {out:?}");
+        out.value.expect("value")
+    };
+
+    let lines = [
+        "pub fn a() -> usize { hit_target() }",
+        "pub fn b() -> usize {",
+        "    1",
+        "}",
+        "pub fn c() -> usize { hit_target() }",
+        "pub fn d() -> usize {",
+        "    2",
+        "}",
+        "pub fn e() -> usize { hit_target() }",
+    ];
+    let window = |from: usize, to: usize| {
+        (from..=to)
+            .map(|n| format!("{n}: {}", lines[n - 1]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let expected_windows = [window(1, 3), window(3, 7), window(7, 9)];
+
+    for (plain, zero, two) in [
+        (
+            r#"find_references(name="hit_target")"#,
+            r#"find_references(name="hit_target", context=0)"#,
+            r#"find_references(name="hit_target", context=2)"#,
+        ),
+        (
+            r#"search_text(query="hit_target()", path_prefix="src/lib.rs")"#,
+            r#"search_text(query="hit_target()", path_prefix="src/lib.rs", context=0)"#,
+            r#"search_text(query="hit_target()", path_prefix="src/lib.rs", context=2)"#,
+        ),
+    ] {
+        let plain_rows = run(plain);
+        assert_eq!(run(zero), plain_rows, "{zero}");
+        let plain_rows = plain_rows.as_array().expect("rows").clone();
+        assert_eq!(plain_rows.len(), 3, "{plain}: {plain_rows:?}");
+        assert!(plain_rows.iter().all(|row| row.get("context").is_none()));
+
+        let rows = run(two).as_array().expect("rows").clone();
+        assert_eq!(rows.len(), 3, "{two}: {rows:?}");
+        for ((row, plain_row), expected) in rows.iter().zip(&plain_rows).zip(&expected_windows) {
+            let mut stripped = row.as_object().expect("row object").clone();
+            assert_eq!(
+                stripped.remove("context"),
+                Some(Value::String(expected.clone())),
+                "{two}"
+            );
+            assert_eq!(&Value::Object(stripped), plain_row, "{two}");
+        }
     }
 }

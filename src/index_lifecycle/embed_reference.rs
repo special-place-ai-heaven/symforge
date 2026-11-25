@@ -202,7 +202,12 @@ fn capture(
     };
     refs.sort_by_key(|(path, reference)| (*path, reference.byte_range));
     refs.dedup_by_key(|(path, reference)| (*path, reference.byte_range));
-    let mut view = live.build_find_references_view(&refs, limits.total_hits, &request.name);
+    let mut view = live.build_find_references_view(
+        &refs,
+        limits.total_hits,
+        &request.name,
+        crate::live_index::query::REFERENCE_CONTEXT_LINES,
+    );
     // The same condition as the MCP lane (`tools.rs` find_references), which collects
     // qualified usages whatever `symbol_kind` / `symbol_line` select.
     if shared::should_collect_qualified_usages(request) {

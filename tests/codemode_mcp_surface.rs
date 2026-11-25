@@ -100,7 +100,11 @@ async fn code_execute_renders_search_references_and_symbol_reads_as_lean_text() 
             r#"get_symbol(path="src/math.rs", name="add_pair")"#
         )
         .await,
-        "@ end_line=3\tkind=fn\tname=add_pair\tpath=src/math.rs\trefusal=\tstart_line=1\twithheld_reason=\nsource:\npub fn add_pair(a: i32, b: i32) -> i32 {\n    a + b\n}"
+        "@ end_line=3\tkind=fn\tname=add_pair\tpath=src/math.rs\tstart_line=1\nsource:\npub fn add_pair(a: i32, b: i32) -> i32 {\n    a + b\n}"
+    );
+    assert_eq!(
+        code_execute_text(&server, r#"find_references(name="add_pair", context=1)"#).await,
+        "@ caller_kind=fn\tenclosing_line=5\tenclosing_symbol=sum_triple\tline=6\tpath=src/math.rs\ttext=    add_pair(add_pair(x, y), z)\ncontext:\n5: pub fn sum_triple(x: i32, y: i32, z: i32) -> i32 {\n6:     add_pair(add_pair(x, y), z)\n7: }\n@ caller_kind=fn\tenclosing_line=5\tenclosing_symbol=sum_triple\tline=6\tpath=src/math.rs\ttext=    add_pair(add_pair(x, y), z)\ncontext:\n5: pub fn sum_triple(x: i32, y: i32, z: i32) -> i32 {\n6:     add_pair(add_pair(x, y), z)\n7: }"
     );
     assert_eq!(
         code_execute_text(&server, "print(\"hi\")\n\"done\"").await,

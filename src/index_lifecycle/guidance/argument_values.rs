@@ -346,6 +346,19 @@ pub(crate) fn value_refusal(tool: &str, args: &Map<String, Value>) -> Option<Str
     check_values(tool, args).err().map(|refusal| refusal.text)
 }
 
+pub(crate) fn range_refusal(
+    tool: &str,
+    argument: &str,
+    min: u64,
+    max: u64,
+    args: &Map<String, Value>,
+) -> Option<String> {
+    match judge(tool, argument, Range(min, Some(max)), args.get(argument)?) {
+        Judged::Refused(text) => Some(text),
+        Judged::Valid | Judged::Capped(_) => None,
+    }
+}
+
 /// A capped value: the caller sent `requested` for `path`, the tool used `max`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CapNote {
