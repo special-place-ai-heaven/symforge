@@ -413,16 +413,15 @@ async fn test_outline_contract_golden() {
     let original = stable_cwd();
     std::env::set_current_dir(tmp.path()).unwrap();
 
-    let index = build_shared_index(
-        tmp.path(),
-        vec![make_rust_file_with_symbols(
-            "src/lib.rs",
-            vec![
-                ("hello", SymbolKind::Function),
-                ("Config", SymbolKind::Struct),
-            ],
-        )],
+    let mut file = make_rust_file_with_symbols(
+        "src/lib.rs",
+        vec![
+            ("hello", SymbolKind::Function),
+            ("Config", SymbolKind::Struct),
+        ],
     );
+    file.byte_len = 40_000;
+    let index = build_shared_index(tmp.path(), vec![file]);
     let handle = spawn_sidecar(
         Arc::clone(&index),
         "127.0.0.1",

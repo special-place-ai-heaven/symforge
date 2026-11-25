@@ -74,6 +74,8 @@ pub(crate) struct HookToolInput {
     pub(crate) pattern: Option<String>,
     /// Directory path for Grep events (alternative field name).
     pub(crate) path: Option<String>,
+    pub(crate) offset: Option<serde::de::IgnoredAny>,
+    pub(crate) limit: Option<serde::de::IgnoredAny>,
 }
 
 /// Workflow buckets used to reason about what SymForge should eventually own
@@ -879,6 +881,9 @@ fn pre_tool_suggestion_for(input: &HookInput, surface: crate::cli::InitSurface) 
     if is_outside_workspace(target, cwd) {
         return String::new();
     }
+    if tool == "Read" && (is_windowed_read(input) || !read_target_is_large(target, cwd)) {
+        return String::new();
+    }
 
     let file = extract_file_path(input, cwd);
     let pattern = input
@@ -1021,6 +1026,18 @@ fn is_outside_workspace(target: &str, root: &str) -> bool {
     target_norm != root_norm && !target_norm.starts_with(&format!("{root_norm}/"))
 }
 
+fn is_windowed_read(input: &HookInput) -> bool {
+    input
+        .tool_input
+        .as_ref()
+        .is_some_and(|ti| ti.offset.is_some() || ti.limit.is_some())
+}
+
+fn read_target_is_large(file_path: &str, cwd: &str) -> bool {
+    std::fs::metadata(std::path::Path::new(cwd).join(file_path))
+        .is_ok_and(|meta| meta.len() >= crate::sidecar::handlers::READ_HOOK_MIN_FILE_BYTES)
+}
+
 /// Returns true when a read should stay conservative and fail open instead of
 /// being steered into semantic code-inspection flows.
 ///
@@ -1116,6 +1133,7 @@ pub(crate) fn endpoint_for(
     let cwd = input.cwd.as_deref().unwrap_or("");
 
     match subcommand {
+        Some(HookSubcommand::Read) if is_windowed_read(input) => None,
         Some(HookSubcommand::Read) => {
             let file = extract_file_path(input, cwd);
             let query = if file.is_empty() {
@@ -2682,15 +2700,76 @@ mod tests {
         );
     }
 
+    fn large_source_repo() -> tempfile::TempDir {
+        let repo = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("src").join("main.rs"),
+            "x".repeat(crate::sidecar::handlers::READ_HOOK_MIN_FILE_BYTES as usize),
+        )
+        .unwrap();
+        repo
+    }
+
+    fn read_input(
+        file_path: &str,
+        cwd: &str,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> HookInput {
+        serde_json::from_value(serde_json::json!({
+            "tool_name": "Read",
+            "cwd": cwd,
+            "tool_input": { "file_path": file_path, "offset": offset, "limit": limit },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_pre_tool_suggestion_read_skips_windowed_and_small_reads() {
+        let repo = large_source_repo();
+        std::fs::write(repo.path().join("src").join("small.rs"), "fn small() {}\n").unwrap();
+        let cwd = repo.path().to_string_lossy().into_owned();
+        let full = crate::cli::InitSurface::Full;
+        assert!(
+            !pre_tool_suggestion_for(&read_input("src/main.rs", &cwd, None, None), full).is_empty()
+        );
+        assert_eq!(
+            pre_tool_suggestion_for(&read_input("src/main.rs", &cwd, Some(40), None), full),
+            ""
+        );
+        assert_eq!(
+            pre_tool_suggestion_for(&read_input("src/main.rs", &cwd, None, Some(110)), full),
+            ""
+        );
+        assert_eq!(
+            pre_tool_suggestion_for(&read_input("src/small.rs", &cwd, None, None), full),
+            ""
+        );
+        assert_eq!(
+            pre_tool_suggestion_for(&read_input("src/missing.rs", &cwd, None, None), full),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_endpoint_for_windowed_read_asks_nothing() {
+        let input = read_input("/abs/src/foo.rs", "/abs", Some(40), Some(70));
+        assert_eq!(endpoint_for(Some(&HookSubcommand::Read), &input), None);
+        let input = read_input("/abs/src/foo.rs", "/abs", None, Some(70));
+        assert_eq!(endpoint_for(Some(&HookSubcommand::Read), &input), None);
+    }
+
     #[test]
     fn test_pre_tool_suggestion_read_source_suggests_get_file_context() {
+        let repo = large_source_repo();
         let input = HookInput {
             tool_name: Some("Read".to_string()),
             tool_input: Some(HookToolInput {
-                file_path: Some("/repo/src/main.rs".to_string()),
+                file_path: Some("src/main.rs".to_string()),
                 ..Default::default()
             }),
-            cwd: Some("/repo".to_string()),
+            cwd: Some(repo.path().to_string_lossy().into_owned()),
             ..Default::default()
         };
         let s = pre_tool_suggestion_for(&input, crate::cli::InitSurface::Full);
@@ -2815,7 +2894,8 @@ mod tests {
     fn test_pre_tool_suggestion_read_in_repo_absolute_still_hints() {
         // In-repo absolute path under cwd keeps the hint. Use a real absolute
         // path so the check is exercised on every platform.
-        let cwd = std::env::current_dir().unwrap();
+        let repo = large_source_repo();
+        let cwd = repo.path().to_path_buf();
         let target = cwd.join("src").join("main.rs");
         let input = HookInput {
             tool_name: Some("Read".to_string()),
@@ -3562,7 +3642,7 @@ mod tests {
             tool_input: Some(HookToolInput {
                 file_path: file_path.map(|s| s.to_string()),
                 pattern: pattern.map(|s| s.to_string()),
-                path: None,
+                ..Default::default()
             }),
             cwd: Some(cwd.to_string()),
             prompt: None,

@@ -6,7 +6,7 @@
 /// Integration tests proving all 5 hook types work end-to-end.
 ///
 /// Proves:
-///   HOOK-04: Read hook — GET /outline returns formatted outline with symbol names, key refs, budget
+///   HOOK-04: Read hook — GET /outline is silent for small files, one line for large ones
 ///   HOOK-05: Edit hook — GET /impact returns symbol diff with Added/Changed/Removed labels
 ///   HOOK-06: Write hook — GET /impact?new_file=true returns indexed confirmation with symbol count
 ///   HOOK-07: Grep hook — GET /symbol-context returns annotated matches, capped at 10
@@ -318,11 +318,11 @@ async fn loading_sidecar_refuses_all_content_routes_without_mutation() {
 }
 
 // ---------------------------------------------------------------------------
-// HOOK-04: Read hook — /outline returns formatted text (not JSON)
+// HOOK-04: Read hook — /outline is silent for a small whole-file read
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_read_hook_returns_formatted_outline() {
+async fn test_read_hook_small_file_is_silent() {
     let tmp = TempDir::new().unwrap();
     let _guard = CWD_LOCK.lock().await;
     let original = std::env::current_dir().unwrap();
@@ -352,26 +352,7 @@ async fn test_read_hook_returns_formatted_outline() {
         .await
         .expect("GET /outline must succeed");
 
-    // Must be plain text, not a JSON array.
-    assert!(
-        !body.trim_start().starts_with('['),
-        "outline response must be plain text, not a JSON array; got: {}",
-        &body[..body.len().min(100)]
-    );
-
-    // Must contain symbol names.
-    assert!(
-        body.contains("alpha"),
-        "outline must contain 'alpha'; body: {body}"
-    );
-    assert!(
-        body.contains("Beta"),
-        "outline must contain 'Beta'; body: {body}"
-    );
-    assert!(
-        body.contains("gamma"),
-        "outline must contain 'gamma'; body: {body}"
-    );
+    assert_eq!(body, "", "a small whole-file read must inject nothing");
 
     handle.shutdown_and_join().await;
     std::env::set_current_dir(&original).unwrap();
@@ -415,35 +396,25 @@ async fn test_read_hook_noop_for_missing_file() {
 }
 
 // ---------------------------------------------------------------------------
-// HOOK-09: Budget enforcement — /outline with tiny max_tokens returns truncated response
+// HOOK-09: Read hook — a large whole-file read gets one short line, no outline
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_read_hook_budget_enforced() {
+async fn test_read_hook_large_file_names_cheaper_reads() {
     let tmp = TempDir::new().unwrap();
     let _guard = CWD_LOCK.lock().await;
     let original = std::env::current_dir().unwrap();
     std::env::set_current_dir(tmp.path()).unwrap();
 
-    // Create a file with 20 symbols to ensure it would exceed a 50-token (200 byte) budget.
-    let symbols: Vec<(&str, SymbolKind)> = vec![
-        ("alpha_fn_one", SymbolKind::Function),
-        ("beta_fn_two", SymbolKind::Function),
-        ("gamma_fn_three", SymbolKind::Function),
-        ("delta_fn_four", SymbolKind::Function),
-        ("epsilon_fn_five", SymbolKind::Function),
-        ("zeta_fn_six", SymbolKind::Function),
-        ("eta_fn_seven", SymbolKind::Function),
-        ("theta_fn_eight", SymbolKind::Function),
-        ("iota_fn_nine", SymbolKind::Function),
-        ("kappa_fn_ten", SymbolKind::Function),
-        ("lambda_fn_eleven", SymbolKind::Function),
-        ("mu_fn_twelve", SymbolKind::Function),
-        ("nu_fn_thirteen", SymbolKind::Function),
-        ("xi_fn_fourteen", SymbolKind::Function),
-        ("omicron_fn_fifteen", SymbolKind::Function),
-    ];
-    let file = make_rust_file_with_symbols("src/big.rs", symbols);
+    let mut file = make_rust_file_with_symbols(
+        "src/service.rs",
+        vec![
+            ("process_request", SymbolKind::Function),
+            ("validate_input", SymbolKind::Function),
+        ],
+    );
+    file.content = medium_rust_source("fn process_request() {}\nfn validate_input() {}");
+    file.byte_len = 40_000;
     let index = build_shared_index(vec![file]);
     let handle = spawn_sidecar(
         Arc::clone(&index),
@@ -456,17 +427,15 @@ async fn test_read_hook_budget_enforced() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    // max_tokens=10 → max 40 bytes — only the header line can fit, the rest must be truncated.
-    let body = raw_http_get(handle.port, "/outline", "path=src/big.rs&max_tokens=10")
+    let body = raw_http_get(handle.port, "/outline", "path=src/service.rs")
         .await
-        .expect("GET /outline with budget must succeed");
+        .expect("GET /outline must succeed");
 
-    // The non-footer portion must be under 40 bytes (10 tokens * 4 bytes/token).
-    // However we also add the "[~N tokens saved]" footer, so we check for "truncated".
-    assert!(
-        body.contains("truncated"),
-        "response with tiny budget must contain 'truncated'; body: {body}"
+    assert_eq!(
+        body,
+        "~10000 tokens read. Cheaper: file_context(path=\"src/service.rs\") for the outline, get_symbol(path=\"src/service.rs\", name=...) for one symbol."
     );
+    assert!(!has_savings_footer(&body), "no savings footer: {body}");
 
     handle.shutdown_and_join().await;
     std::env::set_current_dir(&original).unwrap();
@@ -939,7 +908,11 @@ async fn test_token_stats_after_hooks() {
     // Write the file to disk so impact handler can re-read it.
     let src_dir = tmp.path().join("src");
     std::fs::create_dir_all(&src_dir).unwrap();
-    std::fs::write(src_dir.join("stats_test.rs"), b"fn tracked_fn() {}").unwrap();
+    std::fs::write(
+        src_dir.join("stats_test.rs"),
+        format!("fn tracked_fn() {{}}\n{}", "// pad\n".repeat(1200)),
+    )
+    .unwrap();
 
     let file = make_rust_file_with_symbols(
         "src/stats_test.rs",
@@ -989,54 +962,6 @@ async fn test_token_stats_after_hooks() {
     assert!(
         edit_fires >= 1,
         "edit_fires must be >= 1 after /impact call; got {edit_fires}"
-    );
-
-    handle.shutdown_and_join().await;
-    std::env::set_current_dir(&original).unwrap();
-}
-
-// ---------------------------------------------------------------------------
-// INFR-04: Token savings footer — /outline response ends with "[~N tokens saved]"
-// ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_token_savings_footer() {
-    let tmp = TempDir::new().unwrap();
-    let _guard = CWD_LOCK.lock().await;
-    let original = std::env::current_dir().unwrap();
-    std::env::set_current_dir(tmp.path()).unwrap();
-
-    // Create a large file so savings are non-trivial.
-    let symbols: Vec<(&str, SymbolKind)> = vec![
-        ("process_request", SymbolKind::Function),
-        ("validate_input", SymbolKind::Function),
-        ("handle_error", SymbolKind::Function),
-    ];
-    let mut file = make_rust_file_with_symbols("src/service.rs", symbols);
-    file.content =
-        medium_rust_source("fn process_request() {}\nfn validate_input() {}\nfn handle_error() {}");
-    file.byte_len = file.content.len() as u64;
-
-    let index = build_shared_index(vec![file]);
-    let handle = spawn_sidecar(
-        Arc::clone(&index),
-        "127.0.0.1",
-        None,
-        Some(control_state(tmp.path())),
-    )
-    .await
-    .expect("spawn_sidecar should succeed");
-
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    let body = raw_http_get(handle.port, "/outline", "path=src/service.rs")
-        .await
-        .expect("GET /outline must succeed");
-
-    // Must contain a competent-manual savings footer.
-    assert!(
-        has_savings_footer(&body),
-        "outline response must contain a savings footer; body: {body}"
     );
 
     handle.shutdown_and_join().await;

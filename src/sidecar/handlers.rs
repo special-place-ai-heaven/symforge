@@ -143,12 +143,6 @@ fn format_prompt_context_signal(level: &str, evidence: impl Into<String>, body: 
     )
 }
 
-fn no_high_confidence_prompt_context_message() -> String {
-    // Dogfood #8 (2026-07-06): a no-evidence report must cost one line, not a
-    // multi-line report — this lands in the agent's prompt on EVERY submit.
-    "Prompt-context signal: none (no file/symbol/repo-map cue in prompt)".to_string()
-}
-
 fn freshen_sidecar_path_if_stale_at_generation(
     state: &SidecarState,
     repo_root: Option<&std::path::Path>,
@@ -613,14 +607,10 @@ fn store_cached_symbols_at_generation(
     }
 }
 
-/// `GET /outline?path=<relative>[&max_tokens=N]` — symbol outline for a single file.
+/// `GET /outline?path=<relative>` — Read hook text for a whole-file read.
 ///
-/// Returns formatted plain text with:
-/// - Symbol outline lines (compact, ripgrep-like)
-/// - "Key references" section showing top 3-5 most-called symbols with up to 3 callers each
-/// - "[~N tokens saved]" footer
-///
-/// Budget: 200 tokens (800 bytes) by default.
+/// Empty below [`READ_HOOK_MIN_FILE_BYTES`]; otherwise one line naming the
+/// file's size in tokens and the cheaper partial reads.
 pub async fn outline_handler(
     State(state): State<SidecarState>,
     Query(params): Query<OutlineParams>,
@@ -658,12 +648,35 @@ pub(crate) fn outline_tool_text_for_generation(
     )
 }
 
+pub(crate) const READ_HOOK_MIN_FILE_BYTES: u64 = 2_000 * 4;
+
 fn outline_hook_text(
     state: &SidecarState,
     params: &OutlineParams,
     fence: &SidecarQueryFence,
 ) -> Result<String, StatusCode> {
-    outline_text(state, params, HOOK_RENDER_OPTIONS, fence)
+    freshen_sidecar_path_if_stale_at_generation(
+        state,
+        Some(fence.indexed_root.as_path()),
+        &params.path,
+        fence.project_generation,
+    )?;
+    let published = capture_queryable_sidecar_generation(state, fence)?;
+    let file_bytes = published
+        .live
+        .as_ref()
+        .get_file(&params.path)
+        .ok_or(StatusCode::NOT_FOUND)?
+        .byte_len;
+    if file_bytes < READ_HOOK_MIN_FILE_BYTES {
+        return Ok(String::new());
+    }
+    state.token_stats.record_read(file_bytes, file_bytes);
+    let path = &params.path;
+    Ok(format!(
+        "~{} tokens read. Cheaper: file_context(path=\"{path}\") for the outline, get_symbol(path=\"{path}\", name=...) for one symbol.",
+        crate::stel::handler::estimate_tokens_from_bytes(file_bytes)
+    ))
 }
 
 fn outline_text(
@@ -740,6 +753,9 @@ fn with_withheld_note(
     result: Result<String, StatusCode>,
 ) -> Result<String, StatusCode> {
     result.map(|text| {
+        if text.is_empty() {
+            return text;
+        }
         let live = state.index.data_plane().read();
         match crate::protocol::format::withheld_not_searched_note(
             live.withheld_since_restore(),
@@ -760,8 +776,8 @@ fn with_staleness_marker(
 ) -> Result<String, StatusCode> {
     result.map(
         |text| match sidecar_staleness_marker(published.freshness.as_ref()) {
-            Some(marker) => format!("{marker}\n{text}"),
-            None => text,
+            Some(marker) if !text.is_empty() => format!("{marker}\n{text}"),
+            _ => text,
         },
     )
 }
@@ -1270,13 +1286,11 @@ async fn prompt_context_text(
             return Ok(format_prompt_context_signal(level, evidence, body));
         }
         (None, Some(name)) => {
-            // Dogfood #8 (2026-07-06): a bare prompt token matching a symbol
-            // name is the weakest evidence tier — a conversational word can
-            // collide with an indexed symbol. Emit a one-line pointer, never
-            // a full symbol context (~1000 tokens on every prompt submit).
-            return Ok(format!(
-                "Prompt-context signal: heuristic\nEvidence: symbol token `{name}` matched somewhere in the index — get_symbol_context(name=\"{name}\") if intended"
-            ));
+            if let Some(lines) = prompt_symbol_definition_lines(&hint_generation, &name) {
+                return Ok(format!(
+                    "Prompt-context signal: heuristic, symbol token `{name}` is defined at:\n{lines}"
+                ));
+            }
         }
         (None, None) => {}
     }
@@ -1290,7 +1304,7 @@ async fn prompt_context_text(
         ));
     }
 
-    Ok(no_high_confidence_prompt_context_message())
+    Ok(String::new())
 }
 
 /// `GET /stats` — return token savings snapshot as JSON.
@@ -1468,49 +1482,27 @@ fn find_prompt_qualified_symbol_hint(
     }
 }
 
-/// Common English function words and ubiquitous programming terms that
-/// frequently appear in natural-language coding prompts. A bare lowercase
-/// token in this set is treated as prose rather than a deliberate symbol
-/// reference, which prevents noisy false-positive prompt-context signals such
-/// as the word "any" incidentally matching `fn any` in the index.
-const PROMPT_NOISE_WORDS: &[&str] = &[
-    "add", "all", "and", "any", "api", "app", "are", "arg", "args", "but", "call", "can", "case",
-    "check", "class", "code", "data", "def", "did", "does", "done", "else", "enum", "error",
-    "fail", "few", "field", "file", "find", "fix", "for", "from", "func", "get", "had", "has",
-    "have", "help", "her", "him", "his", "how", "impl", "index", "init", "into", "item", "its",
-    "json", "just", "key", "kind", "let", "like", "line", "list", "load", "main", "make", "many",
-    "map", "match", "may", "mod", "mode", "more", "most", "name", "need", "new", "node", "not",
-    "now", "null", "off", "one", "only", "open", "our", "out", "own", "parse", "path", "read",
-    "ref", "result", "run", "save", "see", "self", "set", "she", "show", "size", "some", "sort",
-    "state", "step", "stop", "str", "sync", "task", "test", "text", "than", "that", "the", "their",
-    "them", "then", "there", "they", "this", "those", "todo", "true", "type", "use", "used",
-    "uses", "using", "value", "void", "want", "was", "way", "were", "what", "when", "where",
-    "which", "who", "why", "will", "with", "write", "you", "your",
-];
+const PROMPT_SYMBOL_MAX_DEFINITIONS: usize = 3;
 
-/// Returns true when `token` looks like a deliberate symbol reference rather
-/// than an incidental natural-language word. Code identifiers (snake_case,
-/// camelCase/PascalCase, all-caps acronyms, or names containing digits) never
-/// collide with prose and are always distinctive; a plain lowercase word must
-/// be at least four characters and absent from [`PROMPT_NOISE_WORDS`].
 fn is_distinctive_symbol_token(token: &str) -> bool {
-    if token.len() < 3 {
-        return false;
-    }
-    if token.contains('_')
-        || token
-            .chars()
-            .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-    {
-        return true;
-    }
-    token.len() >= 4 && !PROMPT_NOISE_WORDS.contains(&token)
+    token.len() >= 3
+        && (token.contains('_')
+            || token.chars().any(|c| c.is_ascii_digit())
+            || (token.chars().any(|c| c.is_ascii_lowercase())
+                && token.chars().skip(1).any(|c| c.is_ascii_uppercase())))
 }
+
 fn find_prompt_symbol_hint(
     generation: &crate::live_index::PublishedGeneration,
     prompt: &str,
 ) -> Result<Option<String>, StatusCode> {
     let guard = generation.live.as_ref();
+    let backticked: Vec<String> = prompt
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .flat_map(prompt_tokens)
+        .collect();
     for token in prompt_tokens(prompt) {
         // Path- and module-qualified mentions are served by the dedicated file
         // and qualified-symbol hints; this bare-token branch only handles plain
@@ -1518,10 +1510,7 @@ fn find_prompt_symbol_hint(
         if token.contains('/') || token.contains('.') {
             continue;
         }
-        // Suppress prose: only fire for tokens that look like a deliberate code
-        // identifier or a distinctive content word, so natural-language prompts
-        // (e.g. "use any tool") do not match incidental symbols like `fn any`.
-        if !is_distinctive_symbol_token(&token) {
+        if !backticked.contains(&token) && !is_distinctive_symbol_token(&token) {
             continue;
         }
 
@@ -1534,6 +1523,33 @@ fn find_prompt_symbol_hint(
     }
 
     Ok(None)
+}
+
+fn prompt_symbol_definition_lines(
+    generation: &crate::live_index::PublishedGeneration,
+    name: &str,
+) -> Option<String> {
+    let lines: Vec<String> = generation
+        .live
+        .as_ref()
+        .all_files()
+        .flat_map(|(path, file)| {
+            file.symbols
+                .iter()
+                .filter(|symbol| symbol.name == name)
+                .map(move |symbol| {
+                    format!(
+                        "{} {}  {}:{}",
+                        symbol.kind,
+                        symbol.name,
+                        path,
+                        symbol.line_range.0 + 1
+                    )
+                })
+        })
+        .take(PROMPT_SYMBOL_MAX_DEFINITIONS + 1)
+        .collect();
+    (lines.len() <= PROMPT_SYMBOL_MAX_DEFINITIONS).then(|| lines.join("\n"))
 }
 
 fn find_prompt_line_hint(prompt: &str, file_hint: Option<&PromptFileHint>) -> Option<u32> {
@@ -2371,7 +2387,11 @@ mod tests {
     #[tokio::test]
     async fn real_unreadable_manifest_entry_on_ready_index_serves_200_with_marker() {
         let project = tempfile::tempdir().unwrap();
-        std::fs::write(project.path().join("main.rs"), "fn alpha() {}\n").unwrap();
+        std::fs::write(
+            project.path().join("main.rs"),
+            format!("fn alpha() {{}}\n{}", "// pad\n".repeat(1200)),
+        )
+        .unwrap();
         std::fs::write(project.path().join("locked.rs"), "fn locked() {}\n").unwrap();
         let shared = LiveIndex::load(project.path()).unwrap();
         let scouted = shared
@@ -2427,17 +2447,21 @@ mod tests {
             text.starts_with("[symforge: index may be stale"),
             "got:\n{text}"
         );
-        assert!(text.contains("alpha"), "got:\n{text}");
+        assert!(
+            text.contains("file_context(path=\"main.rs\")"),
+            "got:\n{text}"
+        );
     }
 
     #[tokio::test]
     async fn observation_degraded_ready_index_serves_hooks_with_staleness_marker() {
-        let file = make_indexed_file(
+        let mut file = make_indexed_file(
             "src/foo.rs",
             vec![make_symbol("alpha", SymbolKind::Function, 1, 5)],
             vec![],
             ParseStatus::Parsed,
         );
+        file.byte_len = READ_HOOK_MIN_FILE_BYTES;
         let state = make_state(vec![("src/foo.rs", file)]);
         let last_valid_content_generation = state
             .index
@@ -2473,7 +2497,7 @@ mod tests {
         );
         assert!(text.contains("could not be read"), "got:\n{text}");
         assert!(
-            text.contains("alpha"),
+            text.contains("file_context(path=\"src/foo.rs\")"),
             "enrichment body must follow; got:\n{text}"
         );
 
@@ -2896,17 +2920,16 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_outline_handler_returns_formatted_text() {
-        let file = make_indexed_file(
+    async fn test_outline_handler_small_whole_file_read_is_silent() {
+        let mut file = make_indexed_file(
             "src/foo.rs",
-            vec![
-                make_symbol("alpha", SymbolKind::Function, 1, 5),
-                make_symbol("Beta", SymbolKind::Struct, 7, 10),
-            ],
+            vec![make_symbol("alpha", SymbolKind::Function, 1, 5)],
             vec![],
             ParseStatus::Parsed,
         );
+        file.byte_len = READ_HOOK_MIN_FILE_BYTES - 1;
         let state = make_state(vec![("src/foo.rs", file)]);
+        let stats = Arc::clone(&state.token_stats);
 
         let params = OutlineParams {
             path: "src/foo.rs".to_string(),
@@ -2914,30 +2937,41 @@ mod tests {
             sections: None,
         };
         let result = outline_handler(State(state), Query(params)).await.unwrap();
-        assert!(
-            result.contains("alpha"),
-            "outline should contain symbol name 'alpha'"
+        assert_eq!(result, "", "a small whole-file read must inject nothing");
+        assert_eq!(stats.summary().read_fires, 0);
+    }
+
+    #[tokio::test]
+    async fn test_outline_handler_large_whole_file_read_is_one_short_line() {
+        let mut file = make_indexed_file(
+            "src/sidecar/handlers.rs",
+            vec![make_symbol("alpha", SymbolKind::Function, 1, 5)],
+            vec![],
+            ParseStatus::Parsed,
         );
+        file.byte_len = 70_592;
+        let state = make_state(vec![("src/sidecar/handlers.rs", file)]);
+
+        let params = OutlineParams {
+            path: "src/sidecar/handlers.rs".to_string(),
+            max_tokens: None,
+            sections: None,
+        };
+        let result = outline_handler(State(state), Query(params)).await.unwrap();
+        assert!(!result.contains('\n'), "one line only: {result}");
+        assert!(result.len() / 4 <= 42, "about 40 tokens at most: {result}");
+        assert!(result.contains("~17648 tokens"), "got: {result}");
         assert!(
-            result.contains("Beta"),
-            "outline should contain symbol name 'Beta'"
-        );
-        assert!(
-            result.contains("src/foo.rs"),
-            "outline should contain file path"
-        );
-        assert!(
-            result.contains("Trust: exact | current index | parsed | full"),
-            "outline should expose the compact trust line; got: {result}"
-        );
-        assert!(
-            result.contains("Scope: path `src/foo.rs`; all sections"),
+            result.contains("file_context(path=\"src/sidecar/handlers.rs\")"),
             "got: {result}"
         );
         assert!(
-            result.contains("Evidence: file anchor `src/foo.rs`"),
+            result.contains("get_symbol(path=\"src/sidecar/handlers.rs\", name=...)"),
             "got: {result}"
         );
+        for absent in ["alpha", "Trust:", "estimated", "assumed", "baseline"] {
+            assert!(!result.contains(absent), "{absent} leaked: {result}");
+        }
     }
 
     #[tokio::test]
@@ -2955,46 +2989,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_outline_handler_budget_enforced() {
-        // Create a file with many symbols to trigger truncation.
-        let symbols: Vec<SymbolRecord> = (0..50)
-            .map(|i| {
-                make_symbol(
-                    &format!("symbol_{:04}", i),
-                    SymbolKind::Function,
-                    i * 2,
-                    i * 2 + 1,
-                )
-            })
-            .collect();
-        let file = make_indexed_file("src/big.rs", symbols, vec![], ParseStatus::Parsed);
-        let state = make_state(vec![("src/big.rs", file)]);
-
-        let params = OutlineParams {
-            path: "src/big.rs".to_string(),
-            max_tokens: Some(10), // tiny budget to force truncation
-            sections: None,
-        };
-        let result = outline_handler(State(state), Query(params)).await.unwrap();
-        // With 10-token (40 byte) budget, only the header fits. Truncation suffix should appear.
-        assert!(
-            result.contains("truncated") || result.len() < 500,
-            "result should be truncated or short: {}",
-            result.len()
-        );
-        assert!(
-            result.contains("Completeness: budget-limited"),
-            "got: {result}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_outline_handler_reports_disk_refreshed_authority_for_stale_exact_path() {
+    async fn test_outline_handler_sizes_a_stale_exact_path_from_disk() {
         let tmp = tempfile::TempDir::new().unwrap();
         let src_dir = tmp.path().join("src");
         std::fs::create_dir_all(&src_dir).unwrap();
         let file_path = src_dir.join("main.rs");
-        std::fs::write(&file_path, "fn refreshed() {}\n").unwrap();
+        std::fs::write(
+            &file_path,
+            format!("fn refreshed() {{}}\n{}", "// pad\n".repeat(1200)),
+        )
+        .unwrap();
 
         let stale_file = make_indexed_file(
             "src/main.rs",
@@ -3013,20 +3017,20 @@ mod tests {
         let result = outline_handler(State(state), Query(params)).await.unwrap();
 
         assert!(
-            result.contains("Source authority: disk-refreshed"),
-            "got: {result}"
+            result.contains("file_context(path=\"src/main.rs\")"),
+            "the refreshed size crosses the threshold; got: {result}"
         );
-        assert!(result.contains("refreshed"), "got: {result}");
     }
 
     #[tokio::test]
     async fn test_outline_handler_records_token_stats() {
-        let file = make_indexed_file(
+        let mut file = make_indexed_file(
             "src/foo.rs",
             vec![make_symbol("alpha", SymbolKind::Function, 1, 5)],
             vec![],
             ParseStatus::Parsed,
         );
+        file.byte_len = READ_HOOK_MIN_FILE_BYTES;
         let state = make_state(vec![("src/foo.rs", file)]);
         let stats = Arc::clone(&state.token_stats);
 
@@ -4038,25 +4042,15 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "where is connect used".to_string(),
+                text: "where is `connect` used".to_string(),
             }),
         )
         .await
         .unwrap();
 
-        // Dogfood #8: a bare-token match is the weakest evidence tier — it
-        // must cost a one-line pointer, never a full symbol context.
-        assert!(
-            result.contains("Prompt-context signal: heuristic"),
-            "symbol-only hints should be labeled heuristic: {result}"
-        );
-        assert!(
-            result.contains("symbol token `connect` matched somewhere in the index"),
-            "symbol-only hints should expose their evidence source: {result}"
-        );
-        assert!(
-            result.contains("get_symbol_context(name=\"connect\")"),
-            "the pointer should name the follow-up tool call: {result}"
+        assert_eq!(
+            result,
+            "Prompt-context signal: heuristic, symbol token `connect` is defined at:\nfn connect  src/db.rs:2"
         );
         assert!(
             !result.contains("src/service.rs"),
@@ -4083,27 +4077,20 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            result.contains("Prompt-context signal: none"),
-            "unmatched prompts should explicitly report no signal: {result}"
-        );
-        // Dogfood #8: a no-evidence report costs one line on every prompt submit.
-        assert!(
-            !result.trim().contains('\n'),
-            "the no-signal report must be a single line: {result}"
-        );
+        assert_eq!(result, "", "unmatched prompts must inject nothing");
     }
 
     #[test]
     fn test_is_distinctive_symbol_token_filters_prose_keeps_identifiers() {
-        // Deliberate code identifiers stay distinctive.
-        assert!(is_distinctive_symbol_token("connect"));
         assert!(is_distinctive_symbol_token("find_prompt_symbol_hint"));
         assert!(is_distinctive_symbol_token("LiveIndex"));
+        assert!(is_distinctive_symbol_token("liveIndex"));
         assert!(is_distinctive_symbol_token("utf8"));
-        assert!(is_distinctive_symbol_token("HTTP"));
-        // Common prose / generic programming words are suppressed.
-        assert!(!is_distinctive_symbol_token("any"));
+        for prose in [
+            "connect", "never", "Never", "files", "time", "method", "both", "HTTP", "any",
+        ] {
+            assert!(!is_distinctive_symbol_token(prose), "{prose}");
+        }
         assert!(!is_distinctive_symbol_token("the"));
         assert!(!is_distinctive_symbol_token("file"));
         assert!(!is_distinctive_symbol_token("value"));
@@ -4135,13 +4122,142 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(
+            result, "",
+            "common-word collisions must not fire a heuristic symbol signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prompt_context_handler_prose_words_never_hint_even_when_indexed() {
+        let words = [
+            "never", "files", "time", "method", "both", "take", "tool", "tests", "hooks", "probe",
+            "symforge",
+        ];
+        let symbols = words
+            .iter()
+            .map(|word| make_symbol(word, SymbolKind::Function, 1, 1))
+            .collect();
+        let target = make_indexed_file("src/words.rs", symbols, vec![], ParseStatus::Parsed);
+        let state = make_state(vec![("src/words.rs", target)]);
+
+        let result = prompt_context_handler(
+            State(state),
+            Query(PromptContextParams {
+                text: words.join(" "),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "");
+    }
+
+    #[tokio::test]
+    async fn test_prompt_context_handler_identifier_shaped_name_prints_its_location() {
+        let target = make_indexed_file(
+            "src/db.rs",
+            vec![make_symbol("connectPool", SymbolKind::Function, 6, 9)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        let state = make_state(vec![("src/db.rs", target)]);
+
+        let result = prompt_context_handler(
+            State(state),
+            Query(PromptContextParams {
+                text: "why does connectPool hang".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            "Prompt-context signal: heuristic, symbol token `connectPool` is defined at:\nfn connectPool  src/db.rs:7"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prompt_context_handler_more_than_three_definitions_prints_nothing() {
+        let files: Vec<(&str, IndexedFile)> = ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"]
+            .into_iter()
+            .map(|path| {
+                (
+                    path,
+                    make_indexed_file(
+                        path,
+                        vec![make_symbol("open_pool", SymbolKind::Function, 1, 1)],
+                        vec![],
+                        ParseStatus::Parsed,
+                    ),
+                )
+            })
+            .collect();
+        let state = make_state(files);
+
+        let result = prompt_context_handler(
+            State(state),
+            Query(PromptContextParams {
+                text: "where is open_pool".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "");
+    }
+
+    #[tokio::test]
+    async fn test_prompt_context_handler_staleness_banner_only_qualifies_content() {
+        let target = make_indexed_file(
+            "src/db.rs",
+            vec![make_symbol("open_pool", SymbolKind::Function, 1, 1)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        let state = make_state(vec![("src/db.rs", target)]);
+        let last_valid_content_generation = state
+            .index
+            .data_plane()
+            .published_generation()
+            .content_generation;
+        state
+            .index
+            .data_plane()
+            .set_freshness_status(crate::domain::FreshnessStatus::Degraded {
+                last_valid_content_generation,
+                reason_codes: vec![
+                    crate::domain::FreshnessReason::ObservationFailed,
+                    crate::domain::FreshnessReason::ReconciliationPending,
+                ],
+            });
+
+        let silent = prompt_context_handler(
+            State(state.clone()),
+            Query(PromptContextParams {
+                text: "please help with the database thing".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(silent, "", "no cue means no banner either");
+
+        let cued = prompt_context_handler(
+            State(state),
+            Query(PromptContextParams {
+                text: "where is open_pool".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
         assert!(
-            result.contains("Prompt-context signal: none"),
-            "common-word collisions must not fire a heuristic symbol signal: {result}"
+            cued.starts_with("[symforge: index may be stale"),
+            "got:\n{cued}"
         );
         assert!(
-            !result.contains("symbol token `any`"),
-            "the prose word \"any\" must not surface as a symbol hint: {result}"
+            cued.contains("]\nPrompt-context signal: heuristic, symbol token `open_pool`"),
+            "got:\n{cued}"
         );
     }
 
@@ -4215,7 +4331,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect src/db.rs connect".to_string(),
+                text: "inspect src/db.rs `connect`".to_string(),
             }),
         )
         .await
@@ -4293,7 +4409,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect src/db.rs connect".to_string(),
+                text: "inspect src/db.rs `connect`".to_string(),
             }),
         )
         .await
@@ -4354,7 +4470,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect src/db.rs connect line 2".to_string(),
+                text: "inspect src/db.rs `connect` line 2".to_string(),
             }),
         )
         .await
@@ -4386,7 +4502,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect src/db.rs connect 2".to_string(),
+                text: "inspect src/db.rs `connect` 2".to_string(),
             }),
         )
         .await
@@ -4445,7 +4561,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect src/db.rs:2 connect".to_string(),
+                text: "inspect src/db.rs:2 `connect`".to_string(),
             }),
         )
         .await
@@ -4508,7 +4624,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect db.rs:2 connect".to_string(),
+                text: "inspect db.rs:2 `connect`".to_string(),
             }),
         )
         .await
@@ -4581,7 +4697,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect db:2 connect".to_string(),
+                text: "inspect db:2 `connect`".to_string(),
             }),
         )
         .await
@@ -4665,7 +4781,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect src/db:2 connect".to_string(),
+                text: "inspect src/db:2 `connect`".to_string(),
             }),
         )
         .await
@@ -4749,7 +4865,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect crate::db:2 connect".to_string(),
+                text: "inspect crate::db:2 `connect`".to_string(),
             }),
         )
         .await
@@ -4830,7 +4946,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect crate::db connect".to_string(),
+                text: "inspect crate::db `connect`".to_string(),
             }),
         )
         .await
@@ -4912,7 +5028,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect src/utils connect".to_string(),
+                text: "inspect src/utils `connect`".to_string(),
             }),
         )
         .await
@@ -4997,7 +5113,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect src/utils:4 connect".to_string(),
+                text: "inspect src/utils:4 `connect`".to_string(),
             }),
         )
         .await
@@ -5126,7 +5242,7 @@ mod tests {
         let partial = prompt_context_handler(
             State(state.clone()),
             Query(PromptContextParams {
-                text: "inspect src/utilsx connect".to_string(),
+                text: "inspect src/utilsx `connect`".to_string(),
             }),
         )
         .await
@@ -5144,7 +5260,7 @@ mod tests {
         let continued = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect src/utils/more connect".to_string(),
+                text: "inspect src/utils/more `connect`".to_string(),
             }),
         )
         .await
@@ -5218,7 +5334,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect src/utils build:3 connect".to_string(),
+                text: "inspect src/utils build:3 `connect`".to_string(),
             }),
         )
         .await
@@ -5406,7 +5522,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect crate::dbx connect".to_string(),
+                text: "inspect crate::dbx `connect`".to_string(),
             }),
         )
         .await
@@ -5457,13 +5573,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            result.contains("symbol token `connect`"),
-            "continued qualified symbol aliases should stay on the fallback path: {result}"
-        );
-        assert!(
-            result.contains("Prompt-context signal: heuristic"),
-            "continued qualified symbol aliases should not collapse to one exact file: {result}"
+        assert_eq!(
+            result, "",
+            "continued qualified symbol aliases should not collapse to one exact file"
         );
     }
 
@@ -5804,7 +5916,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect pkg.db.connect.more connect".to_string(),
+                text: "inspect pkg.db.connect.more `connect`".to_string(),
             }),
         )
         .await
@@ -5891,7 +6003,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect src/utils/connect/more connect".to_string(),
+                text: "inspect src/utils/connect/more `connect`".to_string(),
             }),
         )
         .await
@@ -6176,7 +6288,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect crate::d:2 connect".to_string(),
+                text: "inspect crate::d:2 `connect`".to_string(),
             }),
         )
         .await
@@ -6228,7 +6340,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect src/d:2 connect".to_string(),
+                text: "inspect src/d:2 `connect`".to_string(),
             }),
         )
         .await
@@ -6260,7 +6372,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect src/db.rs connect port 8080:2".to_string(),
+                text: "inspect src/db.rs `connect` port 8080:2".to_string(),
             }),
         )
         .await
@@ -6358,7 +6470,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect db.rs:1 connect".to_string(),
+                text: "inspect db.rs:1 `connect`".to_string(),
             }),
         )
         .await
@@ -6460,7 +6572,7 @@ mod tests {
         let result = prompt_context_handler(
             State(state),
             Query(PromptContextParams {
-                text: "inspect db:1 connect".to_string(),
+                text: "inspect db:1 `connect`".to_string(),
             }),
         )
         .await
@@ -6630,7 +6742,10 @@ mod tests {
         let dir = TempDir::new().expect("repo");
         std::fs::write(
             dir.path().join("plain.rs"),
-            format!("fn plain() {{ let _ = \"{OUTBOUND_LINK_PLAIN}\"; }}\n"),
+            format!(
+                "fn plain() {{ let _ = \"{OUTBOUND_LINK_PLAIN}\"; }}\n{}",
+                "// pad\n".repeat(1200)
+            ),
         )
         .expect("plain");
         let (_outside, link_path) = plant_outbound_link(dir.path());
