@@ -554,6 +554,7 @@ pub fn execute_op_on_generation(
         }
 
         CodeReadOp::FindReferences => {
+            let context = take_hit_context(&mut kwargs)?;
             let input: crate::protocol::tools::FindReferencesInput = decode_op_args(op, kwargs)?;
             if input.name.trim().is_empty() {
                 return Err(CodeBackendError::invalid_args("name must be non-empty"));
@@ -565,6 +566,11 @@ pub fn execute_op_on_generation(
                 ));
             }
             if input.mode.as_deref() == Some("implementations") {
+                if context > 0 {
+                    return Err(CodeBackendError::invalid_args(
+                        "context applies to mode='references' only",
+                    ));
+                }
                 let cap = input.limit.unwrap_or(200).clamp(1, 500) as usize;
                 let impls = generation
                     .live
@@ -602,20 +608,22 @@ pub fn execute_op_on_generation(
                     crate::index_lifecycle::guidance::read_gate::normalize_requested_path(path);
                 generation
                     .live
-                    .capture_find_references_view_for_symbol(
+                    .capture_find_references_view_for_symbol_with_context(
                         &norm,
                         &input.name,
                         input.symbol_kind.as_deref(),
                         input.symbol_line,
                         input.kind.as_deref(),
                         limits.total_hits,
+                        context.max(crate::live_index::query::REFERENCE_CONTEXT_LINES),
                     )
                     .map_err(CodeBackendError::invalid_args)?
             } else {
-                generation.live.capture_find_references_view(
+                generation.live.capture_find_references_view_with_context(
                     &input.name,
                     input.kind.as_deref(),
                     limits.total_hits,
+                    context.max(crate::live_index::query::REFERENCE_CONTEXT_LINES),
                 )
             };
 
@@ -641,14 +649,22 @@ pub fn execute_op_on_generation(
                                 )
                             })
                             .unwrap_or((None, None, None));
-                        out.push(json!({
+                        let mut row = json!({
                             "path": file.file_path,
                             "line": ref_line.line_number,
                             "text": ref_line.text,
                             "enclosing_symbol": enc_name,
                             "enclosing_line": enc_line,
                             "caller_kind": enc_kind,
-                        }));
+                        });
+                        if context > 0 {
+                            row["context"] = Value::String(numbered_window(
+                                hit.context_lines
+                                    .iter()
+                                    .map(|l| (l.line_number as usize, l.text.as_str())),
+                            ));
+                        }
+                        out.push(row);
                     }
                 }
             }
@@ -916,12 +932,28 @@ pub fn execute_op_on_generation(
                     if out.len() >= cap {
                         break;
                     }
-                    out.push(json!({
+                    let mut row = json!({
                         "path": file.path,
                         "line": m.line_number,
                         "preview": m.line,
                         "enclosing_symbol": m.enclosing_symbol.map(|s| s.name),
-                    }));
+                    });
+                    if let Some(n) = input.context.filter(|n| *n > 0) {
+                        row["context"] = Value::String(numbered_window(
+                            file.rendered_lines
+                                .iter()
+                                .flatten()
+                                .filter_map(|l| match l {
+                                    crate::live_index::search::TextDisplayLine::Line(l)
+                                        if l.line_number.abs_diff(m.line_number) <= n as usize =>
+                                    {
+                                        Some((l.line_number, l.line.as_str()))
+                                    }
+                                    _ => None,
+                                }),
+                        ));
+                    }
+                    out.push(row);
                 }
                 if out.len() >= cap {
                     break;
@@ -1727,10 +1759,41 @@ fn validate_op_contract(
     {
         return Err(CodeBackendError::invalid_args(refusal.text));
     }
+    if matches!(op, CodeReadOp::FindReferences | CodeReadOp::SearchText)
+        && let Some(refusal) = crate::index_lifecycle::guidance::argument_values::range_refusal(
+            tool,
+            "context",
+            0,
+            u64::from(MAX_HIT_CONTEXT_LINES),
+            kwargs,
+        )
+    {
+        return Err(CodeBackendError::invalid_args(refusal));
+    }
     if let Err(refusal) = crate::protocol::tool_contract::apply_conditions(tool, kwargs) {
         return Err(CodeBackendError::invalid_args(refusal));
     }
     Ok(())
+}
+
+const MAX_HIT_CONTEXT_LINES: u32 = 20;
+
+fn take_hit_context(kwargs: &mut Map<String, Value>) -> Result<usize, CodeBackendError> {
+    kwargs
+        .remove("context")
+        .map_or(
+            Ok(None),
+            crate::index_lifecycle::guidance::serde_input::lenient_u32,
+        )
+        .map(|n| n.unwrap_or(0) as usize)
+        .map_err(|e| CodeBackendError::invalid_args(e.to_string()))
+}
+
+fn numbered_window<'a>(lines: impl Iterator<Item = (usize, &'a str)>) -> String {
+    lines
+        .map(|(number, text)| format!("{number}: {text}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn decode_op_args<T: serde::de::DeserializeOwned>(
@@ -1750,10 +1813,10 @@ fn decode_op_args<T: serde::de::DeserializeOwned>(
                 .iter()
                 .map(|p| p.name.to_owned())
                 .collect();
-            Err(CodeBackendError::invalid_args(unknown_arguments_refusal(
-                op.as_str(),
-                &unknown,
-                &valid,
+            Err(CodeBackendError::invalid_args(format!(
+                "{} Signature: {}",
+                unknown_arguments_refusal(op.as_str(), &unknown, &valid),
+                op.signature_one_liner()
             )))
         }
         Err(StrictError::Decode(err)) => Err(CodeBackendError::invalid_args(err.to_string())),

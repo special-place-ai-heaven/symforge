@@ -302,9 +302,16 @@ pub const CODE_READ_OPS: &[CodeOpDescriptor] = &[
                 default_repr: "None",
                 doc: "Max files/entries.",
             },
+            ParamSpec {
+                name: "context",
+                py_type: "int",
+                required: false,
+                default_repr: "0",
+                doc: "Lines (0-20) around each hit, numbered, in the row's `context`.",
+            },
         ],
         return_type: "list[RefHit]",
-        typed_dicts: "class RefHit(TypedDict):\n    path: str\n    line: int\n    text: str\n    enclosing_symbol: str | None\n    enclosing_line: int | None\n    caller_kind: str | None",
+        typed_dicts: "class RefHit(TypedDict):\n    path: str\n    line: int\n    text: str\n    enclosing_symbol: str | None\n    enclosing_line: int | None\n    caller_kind: str | None\n    context: NotRequired[str]",
         keywords: &[
             "references",
             "callers",
@@ -523,9 +530,16 @@ pub const CODE_READ_OPS: &[CodeOpDescriptor] = &[
                 default_repr: "None",
                 doc: "Max matches (or max files when group_by='count').",
             },
+            ParamSpec {
+                name: "context",
+                py_type: "int",
+                required: false,
+                default_repr: "0",
+                doc: "Lines (0-20) around each hit, numbered, in the row's `context`.",
+            },
         ],
         return_type: "list[TextHit] | list[TextCountHit]",
-        typed_dicts: "class TextHit(TypedDict):\n    path: str\n    line: int\n    preview: str\n    enclosing_symbol: str | None\n\nclass TextCountHit(TypedDict):\n    path: str\n    count: int",
+        typed_dicts: "class TextHit(TypedDict):\n    path: str\n    line: int\n    preview: str\n    enclosing_symbol: str | None\n    context: NotRequired[str]\n\nclass TextCountHit(TypedDict):\n    path: str\n    count: int",
         keywords: &[
             "grep", "text", "search", "regex", "pattern", "ast", "literal", "code",
         ],
@@ -998,7 +1012,7 @@ pub fn render_stubs(query: Option<&str>, limit: Option<usize>) -> String {
         );
     }
 
-    let mut out = String::from("from typing import TypedDict\n\n");
+    let mut out = String::from("from typing import NotRequired, TypedDict\n\n");
     for (idx, (_, desc)) in scored.into_iter().take(cap).enumerate() {
         if idx > 0 {
             out.push_str("\n\n");
