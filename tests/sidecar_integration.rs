@@ -316,15 +316,7 @@ async fn test_outline_endpoint() {
     std::env::set_current_dir(tmp.path()).unwrap();
 
     let mut file = make_rust_file("src/foo.rs", "hello");
-    let mut padded = String::from_utf8(file.content).unwrap();
-    while padded.lines().count() <= 50 {
-        padded.push_str("// test fixture padding\n");
-    }
-    while padded.len() <= 200 {
-        padded.push_str("// pad\n");
-    }
-    file.content = padded.into_bytes();
-    file.byte_len = file.content.len() as u64;
+    file.byte_len = 40_000;
     let index = build_shared_index(vec![file]);
     let handle = spawn_sidecar(
         Arc::clone(&index),
@@ -342,16 +334,12 @@ async fn test_outline_endpoint() {
         .expect("GET /outline must succeed");
 
     assert!(
-        body.contains("src/foo.rs"),
-        "outline should mention the requested file"
+        body.contains("the SymForge file outline for src/foo.rs,"),
+        "a large whole-file read should name the cheaper reads: {body}"
     );
     assert!(
-        body.contains("hello"),
-        "outline should include the symbol name"
-    );
-    assert!(
-        has_savings_footer(&body),
-        "outline should include the token savings footer"
+        !body.contains("hello") && !has_savings_footer(&body) && !body.contains('\n'),
+        "one line, no outline and no savings footer: {body}"
     );
 
     handle.shutdown_and_join().await;
@@ -430,7 +418,8 @@ async fn test_shared_index_mutation() {
     // Add a new file through the shared Arc<LiveIndex>.
     {
         let mut guard = index.write();
-        let new_file = make_rust_file("src/b.rs", "beta");
+        let mut new_file = make_rust_file("src/b.rs", "beta");
+        new_file.byte_len = 40_000;
         guard.add_file("src/b.rs".to_string(), new_file);
     }
 
@@ -449,12 +438,8 @@ async fn test_shared_index_mutation() {
         .await
         .expect("GET /outline for new file must succeed");
     assert!(
-        outline.contains("src/b.rs"),
-        "outline should mention the new file"
-    );
-    assert!(
-        outline.contains("beta"),
-        "new file symbol must be visible through sidecar"
+        outline.contains("the SymForge file outline for src/b.rs,"),
+        "the new file must be visible through sidecar: {outline}"
     );
 
     handle.shutdown_and_join().await;
