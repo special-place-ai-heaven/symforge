@@ -4,6 +4,13 @@ use crate::domain::ReferenceKind;
 use crate::domain::index::{AdmissionTier, SkippedFile};
 use crate::live_index::{RepoOutlineFileView, RepoOutlineView};
 
+#[cfg(test)]
+thread_local! {
+    static MAP_DEPENDENT_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+const REPO_MAP_MAX_BYTES: u64 = 4000;
+
 pub fn file_tree_view(files: &[RepoOutlineFileView], path: &str, depth: u32) -> String {
     let depth = depth.min(5);
     let prefix = path.trim_matches('/');
@@ -571,6 +578,12 @@ pub(crate) fn repo_map_text_scoped(
                 }
             }
         }
+        let directory_prefix_bytes: u64 = lines.iter().map(|line| line.len() as u64 + 1).sum();
+        let rank_count = if directory_prefix_bytes >= REPO_MAP_MAX_BYTES {
+            0
+        } else {
+            entry_points.len()
+        };
         if !entry_points.is_empty() {
             // Importance ranking (feature 007, US3): rank entry-point lines by
             // their containing file's importance rather than alphabetically.
@@ -589,18 +602,28 @@ pub(crate) fn repo_map_text_scoped(
             // types), so this is O(candidates × refs), never O(all_files²).
             // Keyed by owned path so the memo does not borrow `entry_points`
             // (which must stay mutably sortable/truncatable below).
-            let mut dep_counts: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for (_, _, path) in &entry_points {
-                if !dep_counts.contains_key(path) {
-                    let distinct: std::collections::HashSet<&str> = guard
-                        .find_dependents_for_file(path)
-                        .into_iter()
-                        .map(|(file_path, _)| file_path)
-                        .collect();
-                    dep_counts.insert(path.clone(), distinct.len());
-                }
-            }
+            let mut seen_paths: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let candidate_paths: Vec<&str> = entry_points
+                .iter()
+                .take(rank_count)
+                .map(|(_, _, path)| path.as_str())
+                .filter(|path| seen_paths.insert(path))
+                .collect();
+            #[cfg(test)]
+            MAP_DEPENDENT_LOOKUPS.with(|count| count.set(count.get() + candidate_paths.len()));
+            let counts = crate::live_index::store::ordered_parallel_map(&candidate_paths, |path| {
+                guard
+                    .find_dependents_for_file(path)
+                    .into_iter()
+                    .map(|(file_path, _)| file_path)
+                    .collect::<std::collections::HashSet<&str>>()
+                    .len()
+            });
+            let dep_counts: std::collections::HashMap<String, usize> = candidate_paths
+                .iter()
+                .map(|path| path.to_string())
+                .zip(counts)
+                .collect();
 
             // Churn from the lock-free temporal snapshot; 0.0 when temporal is
             // not Ready or the file is absent (read-only — no frecency bump).
@@ -619,7 +642,7 @@ pub(crate) fn repo_map_text_scoped(
                 }
             };
 
-            entry_points.sort_by(|a, b| {
+            entry_points[..rank_count].sort_by(|a, b| {
                 let (a_kind, a_name, a_path) = a;
                 let (b_kind, b_name, b_path) = b;
                 let a_dep = dep_counts.get(a_path.as_str()).copied().unwrap_or(0);
@@ -662,7 +685,7 @@ pub(crate) fn repo_map_text_scoped(
 
     // Apply budget (1000 tokens = 4000 bytes).
     // Medium repos (up to ~70 directories) fit without truncation.
-    let (mut text, remaining) = build_with_budget(&lines, 4000);
+    let (mut text, remaining) = build_with_budget(&lines, REPO_MAP_MAX_BYTES);
     if remaining > 0 {
         // FR-026: say what was omitted, by kind. The tail of `lines` is cut, so the omitted
         // rows are the last directory rows and/or the key-types section.
@@ -1455,5 +1478,121 @@ mod tests {
         );
         assert!(unbudgeted_text.contains("item_00"));
         assert!(unbudgeted_text.contains("item_39"));
+    }
+
+    #[test]
+    fn compact_map_parallel_importer_counts_match_serial_render() {
+        let root = TempDir::new().unwrap();
+        let files = [
+            (
+                "src/lib.rs",
+                "pub mod zeta;\npub mod alpha;\npub mod mid_a;\npub mod mid_b;\npub mod a;\npub mod b;\npub mod c;\n",
+            ),
+            ("src/zeta.rs", "pub struct Core {\n    pub seed: u32,\n}\n"),
+            ("src/alpha.rs", "pub struct Leaf {\n    pub idle: u32,\n}\n"),
+            ("src/mid_a.rs", "pub struct Zed {\n    pub z: u32,\n}\n"),
+            ("src/mid_b.rs", "pub struct Ayy {\n    pub y: u32,\n}\n"),
+            (
+                "src/a.rs",
+                "use crate::mid_a::Zed;\nuse crate::mid_b::Ayy;\nuse crate::zeta::Core;\n\npub fn a(c: &Core, z: &Zed, y: &Ayy) -> u32 {\n    c.seed + z.z + y.y\n}\n",
+            ),
+            (
+                "src/b.rs",
+                "use crate::mid_a::Zed;\nuse crate::mid_b::Ayy;\nuse crate::zeta::Core;\n\npub fn b(c: &Core, z: &Zed, y: &Ayy) -> u32 {\n    c.seed + z.z + y.y\n}\n",
+            ),
+            (
+                "src/c.rs",
+                "use crate::zeta::Core;\n\npub fn c(c: &Core) -> u32 {\n    c.seed\n}\n",
+            ),
+        ];
+        for (rel, content) in files {
+            let path = root.path().join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let published = shared.published_generation();
+
+        MAP_DEPENDENT_LOOKUPS.with(|count| count.set(0));
+        let parallel = repo_map_text_scoped(&published, None, None);
+        let lookups = MAP_DEPENDENT_LOOKUPS.with(|count| count.get());
+        let serial = crate::live_index::store::with_serial_oracle(|| {
+            repo_map_text_scoped(&published, None, None)
+        });
+
+        assert_eq!(parallel, serial);
+        assert_eq!(lookups, 4);
+        let key_types: Vec<&str> = parallel
+            .lines()
+            .skip_while(|line| *line != "Key types:")
+            .skip(1)
+            .take_while(|line| line.starts_with("  "))
+            .collect();
+        assert_eq!(
+            key_types,
+            [
+                "  struct Core  (src/zeta.rs) (→3)",
+                "  struct Zed  (src/mid_a.rs) (→2)",
+                "  struct Ayy  (src/mid_b.rs) (→2)",
+                "  struct Leaf  (src/alpha.rs)",
+            ],
+            "{parallel}"
+        );
+    }
+
+    #[test]
+    fn compact_map_ranks_at_3999_bytes_and_skips_at_4000() {
+        let file_count = 60;
+        let base_names: Vec<String> = (0..file_count)
+            .map(|index| format!("module_{index:02}{}", "x".repeat(26)))
+            .collect();
+        let header =
+            format!("Index: {file_count} files, {file_count} symbols  [Rust: {file_count}]");
+        let base_prefix_bytes = header.len() as u64
+            + 1
+            + 1
+            + base_names
+                .iter()
+                .map(|name| {
+                    format!("  {name:<35}  {:>3} files   {:>5} symbols", 1, 1).len() as u64 + 1
+                })
+                .sum::<u64>();
+
+        for (prefix_bytes, expected_omitted_lines) in [(3999, 17), (4000, 18)] {
+            let root = TempDir::new().unwrap();
+            let mut names = base_names.clone();
+            names[0].push_str(&"x".repeat((prefix_bytes - base_prefix_bytes) as usize));
+            let modeled_prefix_bytes = header.len() as u64
+                + 1
+                + 1
+                + names
+                    .iter()
+                    .map(|name| {
+                        format!("  {name:<35}  {:>3} files   {:>5} symbols", 1, 1).len() as u64 + 1
+                    })
+                    .sum::<u64>();
+            assert_eq!(modeled_prefix_bytes, prefix_bytes);
+            for (index, name) in names.iter().enumerate() {
+                let dir = root.path().join(name);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join("lib.rs"), format!("pub struct Item{index:02};")).unwrap();
+            }
+
+            let shared = LiveIndex::load(root.path()).unwrap();
+            let published = shared.published_generation();
+            MAP_DEPENDENT_LOOKUPS.with(|count| count.set(0));
+            let text = repo_map_text_scoped(&published, None, None);
+            let lookups = MAP_DEPENDENT_LOOKUPS.with(|count| count.get());
+
+            assert!(text.contains(&format!(
+                "{expected_omitted_lines} line(s) of the key-types section"
+            )));
+            assert!(!text.contains("Key types:"));
+            if prefix_bytes == 3999 {
+                assert!(lookups > 0);
+            } else {
+                assert_eq!(lookups, 0);
+            }
+        }
     }
 }
