@@ -54,4 +54,4 @@ Knowledge evidence:
   1. cases.jsonl:7 bytes=2075..2087 content_hash=<hash> source=<src> generation=<gen> link_id=<id> bridge_index=2 resolution=resolved_exact lifecycle=unknown voice=unknown
   2. cases.jsonl:8 bytes=2354..2366 content_hash=<hash> source=<src> generation=<gen> link_id=<id> bridge_index=3 resolution=resolved_exact lifecycle=unknown voice=unknown
 
-~4588 tokens estimated vs whole-file read; ~332 tokens estimated vs ~50-line windowed read (assumed baseline, not measured)
+~4588 tokens estimated vs whole-file read
