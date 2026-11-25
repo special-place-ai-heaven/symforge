@@ -1172,7 +1172,11 @@ async fn prompt_context_text(
     fence: &SidecarQueryFence,
 ) -> Result<String, StatusCode> {
     let prompt = params.text.trim();
-    if prompt.is_empty() {
+    if prompt.is_empty()
+        || prompt.starts_with("[SYSTEM NOTIFICATION")
+        || prompt.contains("<task-notification>")
+        || prompt.chars().count() > PROMPT_CONTEXT_MAX_CHARS
+    {
         return Ok(String::new());
     }
     let hint_generation = capture_queryable_sidecar_generation(state, fence)?;
@@ -1483,6 +1487,7 @@ fn find_prompt_qualified_symbol_hint(
 }
 
 const PROMPT_SYMBOL_MAX_DEFINITIONS: usize = 3;
+const PROMPT_CONTEXT_MAX_CHARS: usize = 2_000;
 
 fn is_distinctive_symbol_token(token: &str) -> bool {
     token.len() >= 3
@@ -3985,6 +3990,45 @@ mod tests {
         assert!(
             result.contains("exact path `src/main.rs` matched in the prompt"),
             "exact file hints should expose the evidence source: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prompt_context_handler_ignores_machine_written_and_oversized_prompts() {
+        let file = make_indexed_file(
+            "src/main.rs",
+            vec![make_symbol("serve", SymbolKind::Function, 1, 3)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        let state = make_state(vec![("src/main.rs", file)]);
+        let oversized = format!(
+            "please inspect src/main.rs {}",
+            "x".repeat(PROMPT_CONTEXT_MAX_CHARS)
+        );
+        for text in [
+            "[SYSTEM NOTIFICATION - NOT USER INPUT] please inspect src/main.rs".to_string(),
+            "done <task-notification>review of src/main.rs</task-notification>".to_string(),
+            oversized,
+        ] {
+            let result =
+                prompt_context_handler(State(state.clone()), Query(PromptContextParams { text }))
+                    .await
+                    .unwrap();
+            assert!(result.is_empty(), "expected no output, got: {result}");
+        }
+
+        let result = prompt_context_handler(
+            State(state),
+            Query(PromptContextParams {
+                text: "please inspect src/main.rs".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.contains("serve"),
+            "short prompt keeps its outline: {result}"
         );
     }
 

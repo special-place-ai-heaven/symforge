@@ -270,7 +270,7 @@ ab3ea2cd7a4fd692e7e45382637932bdc556390b4451bf48108e49dc59973b53  index_lifecycl
 
 80e3d4ca27482d07b5603945f515f9b20da7f8c4b9b9c2e6e48b31d494caa471  index_lifecycle/guidance/read_admission_format.rs
 
-1b61f8a9ecb915642fc15e332e48f74915eba60e206767ab3ecead4772783b1c  index_lifecycle/guidance/read_context.rs
+783d33d23a045ed6901eb150b25cb1388d416eac518c57eaf1a7a6d636af86b2  index_lifecycle/guidance/read_context.rs
 
 2d8753216cb6488b7eaebb0b4a8e41c64befaaadb441481b42c4e9e766584600  index_lifecycle/guidance/read_contract.rs
 
@@ -518,7 +518,7 @@ a7adb304ce0cf3ed59fa915099ef0b3b0ffe4a0516aa1355c74a434ffe3c31b5  protocol/edit_
 
 397d40d250e90e059490ad3dee1864e365feac22974e2ea57ef6f00f7c833085  protocol/format.rs
 
-b125e13a75c1aad35f523ad5b91549767bcd9e43eaac9d247aacd31fd9660eaa  protocol/format/tests.rs
+ccdadd3fc890df3c7e8789d9aaf650b0755fc7206b4254e50c5ad72864ca1adf  protocol/format/tests.rs
 
 a35b53d32bfd7cb79ea6f8e76c2d8fb348924abaa74afe95a23dab0b000d940e  protocol/investigation.rs
 
@@ -594,7 +594,7 @@ e614f84fae033450f9949a13d90f911459ad55cc29d58ff9981d20d1e33d9dc5  server/mod.rs
 
 0edc6efe3917a718dd73bde560fa102f456de7dfe181bb47ef46093094b78d0f  sidecar/governor.rs
 
-91a048248f454eb29ea4d36dbb161ce8e255da85880a878692049a4385e51398  sidecar/handlers.rs
+4b0d769bf5cae3609a11c2d3e437fc44a1b1279823ee111bbca74cdfd0bd7478  sidecar/handlers.rs
 
 686438184c47ff536eb12e33752cf42995e539e9ed02b06b91fa73195a125273  sidecar/mod.rs
 
