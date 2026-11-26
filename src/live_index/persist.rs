@@ -2691,7 +2691,9 @@ where
     R: Send,
 {
     fn parent_and_leaf(path: &Path) -> Option<(&Path, &std::ffi::OsStr)> {
-        let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())?;
         let leaf = path.file_name()?;
         path.components()
             .all(|component| matches!(component, std::path::Component::Normal(_)))
@@ -2740,11 +2742,13 @@ fn run_snapshot_store_restore_proof_bound(
                 .flat_map(|chunk| {
                     authority
                         .with_source_anchor_read(|lease| {
-                            Ok(crate::live_index::store::ordered_parallel_map(
+                            Ok(ordered_parallel_map_by_directory(
+                                lease,
                                 chunk,
-                                |(path, file)| match read_restore_candidate(
+                                |(path, _)| Path::new(path),
+                                |lease, relative, (_, file)| match read_restore_candidate(
                                     lease,
-                                    Path::new(path),
+                                    relative,
                                     file.content.len(),
                                 ) {
                                     Ok(Some(bytes))
@@ -7109,7 +7113,10 @@ mod tests {
             )
         };
         assert_eq!(grouped(), per_file);
-        assert_eq!(crate::live_index::store::with_serial_oracle(grouped), per_file);
+        assert_eq!(
+            crate::live_index::store::with_serial_oracle(grouped),
+            per_file
+        );
 
         assert!(matches!(per_file[0], Ok(Some(_))));
         assert!(matches!(per_file[5], Ok(Some(_))));
