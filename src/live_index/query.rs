@@ -223,6 +223,7 @@ fn find_reexporters<'a>(
             }
         }
     }
+    reexporters.sort_unstable();
     reexporters
 }
 
@@ -2775,6 +2776,8 @@ impl LiveIndex {
             a.trait_name
                 .cmp(&b.trait_name)
                 .then(a.implementor.cmp(&b.implementor))
+                .then(a.file_path.cmp(&b.file_path))
+                .then(a.line.cmp(&b.line))
         });
 
         ImplementationsView { entries }
@@ -8625,6 +8628,185 @@ public class PacketsController {
             dep_files.contains(&"src/main.rs"),
             "main.rs should be found via lib.rs pub use re-export, got: {dep_files:?}"
         );
+    }
+
+    #[test]
+    fn test_capture_implementations_view_repeats_across_fresh_indexes() {
+        let build = || {
+            let files = ["src/c_impl.rs", "src/a_impl.rs", "src/b_impl.rs"]
+                .into_iter()
+                .enumerate()
+                .map(|(n, path)| {
+                    (
+                        path,
+                        make_file_with_refs(
+                            path,
+                            vec![make_ref(
+                                "Render",
+                                Some("Widget"),
+                                ReferenceKind::Implements,
+                                None,
+                                100 * (n as u32 + 1),
+                            )],
+                            HashMap::new(),
+                        ),
+                    )
+                })
+                .collect();
+            make_index(files, false)
+        };
+        let expected: Vec<(String, u32)> = vec![
+            ("src/a_impl.rs".to_string(), 3),
+            ("src/b_impl.rs".to_string(), 4),
+            ("src/c_impl.rs".to_string(), 2),
+        ];
+
+        let runs: Vec<Vec<(String, String, String, u32)>> = (0..20)
+            .map(|_| {
+                build()
+                    .capture_implementations_view("Render", Some("trait"))
+                    .entries
+                    .into_iter()
+                    .map(|entry| {
+                        (
+                            entry.trait_name,
+                            entry.implementor,
+                            entry.file_path,
+                            entry.line,
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        assert!(
+            runs.iter().all(|entries| entries == &runs[0]),
+            "fresh indexes over the same files disagree: {runs:?}"
+        );
+        let paths_and_lines: Vec<(String, u32)> = runs[0]
+            .iter()
+            .map(|(_, _, path, line)| (path.clone(), *line))
+            .collect();
+        assert_eq!(paths_and_lines, expected);
+    }
+
+    #[test]
+    fn test_find_dependents_rows_repeat_across_fresh_indexes_with_two_barrels() {
+        let widget_symbol = SymbolRecord {
+            name: "Widget".to_string(),
+            kind: SymbolKind::Struct,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (0, 22),
+            line_range: (0, 0),
+            doc_byte_range: None,
+            item_byte_range: None,
+        };
+        let build = || {
+            let mut files = vec![(
+                "src/model.rs".to_string(),
+                make_file_with_refs_and_content(
+                    "src/model.rs",
+                    LanguageId::Rust,
+                    "pub struct Widget {}",
+                    vec![],
+                    vec![widget_symbol.clone()],
+                ),
+            )];
+            for barrel in ["src/shapes.rs", "src/prelude.rs"] {
+                files.push((
+                    barrel.to_string(),
+                    make_file_with_refs_and_content(
+                        barrel,
+                        LanguageId::Rust,
+                        "pub use crate::model::Widget;\n",
+                        vec![make_ref(
+                            "Widget",
+                            Some("crate::model::Widget"),
+                            ReferenceKind::Import,
+                            None,
+                            8,
+                        )],
+                        vec![],
+                    ),
+                ));
+            }
+            for n in 0..5 {
+                let path = format!("src/user_{n}.rs");
+                files.push((
+                    path.clone(),
+                    make_file_with_refs_and_content(
+                        &path,
+                        LanguageId::Rust,
+                        "use crate::shapes::Widget;\nuse crate::prelude::Widget;\n",
+                        vec![
+                            make_ref(
+                                "Widget",
+                                Some("crate::shapes::Widget"),
+                                ReferenceKind::Import,
+                                None,
+                                0,
+                            ),
+                            make_ref(
+                                "Widget",
+                                Some("crate::prelude::Widget"),
+                                ReferenceKind::Import,
+                                None,
+                                100,
+                            ),
+                        ],
+                        vec![],
+                    ),
+                ));
+            }
+            make_index(
+                files
+                    .iter()
+                    .map(|(path, file)| (path.as_str(), file.clone()))
+                    .collect(),
+                false,
+            )
+        };
+        let rows_of = |index: &LiveIndex| -> Vec<(String, u32, Option<String>)> {
+            index
+                .find_dependents_for_file("src/model.rs")
+                .into_iter()
+                .map(|(path, reference)| {
+                    (
+                        path.to_string(),
+                        reference.line_range.0,
+                        reference.qualified_name.clone(),
+                    )
+                })
+                .collect()
+        };
+
+        let mut expected = vec![
+            (
+                "src/prelude.rs".to_string(),
+                0,
+                Some("crate::model::Widget".to_string()),
+            ),
+            (
+                "src/shapes.rs".to_string(),
+                0,
+                Some("crate::model::Widget".to_string()),
+            ),
+        ];
+        for n in 0..5 {
+            expected.push((
+                format!("src/user_{n}.rs"),
+                1,
+                Some("crate::prelude::Widget".to_string()),
+            ));
+        }
+        expected.sort();
+
+        let runs: Vec<_> = (0..20).map(|_| rows_of(&build())).collect();
+        assert!(
+            runs.iter().all(|rows| rows == &runs[0]),
+            "fresh indexes over the same files disagree: {runs:?}"
+        );
+        assert_eq!(runs[0], expected);
     }
 
     #[test]
