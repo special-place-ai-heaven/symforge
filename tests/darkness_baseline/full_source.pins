@@ -396,7 +396,7 @@ bb1c251bd541d7f41d28c49149cb13e91074c690b12222573dd48d2a4e317c22  live_index/mod
 
 e9bded0e817f58d773b483af7d58856c956096eb8f4ff71130bd3e47d7b3208f  live_index/qualified_usages.rs
 
-75b98a2f95ace6f71a67914b94a60fa85dbe1104bbd4150fcaa46a98c1b9deb4  live_index/query.rs
+f7fb0994156649071ede17aca2c98b0de8c1176deccb19a6fad49d3e458cfec5  live_index/query.rs
 
 47eac41dc97e1b8ae7d264ec80b2fb51c369aa3a44c92b7fe2a0a8d586cde4cb  live_index/rank_signals.rs
 

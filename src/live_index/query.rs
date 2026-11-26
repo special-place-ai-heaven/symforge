@@ -223,6 +223,7 @@ fn find_reexporters<'a>(
             }
         }
     }
+    reexporters.sort_unstable();
     reexporters
 }
 
