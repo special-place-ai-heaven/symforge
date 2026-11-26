@@ -248,6 +248,7 @@ jobs:
         run: |
           set -euo pipefail
           CAN_PUBLISH=true
+          TAG_COMMIT=""
           if [[ -z "$MANUAL_TAG" ]]; then
             VERSION="$(git show "$RELEASE_REF:.github/.release-please-manifest.json" | python -I -c 'import json, sys; v = json.load(sys.stdin).get("."); print(v) if isinstance(v, str) and v else sys.exit("release manifest version is unavailable")')"
             TAG_NAME="v$VERSION"
@@ -258,9 +259,11 @@ jobs:
               fi
             fi
           fi
-          FULL_VERIFY="$CAN_PUBLISH"
-          if [[ "$LIFECYCLE_GATE_ACTIVE" != "false" || "$WORKFLOW_EVENT" == "workflow_dispatch" ]]; then
-            FULL_VERIFY=true
+          FULL_VERIFY=true
+          if [[ "$CAN_PUBLISH" == "false" && "$LIFECYCLE_GATE_ACTIVE" == "false" && "$WORKFLOW_EVENT" != "workflow_dispatch" ]]; then
+            if python -I execution/release_scope.py --base "$TAG_COMMIT" --head "$RELEASE_REF"; then
+              FULL_VERIFY=false
+            fi
           fi
           echo "can_publish=$CAN_PUBLISH" >> "$GITHUB_OUTPUT"
           echo "full_verify=$FULL_VERIFY" >> "$GITHUB_OUTPUT"
@@ -2073,7 +2076,7 @@ jobs:
     # then restate the success it would otherwise have got implicitly.
     if: ${{ !cancelled() && needs.resolve-release-ref.result == 'success' && needs.gate-release-ref.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 110
+    timeout-minutes: 20
     permissions:
       actions: write
       contents: write
@@ -2159,11 +2162,11 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_PRS_JSON: ${{ steps.release.outputs.prs }}
           FULL_VERIFY: ${{ needs.resolve-release-ref.outputs.full_verify }}
-          CI_LOOKUP_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [[ "$FULL_VERIFY" != "true" ]]; then
-            GH_TOKEN="$CI_LOOKUP_TOKEN" python -I execution/require_ci_success.py --sha "$GITHUB_SHA"
+            echo "::error::release-please opened a release PR on a push classified as unable to release, so the classification was wrong. The release PR stays open. Merging it by hand is safe: the release commit is fully verified before anything is published. Please report the misclassified commit."
+            exit 1
           fi
           PR="$(python -I - <<'PY'
           import json

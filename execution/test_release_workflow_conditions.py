@@ -221,12 +221,17 @@ LIFECYCLE_EVIDENCE_STEPS = (
 )
 PUBLISHING_JOBS = ("build", "build-npm-package", "upload-release-assets", "cargo-publish", "npm-publish")
 RELEASE_CREATED_TERM = "needs.prepare-release.outputs.release_created == 'true'"
-CI_WAIT_MINUTES = 90
-CI_REQUIREMENT = (
+PREPARE_RELEASE_TIMEOUT_MINUTES = 20
+AUTO_MERGE_REFUSAL = (
     '          if [[ "$FULL_VERIFY" != "true" ]]; then\n'
-    '            GH_TOKEN="$CI_LOOKUP_TOKEN" python -I execution/require_ci_success.py --sha "$GITHUB_SHA"\n'
+    '            echo "::error::release-please opened a release PR on a push classified as unable to '
+    'release, so the classification was wrong. The release PR stays open. Merging it by hand is safe: '
+    'the release commit is fully verified before anything is published. Please report the misclassified '
+    'commit."\n'
+    "            exit 1\n"
     "          fi\n"
 )
+RETIRED_HELPER = "require_ci" + "_success"
 STEP_START_RE = re.compile(r"^      - ")
 STEP_NAME_RE = re.compile(r"^(?:      - |        )name:\s*(.+?)\s*$", re.M)
 STEP_USES_RE = re.compile(r"^(?:      - |        )uses:\s*([^@\s]+)@", re.M)
@@ -378,54 +383,60 @@ class ReleaseVerifySkipsOnlyNonPublishingPushes(unittest.TestCase):
             self.assertNotIn("||", condition, name)
             self.assertIn(RELEASE_CREATED_TERM, expression_terms(condition), name)
 
-    def test_auto_merge_requires_green_ci_unless_fully_verified(self) -> None:
+    def test_auto_merge_refuses_a_run_that_skipped_verification(self) -> None:
         step = step_named(self.prepare_steps, "Auto-merge release PR")
         self.assertIn("          FULL_VERIFY: ${{ needs.resolve-release-ref.outputs.full_verify }}\n", step)
-        self.assertIn("          CI_LOOKUP_TOKEN: ${{ github.token }}\n", step)
-        self.assertEqual(step.count(CI_REQUIREMENT), 1)
+        self.assertNotIn("CI_LOOKUP_TOKEN", step)
+        self.assertEqual(step.count(AUTO_MERGE_REFUSAL), 1)
         self.assertEqual(step.count("gh pr merge "), 1)
-        self.assertTrue(run_script(step).startswith("set -euo pipefail\n" + CI_REQUIREMENT[10:].replace("\n          ", "\n")))
-        self.assertLess(step.index(CI_REQUIREMENT), step.index("autorelease: pending"))
-        self.assertLess(step.index(CI_REQUIREMENT), step.index('gh pr merge "$PR"'))
+        refusal = AUTO_MERGE_REFUSAL.replace("\n          ", "\n")[10:]
+        self.assertTrue(run_script(step).startswith("set -euo pipefail\n" + refusal))
+        self.assertLess(step.index(AUTO_MERGE_REFUSAL), step.index("autorelease: pending"))
+        self.assertLess(step.index(AUTO_MERGE_REFUSAL), step.index('gh pr merge "$PR"'))
 
-    def test_prepare_release_can_outlast_the_ci_wait(self) -> None:
+    def test_prepare_release_keeps_its_original_timeout(self) -> None:
         block = job_block(self.text, "prepare-release")
         timeout = re.search(r"^    timeout-minutes:\s*([0-9]+)\s*$", block, re.M)
         self.assertIsNotNone(timeout)
-        self.assertGreaterEqual(int(timeout.group(1)), CI_WAIT_MINUTES + 20)
-        self.assertRegex(block, r"(?m)^      actions: (read|write)$")
+        self.assertEqual(int(timeout.group(1)), PREPARE_RELEASE_TIMEOUT_MINUTES)
+
+    def test_the_ci_stand_in_is_gone(self) -> None:
+        root = WORKFLOW.parent.parent.parent
+        found = subprocess.run(
+            ["git", "grep", "-l", "-F", RETIRED_HELPER], cwd=root, capture_output=True, check=False
+        )
+        self.assertIn(found.returncode, (0, 1), found.stderr)
+        self.assertEqual(found.stdout.decode("utf-8").split(), [])
+        self.assertFalse((root / "execution" / f"{RETIRED_HELPER}.py").exists())
 
 
-class AutoMergeCiRequirementBehaviour(unittest.TestCase):
+class AutoMergeRefusalBehaviour(unittest.TestCase):
     def setUp(self) -> None:
         bash = find_bash()
         if bash is None:
             if os.name == "nt":
                 self.skipTest("Git Bash is not available on this Windows host")
-            self.fail("bash is required to exercise the auto-merge CI requirement")
+            self.fail("bash is required to exercise the auto-merge refusal")
         self.bash = bash
-        text = WORKFLOW.read_text(encoding="utf-8")
-        step = step_named(job_steps(job_block(text, "prepare-release")), "Auto-merge release PR")
-        script = run_script(step)
-        requirement = CI_REQUIREMENT.replace("\n          ", "\n")[10:]
-        self.assertIn(requirement, script)
-        self.snippet = "set -euo pipefail\npython() { echo \"called $*\"; exit 7; }\n" + requirement + "echo merged\n"
+        refusal = AUTO_MERGE_REFUSAL.replace("\n          ", "\n")[10:]
+        self.snippet = "set -euo pipefail\n" + refusal + "echo merged\n"
 
     def outcome(self, full_verify: str) -> subprocess.CompletedProcess[bytes]:
-        env = {**os.environ, "FULL_VERIFY": full_verify, "CI_LOOKUP_TOKEN": "x", "GITHUB_SHA": "a" * 40}
+        env = {**os.environ, "FULL_VERIFY": full_verify}
         return subprocess.run([self.bash, "-c", self.snippet], env=env, capture_output=True)
 
-    def test_fully_verified_run_bypasses_the_ci_requirement(self) -> None:
+    def test_fully_verified_run_reaches_the_merge(self) -> None:
         result = self.outcome("true")
         self.assertEqual(result.returncode, 0)
-        self.assertNotIn(b"called", result.stdout)
+        self.assertIn(b"merged", result.stdout)
 
-    def test_skipped_verification_requires_the_ci_check_and_stops_on_its_failure(self) -> None:
+    def test_skipped_verification_stops_before_the_merge(self) -> None:
         for value in ("false", "", "TRUE"):
             with self.subTest(full_verify=value):
                 result = self.outcome(value)
-                self.assertEqual(result.returncode, 7)
-                self.assertIn(b"called -I execution/require_ci_success.py --sha " + b"a" * 40, result.stdout)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(b"classification was wrong", result.stdout)
+                self.assertIn(b"The release PR stays open.", result.stdout)
                 self.assertNotIn(b"merged", result.stdout)
 
 
@@ -451,6 +462,7 @@ class PublishScopeScriptBehaviour(unittest.TestCase):
         step = step_with_id(job_steps(job_block(text, "resolve-release-ref")), "publish-scope")
         self.script = run_script(step)
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.repo = Path(self.tmp.name)
         self.env = {
             **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
@@ -463,22 +475,23 @@ class PublishScopeScriptBehaviour(unittest.TestCase):
             "PATH": os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", ""),
         }
         (self.repo / "scope.sh").write_bytes(self.script.encode("utf-8"))
+        helper = WORKFLOW.parent.parent.parent / "execution" / "release_scope.py"
+        if helper.is_file():
+            (self.repo / "execution").mkdir()
+            (self.repo / "execution" / "release_scope.py").write_bytes(helper.read_bytes())
         self.git("init", "-q", "-b", "main")
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
 
     def git(self, *args: str) -> str:
         return subprocess.run(
             ["git", *args], cwd=self.repo, env=self.env, check=True, capture_output=True
         ).stdout.decode("utf-8").strip()
 
-    def commit(self, version: str) -> str:
+    def commit(self, version: str, message: str | None = None) -> str:
         manifest = self.repo / ".github" / ".release-please-manifest.json"
         manifest.parent.mkdir(exist_ok=True)
         manifest.write_bytes(json.dumps({".": version}).encode("utf-8"))
         self.git("add", ".github")
-        self.git("commit", "-q", "--allow-empty", "-m", f"chore: {version}")
+        self.git("commit", "-q", "--allow-empty", "-m", message or f"chore: {version}")
         return self.git("rev-parse", "HEAD")
 
     def scope(self, *, manual_tag: str = "", lifecycle: str = "false", event: str = "push") -> dict[str, str]:
@@ -528,6 +541,58 @@ class PublishScopeScriptBehaviour(unittest.TestCase):
             self.scope(event="workflow_dispatch"), {"can_publish": "false", "full_verify": "true"}
         )
         self.assertEqual(self.scope(event="push"), {"can_publish": "false", "full_verify": "false"})
+
+    def tagged_then(self, *messages: str) -> dict[str, str]:
+        self.commit("1.0.0")
+        self.git("tag", "v1.0.0")
+        for message in messages:
+            self.commit("1.0.0", message)
+        return self.scope()
+
+    def test_only_never_releasing_commits_skip_verification(self) -> None:
+        self.assertEqual(
+            self.tagged_then("ci: a", "docs(readme): b", "chore: c", "test(x): d", "style: e", "build: f", "refactor: g"),
+            {"can_publish": "false", "full_verify": "false"},
+        )
+
+    def test_a_releasable_commit_keeps_full_verification(self) -> None:
+        for kind in ("fix", "feat", "perf", "revert", "deps"):
+            with self.subTest(kind=kind):
+                self.setUp()
+                self.assertEqual(
+                    self.tagged_then("ci: a", f"{kind}(x): b", "docs: c"),
+                    {"can_publish": "false", "full_verify": "true"},
+                )
+
+    def test_breaking_or_release_as_commits_keep_full_verification(self) -> None:
+        for message in (
+            "chore!: x",
+            "ci(scope)!: x",
+            "chore: x\n\nBREAKING CHANGE: drops a flag",
+            "docs: x\n\nBREAKING-CHANGE: drops a flag",
+            "chore: x\n\nRelease-As: 13.0.0",
+            "chore: x\n\nfix: a body paragraph release-please parses as its own commit",
+        ):
+            with self.subTest(message=message):
+                self.setUp()
+                self.assertEqual(
+                    self.tagged_then("ci: a", message), {"can_publish": "false", "full_verify": "true"}
+                )
+
+    def test_unparsable_or_merge_commits_keep_full_verification(self) -> None:
+        for message in ("Update readme", "Revert \"ci: a\"", "ci:missing space", "ci(): empty scope"):
+            with self.subTest(message=message):
+                self.setUp()
+                self.assertEqual(self.tagged_then(message), {"can_publish": "false", "full_verify": "true"})
+        self.setUp()
+        self.commit("1.0.0")
+        self.git("tag", "v1.0.0")
+        self.git("checkout", "-q", "-b", "side")
+        self.commit("1.0.0", "ci: side")
+        self.git("checkout", "-q", "main")
+        self.commit("1.0.0", "ci: main")
+        self.git("merge", "-q", "--no-ff", "-m", "ci: merge side", "side")
+        self.assertEqual(self.scope(), {"can_publish": "false", "full_verify": "true"})
 
     def test_manual_tag_can_publish(self) -> None:
         self.commit("1.0.0")
