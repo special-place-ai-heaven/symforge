@@ -3100,10 +3100,12 @@ fn discover_files_from_source_anchor(
     let mut level = vec![PathBuf::from(".")];
     let mut files = Vec::new();
     let mut observed = HashMap::new();
-    let mut ignore_files = Vec::new();
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    let mut matcher = ignore::gitignore::Gitignore::empty();
     let mut visited = 0usize;
     while !level.is_empty() {
         let mut next_level = Vec::new();
+        let mut ignore_files = Vec::new();
         for batch in level.chunks(SOURCE_ANCHOR_READ_BATCH) {
             if stop() {
                 return Err(AnchoredDiscoveryError::Cancelled);
@@ -3158,33 +3160,39 @@ fn discover_files_from_source_anchor(
                 }
             }
         }
+        if !ignore_files.is_empty() {
+            for (relative, path) in ignore_files {
+                let bytes = authority
+                    .with_source_anchor_read(|lease| {
+                        crate::index_lifecycle::physical_root::read_regular_beneath(
+                            lease,
+                            &path,
+                            256 * 1024,
+                        )
+                    })
+                    .map_err(|_| "an admitted ignore file could not be read".to_string())?
+                    .ok_or_else(|| "an admitted ignore file vanished".to_string())?;
+                let contents = std::str::from_utf8(&bytes)
+                    .map_err(|_| "an admitted ignore file is not UTF-8".to_string())?;
+                let relative_parent = path.parent().unwrap_or_else(|| Path::new("."));
+                crate::discovery::add_gitignore_contents(
+                    &mut builder,
+                    relative_parent,
+                    &root.join(relative),
+                    contents,
+                );
+            }
+            matcher = builder
+                .build()
+                .map_err(|_| "admitted ignore rules could not be compiled".to_string())?;
+        }
+        next_level.retain(|directory| {
+            !matcher
+                .matched_path_or_any_parents(directory.to_string_lossy().replace('\\', "/"), true)
+                .is_ignore()
+        });
         level = next_level;
     }
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
-    for (relative, path) in ignore_files {
-        let bytes = authority
-            .with_source_anchor_read(|lease| {
-                crate::index_lifecycle::physical_root::read_regular_beneath(
-                    lease,
-                    &path,
-                    256 * 1024,
-                )
-            })
-            .map_err(|_| "an admitted ignore file could not be read".to_string())?
-            .ok_or_else(|| "an admitted ignore file vanished".to_string())?;
-        let contents = std::str::from_utf8(&bytes)
-            .map_err(|_| "an admitted ignore file is not UTF-8".to_string())?;
-        let relative_parent = path.parent().unwrap_or_else(|| Path::new("."));
-        crate::discovery::add_gitignore_contents(
-            &mut builder,
-            relative_parent,
-            &root.join(relative),
-            contents,
-        );
-    }
-    let matcher = builder
-        .build()
-        .map_err(|_| "admitted ignore rules could not be compiled".to_string())?;
     files.retain(|path| !matcher.matched_path_or_any_parents(path, false).is_ignore());
     files.sort();
     files.dedup();
@@ -7063,7 +7071,13 @@ mod tests {
 
         assert_eq!(
             parallel.files,
-            vec![".gitignore", "a.rs", "src/.gitignore", "src/b.rs", "src/build/x.rs"]
+            vec![
+                ".gitignore",
+                "a.rs",
+                "src/.gitignore",
+                "src/b.rs",
+                "src/build/x.rs"
+            ]
         );
         let mut observed: Vec<&str> = parallel.observed.keys().map(String::as_str).collect();
         observed.sort();
