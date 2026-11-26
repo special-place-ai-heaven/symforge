@@ -2072,7 +2072,7 @@ jobs:
     # then restate the success it would otherwise have got implicitly.
     if: ${{ !cancelled() && needs.resolve-release-ref.result == 'success' && needs.gate-release-ref.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 110
     permissions:
       actions: write
       contents: write
@@ -2157,8 +2157,13 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RELEASE_PRS_JSON: ${{ steps.release.outputs.prs }}
+          FULL_VERIFY: ${{ needs.resolve-release-ref.outputs.full_verify }}
+          CI_LOOKUP_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [[ "$FULL_VERIFY" != "true" ]]; then
+            GH_TOKEN="$CI_LOOKUP_TOKEN" python -I execution/require_ci_success.py --sha "$GITHUB_SHA"
+          fi
           PR="$(python -I - <<'PY'
           import json
           import os

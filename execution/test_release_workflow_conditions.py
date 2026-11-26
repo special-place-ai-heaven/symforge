@@ -184,9 +184,9 @@ class ReleaseWorkflowConditions(unittest.TestCase):
 
 
 FULL_VERIFY_CONDITION = "needs.resolve-release-ref.outputs.full_verify == 'true'"
-HEAVY_MARKERS = ("cargo ", "npm ", "verify-tools", "ensure_rustup", "ensure_ripgrep", "free_runner_disk", "clone_phase0")
+FREE_DISK_CONDITION = "runner.environment == 'github-hosted' && " + FULL_VERIFY_CONDITION
+LIFECYCLE_CONDITION = "needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'"
 HEAVY_STEPS = (
-    "Free disk space for Rust builds",
     "Install Rust toolchain (rust-toolchain.toml)",
     "Run cargo check",
     "Clone phase0 golden-replay corpora",
@@ -200,16 +200,36 @@ HEAVY_STEPS = (
     "Install ripgrep (harness grep oracle)",
     "Verify tool correctness (both fixtures)",
 )
+FREE_DISK_STEP = "Free disk space for Rust builds"
+HEAVY_STEP_COUNT = 14
 EVERY_PUSH_STEPS = (
+    "uses:actions/checkout",
+    "Report Rust build storage",
+    "uses:actions/setup-python",
+    "uses:actions/setup-node",
     "Test release-please recovery contracts",
     "Install GitHub CLI",
     "Validate commit subjects since last successful Release",
     "Validate manual run resolved tag commit subject",
     "Run version sync tests",
 )
+LIFECYCLE_EVIDENCE_STEPS = (
+    "Verify Feature 020 V11 refreeze integrity",
+    "Test and verify Feature 020 V11 lifecycle traceability",
+    "Require code-owned Feature 020 V11 pre-approval evidence",
+    "Upload code-owned Feature 020 V11 pre-approval evidence",
+)
 PUBLISHING_JOBS = ("build", "build-npm-package", "upload-release-assets", "cargo-publish", "npm-publish")
+RELEASE_CREATED_TERM = "needs.prepare-release.outputs.release_created == 'true'"
+CI_WAIT_MINUTES = 90
+CI_REQUIREMENT = (
+    '          if [[ "$FULL_VERIFY" != "true" ]]; then\n'
+    '            GH_TOKEN="$CI_LOOKUP_TOKEN" python -I execution/require_ci_success.py --sha "$GITHUB_SHA"\n'
+    "          fi\n"
+)
 STEP_START_RE = re.compile(r"^      - ")
 STEP_NAME_RE = re.compile(r"^(?:      - |        )name:\s*(.+?)\s*$", re.M)
+STEP_USES_RE = re.compile(r"^(?:      - |        )uses:\s*([^@\s]+)@", re.M)
 STEP_ID_RE = re.compile(r"^(?:      - |        )id:\s*(.+?)\s*$", re.M)
 STEP_IF_RE = re.compile(r"^        if:\s*(.+?)\s*$", re.M)
 
@@ -238,8 +258,16 @@ def job_steps(block: str) -> list[str]:
     return ["\n".join(step) for step in steps if step]
 
 
+def step_key(step: str) -> str:
+    name = STEP_NAME_RE.search(step)
+    if name:
+        return name.group(1)
+    uses = STEP_USES_RE.search(step)
+    return f"uses:{uses.group(1)}" if uses else ""
+
+
 def step_named(steps: list[str], name: str) -> str:
-    found = [step for step in steps if (m := STEP_NAME_RE.search(step)) and m.group(1) == name]
+    found = [step for step in steps if step_key(step) == name]
     if len(found) != 1:
         raise AssertionError(f"expected exactly one step named {name!r}, found {len(found)}")
     return found[0]
@@ -268,10 +296,18 @@ def run_script(step: str) -> str:
     return "\n".join(body).rstrip() + "\n"
 
 
+def expression_terms(condition: str) -> list[str]:
+    inner = condition.strip()
+    if inner.startswith("${{") and inner.endswith("}}"):
+        inner = inner[3:-2].strip()
+    return [term.strip() for term in inner.split("&&")]
+
+
 class ReleaseVerifySkipsOnlyNonPublishingPushes(unittest.TestCase):
     def setUp(self) -> None:
         self.text = WORKFLOW.read_text(encoding="utf-8")
         self.verify_steps = job_steps(job_block(self.text, "verify-release-ref"))
+        self.prepare_steps = job_steps(job_block(self.text, "prepare-release"))
 
     def test_resolve_exports_the_publish_scope(self) -> None:
         resolve = job_block(self.text, "resolve-release-ref")
@@ -279,31 +315,43 @@ class ReleaseVerifySkipsOnlyNonPublishingPushes(unittest.TestCase):
         self.assertIn("      full_verify: ${{ steps.publish-scope.outputs.full_verify }}", resolve)
         step_with_id(job_steps(resolve), "publish-scope")
 
-    def test_every_heavy_verify_step_requires_full_verification(self) -> None:
+    def test_heavy_steps_carry_exactly_the_full_verify_condition(self) -> None:
         for name in HEAVY_STEPS:
-            self.assertIn(FULL_VERIFY_CONDITION, step_condition(step_named(self.verify_steps, name)), name)
+            self.assertEqual(step_condition(step_named(self.verify_steps, name)), FULL_VERIFY_CONDITION, name)
+        self.assertEqual(step_condition(step_named(self.verify_steps, FREE_DISK_STEP)), FREE_DISK_CONDITION)
+
+    def test_every_verify_step_is_classified(self) -> None:
         heavy = 0
+        lifecycle = []
         for step in self.verify_steps:
-            body = "\n".join(line for line in step.splitlines() if not line.lstrip().startswith("#"))
-            if any(marker in body for marker in HEAVY_MARKERS):
+            key = step_key(step)
+            condition = step_condition(step)
+            if condition == FULL_VERIFY_CONDITION or (key == FREE_DISK_STEP and condition == FREE_DISK_CONDITION):
                 heavy += 1
-                self.assertIn(
-                    FULL_VERIFY_CONDITION,
-                    step_condition(step),
-                    f"verify-release-ref step without the full_verify condition:\n{step}",
+            elif condition == LIFECYCLE_CONDITION and key in LIFECYCLE_EVIDENCE_STEPS:
+                lifecycle.append(key)
+            elif key in EVERY_PUSH_STEPS and "full_verify" not in condition:
+                continue
+            else:
+                self.fail(
+                    "verify-release-ref step is neither an every-push step, nor gated exactly on "
+                    f"full_verify, nor a lifecycle evidence step:\n{step}"
                 )
-        self.assertGreaterEqual(heavy, len(HEAVY_STEPS))
+        self.assertEqual(heavy, HEAVY_STEP_COUNT)
+        self.assertEqual(sorted(lifecycle), sorted(LIFECYCLE_EVIDENCE_STEPS))
 
     def test_every_push_steps_still_run(self) -> None:
         for name in EVERY_PUSH_STEPS:
+            if name.startswith("uses:"):
+                continue
             self.assertNotIn("full_verify", step_condition(step_named(self.verify_steps, name)), name)
         for step in self.verify_steps:
             if "actions/checkout@" in step or "actions/setup-python@" in step:
                 self.assertNotIn("full_verify", step)
-        self.assertIn("check-push-range", step_named(self.verify_steps, EVERY_PUSH_STEPS[2]))
+        self.assertIn("check-push-range", step_named(self.verify_steps, EVERY_PUSH_STEPS[6]))
 
     def test_context_refuses_a_release_this_run_did_not_fully_verify(self) -> None:
-        context = step_with_id(job_steps(job_block(self.text, "prepare-release")), "context")
+        context = step_with_id(self.prepare_steps, "context")
         self.assertIn(
             "          RESOLVED_CAN_PUBLISH: ${{ needs.resolve-release-ref.outputs.can_publish }}",
             context,
@@ -314,14 +362,69 @@ class ReleaseVerifySkipsOnlyNonPublishingPushes(unittest.TestCase):
             "            exit 1\n"
             "          fi\n"
         )
-        self.assertIn(guard, context)
-        self.assertLess(context.index(guard), context.index('echo "release_created=$RELEASE_READY"'))
+        self.assertEqual(context.count(guard), 1)
+        output = 'echo "release_created=$RELEASE_READY"'
         self.assertEqual(context.count('echo "release_created='), 1)
+        between = context[context.index(guard) + len(guard):context.index(output)]
+        self.assertNotIn("RELEASE_READY=", between)
 
     def test_publishing_jobs_require_a_created_release(self) -> None:
         jobs = parse_jobs(self.text)
         for name in PUBLISHING_JOBS:
-            self.assertIn("needs.prepare-release.outputs.release_created == 'true'", jobs[name]["if"], name)
+            condition = jobs[name]["if"]
+            self.assertIsInstance(condition, str, name)
+            self.assertNotIn("||", condition, name)
+            self.assertIn(RELEASE_CREATED_TERM, expression_terms(condition), name)
+
+    def test_auto_merge_requires_green_ci_unless_fully_verified(self) -> None:
+        step = step_named(self.prepare_steps, "Auto-merge release PR")
+        self.assertIn("          FULL_VERIFY: ${{ needs.resolve-release-ref.outputs.full_verify }}\n", step)
+        self.assertIn("          CI_LOOKUP_TOKEN: ${{ github.token }}\n", step)
+        self.assertEqual(step.count(CI_REQUIREMENT), 1)
+        self.assertEqual(step.count("gh pr merge "), 1)
+        self.assertTrue(run_script(step).startswith("set -euo pipefail\n" + CI_REQUIREMENT[10:].replace("\n          ", "\n")))
+        self.assertLess(step.index(CI_REQUIREMENT), step.index("autorelease: pending"))
+        self.assertLess(step.index(CI_REQUIREMENT), step.index('gh pr merge "$PR"'))
+
+    def test_prepare_release_can_outlast_the_ci_wait(self) -> None:
+        block = job_block(self.text, "prepare-release")
+        timeout = re.search(r"^    timeout-minutes:\s*([0-9]+)\s*$", block, re.M)
+        self.assertIsNotNone(timeout)
+        self.assertGreaterEqual(int(timeout.group(1)), CI_WAIT_MINUTES + 20)
+        self.assertRegex(block, r"(?m)^      actions: (read|write)$")
+
+
+class AutoMergeCiRequirementBehaviour(unittest.TestCase):
+    def setUp(self) -> None:
+        bash = find_bash()
+        if bash is None:
+            if os.name == "nt":
+                self.skipTest("Git Bash is not available on this Windows host")
+            self.fail("bash is required to exercise the auto-merge CI requirement")
+        self.bash = bash
+        text = WORKFLOW.read_text(encoding="utf-8")
+        step = step_named(job_steps(job_block(text, "prepare-release")), "Auto-merge release PR")
+        script = run_script(step)
+        requirement = CI_REQUIREMENT.replace("\n          ", "\n")[10:]
+        self.assertIn(requirement, script)
+        self.snippet = "set -euo pipefail\npython() { echo \"called $*\"; exit 7; }\n" + requirement + "echo merged\n"
+
+    def outcome(self, full_verify: str) -> subprocess.CompletedProcess[bytes]:
+        env = {**os.environ, "FULL_VERIFY": full_verify, "CI_LOOKUP_TOKEN": "x", "GITHUB_SHA": "a" * 40}
+        return subprocess.run([self.bash, "-c", self.snippet], env=env, capture_output=True)
+
+    def test_fully_verified_run_bypasses_the_ci_requirement(self) -> None:
+        result = self.outcome("true")
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn(b"called", result.stdout)
+
+    def test_skipped_verification_requires_the_ci_check_and_stops_on_its_failure(self) -> None:
+        for value in ("false", "", "TRUE"):
+            with self.subTest(full_verify=value):
+                result = self.outcome(value)
+                self.assertEqual(result.returncode, 7)
+                self.assertIn(b"called -I execution/require_ci_success.py --sha " + b"a" * 40, result.stdout)
+                self.assertNotIn(b"merged", result.stdout)
 
 
 def find_bash() -> str | None:

@@ -1878,7 +1878,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 // three in, none a doctest lane; census still 91/53/2.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
     ("ci.yml", "f7b866f75b7ae374:47014"),
-    ("release.yml", "15cdbbea387160ee:117752"),
+    ("release.yml", "90d2496ac54feca4:118041"),
 ];
 
 /// The repo's cargo config, verbatim. Pinned rather than parsed: an
