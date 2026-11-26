@@ -236,3 +236,30 @@ The small-file penalty that motivated `repo_map(detail="routing")` fell from abo
 | #954 | `code_execute` decides inline-or-spill on the lean text it sends, and the default inline limit is 32,000 characters (was 16,000) | A 1,000-row list (about 10K as lean text) and three functions of 340 to 382 lines (16.4K to 17.6K characters) each came back as a truncated preview plus a spill file | All four return inline in one call | Sandbox and MCP surface tests; sizes from a throwaway measurement test |
 
 The row above belongs to the 25 November results table; it merged after the table was written.
+
+
+## 26 November results (merged to main)
+
+Measured on the same Windows host after a reboot (23.5 GB committed of 51.4 GB), matched optimized builds (opt-level 3, 8 codegen units, no LTO), runs interleaved, against the Moldwright checkout: 5,194 indexed files, 34 MB, and an ignored `node_modules` tree of 1.2 million entries. Harness: `fix7-clocks/restore_measure.py` with `SYMFORGE_CODE_OUTPUT=json` added to its environment, because `code_execute` returns lean text since #949.
+
+| PR | Change | Before | After |
+|---|---|---|---|
+| #955 | The post-restore check no longer walks ignored directories, lists each directory level in parallel, and reuses the size and mtime its walk already read instead of a second lookup per file | First correct stdio answer 169.7 s on the 7th attempt after 6 loading refusals; four other runs gave no answer inside 120 s. New-file walk 156.0 s, ending in "admitted source discovery exceeds its file bound". Stat pass 3.70 s. Whole verification 161.1 s | First correct answer 10.5 to 11.8 s on the first attempt. Walk 0.93 to 0.97 s and it completes. Stat pass 0.21 s (423 individual lookups, 4,771 taken from the walk). Whole verification 2.7 s |
+| #957 | The restore proof proves files in path order and opens each parent directory once per run of up to 32 files, instead of re-checking every ancestor from the root for every file. Every file is still read and hashed | Read and hash 5.56 to 8.78 s; first correct answer 9.56 to 13.59 s | Read and hash 2.73 to 2.93 s in five of six runs; first correct answer 6.91 to 7.51 s in five of six runs |
+| #956 | CI only: the `embed-musl` job builds the musl 1.2.6 compiler wrapper from the official source with a pinned SHA-256, after the prebuilt download site's TLS certificate expired on 26 November | Job failed before compiling on every run | Job passes in under 3 minutes |
+
+What the measurements showed:
+
+- The 25 November figure of 2.73 s for the new-file walk on this repo was not reproduced on 26 November, when the same walk on main took 156 s and failed at its 200,000-entry bound. The reason for the fast figure on the 25th was not established. Treat the 25 November restore totals (13.4 s and 11.3 s) as not representative of a repo with a large ignored tree.
+- The cost of the restore proof is file opens, not reading or hashing. A plain serial open, read and SHA-256 of 5,078 files spent 2.8 to 5.2 s opening, 0.13 to 0.19 s reading and about 0.2 s hashing. In an isolated reader over 5,609 files the per-file route took a median 5.44 s, the grouped route 1.85 s, and plain unguarded reads 1.26 s.
+- Grouping by directory only pays when a batch shares directories. The snapshot map iterates in hash order; before the entries were sorted by path the grouped reader gave 3.72 to 4.34 s live, after sorting 2.16 to 3.07 s.
+- A first shape that opened all of a batch's directories up front could hold 256 directory handles at once, enough to reach the macOS default open-file limit. The merged shape holds one directory per worker. A group limit of 8 instead of 32 measured no faster.
+
+Phase clocks on main after #957, one typical run: files read and hashed 2.8 s, new-file walk 0.87 s, stat pass 0.22 s, spot check 0.5 s, verification publication 0.3 s, first answer 7.0 s.
+
+### Still open after 26 November
+
+- The read-and-hash phase is still the largest part of launch. The remaining floor is one open per file, about 0.5 ms each on this host. Going below it means not opening every file, which is a decision about what the restore proof promises and belongs to the owner.
+- The spot check re-reads 10% of files the proof hashed in full seconds earlier, about 0.5 s.
+- A repo with more than 200,000 entries that are not ignored still fails the new-file walk at its bound.
+- The items listed under "Still open, found on 25 November" are unchanged, except that the restore second pass is done.
