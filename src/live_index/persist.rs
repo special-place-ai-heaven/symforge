@@ -2677,6 +2677,50 @@ fn read_restore_candidate(
     Ok((bytes.len() == expected_len).then_some(bytes))
 }
 
+#[cfg(any(feature = "server", feature = "embed"))]
+fn ordered_parallel_map_by_directory<T, R>(
+    lease: &crate::index_lifecycle::physical_root::PhysicalRootLease,
+    items: &[T],
+    relative: impl Fn(&T) -> &Path + Sync + Send,
+    work: impl Fn(&crate::index_lifecycle::physical_root::PhysicalRootLease, &Path, &T) -> R
+    + Sync
+    + Send,
+) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+{
+    fn parent_and_leaf(path: &Path) -> Option<(&Path, &std::ffi::OsStr)> {
+        let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())?;
+        let leaf = path.file_name()?;
+        path.components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+            .then_some((parent, leaf))
+    }
+    let mut parents: Vec<&Path> = items
+        .iter()
+        .filter_map(|item| parent_and_leaf(relative(item)).map(|(parent, _)| parent))
+        .collect();
+    parents.sort_unstable();
+    parents.dedup();
+    let opened = crate::live_index::store::ordered_parallel_map(&parents, |parent| {
+        lease.child_directory(parent, false).ok()
+    });
+    let children: HashMap<&Path, _> = parents
+        .iter()
+        .copied()
+        .zip(opened)
+        .filter_map(|(parent, child)| Some((parent, child?)))
+        .collect();
+    crate::live_index::store::ordered_parallel_map(items, |item| {
+        let path = relative(item);
+        match parent_and_leaf(path).and_then(|(parent, leaf)| Some((children.get(parent)?, leaf))) {
+            Some((child, leaf)) => work(child, Path::new(leaf), item),
+            None => work(lease, path, item),
+        }
+    })
+}
+
 /// Prove snapshot entries against the source directory originally admitted by
 /// the embedded runtime. A path with the same spelling and bytes is not proof
 /// when its physical directory has changed.
@@ -6997,6 +7041,88 @@ mod tests {
         assert_eq!(result.deleted.len(), view.files.len());
         assert!(result.new_files.is_empty());
         assert_eq!(result.discovery_error.as_deref(), Some("the walk failed"));
+    }
+
+    #[cfg(any(feature = "server", feature = "embed"))]
+    #[test]
+    fn directory_grouped_restore_reads_match_per_file_reads() {
+        use crate::index_lifecycle::physical_root::PhysicalRootLease;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        for relative in [
+            "top.rs",
+            "src/a.rs",
+            "src/b.rs",
+            "src/deep/c.rs",
+            "src/deep/deeper/d.rs",
+            "other/e.rs",
+        ] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("// {relative}\n")).unwrap();
+        }
+        #[cfg(unix)]
+        let (file_link, dir_link) = (
+            std::os::unix::fs::symlink(root.join("src/a.rs"), root.join("src/link.rs")),
+            std::os::unix::fs::symlink(root.join("src"), root.join("linked")),
+        );
+        #[cfg(windows)]
+        let (file_link, dir_link) = (
+            std::os::windows::fs::symlink_file(root.join("src/a.rs"), root.join("src/link.rs")),
+            std::os::windows::fs::symlink_dir(root.join("src"), root.join("linked")),
+        );
+        let entries: Vec<(String, usize)> = [
+            "top.rs",
+            "src/a.rs",
+            "src/b.rs",
+            "src/missing.rs",
+            "src/deep/c.rs",
+            "src/deep/deeper/d.rs",
+            "other/e.rs",
+            "absent/x.rs",
+            "absent/deeper/y.rs",
+            "top.rs/inside.rs",
+            "src/link.rs",
+            "linked/a.rs",
+            "linked/deep/c.rs",
+            "../escape.rs",
+            "src/deep/../a.rs",
+            "./src/a.rs",
+        ]
+        .iter()
+        .map(|relative| {
+            let len = std::fs::metadata(root.join(relative)).map_or(0, |m| m.len() as usize);
+            ((*relative).to_owned(), len)
+        })
+        .collect();
+        let lease = PhysicalRootLease::take(root);
+        let per_file: Vec<_> = entries
+            .iter()
+            .map(|(path, len)| read_restore_candidate(&lease, Path::new(path), *len))
+            .collect();
+        let grouped = || {
+            ordered_parallel_map_by_directory(
+                &lease,
+                &entries,
+                |(path, _)| Path::new(path),
+                |lease, relative, (_, len)| read_restore_candidate(lease, relative, *len),
+            )
+        };
+        assert_eq!(grouped(), per_file);
+        assert_eq!(crate::live_index::store::with_serial_oracle(grouped), per_file);
+
+        assert!(matches!(per_file[0], Ok(Some(_))));
+        assert!(matches!(per_file[5], Ok(Some(_))));
+        assert!(matches!(per_file[3], Ok(None)));
+        assert!(matches!(per_file[7], Ok(None)));
+        assert!(per_file[13].is_err());
+        if file_link.is_ok() {
+            assert!(per_file[10].is_err());
+        }
+        if dir_link.is_ok() {
+            assert!(per_file[11].is_err());
+            assert!(per_file[12].is_err());
+        }
     }
 
     #[cfg(any(feature = "server", feature = "embed"))]
