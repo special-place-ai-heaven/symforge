@@ -2933,10 +2933,19 @@ fn stat_check_files_from_view(
                 _ => discovered,
             };
             discovered
-                .map(|files| files.into_iter().map(|file| file.relative_path).collect())
+                .map(|files| DiscoveredSource {
+                    files: files.into_iter().map(|file| file.relative_path).collect(),
+                    observed: HashMap::new(),
+                })
                 .map_err(|error| AnchoredDiscoveryError::Failed(error.to_string()))
         },
     )
+}
+
+#[derive(Default)]
+struct DiscoveredSource {
+    files: Vec<String>,
+    observed: HashMap<String, (u64, u64)>,
 }
 
 enum AnchoredDiscoveryError {
@@ -2956,7 +2965,7 @@ fn stat_check_files_from_view_with(
     snapshot_mtimes: &HashMap<String, u64>,
     stop: &dyn Fn() -> bool,
     mut observe: impl FnMut(&[&str]) -> Vec<Result<Option<(u64, u64)>, String>>,
-    mut discover: impl FnMut() -> Result<Vec<String>, AnchoredDiscoveryError>,
+    mut discover: impl FnMut() -> Result<DiscoveredSource, AnchoredDiscoveryError>,
 ) -> Option<StatCheckResult> {
     let known_paths: std::collections::HashSet<&str> = verify_view
         .files
@@ -2969,21 +2978,57 @@ fn stat_check_files_from_view_with(
                 .map(String::as_str),
         )
         .collect();
+
+    let phase = Instant::now();
+    let discovered = discover();
+    info!(
+        "snapshot verify: new-file discovery finished in {:?}",
+        phase.elapsed()
+    );
+    let (discovered_files, walk_observed, discovery_failure) = match discovered {
+        Ok(DiscoveredSource { files, observed }) => (files, observed, None),
+        #[cfg(any(feature = "server", feature = "embed"))]
+        Err(AnchoredDiscoveryError::Cancelled) => return None,
+        Err(AnchoredDiscoveryError::Failed(e)) => {
+            warn!("stat_check_files: discover_files failed: {e}");
+            (Vec::new(), HashMap::new(), Some(e))
+        }
+    };
+
     let mut changed = Vec::new();
     let mut deleted = Vec::new();
     let mut observation_error = None;
+    let mut observed_individually = 0usize;
 
-    // Check each indexed file against disk
     let phase = Instant::now();
     for chunk in verify_view.files.chunks(SNAPSHOT_VERIFY_STOP_EVERY) {
         if stop() {
             return None;
         }
-        let paths: Vec<&str> = chunk
+        let from_walk: Vec<Option<(u64, u64)>> = chunk
             .iter()
-            .map(|file| file.relative_path.as_str())
+            .map(|file| walk_observed.get(&file.relative_path).copied())
             .collect();
-        for (file, observed) in chunk.iter().zip(observe(&paths)) {
+        let pending: Vec<&str> = chunk
+            .iter()
+            .zip(&from_walk)
+            .filter(|(_, walked)| walked.is_none())
+            .map(|(file, _)| file.relative_path.as_str())
+            .collect();
+        observed_individually += pending.len();
+        let mut fetched = if pending.is_empty() {
+            Vec::new()
+        } else {
+            observe(&pending)
+        }
+        .into_iter();
+        for (file, walked) in chunk.iter().zip(from_walk) {
+            let Some(observed) = walked
+                .map(|metadata| Ok(Some(metadata)))
+                .or_else(|| fetched.next())
+            else {
+                break;
+            };
             match observed {
                 Ok(Some((on_disk_size, on_disk_mtime))) => {
                     let stored_mtime = snapshot_mtimes
@@ -2996,7 +3041,6 @@ fn stat_check_files_from_view_with(
                     }
                 }
                 Ok(None) => {
-                    // File gone
                     deleted.push(file.relative_path.clone());
                 }
                 Err(error) => {
@@ -3007,33 +3051,17 @@ fn stat_check_files_from_view_with(
         }
     }
     info!(
-        "snapshot verify: stat pass observed {} files in {:?}",
+        "snapshot verify: stat pass checked {} files in {:?} ({} observed individually, {} taken from the discovery walk)",
         verify_view.files.len(),
-        phase.elapsed()
+        phase.elapsed(),
+        observed_individually,
+        verify_view.files.len() - observed_individually
     );
 
-    // Find new files (on disk but not in index)
-    let phase = Instant::now();
-    let discovered = discover();
-    info!(
-        "snapshot verify: new-file discovery finished in {:?}",
-        phase.elapsed()
-    );
-    let (new_files, discovery_error) = match discovered {
-        Ok(discovered) => (
-            discovered
-                .into_iter()
-                .filter(|path| !known_paths.contains(path.as_str()))
-                .collect(),
-            observation_error,
-        ),
-        #[cfg(any(feature = "server", feature = "embed"))]
-        Err(AnchoredDiscoveryError::Cancelled) => return None,
-        Err(AnchoredDiscoveryError::Failed(e)) => {
-            warn!("stat_check_files: discover_files failed: {e}");
-            (Vec::new(), Some(e))
-        }
-    };
+    let new_files = discovered_files
+        .into_iter()
+        .filter(|path| !known_paths.contains(path.as_str()))
+        .collect();
 
     if stop() {
         return None;
@@ -3042,7 +3070,7 @@ fn stat_check_files_from_view_with(
         changed,
         deleted,
         new_files,
-        discovery_error,
+        discovery_error: discovery_failure.or(observation_error),
     })
 }
 
@@ -3052,10 +3080,7 @@ fn discover_files_from_source_anchor(
     index: &crate::live_index::store::SharedIndex,
     authority: &crate::index_lifecycle::activation::ProjectSourceAuthority,
     stop: &dyn Fn() -> bool,
-) -> Result<Vec<String>, AnchoredDiscoveryError> {
-    use crate::index_lifecycle::physical_root::{AnchoredEntryKind, list_directory_beneath};
-    use std::collections::VecDeque;
-
+) -> Result<DiscoveredSource, AnchoredDiscoveryError> {
     #[cfg(test)]
     if test_discovery_failure_root().lock().as_deref() == Some(root) {
         return Err(format!("injected discovery failure under {}", root.display()).into());
@@ -3065,82 +3090,143 @@ fn discover_files_from_source_anchor(
     let max_entries = usize::try_from(limits.max_files)
         .unwrap_or(usize::MAX)
         .min(200_000);
+    discover_files_from_source_anchor_within(root, index, authority, stop, max_entries)
+}
+
+#[cfg(any(feature = "server", feature = "embed"))]
+fn discover_files_from_source_anchor_within(
+    root: &Path,
+    index: &crate::live_index::store::SharedIndex,
+    authority: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+    stop: &dyn Fn() -> bool,
+    max_entries: usize,
+) -> Result<DiscoveredSource, AnchoredDiscoveryError> {
+    use crate::index_lifecycle::physical_root::{AnchoredEntryKind, list_directory_beneath};
+
     let exclusions = index.source_exclusions();
-    let mut directories = VecDeque::from([PathBuf::from(".")]);
+    let unlisted = || "the admitted source directory could not be listed".to_string();
+    let mut level = vec![PathBuf::from(".")];
     let mut files = Vec::new();
-    let mut ignore_files = Vec::new();
+    let mut observed = HashMap::new();
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    let mut matcher = ignore::gitignore::Gitignore::empty();
     let mut visited = 0usize;
-    while let Some(directory) = directories.pop_front() {
-        if stop() {
-            return Err(AnchoredDiscoveryError::Cancelled);
-        }
-        let entries = authority
-            .with_source_anchor_read(|lease| list_directory_beneath(lease, &directory, max_entries))
-            .map_err(|_| "the admitted source directory could not be listed".to_string())?
-            .ok_or_else(|| "an admitted source directory vanished".to_string())?;
-        visited = visited.saturating_add(entries.len());
-        if visited > max_entries {
-            return Err("admitted source discovery exceeds its file bound"
-                .to_string()
-                .into());
-        }
-        for entry in entries {
-            if crate::discovery::path_is_hard_scope_excluded(&entry.relative)
-                || exclusions.excludes_relative(&entry.relative)
-            {
-                continue;
+    while !level.is_empty() {
+        let mut next_level = Vec::new();
+        let mut ignore_files = Vec::new();
+        for batch in level.chunks(SOURCE_ANCHOR_READ_BATCH) {
+            if stop() {
+                return Err(AnchoredDiscoveryError::Cancelled);
             }
-            let relative = entry
-                .relative
-                .to_str()
-                .ok_or_else(|| "source path encoding is unsupported".to_string())?
-                .replace('\\', "/");
-            if crate::discovery::is_under_repo_root_build_dir(&relative, None) {
-                continue;
-            }
-            match entry.kind {
-                AnchoredEntryKind::Directory => directories.push_back(entry.relative),
-                AnchoredEntryKind::Regular => {
-                    if relative.ends_with(".gitignore") || relative.ends_with(".ignore") {
-                        ignore_files.push((relative.clone(), entry.relative.clone()));
+            let listed = std::sync::atomic::AtomicUsize::new(visited);
+            let list = |lease: &crate::index_lifecycle::physical_root::PhysicalRootLease,
+                        directory: &PathBuf| {
+                #[cfg(test)]
+                test_anchor_listings().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                list_directory_beneath(lease, directory, max_entries)
+            };
+            let listings = authority
+                .with_source_anchor_read(|lease| {
+                    Ok(crate::live_index::store::ordered_parallel_map(
+                        batch,
+                        |directory| {
+                            if listed.load(std::sync::atomic::Ordering::Relaxed) > max_entries {
+                                return None;
+                            }
+                            let listing = list(lease, directory);
+                            if let Ok(Some(entries)) = &listing {
+                                listed
+                                    .fetch_add(entries.len(), std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Some(listing)
+                        },
+                    ))
+                })
+                .map_err(|_| unlisted())?;
+            for (directory, listing) in batch.iter().zip(listings) {
+                let listing = match listing {
+                    Some(listing) => listing.map_err(|_| unlisted()),
+                    None => authority
+                        .with_source_anchor_read(|lease| list(lease, directory))
+                        .map_err(|_| unlisted()),
+                };
+                let entries =
+                    listing?.ok_or_else(|| "an admitted source directory vanished".to_string())?;
+                visited = visited.saturating_add(entries.len());
+                if visited > max_entries {
+                    return Err("admitted source discovery exceeds its file bound"
+                        .to_string()
+                        .into());
+                }
+                for entry in entries {
+                    if crate::discovery::path_is_hard_scope_excluded(&entry.relative)
+                        || exclusions.excludes_relative(&entry.relative)
+                    {
+                        continue;
                     }
-                    if crate::domain::LanguageId::from_path(&relative).is_some() {
-                        files.push(relative);
+                    let relative = entry
+                        .relative
+                        .to_str()
+                        .ok_or_else(|| "source path encoding is unsupported".to_string())?
+                        .replace('\\', "/");
+                    if crate::discovery::is_under_repo_root_build_dir(&relative, None) {
+                        continue;
+                    }
+                    match entry.kind {
+                        AnchoredEntryKind::Directory => next_level.push(entry.relative),
+                        AnchoredEntryKind::Regular => {
+                            if relative.ends_with(".gitignore") || relative.ends_with(".ignore") {
+                                ignore_files.push((relative.clone(), entry.relative.clone()));
+                            }
+                            if crate::domain::LanguageId::from_path(&relative).is_some() {
+                                if let Some(modified_secs) = entry.modified_secs {
+                                    observed.insert(relative.clone(), (entry.len, modified_secs));
+                                }
+                                files.push(relative);
+                            }
+                        }
+                        AnchoredEntryKind::Link | AnchoredEntryKind::Other => {}
                     }
                 }
-                AnchoredEntryKind::Link | AnchoredEntryKind::Other => {}
             }
         }
+        if !ignore_files.is_empty() {
+            for (relative, path) in ignore_files {
+                let bytes = authority
+                    .with_source_anchor_read(|lease| {
+                        crate::index_lifecycle::physical_root::read_regular_beneath(
+                            lease,
+                            &path,
+                            256 * 1024,
+                        )
+                    })
+                    .map_err(|_| "an admitted ignore file could not be read".to_string())?
+                    .ok_or_else(|| "an admitted ignore file vanished".to_string())?;
+                let contents = std::str::from_utf8(&bytes)
+                    .map_err(|_| "an admitted ignore file is not UTF-8".to_string())?;
+                let relative_parent = path.parent().unwrap_or_else(|| Path::new("."));
+                crate::discovery::add_gitignore_contents(
+                    &mut builder,
+                    relative_parent,
+                    &root.join(relative),
+                    contents,
+                );
+            }
+            matcher = builder
+                .build()
+                .map_err(|_| "admitted ignore rules could not be compiled".to_string())?;
+        }
+        next_level.retain(|directory| {
+            !matcher
+                .matched_path_or_any_parents(directory.to_string_lossy().replace('\\', "/"), true)
+                .is_ignore()
+        });
+        level = next_level;
     }
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
-    for (relative, path) in ignore_files {
-        let bytes = authority
-            .with_source_anchor_read(|lease| {
-                crate::index_lifecycle::physical_root::read_regular_beneath(
-                    lease,
-                    &path,
-                    256 * 1024,
-                )
-            })
-            .map_err(|_| "an admitted ignore file could not be read".to_string())?
-            .ok_or_else(|| "an admitted ignore file vanished".to_string())?;
-        let contents = std::str::from_utf8(&bytes)
-            .map_err(|_| "an admitted ignore file is not UTF-8".to_string())?;
-        let relative_parent = path.parent().unwrap_or_else(|| Path::new("."));
-        crate::discovery::add_gitignore_contents(
-            &mut builder,
-            relative_parent,
-            &root.join(relative),
-            contents,
-        );
-    }
-    let matcher = builder
-        .build()
-        .map_err(|_| "admitted ignore rules could not be compiled".to_string())?;
     files.retain(|path| !matcher.matched_path_or_any_parents(path, false).is_ignore());
     files.sort();
     files.dedup();
-    Ok(files)
+    Ok(DiscoveredSource { files, observed })
 }
 
 #[cfg(any(feature = "server", feature = "embed"))]
@@ -3310,6 +3396,12 @@ fn publish_snapshot_verify_from_source_anchor(
 fn test_discovery_failure_root() -> &'static parking_lot::Mutex<Option<PathBuf>> {
     static ROOT: parking_lot::Mutex<Option<PathBuf>> = parking_lot::Mutex::new(None);
     &ROOT
+}
+
+#[cfg(all(test, any(feature = "server", feature = "embed")))]
+fn test_anchor_listings() -> &'static std::sync::atomic::AtomicUsize {
+    static LISTINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    &LISTINGS
 }
 
 /// Files a stat pass or spot check handles between two stop checks.
@@ -6733,7 +6825,7 @@ mod tests {
                     verdict(positions[path])
                 })
             },
-            || Ok(Vec::new()),
+            || Ok(DiscoveredSource::default()),
         )
         .expect("not stopped");
         assert_eq!(batches.get(), 3);
@@ -6752,11 +6844,325 @@ mod tests {
                     observed.set(true);
                     paths.iter().map(|_| Ok(None)).collect()
                 },
-                || Ok(Vec::new()),
+                || Ok(DiscoveredSource::default()),
             )
             .is_none()
         );
         assert!(!observed.get(), "a stopped pass observes nothing");
+    }
+
+    #[test]
+    fn stat_pass_takes_walk_observations_and_observes_only_the_rest() {
+        let names: Vec<String> = (0..SNAPSHOT_VERIFY_STOP_EVERY + 11)
+            .map(|i| format!("f{i:05}.rs"))
+            .collect();
+        let index = make_live_index_with_files(
+            names
+                .iter()
+                .map(|name| (name.as_str(), b"fn f() {}\n".as_slice()))
+                .collect(),
+        );
+        let view = capture_verify_view(&index);
+        let snapshot_mtimes: HashMap<String, u64> = view
+            .files
+            .iter()
+            .map(|file| (file.relative_path.clone(), 100))
+            .collect();
+        let positions: HashMap<&str, usize> = view
+            .files
+            .iter()
+            .enumerate()
+            .map(|(position, file)| (file.relative_path.as_str(), position))
+            .collect();
+        let disk = |position: usize| -> Option<(u64, u64)> {
+            let len = view.files[position].byte_len;
+            match position % 6 {
+                1 => Some((len + 1, 100)),
+                2 => Some((len, 101)),
+                3 => None,
+                _ => Some((len, 100)),
+            }
+        };
+        let walked_files: Vec<String> = view
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| disk(*position).is_some())
+            .map(|(_, file)| file.relative_path.clone())
+            .chain(["new/one.rs".to_string(), "new/two.rs".to_string()])
+            .collect();
+        let walked_metadata: HashMap<String, (u64, u64)> = view
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| position % 4 != 1)
+            .filter_map(|(position, file)| {
+                disk(position).map(|observed| (file.relative_path.clone(), observed))
+            })
+            .collect();
+
+        let all_observed = stat_check_files_from_view_with(
+            &view,
+            &snapshot_mtimes,
+            &|| false,
+            |paths| paths.iter().map(|path| Ok(disk(positions[path]))).collect(),
+            || {
+                Ok(DiscoveredSource {
+                    files: walked_files.clone(),
+                    observed: HashMap::new(),
+                })
+            },
+        )
+        .expect("not stopped");
+
+        let individually = std::cell::RefCell::new(Vec::new());
+        let reused = stat_check_files_from_view_with(
+            &view,
+            &snapshot_mtimes,
+            &|| false,
+            |paths| {
+                individually
+                    .borrow_mut()
+                    .extend(paths.iter().map(|path| path.to_string()));
+                paths.iter().map(|path| Ok(disk(positions[path]))).collect()
+            },
+            || {
+                Ok(DiscoveredSource {
+                    files: walked_files.clone(),
+                    observed: walked_metadata.clone(),
+                })
+            },
+        )
+        .expect("not stopped");
+
+        let expected_individual: Vec<String> = view
+            .files
+            .iter()
+            .filter(|file| !walked_metadata.contains_key(&file.relative_path))
+            .map(|file| file.relative_path.clone())
+            .collect();
+        assert!(!expected_individual.is_empty());
+        assert!(expected_individual.len() < view.files.len());
+        assert_eq!(individually.into_inner(), expected_individual);
+        assert_eq!(reused.changed, all_observed.changed);
+        assert_eq!(reused.deleted, all_observed.deleted);
+        assert_eq!(reused.new_files, all_observed.new_files);
+        assert_eq!(reused.discovery_error, all_observed.discovery_error);
+        assert!(!reused.deleted.is_empty());
+        assert!(
+            reused
+                .changed
+                .iter()
+                .any(|path| positions[path.as_str()] % 6 == 1)
+        );
+        assert!(
+            reused
+                .changed
+                .iter()
+                .any(|path| positions[path.as_str()] % 6 == 2)
+        );
+        assert_eq!(reused.new_files, vec!["new/one.rs", "new/two.rs"]);
+        assert_eq!(reused.discovery_error, None);
+    }
+
+    #[test]
+    fn stat_pass_observes_every_file_when_discovery_fails() {
+        let names: Vec<String> = (0..SNAPSHOT_VERIFY_STOP_EVERY + 5)
+            .map(|i| format!("f{i:05}.rs"))
+            .collect();
+        let index = make_live_index_with_files(
+            names
+                .iter()
+                .map(|name| (name.as_str(), b"fn f() {}\n".as_slice()))
+                .collect(),
+        );
+        let view = capture_verify_view(&index);
+        let observed = std::cell::Cell::new(0usize);
+        let result = stat_check_files_from_view_with(
+            &view,
+            &HashMap::new(),
+            &|| false,
+            |paths| {
+                observed.set(observed.get() + paths.len());
+                paths.iter().map(|_| Ok(None)).collect()
+            },
+            || {
+                Err(AnchoredDiscoveryError::Failed(
+                    "the walk failed".to_string(),
+                ))
+            },
+        )
+        .expect("not stopped");
+        assert_eq!(observed.get(), view.files.len());
+        assert_eq!(result.deleted.len(), view.files.len());
+        assert!(result.new_files.is_empty());
+        assert_eq!(result.discovery_error.as_deref(), Some("the walk failed"));
+    }
+
+    #[cfg(any(feature = "server", feature = "embed"))]
+    #[test]
+    fn level_parallel_discovery_matches_the_serial_walk() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let wide: Vec<String> = (0..SOURCE_ANCHOR_READ_BATCH + 3)
+            .map(|i| format!("wide/d{i:03}/x.rs"))
+            .collect();
+        let fixed = [
+            "a.rs",
+            "src/b.rs",
+            "src/deep/c.rs",
+            "src/deep/deeper/d.rs",
+            "ignored/e.rs",
+            "notes.txt",
+        ];
+        for relative in fixed.iter().copied().chain(wide.iter().map(String::as_str)) {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("// {relative}\n")).unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(root.join("src"), root.join("linked"));
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_dir(root.join("src"), root.join("linked"));
+
+        let index =
+            crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(Vec::new()));
+        let authority = crate::index_lifecycle::activation::ProjectSourceAuthority::for_root(root);
+        let walk = || match discover_files_from_source_anchor(root, &index, &authority, &|| false) {
+            Ok(discovered) => discovered,
+            Err(_) => panic!("the walk must succeed"),
+        };
+        let parallel = walk();
+        let serial = crate::live_index::store::with_serial_oracle(walk);
+        assert_eq!(parallel.files, serial.files);
+        assert_eq!(parallel.observed, serial.observed);
+
+        let mut expected: Vec<String> = [
+            ".gitignore",
+            "a.rs",
+            "notes.txt",
+            "src/b.rs",
+            "src/deep/c.rs",
+            "src/deep/deeper/d.rs",
+        ]
+        .iter()
+        .map(|path| path.to_string())
+        .chain(wide.iter().cloned())
+        .collect();
+        expected.sort();
+        assert_eq!(parallel.files, expected);
+        assert!(!parallel.observed.contains_key("ignored/e.rs"));
+        for relative in &parallel.files {
+            let metadata = std::fs::metadata(root.join(relative)).unwrap();
+            let modified = metadata
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            assert_eq!(parallel.observed[relative], (metadata.len(), modified));
+        }
+
+        let stops = std::cell::Cell::new(0usize);
+        let cancelled = discover_files_from_source_anchor(root, &index, &authority, &|| {
+            stops.set(stops.get() + 1);
+            stops.get() > 2
+        });
+        assert!(matches!(cancelled, Err(AnchoredDiscoveryError::Cancelled)));
+    }
+
+    #[cfg(any(feature = "server", feature = "embed"))]
+    #[test]
+    fn discovery_does_not_list_ignored_directories_and_honours_nested_reinclusion() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        for relative in [
+            "a.rs",
+            "build/y.rs",
+            "src/b.rs",
+            "src/gen/g.rs",
+            "src/gen/inner/h.rs",
+            "src/build/x.rs",
+        ] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("// {relative}\n")).unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "build/\n").unwrap();
+        std::fs::write(root.join("src/.gitignore"), "gen/\n!build/\n").unwrap();
+        std::fs::write(root.join("src/gen/.gitignore"), "!inner/\n").unwrap();
+
+        let index =
+            crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(Vec::new()));
+        let authority = crate::index_lifecycle::activation::ProjectSourceAuthority::for_root(root);
+        let walk = || match discover_files_from_source_anchor(root, &index, &authority, &|| false) {
+            Ok(discovered) => discovered,
+            Err(_) => panic!("the walk must succeed"),
+        };
+        let parallel = walk();
+        let serial = crate::live_index::store::with_serial_oracle(walk);
+        assert_eq!(parallel.files, serial.files);
+        assert_eq!(parallel.observed, serial.observed);
+
+        assert_eq!(
+            parallel.files,
+            vec![
+                ".gitignore",
+                "a.rs",
+                "src/.gitignore",
+                "src/b.rs",
+                "src/build/x.rs"
+            ]
+        );
+        let mut observed: Vec<&str> = parallel.observed.keys().map(String::as_str).collect();
+        observed.sort();
+        assert_eq!(observed, parallel.files);
+    }
+
+    #[cfg(any(feature = "server", feature = "embed"))]
+    #[test]
+    fn discovery_stops_listing_once_the_entry_bound_is_crossed() {
+        use std::sync::atomic::Ordering;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        for directory in 0..200 {
+            for file in 0..3 {
+                let path = root.join(format!("wide/d{directory:03}/f{file}.rs"));
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "// f\n").unwrap();
+            }
+        }
+        let index =
+            crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(Vec::new()));
+        let authority = crate::index_lifecycle::activation::ProjectSourceAuthority::for_root(root);
+        let walk = || {
+            test_anchor_listings().store(0, Ordering::SeqCst);
+            let outcome = match discover_files_from_source_anchor_within(
+                root,
+                &index,
+                &authority,
+                &|| false,
+                250,
+            ) {
+                Ok(_) => panic!("the walk must cross its bound"),
+                Err(AnchoredDiscoveryError::Failed(error)) => error,
+                Err(AnchoredDiscoveryError::Cancelled) => panic!("the walk was not stopped"),
+            };
+            (outcome, test_anchor_listings().load(Ordering::SeqCst))
+        };
+        let (parallel_error, parallel_listings) = walk();
+        let (serial_error, serial_listings) = crate::live_index::store::with_serial_oracle(walk);
+        assert_eq!(
+            serial_error,
+            "admitted source discovery exceeds its file bound"
+        );
+        assert_eq!(parallel_error, serial_error);
+        assert_eq!(serial_listings, 19);
+        assert!(
+            parallel_listings < 200,
+            "listed {parallel_listings} directories past the bound"
+        );
     }
 
     #[test]
