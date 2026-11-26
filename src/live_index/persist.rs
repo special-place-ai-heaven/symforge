@@ -2567,10 +2567,11 @@ fn run_snapshot_store_restore_proof_with(
     let proofs = std::cell::OnceCell::new();
     let prove_all = || -> HashMap<&str, RestoreFileProof> {
         let phase = Instant::now();
-        let entries: Vec<(&str, &IndexedFileSnapshot)> = files
+        let mut entries: Vec<(&str, &IndexedFileSnapshot)> = files
             .iter()
             .map(|(path, file)| (path.as_str(), file))
             .collect();
+        entries.sort_unstable_by_key(|(path, _)| *path);
         let proven = entries
             .iter()
             .map(|(path, _)| *path)
