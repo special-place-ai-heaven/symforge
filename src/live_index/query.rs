@@ -8628,6 +8628,126 @@ public class PacketsController {
     }
 
     #[test]
+    fn test_find_dependents_rows_repeat_across_fresh_indexes_with_two_barrels() {
+        let widget_symbol = SymbolRecord {
+            name: "Widget".to_string(),
+            kind: SymbolKind::Struct,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (0, 22),
+            line_range: (0, 0),
+            doc_byte_range: None,
+            item_byte_range: None,
+        };
+        let build = || {
+            let mut files = vec![(
+                "src/model.rs".to_string(),
+                make_file_with_refs_and_content(
+                    "src/model.rs",
+                    LanguageId::Rust,
+                    "pub struct Widget {}",
+                    vec![],
+                    vec![widget_symbol.clone()],
+                ),
+            )];
+            for barrel in ["src/shapes.rs", "src/prelude.rs"] {
+                files.push((
+                    barrel.to_string(),
+                    make_file_with_refs_and_content(
+                        barrel,
+                        LanguageId::Rust,
+                        "pub use crate::model::Widget;\n",
+                        vec![make_ref(
+                            "Widget",
+                            Some("crate::model::Widget"),
+                            ReferenceKind::Import,
+                            None,
+                            8,
+                        )],
+                        vec![],
+                    ),
+                ));
+            }
+            for n in 0..5 {
+                let path = format!("src/user_{n}.rs");
+                files.push((
+                    path.clone(),
+                    make_file_with_refs_and_content(
+                        &path,
+                        LanguageId::Rust,
+                        "use crate::shapes::Widget;\nuse crate::prelude::Widget;\n",
+                        vec![
+                            make_ref(
+                                "Widget",
+                                Some("crate::shapes::Widget"),
+                                ReferenceKind::Import,
+                                None,
+                                0,
+                            ),
+                            make_ref(
+                                "Widget",
+                                Some("crate::prelude::Widget"),
+                                ReferenceKind::Import,
+                                None,
+                                100,
+                            ),
+                        ],
+                        vec![],
+                    ),
+                ));
+            }
+            make_index(
+                files
+                    .iter()
+                    .map(|(path, file)| (path.as_str(), file.clone()))
+                    .collect(),
+                false,
+            )
+        };
+        let rows_of = |index: &LiveIndex| -> Vec<(String, u32, Option<String>)> {
+            index
+                .find_dependents_for_file("src/model.rs")
+                .into_iter()
+                .map(|(path, reference)| {
+                    (
+                        path.to_string(),
+                        reference.line_range.0,
+                        reference.qualified_name.clone(),
+                    )
+                })
+                .collect()
+        };
+
+        let mut expected = vec![
+            (
+                "src/prelude.rs".to_string(),
+                0,
+                Some("crate::model::Widget".to_string()),
+            ),
+            (
+                "src/shapes.rs".to_string(),
+                0,
+                Some("crate::model::Widget".to_string()),
+            ),
+        ];
+        for n in 0..5 {
+            expected.push((
+                format!("src/user_{n}.rs"),
+                1,
+                Some("crate::prelude::Widget".to_string()),
+            ));
+        }
+        expected.sort();
+
+        let runs: Vec<_> = (0..20).map(|_| rows_of(&build())).collect();
+        assert!(
+            runs.iter().all(|rows| rows == &runs[0]),
+            "fresh indexes over the same files disagree: {runs:?}"
+        );
+        assert_eq!(runs[0], expected);
+    }
+
+    #[test]
     fn test_find_dependents_non_pub_use_does_not_create_reexport_chain() {
         // Ensure that a normal `use` (not `pub use`) does NOT trigger
         // re-export chain resolution.
