@@ -8629,6 +8629,65 @@ public class PacketsController {
     }
 
     #[test]
+    fn test_capture_implementations_view_repeats_across_fresh_indexes() {
+        let build = || {
+            let files = ["src/c_impl.rs", "src/a_impl.rs", "src/b_impl.rs"]
+                .into_iter()
+                .enumerate()
+                .map(|(n, path)| {
+                    (
+                        path,
+                        make_file_with_refs(
+                            path,
+                            vec![make_ref(
+                                "Render",
+                                Some("Widget"),
+                                ReferenceKind::Implements,
+                                None,
+                                100 * (n as u32 + 1),
+                            )],
+                            HashMap::new(),
+                        ),
+                    )
+                })
+                .collect();
+            make_index(files, false)
+        };
+        let expected: Vec<(String, u32)> = vec![
+            ("src/a_impl.rs".to_string(), 3),
+            ("src/b_impl.rs".to_string(), 4),
+            ("src/c_impl.rs".to_string(), 2),
+        ];
+
+        let runs: Vec<Vec<(String, String, String, u32)>> = (0..20)
+            .map(|_| {
+                build()
+                    .capture_implementations_view("Render", Some("trait"))
+                    .entries
+                    .into_iter()
+                    .map(|entry| {
+                        (
+                            entry.trait_name,
+                            entry.implementor,
+                            entry.file_path,
+                            entry.line,
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        assert!(
+            runs.iter().all(|entries| entries == &runs[0]),
+            "fresh indexes over the same files disagree: {runs:?}"
+        );
+        let paths_and_lines: Vec<(String, u32)> = runs[0]
+            .iter()
+            .map(|(_, _, path, line)| (path.clone(), *line))
+            .collect();
+        assert_eq!(paths_and_lines, expected);
+    }
+
+    #[test]
     fn test_find_dependents_rows_repeat_across_fresh_indexes_with_two_barrels() {
         let widget_symbol = SymbolRecord {
             name: "Widget".to_string(),
