@@ -125,7 +125,7 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '24'
+          node-version: '26'
 
       - name: Test release-please recovery contracts
         run: node --test execution/test_release_please.cjs
@@ -310,7 +310,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '22'
+          node-version: '26'
 
       # Slice 0's product is positive controls that MUST fail, so the suite
       # step below cannot check them: it runs the default suite, where every
@@ -456,7 +456,7 @@ jobs:
       - name: Set up Node for tool-correctness harness
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '22'
+          node-version: '26'
 
       # The harness grep oracle shells out to ripgrep as a completeness
       # tripwire. ubuntu-latest doesn't ship rg, so without this the oracle
@@ -738,7 +738,7 @@ jobs:
       - name: Set up Node for tests that spawn node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '22'
+          node-version: '26'
 
       - name: Run Rust tests
         # `--lib --bins --tests`, not `--all-targets`: the trailing libtest
@@ -806,7 +806,7 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 20
+          node-version: 26
 
       - name: Test npm package
         working-directory: npm

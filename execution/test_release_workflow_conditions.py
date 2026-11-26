@@ -19,7 +19,13 @@ defect it exists to prevent.
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -175,6 +181,429 @@ class ReleaseWorkflowConditions(unittest.TestCase):
                 f"is skipped it silently skips too. Add a status function plus explicit "
                 f"result checks, or record why here.",
             )
+
+
+FULL_VERIFY_CONDITION = "needs.resolve-release-ref.outputs.full_verify == 'true'"
+FREE_DISK_CONDITION = "runner.environment == 'github-hosted' && " + FULL_VERIFY_CONDITION
+LIFECYCLE_CONDITION = "needs.resolve-release-ref.outputs.lifecycle_gate_active == 'true'"
+HEAVY_STEPS = (
+    "Install Rust toolchain (rust-toolchain.toml)",
+    "Run cargo check",
+    "Clone phase0 golden-replay corpora",
+    "Run Rust tests",
+    "Smoke the observed-refresh benchmark (criterion --test mode)",
+    "Build release binary on main pushes",
+    "Build engine-only embed feature",
+    "Run embed-feature lib tests",
+    "Run embed parity and replay contracts",
+    "Test npm package",
+    "Install ripgrep (harness grep oracle)",
+    "Verify tool correctness (both fixtures)",
+)
+FREE_DISK_STEP = "Free disk space for Rust builds"
+HEAVY_STEP_COUNT = 14
+EVERY_PUSH_STEPS = (
+    "uses:actions/checkout",
+    "Report Rust build storage",
+    "uses:actions/setup-python",
+    "uses:actions/setup-node",
+    "Test release-please recovery contracts",
+    "Install GitHub CLI",
+    "Validate commit subjects since last successful Release",
+    "Validate manual run resolved tag commit subject",
+    "Run version sync tests",
+)
+LIFECYCLE_EVIDENCE_STEPS = (
+    "Verify Feature 020 V11 refreeze integrity",
+    "Test and verify Feature 020 V11 lifecycle traceability",
+    "Require code-owned Feature 020 V11 pre-approval evidence",
+    "Upload code-owned Feature 020 V11 pre-approval evidence",
+)
+PUBLISHING_JOBS = ("build", "build-npm-package", "upload-release-assets", "cargo-publish", "npm-publish")
+RELEASE_CREATED_TERM = "needs.prepare-release.outputs.release_created == 'true'"
+PREPARE_RELEASE_TIMEOUT_MINUTES = 20
+AUTO_MERGE_REFUSAL = (
+    '          if [[ "$FULL_VERIFY" != "true" ]]; then\n'
+    '            echo "::error::release-please opened a release PR on a push classified as unable to '
+    'release, so the classification was wrong. The release PR stays open. Merging it by hand is safe: '
+    'the release commit is fully verified before anything is published. Please report the misclassified '
+    'commit."\n'
+    "            exit 1\n"
+    "          fi\n"
+)
+RETIRED_HELPER = "require_ci" + "_success"
+STEP_START_RE = re.compile(r"^      - ")
+STEP_NAME_RE = re.compile(r"^(?:      - |        )name:\s*(.+?)\s*$", re.M)
+STEP_USES_RE = re.compile(r"^(?:      - |        )uses:\s*([^@\s]+)@", re.M)
+STEP_ID_RE = re.compile(r"^(?:      - |        )id:\s*(.+?)\s*$", re.M)
+STEP_IF_RE = re.compile(r"^        if:\s*(.+?)\s*$", re.M)
+
+
+def job_block(text: str, name: str) -> str:
+    lines = text.splitlines()
+    start = lines.index(f"  {name}:")
+    end = next(
+        (i for i in range(start + 1, len(lines)) if JOB_RE.match(lines[i])),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
+def job_steps(block: str) -> list[str]:
+    steps: list[list[str]] = []
+    for line in block.splitlines():
+        if STEP_START_RE.match(line):
+            steps.append([line])
+        elif steps and (line.startswith("        ") or not line.strip()):
+            steps[-1].append(line)
+        elif steps and line.startswith("      #"):
+            continue
+        elif steps:
+            steps.append([])
+    return ["\n".join(step) for step in steps if step]
+
+
+def step_key(step: str) -> str:
+    name = STEP_NAME_RE.search(step)
+    if name:
+        return name.group(1)
+    uses = STEP_USES_RE.search(step)
+    return f"uses:{uses.group(1)}" if uses else ""
+
+
+def step_named(steps: list[str], name: str) -> str:
+    found = [step for step in steps if step_key(step) == name]
+    if len(found) != 1:
+        raise AssertionError(f"expected exactly one step named {name!r}, found {len(found)}")
+    return found[0]
+
+
+def step_with_id(steps: list[str], step_id: str) -> str:
+    found = [step for step in steps if (m := STEP_ID_RE.search(step)) and m.group(1) == step_id]
+    if len(found) != 1:
+        raise AssertionError(f"expected exactly one step with id {step_id!r}, found {len(found)}")
+    return found[0]
+
+
+def step_condition(step: str) -> str:
+    match = STEP_IF_RE.search(step)
+    return match.group(1) if match else ""
+
+
+def run_script(step: str) -> str:
+    lines = step.splitlines()
+    start = lines.index("        run: |") + 1
+    body = []
+    for line in lines[start:]:
+        if line and not line.startswith("          "):
+            break
+        body.append(line[10:])
+    return "\n".join(body).rstrip() + "\n"
+
+
+def expression_terms(condition: str) -> list[str]:
+    inner = condition.strip()
+    if inner.startswith("${{") and inner.endswith("}}"):
+        inner = inner[3:-2].strip()
+    return [term.strip() for term in inner.split("&&")]
+
+
+class ReleaseVerifySkipsOnlyNonPublishingPushes(unittest.TestCase):
+    def setUp(self) -> None:
+        self.text = WORKFLOW.read_text(encoding="utf-8")
+        self.verify_steps = job_steps(job_block(self.text, "verify-release-ref"))
+        self.prepare_steps = job_steps(job_block(self.text, "prepare-release"))
+
+    def test_resolve_exports_the_publish_scope(self) -> None:
+        resolve = job_block(self.text, "resolve-release-ref")
+        self.assertIn("      can_publish: ${{ steps.publish-scope.outputs.can_publish }}", resolve)
+        self.assertIn("      full_verify: ${{ steps.publish-scope.outputs.full_verify }}", resolve)
+        scope = step_with_id(job_steps(resolve), "publish-scope")
+        self.assertIn("          WORKFLOW_EVENT: ${{ github.event_name }}\n", scope)
+        self.assertNotIn("github.event_name", run_script(scope))
+
+    def test_heavy_steps_carry_exactly_the_full_verify_condition(self) -> None:
+        for name in HEAVY_STEPS:
+            self.assertEqual(step_condition(step_named(self.verify_steps, name)), FULL_VERIFY_CONDITION, name)
+        self.assertEqual(step_condition(step_named(self.verify_steps, FREE_DISK_STEP)), FREE_DISK_CONDITION)
+
+    def test_every_verify_step_is_classified(self) -> None:
+        heavy = 0
+        lifecycle = []
+        for step in self.verify_steps:
+            key = step_key(step)
+            condition = step_condition(step)
+            if condition == FULL_VERIFY_CONDITION or (key == FREE_DISK_STEP and condition == FREE_DISK_CONDITION):
+                heavy += 1
+            elif condition == LIFECYCLE_CONDITION and key in LIFECYCLE_EVIDENCE_STEPS:
+                lifecycle.append(key)
+            elif key in EVERY_PUSH_STEPS and "full_verify" not in condition:
+                continue
+            else:
+                self.fail(
+                    "verify-release-ref step is neither an every-push step, nor gated exactly on "
+                    f"full_verify, nor a lifecycle evidence step:\n{step}"
+                )
+        self.assertEqual(heavy, HEAVY_STEP_COUNT)
+        self.assertEqual(sorted(lifecycle), sorted(LIFECYCLE_EVIDENCE_STEPS))
+
+    def test_every_push_steps_still_run(self) -> None:
+        for name in EVERY_PUSH_STEPS:
+            if name.startswith("uses:"):
+                continue
+            self.assertNotIn("full_verify", step_condition(step_named(self.verify_steps, name)), name)
+        for step in self.verify_steps:
+            if "actions/checkout@" in step or "actions/setup-python@" in step:
+                self.assertNotIn("full_verify", step)
+        self.assertIn("check-push-range", step_named(self.verify_steps, EVERY_PUSH_STEPS[6]))
+
+    def test_context_refuses_a_release_this_run_did_not_fully_verify(self) -> None:
+        context = step_with_id(self.prepare_steps, "context")
+        self.assertIn(
+            "          RESOLVED_CAN_PUBLISH: ${{ needs.resolve-release-ref.outputs.can_publish }}",
+            context,
+        )
+        guard = (
+            '          if [[ "$RELEASE_READY" == "true" && "$RESOLVED_CAN_PUBLISH" != "true" ]]; then\n'
+            '            echo "::error::This run skipped full verification but now resolves to a publishable release."\n'
+            "            exit 1\n"
+            "          fi\n"
+        )
+        self.assertEqual(context.count(guard), 1)
+        output = 'echo "release_created=$RELEASE_READY"'
+        self.assertEqual(context.count('echo "release_created='), 1)
+        between = context[context.index(guard) + len(guard):context.index(output)]
+        self.assertNotIn("RELEASE_READY=", between)
+
+    def test_publishing_jobs_require_a_created_release(self) -> None:
+        jobs = parse_jobs(self.text)
+        for name in PUBLISHING_JOBS:
+            condition = jobs[name]["if"]
+            self.assertIsInstance(condition, str, name)
+            self.assertNotIn("||", condition, name)
+            self.assertIn(RELEASE_CREATED_TERM, expression_terms(condition), name)
+
+    def test_auto_merge_refuses_a_run_that_skipped_verification(self) -> None:
+        step = step_named(self.prepare_steps, "Auto-merge release PR")
+        self.assertIn("          FULL_VERIFY: ${{ needs.resolve-release-ref.outputs.full_verify }}\n", step)
+        self.assertNotIn("CI_LOOKUP_TOKEN", step)
+        self.assertEqual(step.count(AUTO_MERGE_REFUSAL), 1)
+        self.assertEqual(step.count("gh pr merge "), 1)
+        refusal = AUTO_MERGE_REFUSAL.replace("\n          ", "\n")[10:]
+        self.assertTrue(run_script(step).startswith("set -euo pipefail\n" + refusal))
+        self.assertLess(step.index(AUTO_MERGE_REFUSAL), step.index("autorelease: pending"))
+        self.assertLess(step.index(AUTO_MERGE_REFUSAL), step.index('gh pr merge "$PR"'))
+
+    def test_prepare_release_keeps_its_original_timeout(self) -> None:
+        block = job_block(self.text, "prepare-release")
+        timeout = re.search(r"^    timeout-minutes:\s*([0-9]+)\s*$", block, re.M)
+        self.assertIsNotNone(timeout)
+        self.assertEqual(int(timeout.group(1)), PREPARE_RELEASE_TIMEOUT_MINUTES)
+
+    def test_the_ci_stand_in_is_gone(self) -> None:
+        root = WORKFLOW.parent.parent.parent
+        found = subprocess.run(
+            ["git", "grep", "-l", "-F", RETIRED_HELPER], cwd=root, capture_output=True, check=False
+        )
+        self.assertIn(found.returncode, (0, 1), found.stderr)
+        self.assertEqual(found.stdout.decode("utf-8").split(), [])
+        self.assertFalse((root / "execution" / f"{RETIRED_HELPER}.py").exists())
+
+
+class AutoMergeRefusalBehaviour(unittest.TestCase):
+    def setUp(self) -> None:
+        bash = find_bash()
+        if bash is None:
+            if os.name == "nt":
+                self.skipTest("Git Bash is not available on this Windows host")
+            self.fail("bash is required to exercise the auto-merge refusal")
+        self.bash = bash
+        refusal = AUTO_MERGE_REFUSAL.replace("\n          ", "\n")[10:]
+        self.snippet = "set -euo pipefail\n" + refusal + "echo merged\n"
+
+    def outcome(self, full_verify: str) -> subprocess.CompletedProcess[bytes]:
+        env = {**os.environ, "FULL_VERIFY": full_verify}
+        return subprocess.run([self.bash, "-c", self.snippet], env=env, capture_output=True)
+
+    def test_fully_verified_run_reaches_the_merge(self) -> None:
+        result = self.outcome("true")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"merged", result.stdout)
+
+    def test_skipped_verification_stops_before_the_merge(self) -> None:
+        for value in ("false", "", "TRUE"):
+            with self.subTest(full_verify=value):
+                result = self.outcome(value)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(b"classification was wrong", result.stdout)
+                self.assertIn(b"The release PR stays open.", result.stdout)
+                self.assertNotIn(b"merged", result.stdout)
+
+
+def find_bash() -> str | None:
+    if os.name != "nt":
+        return shutil.which("bash")
+    git = shutil.which("git")
+    candidates = [Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "bin" / "bash.exe"]
+    if git:
+        candidates.insert(0, Path(git).resolve().parent.parent / "bin" / "bash.exe")
+    return next((str(c) for c in candidates if c.is_file()), None)
+
+
+class PublishScopeScriptBehaviour(unittest.TestCase):
+    def setUp(self) -> None:
+        bash = find_bash()
+        if bash is None:
+            if os.name == "nt":
+                self.skipTest("Git Bash is not available on this Windows host")
+            self.fail("bash is required to exercise the publish-scope script")
+        self.bash = bash
+        text = WORKFLOW.read_text(encoding="utf-8")
+        step = step_with_id(job_steps(job_block(text, "resolve-release-ref")), "publish-scope")
+        self.script = run_script(step)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name)
+        self.env = {
+            **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.invalid",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "PATH": os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", ""),
+        }
+        (self.repo / "scope.sh").write_bytes(self.script.encode("utf-8"))
+        helper = WORKFLOW.parent.parent.parent / "execution" / "release_scope.py"
+        if helper.is_file():
+            (self.repo / "execution").mkdir()
+            (self.repo / "execution" / "release_scope.py").write_bytes(helper.read_bytes())
+        self.git("init", "-q", "-b", "main")
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=self.repo, env=self.env, check=True, capture_output=True
+        ).stdout.decode("utf-8").strip()
+
+    def commit(self, version: str, message: str | None = None) -> str:
+        manifest = self.repo / ".github" / ".release-please-manifest.json"
+        manifest.parent.mkdir(exist_ok=True)
+        manifest.write_bytes(json.dumps({".": version}).encode("utf-8"))
+        self.git("add", ".github")
+        self.git("commit", "-q", "--allow-empty", "-m", message or f"chore: {version}")
+        return self.git("rev-parse", "HEAD")
+
+    def scope(self, *, manual_tag: str = "", lifecycle: str = "false", event: str = "push") -> dict[str, str]:
+        output = self.repo / "out.txt"
+        output.write_bytes(b"")
+        env = {
+            **self.env,
+            "GITHUB_OUTPUT": str(output),
+            "MANUAL_TAG": manual_tag,
+            "LIFECYCLE_GATE_ACTIVE": lifecycle,
+            "WORKFLOW_EVENT": event,
+            "RELEASE_REF": self.git("rev-parse", "HEAD"),
+        }
+        subprocess.run([self.bash, "scope.sh"], cwd=self.repo, env=env, check=True, capture_output=True)
+        pairs = output.read_bytes().decode("utf-8").split("\n")
+        return dict(line.split("=", 1) for line in pairs if line)
+
+    def test_missing_manifest_tag_can_publish(self) -> None:
+        self.commit("1.0.0")
+        self.assertEqual(self.scope(), {"can_publish": "true", "full_verify": "true"})
+
+    def test_manifest_tag_on_head_can_publish(self) -> None:
+        self.commit("1.0.0")
+        self.git("tag", "v1.0.0")
+        self.assertEqual(self.scope(), {"can_publish": "true", "full_verify": "true"})
+
+    def test_manifest_tag_on_ancestor_cannot_publish(self) -> None:
+        self.commit("1.0.0")
+        self.git("tag", "v1.0.0")
+        self.commit("1.0.0")
+        self.assertEqual(self.scope(), {"can_publish": "false", "full_verify": "false"})
+
+    def test_active_lifecycle_keeps_full_verification(self) -> None:
+        self.commit("1.0.0")
+        self.git("tag", "v1.0.0")
+        self.commit("1.0.0")
+        for lifecycle in ("true", ""):
+            self.assertEqual(
+                self.scope(lifecycle=lifecycle), {"can_publish": "false", "full_verify": "true"}
+            )
+
+    def test_manual_dispatch_forces_full_verification(self) -> None:
+        self.commit("1.0.0")
+        self.git("tag", "v1.0.0")
+        self.commit("1.0.0")
+        self.assertEqual(
+            self.scope(event="workflow_dispatch"), {"can_publish": "false", "full_verify": "true"}
+        )
+        self.assertEqual(self.scope(event="push"), {"can_publish": "false", "full_verify": "false"})
+
+    def tagged_then(self, *messages: str) -> dict[str, str]:
+        self.commit("1.0.0")
+        self.git("tag", "v1.0.0")
+        for message in messages:
+            self.commit("1.0.0", message)
+        return self.scope()
+
+    def test_only_never_releasing_commits_skip_verification(self) -> None:
+        self.assertEqual(
+            self.tagged_then("ci: a", "docs(readme): b", "chore: c", "test(x): d", "style: e", "build: f", "refactor: g"),
+            {"can_publish": "false", "full_verify": "false"},
+        )
+
+    def test_a_releasable_commit_keeps_full_verification(self) -> None:
+        for kind in ("fix", "feat", "perf", "revert", "deps"):
+            with self.subTest(kind=kind):
+                self.setUp()
+                self.assertEqual(
+                    self.tagged_then("ci: a", f"{kind}(x): b", "docs: c"),
+                    {"can_publish": "false", "full_verify": "true"},
+                )
+
+    def test_breaking_or_release_as_commits_keep_full_verification(self) -> None:
+        for message in (
+            "chore!: x",
+            "ci(scope)!: x",
+            "chore: x\n\nBREAKING CHANGE: drops a flag",
+            "docs: x\n\nBREAKING-CHANGE: drops a flag",
+            "chore: x\n\nRelease-As: 13.0.0",
+            "chore: x\n\nfix: a body paragraph release-please parses as its own commit",
+        ):
+            with self.subTest(message=message):
+                self.setUp()
+                self.assertEqual(
+                    self.tagged_then("ci: a", message), {"can_publish": "false", "full_verify": "true"}
+                )
+
+    def test_unparsable_or_merge_commits_keep_full_verification(self) -> None:
+        for message in ("Update readme", "Revert \"ci: a\"", "ci:missing space", "ci(): empty scope"):
+            with self.subTest(message=message):
+                self.setUp()
+                self.assertEqual(self.tagged_then(message), {"can_publish": "false", "full_verify": "true"})
+        self.setUp()
+        self.commit("1.0.0")
+        self.git("tag", "v1.0.0")
+        self.git("checkout", "-q", "-b", "side")
+        self.commit("1.0.0", "ci: side")
+        self.git("checkout", "-q", "main")
+        self.commit("1.0.0", "ci: main")
+        self.git("merge", "-q", "--no-ff", "-m", "ci: merge side", "side")
+        self.assertEqual(self.scope(), {"can_publish": "false", "full_verify": "true"})
+
+    def test_manual_tag_can_publish(self) -> None:
+        self.commit("1.0.0")
+        self.git("tag", "v1.0.0")
+        self.commit("1.0.0")
+        self.assertEqual(self.scope(manual_tag="v1.0.0"), {"can_publish": "true", "full_verify": "true"})
+
+    def test_unreadable_manifest_fails_the_step(self) -> None:
+        self.commit("")
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.scope()
 
 
 if __name__ == "__main__":

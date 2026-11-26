@@ -201,7 +201,7 @@ test('workflow preserves every action input and downstream PR gates', () => {
   assert(workflow.includes("steps.release.outputs.prs_created != 'true'"));
   assert(workflow.includes("steps.release.outputs.prs_created == 'true'"));
   assert(workflow.includes('RELEASE_PRS_JSON: ${{ steps.release.outputs.prs }}'));
-  assert.match(workflow, /node-version: '24'/);
+  assert.match(workflow, /node-version: '26'/);
   assert(workflow.includes('node --test execution/test_release_please.cjs'));
 });
 test('concurrent pages reserve the shared retry budget before waiting', async () => {
@@ -249,13 +249,13 @@ function assertHistoricalRecoverySkips(workflow) {
   const testSteps = steps.filter(step => step.startsWith('      - name: Test release-please recovery contracts\n'));
   assert.equal(testSteps.length, 2);
   for (const step of testSteps) assert(step.includes(condition));
-  const node24 = steps.find(step => step.startsWith('      - uses: actions/setup-node@') && step.includes("          node-version: '24'"));
+  const node24 = steps.findLast(step => step.startsWith('      - uses: actions/setup-node@') && step.includes("          node-version: '26'"));
   assert(node24?.includes(condition));
 }
 function assertCiRecoveryGate(workflow) {
   const job = workflow.split(/^  release-version:[ \t]*$/m)[1]?.split(/^  [A-Za-z0-9_-]+:[ \t]*$/m)[0];
   assert(job);
-  assert(job.includes("node-version: '24'"));
+  assert(job.includes("node-version: '26'"));
   assert(job.includes('run: node --test execution/test_release_please.cjs'));
   assert(job.includes("python -m unittest discover -s execution -p 'test_*.py'"));
 }
@@ -267,8 +267,8 @@ test('the existing PR release-version gate runs recovery contracts on Node24', (
 });
 test('workflow guards reject a borrowed step condition and a test in another job', () => {
   const {workflow} = releaseBlock();
-  const node24 = workflowSteps(workflow).find(step =>
-    step.startsWith('      - uses: actions/setup-node@') && step.includes("          node-version: '24'"));
+  const node24 = workflowSteps(workflow).findLast(step =>
+    step.startsWith('      - uses: actions/setup-node@') && step.includes("          node-version: '26'"));
   assert(node24);
   const unguarded = node24.replace(/^        if:[^\n]*\n/m, '');
   assert.notEqual(unguarded, node24);
@@ -276,7 +276,7 @@ test('workflow guards reject a borrowed step condition and a test in another job
 
   const contract = '      - run: node --test execution/test_release_please.cjs\n';
   const fixture = "jobs:\n  release-version:\n    steps:\n" +
-    "      - uses: actions/setup-node@pinned\n        with:\n          node-version: '24'\n" +
+    "      - uses: actions/setup-node@pinned\n        with:\n          node-version: '26'\n" +
     "      - run: python -m unittest discover -s execution -p 'test_*.py'\n" +
     contract + "  unrelated-check:\n    steps:\n";
   assertCiRecoveryGate(fixture);
