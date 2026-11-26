@@ -1009,6 +1009,8 @@ pub(crate) enum AnchoredEntryKind {
 pub(crate) struct AnchoredDirectoryEntry {
     pub relative: PathBuf,
     pub kind: AnchoredEntryKind,
+    pub len: u64,
+    pub modified_secs: Option<u64>,
 }
 
 /// List one directory through the admitted root, bounded to one chunk. The
@@ -1106,6 +1108,13 @@ fn list_entries_from_dir(
         } else {
             AnchoredEntryKind::Other
         };
+        let modified_secs = metadata.modified().ok().map(|modified| {
+            modified
+                .into_std()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        });
         entries.push(AnchoredDirectoryEntry {
             relative: if relative == Path::new(".") {
                 PathBuf::from(name)
@@ -1113,6 +1122,8 @@ fn list_entries_from_dir(
                 relative.join(name)
             },
             kind,
+            len: metadata.len(),
+            modified_secs,
         });
         if entries.len() > max_entries {
             return Err(RootRefusal::Unreadable {
