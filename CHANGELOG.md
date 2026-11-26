@@ -46,6 +46,30 @@ Embedders keep their own response bytes and check them with `ReplayOutcome::resp
 
 AAP S14-S16 add opt-in refresh-safe snapshot reads for Graph, File, SymbolSearch, and References via `EmbeddedSourceHandle::query_allowing_refresh`; the claim keeps the prior publication identity and reports `Refreshing`. Strict `query` remains Current-only, and mutating/mixed-disk variants are refused before freshening. `change_version` plus blocking `wait_for_change` provide lossless phase/publication event waits. `begin_graph_publication_lease` pins one Graph snapshot across pages for at most 30 seconds; no more than eight leases are live per source, and expired leases return `GraphPublicationLeaseExpired`.
 
+## [12.2.0](https://github.com/special-place-ai-heaven/symforge/compare/v12.1.1...v12.2.0) (2026-11-26)
+
+
+### Features
+
+* **code-mode:** render code_execute results as lean text ([#949](https://github.com/special-place-ai-heaven/symforge/issues/949)) ([339cdef](https://github.com/special-place-ai-heaven/symforge/commit/339cdef65fbd2ffd36785dbb1b6f213da389555a))
+* **code-mode:** return source lines around reference and text hits ([#951](https://github.com/special-place-ai-heaven/symforge/issues/951)) ([be0957c](https://github.com/special-place-ai-heaven/symforge/commit/be0957cf1abe9391f92e17694450ee3ce07c4aff))
+
+
+### Bug Fixes
+
+* **hooks:** ignore machine-written prompts and drop the assumed savings footer ([#953](https://github.com/special-place-ai-heaven/symforge/issues/953)) ([8878ff5](https://github.com/special-place-ai-heaven/symforge/commit/8878ff52d3e414471cb0185d046b4cf93a51ce1e))
+* **hooks:** stay silent unless the hook text pays for itself ([#950](https://github.com/special-place-ai-heaven/symforge/issues/950)) ([dc672ec](https://github.com/special-place-ai-heaven/symforge/commit/dc672ec503a7516e1598ce81dc91df8a58739583))
+* **index:** return dependents and implementations rows in a repeatable order ([#959](https://github.com/special-place-ai-heaven/symforge/issues/959)) ([cbb5c13](https://github.com/special-place-ai-heaven/symforge/commit/cbb5c13b11f7494c6d501abcb3ccb2150225b342))
+* **index:** stop the restore check from walking ignored directories ([#955](https://github.com/special-place-ai-heaven/symforge/issues/955)) ([8bcd8b9](https://github.com/special-place-ai-heaven/symforge/commit/8bcd8b9ecb5c5db012f2dece0360e738aaa09db8))
+
+
+### Performance Improvements
+
+* **code-mode:** decide spilling on the text the model actually receives ([#954](https://github.com/special-place-ai-heaven/symforge/issues/954)) ([d9a0b76](https://github.com/special-place-ai-heaven/symforge/commit/d9a0b765051eca147d36725b3b29abe3f7b452c5))
+* **index:** match importers without allocating per reference ([#952](https://github.com/special-place-ai-heaven/symforge/issues/952)) ([78a9955](https://github.com/special-place-ai-heaven/symforge/commit/78a9955f17f817362ed6628effd8c1a5f9af1e4e))
+* **index:** open each directory once while proving restored files ([#957](https://github.com/special-place-ai-heaven/symforge/issues/957)) ([40cbdfe](https://github.com/special-place-ai-heaven/symforge/commit/40cbdfeb3b419a23e81d28369d2ecc655576770b))
+* **restore:** prove snapshot files in parallel ([#947](https://github.com/special-place-ai-heaven/symforge/issues/947)) ([2f42a4f](https://github.com/special-place-ai-heaven/symforge/commit/2f42a4fb34c9c064b534c003dd70fdc186a7660b))
+
 ## [12.1.1](https://github.com/special-place-ai-heaven/symforge/compare/v12.1.0...v12.1.1) (2026-11-25)
 
 
