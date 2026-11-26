@@ -2978,9 +2978,6 @@ fn stat_check_files_from_view_with(
                 .map(String::as_str),
         )
         .collect();
-    if stop() {
-        return None;
-    }
 
     let phase = Instant::now();
     let discovered = discover();
@@ -3121,23 +3118,40 @@ fn discover_files_from_source_anchor_within(
             if stop() {
                 return Err(AnchoredDiscoveryError::Cancelled);
             }
+            let listed = std::sync::atomic::AtomicUsize::new(visited);
+            let list = |lease: &crate::index_lifecycle::physical_root::PhysicalRootLease,
+                        directory: &PathBuf| {
+                #[cfg(test)]
+                test_anchor_listings().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                list_directory_beneath(lease, directory, max_entries)
+            };
             let listings = authority
                 .with_source_anchor_read(|lease| {
                     Ok(crate::live_index::store::ordered_parallel_map(
                         batch,
                         |directory| {
-                            #[cfg(test)]
-                            test_anchor_listings()
-                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            list_directory_beneath(lease, directory, max_entries)
+                            if listed.load(std::sync::atomic::Ordering::Relaxed) > max_entries {
+                                return None;
+                            }
+                            let listing = list(lease, directory);
+                            if let Ok(Some(entries)) = &listing {
+                                listed
+                                    .fetch_add(entries.len(), std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Some(listing)
                         },
                     ))
                 })
                 .map_err(|_| unlisted())?;
-            for listing in listings {
-                let entries = listing
-                    .map_err(|_| unlisted())?
-                    .ok_or_else(|| "an admitted source directory vanished".to_string())?;
+            for (directory, listing) in batch.iter().zip(listings) {
+                let listing = match listing {
+                    Some(listing) => listing.map_err(|_| unlisted()),
+                    None => authority
+                        .with_source_anchor_read(|lease| list(lease, directory))
+                        .map_err(|_| unlisted()),
+                };
+                let entries =
+                    listing?.ok_or_else(|| "an admitted source directory vanished".to_string())?;
                 visited = visited.saturating_add(entries.len());
                 if visited > max_entries {
                     return Err("admitted source discovery exceeds its file bound"
@@ -7139,7 +7153,10 @@ mod tests {
         };
         let (parallel_error, parallel_listings) = walk();
         let (serial_error, serial_listings) = crate::live_index::store::with_serial_oracle(walk);
-        assert_eq!(serial_error, "admitted source discovery exceeds its file bound");
+        assert_eq!(
+            serial_error,
+            "admitted source discovery exceeds its file bound"
+        );
         assert_eq!(parallel_error, serial_error);
         assert_eq!(serial_listings, 19);
         assert!(
