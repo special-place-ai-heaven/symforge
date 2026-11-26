@@ -263,3 +263,12 @@ Phase clocks on main after #957, one typical run: files read and hashed 2.8 s, n
 - The spot check re-reads 10% of files the proof hashed in full seconds earlier, about 0.5 s.
 - A repo with more than 200,000 entries that are not ignored still fails the new-file walk at its bound.
 - The items listed under "Still open, found on 25 November" are unchanged, except that the restore second pass is done.
+
+
+### Later on 26 November: releases, repeatable rows, CI
+
+- Releases: v12.1.1 was published by re-running the failed job of the stuck Release run (it carries only #945 and #946). v12.2.0 followed and carries #947 to #957 and #959. Both were checked on GitHub (Linux and Windows assets), npm and crates.io.
+- #959: `find_dependents` rows for an importer reached through two barrel files, and `implementations` entries with the same trait and type in several files, followed hash-map order and changed from run to run. Barrels are now visited in path order and ties are broken by file path and line. Each fix has a test that builds the same index in 20 fresh instances; both failed before the fix.
+- #958: workflow steps install Node 26 (11 pins; the runner's own action runtime stays on Node 24 because the runner offers no Node 26 runtime). The Release workflow skips its verification build only when every commit since the last release tag is build, chore, ci, docs, refactor, style or test with no breaking or Release-As marker. First real run, on the merge of #958 itself: the Release run finished in 2 min 27 s with the 14 heavy steps skipped, where the previous runs took about 35 minutes for the same job.
+- A wider skip was tried first and withdrawn: skipping on every non-publishing push and relying on the commit's CI run before auto-merging the release PR. Three review rounds each found a real hole (the auto-merge ran without verification; `ci.yml` skips its heavy jobs on docs-only pushes and still reports green; a refused auto-merge leaves an open release PR that later pushes never merge). Product pushes are therefore still verified twice, on the push and on the release commit. Removing that duplicate needs a redesign of how the release PR is created and merged.
+- Still open from the lists above: the spot check that re-reads 10% of files the proof just hashed; the one-open-per-file floor of the restore proof; tied compact-map rows ordered by git churn that reads 0 until history statistics load; #2 (directory-module edge, 56 false fixture importers); an importer reached through two barrels still lists one barrel's rows only.
