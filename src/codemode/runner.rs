@@ -61,6 +61,17 @@ impl CodeModeRunner {
 
 /// Executes one Python snippet inside a fresh, zero-egress `MontyRepl`.
 pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -> ExecuteOutcome {
+    let mut notices = Vec::new();
+    let mut outcome = execute_script_inner(request, backend, &mut notices);
+    outcome.notices = notices;
+    outcome
+}
+
+fn execute_script_inner(
+    request: &ExecuteRequest,
+    backend: &dyn CodeReadBackend,
+    notices: &mut Vec<super::CodeReadNotice>,
+) -> ExecuteOutcome {
     let started = Instant::now();
     let limits = request.limits.clamped();
     let max_wall_duration = limits
@@ -290,8 +301,16 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                     }
                     Ok(kwargs) => {
                         host_calls += 1;
-                        match backend.execute_op(op, kwargs) {
-                            Ok(val) => {
+                        match backend.execute_op_with_completeness(op, kwargs) {
+                            Ok(result) => {
+                                if !result.completeness.is_empty() {
+                                    notices.push(super::CodeReadNotice {
+                                        call: host_calls,
+                                        op,
+                                        completeness: result.completeness,
+                                    });
+                                }
+                                let val = result.value;
                                 let converted = json_to_monty(&val);
                                 drop_json_iteratively(val);
                                 match converted {
@@ -563,6 +582,7 @@ fn finalize_error_with_stdout(
         stdout: capped_stdout,
         calls,
         duration_ms,
+        notices: Vec::new(),
         output_bytes: stdout_buf.len(),
         truncated: stdout_truncated.then_some(true),
         total_bytes,
@@ -602,6 +622,7 @@ fn finalize_ok_outcome(
             stdout: stdout_buf,
             calls,
             duration_ms,
+            notices: Vec::new(),
             output_bytes: total_bytes,
             truncated: None,
             spill_path: None,
@@ -659,6 +680,7 @@ fn finalize_ok_outcome(
         stdout: stdout_preview,
         calls,
         duration_ms,
+        notices: Vec::new(),
         output_bytes: total_bytes,
         truncated: Some(true),
         spill_path,

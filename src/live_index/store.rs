@@ -2348,6 +2348,7 @@ pub struct LiveIndex {
     /// Updated incrementally on single-file mutations (update_file, remove_file);
     /// rebuilt from scratch on bulk operations (load, reload, snapshot restore).
     pub(crate) reverse_index: HashMap<String, Vec<ReferenceLocation>>,
+    pub(crate) callable_values: super::callable_values::CallableValueIndex,
     /// Secondary path index: lowercase basename -> sorted matching relative paths.
     pub(crate) files_by_basename: HashMap<String, Vec<String>>,
     /// Secondary path index: lowercase directory component -> sorted matching relative paths.
@@ -6357,6 +6358,7 @@ impl TrustHeadline {
 pub(crate) struct DerivedIndices {
     pub trigram_index: super::trigram::TrigramIndex,
     pub reverse_index: HashMap<String, Vec<ReferenceLocation>>,
+    pub callable_values: super::callable_values::CallableValueIndex,
     pub files_by_basename: HashMap<String, Vec<String>>,
     pub files_by_dir_component: HashMap<String, Vec<String>>,
 }
@@ -6374,6 +6376,13 @@ impl DerivedIndices {
         pause_between_derived_stages(cancel)?;
         let rest_phase = Instant::now();
         let reverse_index = build_reverse_index_from_files(files);
+        let mut callable_values = super::callable_values::CallableValueIndex::new();
+        for (path, file) in files {
+            check_reload_cancelled(cancel)?;
+            if let Some(facts) = super::callable_values::file_facts(file) {
+                callable_values.insert(path.clone(), facts);
+            }
+        }
         check_reload_cancelled(cancel)?;
         let (files_by_basename, files_by_dir_component) = build_path_indices_from_files(files);
         info!(
@@ -6385,6 +6394,7 @@ impl DerivedIndices {
         Ok(Self {
             trigram_index,
             reverse_index,
+            callable_values,
             files_by_basename,
             files_by_dir_component,
         })
@@ -7440,6 +7450,7 @@ impl LiveIndex {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index,
@@ -7502,6 +7513,7 @@ impl LiveIndex {
             load_source: IndexLoadSource::EmptyBootstrap,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index: super::trigram::TrigramIndex::new(),
@@ -7538,6 +7550,7 @@ impl LiveIndex {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index,
@@ -7874,6 +7887,7 @@ impl LiveIndex {
         self.snapshot_verify_state = SnapshotVerifyState::NotNeeded;
         self.trigram_index = data.derived.trigram_index;
         self.reverse_index = data.derived.reverse_index;
+        self.callable_values = data.derived.callable_values;
         self.files_by_basename = data.derived.files_by_basename;
         self.files_by_dir_component = data.derived.files_by_dir_component;
         self.gitignore = data.gitignore;
@@ -7928,6 +7942,7 @@ impl LiveIndex {
             .unwrap_or_default();
         let had_existing = !old_ref_names.is_empty() || self.files.contains_key(&path);
         let manifest_entry = manifest.then(|| self.derived_manifest_entry(&path, &file));
+        let callable_facts = super::callable_values::file_facts(&file);
 
         // SAFETY: Insert the new file into the primary store FIRST.
         // This ensures the file is always present in `self.files` even if
@@ -7935,6 +7950,10 @@ impl LiveIndex {
         // gitignore assertion failures). Auxiliary indices may become
         // temporarily stale, but the file won't vanish from the index.
         let old_row = self.files.insert(path.clone(), Arc::new(file));
+        self.callable_values.remove(&path);
+        if let Some(facts) = callable_facts {
+            self.callable_values.insert(path.clone(), facts);
+        }
         #[cfg(test)]
         if snapshot_verify_test_panic_path()
             .lock()
@@ -8073,6 +8092,7 @@ impl LiveIndex {
     /// Remove a row and its derived indices, leaving its catalog entry.
     fn remove_row(&mut self, path: &str) -> bool {
         self.remove_reverse_index_for_path(path);
+        self.callable_values.remove(path);
         let Some(row) = self.files.remove(path) else {
             return false;
         };
@@ -8174,6 +8194,13 @@ impl LiveIndex {
     /// For bulk reload, prefer `DerivedIndices::build_from_files` outside the lock.
     pub(crate) fn rebuild_reverse_index(&mut self) {
         self.reverse_index = build_reverse_index_from_files(&self.files);
+        self.callable_values = self
+            .files
+            .iter()
+            .filter_map(|(path, file)| {
+                Some((path.clone(), super::callable_values::file_facts(file)?))
+            })
+            .collect();
     }
 
     /// Rebuild path indices (basename + dir component) from current `self.files`.
@@ -11369,6 +11396,7 @@ mod tests {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index: crate::live_index::trigram::TrigramIndex::new(),

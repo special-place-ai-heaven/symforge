@@ -1,8 +1,31 @@
 //! Pure symbol retrieval and inspection renderers shared by native and MCP.
 use super::file_read::{not_found_file, render_not_found_symbol};
+use crate::domain::{LanguageId, SymbolRecord};
 #[cfg(feature = "server")]
 use crate::live_index::SymbolDetailView;
 use crate::live_index::{IndexedFile, InspectMatchView, LiveIndex};
+
+/// A display span is not an edit footprint or a `symbol_line` selector.
+pub(crate) fn symbol_display_span(
+    lang: Option<LanguageId>,
+    symbol: &SymbolRecord,
+) -> (usize, usize) {
+    let (mut start, mut end) = (symbol.effective_start(), symbol.byte_range.1);
+    if matches!(lang, Some(LanguageId::JavaScript | LanguageId::TypeScript))
+        && let Some((item_start, item_end)) = symbol.item_byte_range
+    {
+        start = start.min(item_start);
+        end = end.max(item_end);
+    }
+    (start as usize, end as usize)
+}
+
+/// Context readers historically include the editable item tail (e.g. config
+/// entries), in addition to the JS/TS enclosing declaration used by body reads.
+pub(crate) fn symbol_context_span(lang: LanguageId, symbol: &SymbolRecord) -> (usize, usize) {
+    let (start, end) = symbol_display_span(Some(lang), symbol);
+    (start, end.max(symbol.item_end() as usize))
+}
 
 /// Return the full source body for a named symbol plus a footer.
 ///
@@ -49,8 +72,7 @@ pub fn symbol_detail_from_indexed_file_with(
 
     match resolve_symbol_selector(file, name, kind_filter, symbol_line) {
         SymbolSelectorMatch::Selected(_idx, sym) => {
-            let start = sym.effective_start() as usize;
-            let end = sym.byte_range.1 as usize;
+            let (start, end) = symbol_display_span(Some(file.language), sym);
             let clamped_end = end.min(file.content.len());
             let clamped_start = start.min(clamped_end);
             let mut body =
@@ -137,8 +159,7 @@ fn render_symbol_detail(
     match matching.first() {
         None => render_not_found_symbol(relative_path, symbols, name),
         Some(s) => {
-            let start = s.effective_start() as usize;
-            let end = s.byte_range.1 as usize;
+            let (start, end) = symbol_display_span(LanguageId::from_path(relative_path), s);
             let clamped_end = end.min(content.len());
             let clamped_start = start.min(clamped_end);
             let body = String::from_utf8_lossy(&content[clamped_start..clamped_end]).into_owned();

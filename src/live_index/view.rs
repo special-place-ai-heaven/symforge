@@ -596,6 +596,19 @@ impl<'a> IndexView<'a> {
 
         // (2) Drop base hits whose file is dirty (stale or deleted).
         out.retain(|(path, _)| !deltas.contains_key(path));
+        if matches!(kind_filter, None | Some(ReferenceKind::ValueUse)) {
+            // An unchanged importer cannot vouch for an edited/removed
+            // declaration in the overlay. Rejoin after publication rather
+            // than return an imported value based on superseded evidence.
+            let stale: std::collections::HashSet<_> = self
+                .base
+                .imported_callable_values(name, None)
+                .into_iter()
+                .filter(|value| deltas.contains_key(value.definition_path))
+                .map(|value| (value.path, value.reference.byte_range))
+                .collect();
+            out.retain(|(path, reference)| !stale.contains(&(path.as_str(), reference.byte_range)));
+        }
 
         // (3) Scan overlay Upserts directly for matching references.
         //

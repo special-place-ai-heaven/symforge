@@ -930,7 +930,7 @@ fn matches_target_module(language: &LanguageId, text: &str, module_path: Option<
 /// The only genuine cross-language interop for bare-module imports is the
 /// JavaScript/TypeScript family, where a `.js` file may import a `.ts` module and
 /// vice versa; those are treated as mutually compatible.
-fn import_languages_compatible(
+pub(crate) fn import_languages_compatible(
     importer_language: &LanguageId,
     target_language: &LanguageId,
 ) -> bool {
@@ -1934,6 +1934,27 @@ impl LiveIndex {
             .map(|entry| &entry.disposition)
     }
 
+    /// Snapshot of the recorded security demotions for a bulk read of this
+    /// publication. A caller must still check the current path rule, hard
+    /// scope and restore state, and use the byte gate where required.
+    pub(crate) fn capture_sensitive_admission_paths(&self) -> HashSet<String> {
+        use crate::domain::{FileDisposition, MetadataOnlyReason};
+
+        self.manifest_entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.disposition,
+                    FileDisposition::MetadataOnly {
+                        reason: MetadataOnlyReason::SensitivePath { .. }
+                            | MetadataOnlyReason::SensitiveContent { .. },
+                    }
+                )
+            })
+            .map(|entry| normalize_path_query(super::store::scouted_catalog_path(&entry.path)))
+            .collect()
+    }
+
     /// Paths eligible for the Tier-2 textual sweep: ONLY oversized first-party
     /// files. Positive eligibility off the typed disposition — a security demotion
     /// can never appear here regardless of what the legacy `SkipReason` projection
@@ -2914,6 +2935,21 @@ impl LiveIndex {
             .references
             .iter()
             .filter(|reference| {
+                if reference.kind == ReferenceKind::ValueUse
+                    && matches!(
+                        file.language,
+                        LanguageId::Python | LanguageId::JavaScript | LanguageId::TypeScript
+                    )
+                    && let Some(qualifier) = reference.qualified_name.as_deref()
+                    && target_container.as_ref().is_none_or(|(owner, _)| {
+                        qualifier
+                            .strip_suffix(target_name)
+                            .and_then(|head| head.strip_suffix('.'))
+                            != Some(owner.as_str())
+                    })
+                {
+                    return false;
+                }
                 if reference.kind == ReferenceKind::Call
                     && target_symbol_index.is_some()
                     && reference.enclosing_symbol_index == target_symbol_index
@@ -2942,6 +2978,15 @@ impl LiveIndex {
             })
             .map(|reference| (path, reference, "exact"))
             .collect();
+        if matches!(kind_filter, None | Some(ReferenceKind::ValueUse)) {
+            for value in self.imported_callable_values(target_name, Some(path)) {
+                if target_symbol.byte_range.0 <= value.definition_offset
+                    && value.definition_offset < target_symbol.byte_range.1
+                {
+                    refs.push((value.path, value.reference, "exact"));
+                }
+            }
+        }
 
         let dependent_refs = self.find_dependents_for_file(path);
         let dependent_paths: HashSet<&str> = dependent_refs.iter().map(|(fp, _)| *fp).collect();
@@ -2950,6 +2995,17 @@ impl LiveIndex {
             |ref_path: &'a str, ref_record: &'a ReferenceRecord| -> Option<&'static str> {
                 let ref_file = self.get_file(ref_path)?;
                 if !import_languages_compatible(&ref_file.language, &file.language) {
+                    return None;
+                }
+                if ref_record.kind == ReferenceKind::ValueUse
+                    && matches!(
+                        file.language,
+                        LanguageId::Python | LanguageId::JavaScript | LanguageId::TypeScript
+                    )
+                {
+                    // Already joined to a specific import binding above. An
+                    // unrelated same-name local value in a dependent file is
+                    // not evidence of a use of this symbol.
                     return None;
                 }
                 if !matches_exact_symbol_reference(
@@ -3078,7 +3134,7 @@ impl LiveIndex {
 
     /// Interleave test and non-test file paths so compact `find_references` output
     /// is not starved of `tests/**` hits by pure lexicographic ordering under file caps.
-    fn order_find_references_file_paths_fair(&self, paths: Vec<String>) -> Vec<String> {
+    pub(crate) fn order_find_references_file_paths_fair(&self, paths: Vec<String>) -> Vec<String> {
         let mut tests = Vec::new();
         let mut non_tests = Vec::new();
         for path in paths {
@@ -3705,7 +3761,21 @@ impl LiveIndex {
                 .collect();
 
             for alias in &aliases {
-                self.collect_refs_for_key(alias, kind_filter, include_filtered, &mut results);
+                let mut alias_hits = Vec::new();
+                self.collect_refs_for_key(alias, kind_filter, include_filtered, &mut alias_hits);
+                // A proven value is associated with its lexical binding, not
+                // with an alias of the same spelling in some other file.
+                results.extend(alias_hits.into_iter().filter(|(path, reference)| {
+                    reference.kind != ReferenceKind::ValueUse
+                        || self.get_file(path).is_some_and(|file| {
+                            !matches!(
+                                file.language,
+                                LanguageId::Python
+                                    | LanguageId::JavaScript
+                                    | LanguageId::TypeScript
+                            )
+                        })
+                }));
             }
 
             // D13 recall: qualified-call construction sites (`Foo::new()`,
@@ -3793,6 +3863,24 @@ impl LiveIndex {
             }
         }
 
+        if !is_qualified && matches!(kind_filter, None | Some(ReferenceKind::ValueUse)) {
+            let already: HashSet<_> = results
+                .iter()
+                .map(|(path, reference)| (*path, reference.byte_range))
+                .collect();
+            results.extend(
+                self.imported_callable_values(name, None)
+                    .into_iter()
+                    .filter(|value| {
+                        !already.contains(&(value.path, value.reference.byte_range))
+                            && (include_filtered
+                                || self.get_file(value.path).is_some_and(|file| {
+                                    !is_filtered_name(&value.reference.name, &file.language)
+                                }))
+                    })
+                    .map(|value| (value.path, value.reference)),
+            );
+        }
         results
     }
 
@@ -4302,6 +4390,7 @@ mod tests {
             load_source: crate::live_index::store::IndexLoadSource::FreshLoad,
             snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
             reverse_index: std::collections::HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: std::collections::HashMap::new(),
             files_by_dir_component: std::collections::HashMap::new(),
             trigram_index,
@@ -7169,6 +7258,7 @@ impl Actor for MyActor {
             load_source: crate::live_index::store::IndexLoadSource::FreshLoad,
             snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
             reverse_index: std::collections::HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: std::collections::HashMap::new(),
             files_by_dir_component: std::collections::HashMap::new(),
             trigram_index: crate::live_index::trigram::TrigramIndex::new(),
@@ -7208,6 +7298,7 @@ impl Actor for MyActor {
             load_source: crate::live_index::store::IndexLoadSource::FreshLoad,
             snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
             reverse_index: std::collections::HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: std::collections::HashMap::new(),
             files_by_dir_component: std::collections::HashMap::new(),
             trigram_index: crate::live_index::trigram::TrigramIndex::new(),

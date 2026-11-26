@@ -96,6 +96,36 @@ print("checked", len(refs), "refs")
 }
 
 #[test]
+fn rendered_idioms_example_runs_in_monty() {
+    let guide = render_idioms();
+    let (_, fence) = guide.split_once("```python\n").expect("worked example");
+    let (script, _) = fence.split_once("\n```").expect("closing fence");
+    let backend = |op: CodeReadOp, kwargs: Map<String, Value>| {
+        if op == CodeReadOp::FindReferences {
+            let row = |line| json!({"path":"src/a.ts", "enclosing_symbol":"render", "caller_kind":"method", "enclosing_line":line});
+            return Ok(json!([row(4), row(4), row(19)]));
+        }
+        if op == CodeReadOp::GetSymbol {
+            let targets = kwargs["targets"].as_array().unwrap();
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[0]["symbol_line"], 4);
+            assert_eq!(targets[1]["symbol_line"], 19);
+            assert_eq!(targets[1]["kind"], "method");
+        }
+        mock_backend(op, kwargs)
+    };
+    let out = CodeModeRunner::default().execute(script, &backend);
+    assert_eq!(out.status, ExecuteStatus::Ok, "{:?}", out.error);
+    assert_eq!(out.calls, 3);
+    let result = out.value.expect("example output");
+    assert_eq!(result["visible_caller_count"], 2);
+    assert_eq!(
+        result["caller_bodies"][0]["source"],
+        "fn call_tool() { /* batch=2 */ }"
+    );
+}
+
+#[test]
 fn positional_arguments_raise_type_error_with_signature_hint() {
     let runner = CodeModeRunner::default();
     let out = runner.execute(r#"search_symbols("foo")"#, &mock_backend);

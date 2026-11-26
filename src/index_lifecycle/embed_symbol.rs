@@ -110,11 +110,8 @@ fn target(
         match resolve_symbol_selector(file, name, target.kind.as_deref(), target.symbol_line) {
             SymbolSelectorMatch::Selected(index, symbol) => {
                 row.symbol = Some(symbol_row(file, index, symbol)?);
-                (
-                    symbol.effective_start() as usize,
-                    symbol.byte_range.1 as usize,
-                    rendered,
-                )
+                let (start, end) = symbol_read::symbol_display_span(Some(file.language), symbol);
+                (start, end, rendered)
             }
             SymbolSelectorMatch::NotFound => {
                 row.refusal = Some(QueryRefusalKind::NotFound);

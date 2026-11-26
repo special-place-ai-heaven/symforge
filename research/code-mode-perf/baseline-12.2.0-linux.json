@@ -1,0 +1,1237 @@
+{
+  "binary": {
+    "version": "symforge 12.2.0",
+    "sha256": "90638440da9c4853fc918e2696318d724057de14c9479b4d209696a2d495c86f"
+  },
+  "environment": {
+    "system": "Linux",
+    "release": "7.0.0-43-generic",
+    "machine": "x86_64",
+    "visible_logical_cpus": 4
+  },
+  "runs": 5,
+  "warm_runs_per_ready_process": 7,
+  "fixtures": {
+    "small": {
+      "tracked_files": 12,
+      "tracked_bytes": 7469
+    },
+    "large": {
+      "tracked_files": 2206,
+      "tracked_bytes": 1699181
+    }
+  },
+  "f11_f13_samples": {
+    "f11_bundle": [
+      {
+        "rpc_ms": 0.435,
+        "request_bytes": 182,
+        "response_bytes": 2049,
+        "text_bytes": 1370,
+        "host_calls": 1,
+        "runner_ms": 0
+      },
+      {
+        "rpc_ms": 1.021,
+        "request_bytes": 182,
+        "response_bytes": 2049,
+        "text_bytes": 1370,
+        "host_calls": 1,
+        "runner_ms": 0
+      },
+      {
+        "rpc_ms": 0.37,
+        "request_bytes": 182,
+        "response_bytes": 2049,
+        "text_bytes": 1370,
+        "host_calls": 1,
+        "runner_ms": 0
+      },
+      {
+        "rpc_ms": 0.39,
+        "request_bytes": 182,
+        "response_bytes": 2049,
+        "text_bytes": 1370,
+        "host_calls": 1,
+        "runner_ms": 0
+      },
+      {
+        "rpc_ms": 0.311,
+        "request_bytes": 182,
+        "response_bytes": 2049,
+        "text_bytes": 1370,
+        "host_calls": 1,
+        "runner_ms": 0
+      }
+    ],
+    "f11_windows": [
+      {
+        "rpc_ms": 0.725,
+        "request_bytes": 291,
+        "response_bytes": 1051,
+        "text_bytes": 441,
+        "host_calls": 2,
+        "runner_ms": 0
+      },
+      {
+        "rpc_ms": 1.11,
+        "request_bytes": 291,
+        "response_bytes": 1051,
+        "text_bytes": 441,
+        "host_calls": 2,
+        "runner_ms": 0
+      },
+      {
+        "rpc_ms": 0.37,
+        "request_bytes": 291,
+        "response_bytes": 1051,
+        "text_bytes": 441,
+        "host_calls": 2,
+        "runner_ms": 0
+      },
+      {
+        "rpc_ms": 0.351,
+        "request_bytes": 291,
+        "response_bytes": 1051,
+        "text_bytes": 441,
+        "host_calls": 2,
+        "runner_ms": 0
+      },
+      {
+        "rpc_ms": 0.321,
+        "request_bytes": 291,
+        "response_bytes": 1051,
+        "text_bytes": 441,
+        "host_calls": 2,
+        "runner_ms": 0
+      }
+    ],
+    "f11_bundle_projected": [
+      {
+        "rpc_ms": 3.288,
+        "request_bytes": 331,
+        "response_bytes": 775,
+        "text_bytes": 173,
+        "host_calls": 1,
+        "runner_ms": 0
+      },
+      {
+        "rpc_ms": 0.742,
+        "request_bytes": 331,
+        "response_bytes": 775,
+        "text_bytes": 173,
+        "host_calls": 1,
+        "runner_ms": 0
+      },
+      {
+        "rpc_ms": 0.403,
+        "request_bytes": 331,
+        "response_bytes": 775,
+        "text_bytes": 173,
+        "host_calls": 1,
+        "runner_ms": 0
+      },
+      {
+        "rpc_ms": 0.406,
+        "request_bytes": 331,
+        "response_bytes": 775,
+        "text_bytes": 173,
+        "host_calls": 1,
+        "runner_ms": 0
+      },
+      {
+        "rpc_ms": 0.399,
+        "request_bytes": 331,
+        "response_bytes": 775,
+        "text_bytes": 173,
+        "host_calls": 1,
+        "runner_ms": 0
+      }
+    ],
+    "f11_windows_projected": [
+      {
+        "rpc_ms": 0.668,
+        "request_bytes": 326,
+        "response_bytes": 775,
+        "text_bytes": 173,
+        "host_calls": 2,
+        "runner_ms": 0
+      },
+      {
+        "rpc_ms": 0.344,
+        "request_bytes": 326,
+        "response_bytes": 775,
+        "text_bytes": 173,
+        "host_calls": 2,
+        "runner_ms": 0
+      },
+      {
+        "rpc_ms": 0.327,
+        "request_bytes": 326,
+        "response_bytes": 775,
+        "text_bytes": 173,
+        "host_calls": 2,
+        "runner_ms": 0
+      },
+      {
+        "rpc_ms": 0.274,
+        "request_bytes": 326,
+        "response_bytes": 775,
+        "text_bytes": 173,
+        "host_calls": 2,
+        "runner_ms": 0
+      },
+      {
+        "rpc_ms": 1.977,
+        "request_bytes": 326,
+        "response_bytes": 775,
+        "text_bytes": 173,
+        "host_calls": 2,
+        "runner_ms": 0
+      }
+    ],
+    "f13_hits": [
+      {
+        "rpc_ms": 0.839,
+        "request_bytes": 170,
+        "response_bytes": 2067,
+        "text_bytes": 1393,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 3
+      },
+      {
+        "rpc_ms": 0.585,
+        "request_bytes": 170,
+        "response_bytes": 2067,
+        "text_bytes": 1393,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 3
+      },
+      {
+        "rpc_ms": 0.423,
+        "request_bytes": 170,
+        "response_bytes": 2067,
+        "text_bytes": 1393,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 3
+      },
+      {
+        "rpc_ms": 0.537,
+        "request_bytes": 170,
+        "response_bytes": 2067,
+        "text_bytes": 1393,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 3
+      },
+      {
+        "rpc_ms": 4.123,
+        "request_bytes": 170,
+        "response_bytes": 2067,
+        "text_bytes": 1393,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 3
+      }
+    ],
+    "f13_context_hits": [
+      {
+        "rpc_ms": 0.764,
+        "request_bytes": 181,
+        "response_bytes": 7220,
+        "text_bytes": 6432,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 24
+      },
+      {
+        "rpc_ms": 0.569,
+        "request_bytes": 181,
+        "response_bytes": 7220,
+        "text_bytes": 6432,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 24
+      },
+      {
+        "rpc_ms": 0.584,
+        "request_bytes": 181,
+        "response_bytes": 7220,
+        "text_bytes": 6432,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 24
+      },
+      {
+        "rpc_ms": 0.43,
+        "request_bytes": 181,
+        "response_bytes": 7220,
+        "text_bytes": 6432,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 24
+      },
+      {
+        "rpc_ms": 0.485,
+        "request_bytes": 181,
+        "response_bytes": 7220,
+        "text_bytes": 6432,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 24
+      }
+    ],
+    "f13_grouped_context": [
+      {
+        "rpc_ms": 1.226,
+        "request_bytes": 446,
+        "response_bytes": 3705,
+        "text_bytes": 3010,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 3
+      },
+      {
+        "rpc_ms": 1.339,
+        "request_bytes": 446,
+        "response_bytes": 3705,
+        "text_bytes": 3010,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 3
+      },
+      {
+        "rpc_ms": 0.549,
+        "request_bytes": 446,
+        "response_bytes": 3705,
+        "text_bytes": 3010,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 3
+      },
+      {
+        "rpc_ms": 0.553,
+        "request_bytes": 446,
+        "response_bytes": 3705,
+        "text_bytes": 3010,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 3
+      },
+      {
+        "rpc_ms": 0.484,
+        "request_bytes": 446,
+        "response_bytes": 3705,
+        "text_bytes": 3010,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 3
+      }
+    ],
+    "f13_counts": [
+      {
+        "rpc_ms": 0.774,
+        "request_bytes": 174,
+        "response_bytes": 789,
+        "text_bytes": 187,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 3
+      },
+      {
+        "rpc_ms": 0.41,
+        "request_bytes": 174,
+        "response_bytes": 789,
+        "text_bytes": 187,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 3
+      },
+      {
+        "rpc_ms": 0.541,
+        "request_bytes": 174,
+        "response_bytes": 789,
+        "text_bytes": 187,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 3
+      },
+      {
+        "rpc_ms": 0.421,
+        "request_bytes": 174,
+        "response_bytes": 789,
+        "text_bytes": 187,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 3
+      },
+      {
+        "rpc_ms": 0.404,
+        "request_bytes": 174,
+        "response_bytes": 789,
+        "text_bytes": 187,
+        "host_calls": 1,
+        "runner_ms": 0,
+        "path_mentions": 3
+      }
+    ]
+  },
+  "f12_samples": {
+    "cold": [
+      {
+        "launch_to_initialize_ms": 55.462,
+        "first_rpc": {
+          "rpc_ms": 1046.178,
+          "request_bytes": 132,
+          "response_bytes": 3225,
+          "text_bytes": 2577
+        },
+        "loading_retries": 0,
+        "first_map": {
+          "rpc_ms": 1046.178,
+          "request_bytes": 132,
+          "response_bytes": 3225,
+          "text_bytes": 2577,
+          "host_calls": 1,
+          "runner_ms": 8
+        },
+        "launch_to_first_map_ms": 1101.816,
+        "warm_maps": []
+      },
+      {
+        "launch_to_initialize_ms": 55.711,
+        "first_rpc": {
+          "rpc_ms": 1560.112,
+          "request_bytes": 132,
+          "response_bytes": 3225,
+          "text_bytes": 2577
+        },
+        "loading_retries": 0,
+        "first_map": {
+          "rpc_ms": 1560.112,
+          "request_bytes": 132,
+          "response_bytes": 3225,
+          "text_bytes": 2577,
+          "host_calls": 1,
+          "runner_ms": 4
+        },
+        "launch_to_first_map_ms": 1616.042,
+        "warm_maps": []
+      },
+      {
+        "launch_to_initialize_ms": 61.288,
+        "first_rpc": {
+          "rpc_ms": 1031.207,
+          "request_bytes": 132,
+          "response_bytes": 3225,
+          "text_bytes": 2577
+        },
+        "loading_retries": 0,
+        "first_map": {
+          "rpc_ms": 1031.207,
+          "request_bytes": 132,
+          "response_bytes": 3225,
+          "text_bytes": 2577,
+          "host_calls": 1,
+          "runner_ms": 3
+        },
+        "launch_to_first_map_ms": 1092.804,
+        "warm_maps": []
+      },
+      {
+        "launch_to_initialize_ms": 57.117,
+        "first_rpc": {
+          "rpc_ms": 1033.482,
+          "request_bytes": 132,
+          "response_bytes": 3225,
+          "text_bytes": 2577
+        },
+        "loading_retries": 0,
+        "first_map": {
+          "rpc_ms": 1033.482,
+          "request_bytes": 132,
+          "response_bytes": 3225,
+          "text_bytes": 2577,
+          "host_calls": 1,
+          "runner_ms": 3
+        },
+        "launch_to_first_map_ms": 1090.955,
+        "warm_maps": []
+      },
+      {
+        "launch_to_initialize_ms": 49.039,
+        "first_rpc": {
+          "rpc_ms": 1061.447,
+          "request_bytes": 132,
+          "response_bytes": 3225,
+          "text_bytes": 2577
+        },
+        "loading_retries": 0,
+        "first_map": {
+          "rpc_ms": 1061.447,
+          "request_bytes": 132,
+          "response_bytes": 3225,
+          "text_bytes": 2577,
+          "host_calls": 1,
+          "runner_ms": 4
+        },
+        "launch_to_first_map_ms": 1111.939,
+        "warm_maps": []
+      }
+    ],
+    "ready": [
+      {
+        "launch_to_initialize_ms": 55.362,
+        "launch_to_ready_ms": 902.112,
+        "polls": 36,
+        "first_map": {
+          "rpc_ms": 4.816,
+          "request_bytes": 133,
+          "response_bytes": 3228,
+          "text_bytes": 2577,
+          "host_calls": 1,
+          "runner_ms": 3
+        },
+        "launch_to_first_map_ms": 907.143,
+        "warm_maps": [
+          {
+            "rpc_ms": 2.245,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 1
+          },
+          {
+            "rpc_ms": 2.572,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 2
+          },
+          {
+            "rpc_ms": 1.889,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 1
+          },
+          {
+            "rpc_ms": 1.892,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 1
+          },
+          {
+            "rpc_ms": 1.689,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 1
+          },
+          {
+            "rpc_ms": 2.66,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 1
+          },
+          {
+            "rpc_ms": 2.303,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 2
+          }
+        ]
+      },
+      {
+        "launch_to_initialize_ms": 60.986,
+        "launch_to_ready_ms": 1219.791,
+        "polls": 51,
+        "first_map": {
+          "rpc_ms": 8.539,
+          "request_bytes": 133,
+          "response_bytes": 3228,
+          "text_bytes": 2577,
+          "host_calls": 1,
+          "runner_ms": 7
+        },
+        "launch_to_first_map_ms": 1228.532,
+        "warm_maps": [
+          {
+            "rpc_ms": 3.025,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 2
+          },
+          {
+            "rpc_ms": 1.777,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 1
+          },
+          {
+            "rpc_ms": 1.591,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 1
+          },
+          {
+            "rpc_ms": 1.652,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 1
+          },
+          {
+            "rpc_ms": 1.512,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 1
+          },
+          {
+            "rpc_ms": 1.629,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 1
+          },
+          {
+            "rpc_ms": 1.554,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 1
+          }
+        ]
+      },
+      {
+        "launch_to_initialize_ms": 71.441,
+        "launch_to_ready_ms": 1111.176,
+        "polls": 44,
+        "first_map": {
+          "rpc_ms": 5.317,
+          "request_bytes": 133,
+          "response_bytes": 3228,
+          "text_bytes": 2577,
+          "host_calls": 1,
+          "runner_ms": 4
+        },
+        "launch_to_first_map_ms": 1116.703,
+        "warm_maps": [
+          {
+            "rpc_ms": 3.479,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 3
+          },
+          {
+            "rpc_ms": 3.127,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 2
+          },
+          {
+            "rpc_ms": 3.553,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 3
+          },
+          {
+            "rpc_ms": 2.673,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 2
+          },
+          {
+            "rpc_ms": 2.517,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 2
+          },
+          {
+            "rpc_ms": 3.079,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 2
+          },
+          {
+            "rpc_ms": 6.144,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 4
+          }
+        ]
+      },
+      {
+        "launch_to_initialize_ms": 46.491,
+        "launch_to_ready_ms": 1108.628,
+        "polls": 44,
+        "first_map": {
+          "rpc_ms": 5.707,
+          "request_bytes": 133,
+          "response_bytes": 3228,
+          "text_bytes": 2577,
+          "host_calls": 1,
+          "runner_ms": 5
+        },
+        "launch_to_first_map_ms": 1114.545,
+        "warm_maps": [
+          {
+            "rpc_ms": 2.476,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 2
+          },
+          {
+            "rpc_ms": 2.195,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 1
+          },
+          {
+            "rpc_ms": 2.36,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 2
+          },
+          {
+            "rpc_ms": 2.151,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 1
+          },
+          {
+            "rpc_ms": 2.56,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 2
+          },
+          {
+            "rpc_ms": 2.273,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 1
+          },
+          {
+            "rpc_ms": 3.657,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 3
+          }
+        ]
+      },
+      {
+        "launch_to_initialize_ms": 77.349,
+        "launch_to_ready_ms": 1134.902,
+        "polls": 45,
+        "first_map": {
+          "rpc_ms": 7.792,
+          "request_bytes": 133,
+          "response_bytes": 3228,
+          "text_bytes": 2577,
+          "host_calls": 1,
+          "runner_ms": 6
+        },
+        "launch_to_first_map_ms": 1143.028,
+        "warm_maps": [
+          {
+            "rpc_ms": 8.769,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 6
+          },
+          {
+            "rpc_ms": 5.833,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 4
+          },
+          {
+            "rpc_ms": 7.546,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 6
+          },
+          {
+            "rpc_ms": 6.564,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 4
+          },
+          {
+            "rpc_ms": 2.726,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 2
+          },
+          {
+            "rpc_ms": 1.933,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 1
+          },
+          {
+            "rpc_ms": 2.379,
+            "request_bytes": 133,
+            "response_bytes": 3228,
+            "text_bytes": 2577,
+            "host_calls": 1,
+            "runner_ms": 2
+          }
+        ]
+      }
+    ]
+  },
+  "compact_map_text_sha256": "e102094fa8f6cec34a525461b69b613eb7d959cb18f47c7244f2a6483451bf87",
+  "summary": {
+    "f11_bundle": {
+      "rpc_ms": {
+        "median": 0.39,
+        "min": 0.311,
+        "max": 1.021
+      },
+      "request_bytes": {
+        "median": 182,
+        "min": 182,
+        "max": 182
+      },
+      "response_bytes": {
+        "median": 2049,
+        "min": 2049,
+        "max": 2049
+      },
+      "text_bytes": {
+        "median": 1370,
+        "min": 1370,
+        "max": 1370
+      },
+      "host_calls": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "runner_ms": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      }
+    },
+    "f11_windows": {
+      "rpc_ms": {
+        "median": 0.37,
+        "min": 0.321,
+        "max": 1.11
+      },
+      "request_bytes": {
+        "median": 291,
+        "min": 291,
+        "max": 291
+      },
+      "response_bytes": {
+        "median": 1051,
+        "min": 1051,
+        "max": 1051
+      },
+      "text_bytes": {
+        "median": 441,
+        "min": 441,
+        "max": 441
+      },
+      "host_calls": {
+        "median": 2,
+        "min": 2,
+        "max": 2
+      },
+      "runner_ms": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      }
+    },
+    "f11_bundle_projected": {
+      "rpc_ms": {
+        "median": 0.406,
+        "min": 0.399,
+        "max": 3.288
+      },
+      "request_bytes": {
+        "median": 331,
+        "min": 331,
+        "max": 331
+      },
+      "response_bytes": {
+        "median": 775,
+        "min": 775,
+        "max": 775
+      },
+      "text_bytes": {
+        "median": 173,
+        "min": 173,
+        "max": 173
+      },
+      "host_calls": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "runner_ms": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      }
+    },
+    "f11_windows_projected": {
+      "rpc_ms": {
+        "median": 0.344,
+        "min": 0.274,
+        "max": 1.977
+      },
+      "request_bytes": {
+        "median": 326,
+        "min": 326,
+        "max": 326
+      },
+      "response_bytes": {
+        "median": 775,
+        "min": 775,
+        "max": 775
+      },
+      "text_bytes": {
+        "median": 173,
+        "min": 173,
+        "max": 173
+      },
+      "host_calls": {
+        "median": 2,
+        "min": 2,
+        "max": 2
+      },
+      "runner_ms": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      }
+    },
+    "f13_hits": {
+      "rpc_ms": {
+        "median": 0.585,
+        "min": 0.423,
+        "max": 4.123
+      },
+      "request_bytes": {
+        "median": 170,
+        "min": 170,
+        "max": 170
+      },
+      "response_bytes": {
+        "median": 2067,
+        "min": 2067,
+        "max": 2067
+      },
+      "text_bytes": {
+        "median": 1393,
+        "min": 1393,
+        "max": 1393
+      },
+      "host_calls": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "runner_ms": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      },
+      "path_mentions": {
+        "median": 3,
+        "min": 3,
+        "max": 3
+      }
+    },
+    "f13_context_hits": {
+      "rpc_ms": {
+        "median": 0.569,
+        "min": 0.43,
+        "max": 0.764
+      },
+      "request_bytes": {
+        "median": 181,
+        "min": 181,
+        "max": 181
+      },
+      "response_bytes": {
+        "median": 7220,
+        "min": 7220,
+        "max": 7220
+      },
+      "text_bytes": {
+        "median": 6432,
+        "min": 6432,
+        "max": 6432
+      },
+      "host_calls": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "runner_ms": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      },
+      "path_mentions": {
+        "median": 24,
+        "min": 24,
+        "max": 24
+      }
+    },
+    "f13_grouped_context": {
+      "rpc_ms": {
+        "median": 0.553,
+        "min": 0.484,
+        "max": 1.339
+      },
+      "request_bytes": {
+        "median": 446,
+        "min": 446,
+        "max": 446
+      },
+      "response_bytes": {
+        "median": 3705,
+        "min": 3705,
+        "max": 3705
+      },
+      "text_bytes": {
+        "median": 3010,
+        "min": 3010,
+        "max": 3010
+      },
+      "host_calls": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "runner_ms": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      },
+      "path_mentions": {
+        "median": 3,
+        "min": 3,
+        "max": 3
+      }
+    },
+    "f13_counts": {
+      "rpc_ms": {
+        "median": 0.421,
+        "min": 0.404,
+        "max": 0.774
+      },
+      "request_bytes": {
+        "median": 174,
+        "min": 174,
+        "max": 174
+      },
+      "response_bytes": {
+        "median": 789,
+        "min": 789,
+        "max": 789
+      },
+      "text_bytes": {
+        "median": 187,
+        "min": 187,
+        "max": 187
+      },
+      "host_calls": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "runner_ms": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      },
+      "path_mentions": {
+        "median": 3,
+        "min": 3,
+        "max": 3
+      }
+    },
+    "f12_cold_first_map": {
+      "rpc_ms": {
+        "median": 1046.178,
+        "min": 1031.207,
+        "max": 1560.112
+      },
+      "request_bytes": {
+        "median": 132,
+        "min": 132,
+        "max": 132
+      },
+      "response_bytes": {
+        "median": 3225,
+        "min": 3225,
+        "max": 3225
+      },
+      "text_bytes": {
+        "median": 2577,
+        "min": 2577,
+        "max": 2577
+      },
+      "host_calls": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "runner_ms": {
+        "median": 4,
+        "min": 3,
+        "max": 8
+      }
+    },
+    "f12_ready_first_map": {
+      "rpc_ms": {
+        "median": 5.707,
+        "min": 4.816,
+        "max": 8.539
+      },
+      "request_bytes": {
+        "median": 133,
+        "min": 133,
+        "max": 133
+      },
+      "response_bytes": {
+        "median": 3228,
+        "min": 3228,
+        "max": 3228
+      },
+      "text_bytes": {
+        "median": 2577,
+        "min": 2577,
+        "max": 2577
+      },
+      "host_calls": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "runner_ms": {
+        "median": 5,
+        "min": 3,
+        "max": 7
+      }
+    },
+    "f12_warm": {
+      "rpc_ms": {
+        "median": 2.476,
+        "min": 1.512,
+        "max": 8.769
+      },
+      "request_bytes": {
+        "median": 133,
+        "min": 133,
+        "max": 133
+      },
+      "response_bytes": {
+        "median": 3228,
+        "min": 3228,
+        "max": 3228
+      },
+      "text_bytes": {
+        "median": 2577,
+        "min": 2577,
+        "max": 2577
+      },
+      "host_calls": {
+        "median": 1,
+        "min": 1,
+        "max": 1
+      },
+      "runner_ms": {
+        "median": 2,
+        "min": 1,
+        "max": 6
+      }
+    },
+    "f12_cold_launch_to_map": {
+      "ms": {
+        "median": 1101.816,
+        "min": 1090.955,
+        "max": 1616.042
+      }
+    },
+    "f12_ready_launch_to_status": {
+      "ms": {
+        "median": 1111.176,
+        "min": 902.112,
+        "max": 1219.791
+      }
+    }
+  }
+}

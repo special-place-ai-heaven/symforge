@@ -231,11 +231,11 @@ pub const CODE_READ_OPS: &[CodeOpDescriptor] = &[
                 py_type: "int | None",
                 required: false,
                 default_repr: "None",
-                doc: "Optional token budget.",
+                doc: "Positive approximate token budget per source; clipped rows set truncated=True.",
             },
         ],
         return_type: "list[SymbolBody]",
-        typed_dicts: "class SymbolBody(TypedDict):\n    path: str\n    name: str\n    kind: str\n    start_line: int\n    end_line: int\n    source: str | None\n    refusal: str | None\n    withheld_reason: str | None",
+        typed_dicts: "class SymbolBody(TypedDict):\n    path: str\n    name: str\n    kind: str\n    start_line: int  # First line of returned source, including attached docs; not the symbol_line selector.\n    end_line: int  # Last line returned (inclusive).\n    source: str | None\n    truncated: NotRequired[bool]\n    refusal: str | None\n    withheld_reason: str | None",
         keywords: &[
             "symbol",
             "body",
@@ -303,6 +303,13 @@ pub const CODE_READ_OPS: &[CodeOpDescriptor] = &[
                 doc: "Max files/entries.",
             },
             ParamSpec {
+                name: "max_per_file",
+                py_type: "int | None",
+                required: false,
+                default_repr: "None",
+                doc: "Max reference rows per file (default 10, capped at 50); references mode only.",
+            },
+            ParamSpec {
                 name: "context",
                 py_type: "int",
                 required: false,
@@ -349,6 +356,13 @@ pub const CODE_READ_OPS: &[CodeOpDescriptor] = &[
                 required: false,
                 default_repr: "None",
                 doc: "Max dependent files.",
+            },
+            ParamSpec {
+                name: "max_per_file",
+                py_type: "int | None",
+                required: false,
+                default_repr: "None",
+                doc: "Max matching dependent rows per file (default 10, capped at 50).",
             },
         ],
         return_type: "list[DependentHit]",
@@ -529,6 +543,13 @@ pub const CODE_READ_OPS: &[CodeOpDescriptor] = &[
                 required: false,
                 default_repr: "None",
                 doc: "Max matches (or max files when group_by='count').",
+            },
+            ParamSpec {
+                name: "max_per_file",
+                py_type: "int | None",
+                required: false,
+                default_repr: "None",
+                doc: "Max match rows per file (default 5); ignored when group_by='count'.",
             },
             ParamSpec {
                 name: "context",
@@ -1042,6 +1063,9 @@ pub fn render_idioms() -> String {
 - **Single query (quote-free, PowerShell/cmd/bash safe)**: `symforge q <op> -a key=val -a limit=5` (also accepts `symforge q <op> '<json>'` or `--args-file args.json`; zero script overhead, pure JSON stdout).\n\
 - **Multi-step chain / filtering**: `symforge code run script.py`, PowerShell `@' ... '@ | symforge code run -`, or `symforge code run -c \"<python>\"`.\n\
 - **Inspect return fields**: `symforge code stubs <topic>` (e.g. `symforge code stubs references`).\n\
+- **Known source locations**: Return targeted `file_content` windows. Use `symbol_context(bundle=True, ...)` when you also need caller, callee, or type evidence.\n\
+- **Text search**: Use `group_by=\"count\"` only when locations are unnecessary. When returning many hits, group by path in the script to avoid repeating paths.\n\
+- **Partial answers**: Check host-call completeness notices even when the script returns a scalar or empty list. Omitted rows are known matches; withheld files were not searched and may or may not contain matches.\n\
 - **Edits**: Mutations NEVER run inside Code Mode; perform edits explicitly after narrowing.\n\
 \n\
 ## Sandbox rules & resource caps\n\
@@ -1053,20 +1077,21 @@ pub fn render_idioms() -> String {
 ## Registered read-only functions ({count})\n\
 {fn_list}\n\
 ## Worked example: find non-test callers and read their bodies in 1 turn\n\
-```python\n\
-hits = search_symbols(query=\"enforce_compact_surface\", kind=\"fn\")\n\
-refs = find_references(name=\"enforce_compact_surface\", kind=\"call\")\n\
-caller_targets = []\n\
-seen = set()\n\
-for r in refs:\n\
-    caller = r.get(\"enclosing_symbol\")\n\
-    key = (r[\"path\"], caller)\n\
-    if caller and not r[\"path\"].startswith(\"tests/\") and key not in seen:\n\
-        seen.add(key)\n\
-        caller_targets.append({{\"path\": r[\"path\"], \"name\": caller}})\n\
-bodies = get_symbol(targets=caller_targets[:5]) if caller_targets else []\n\
-{{\"definitions\": hits, \"caller_count\": len(refs), \"caller_bodies\": bodies}}\n\
-```\n",
+```python\n{example}\n```\n",
         count = CODE_READ_OPS.len(),
+        example = r#"hits = search_symbols(query="enforce_compact_surface", kind="fn")
+refs = find_references(name="enforce_compact_surface", kind="call")
+caller_targets = []
+seen = set()
+for r in refs:
+    caller = r.get("enclosing_symbol")
+    line = r.get("enclosing_line")
+    kind = r.get("caller_kind")
+    key = (r["path"], caller, kind, line)
+    if caller and line and not r["path"].startswith("tests/") and key not in seen:
+        seen.add(key)
+        caller_targets.append({"path": r["path"], "name": caller, "kind": kind, "symbol_line": line})
+bodies = get_symbol(targets=caller_targets[:5]) if caller_targets else []
+{"definitions": hits, "visible_caller_count": len(caller_targets), "caller_bodies": bodies}"#,
     )
 }

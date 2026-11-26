@@ -87,6 +87,7 @@ fn make_index(files: Vec<(String, IndexedFile)>) -> LiveIndex {
         load_source: crate::live_index::store::IndexLoadSource::FreshLoad,
         snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
         reverse_index: HashMap::new(),
+        callable_values: Default::default(),
         files_by_basename: HashMap::new(),
         files_by_dir_component: HashMap::new(),
         trigram_index,
@@ -621,7 +622,7 @@ fn structural_zero_hit_names_files_skipped_by_a_cancelled_parse() {
         SearchSuggestionContext::default(),
     );
     assert!(
-        rendered.ends_with("This search skipped 1 file whose parse was cancelled or failed."),
+        rendered.ends_with("This search skipped 1 file (grammar, parse or work budget)."),
         "missing skipped-file note: {rendered}"
     );
 }
@@ -1151,6 +1152,7 @@ fn test_health_report_empty_state() {
         load_source: crate::live_index::store::IndexLoadSource::EmptyBootstrap,
         snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
         reverse_index: HashMap::new(),
+        callable_values: Default::default(),
         files_by_basename: HashMap::new(),
         files_by_dir_component: HashMap::new(),
         trigram_index: crate::live_index::trigram::TrigramIndex::new(),
@@ -3402,6 +3404,7 @@ fn make_index_with_reverse(files: Vec<(String, IndexedFile)>) -> LiveIndex {
         load_source: crate::live_index::store::IndexLoadSource::FreshLoad,
         snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
         reverse_index: HashMap::new(),
+        callable_values: Default::default(),
         files_by_basename: HashMap::new(),
         files_by_dir_component: HashMap::new(),
         trigram_index,

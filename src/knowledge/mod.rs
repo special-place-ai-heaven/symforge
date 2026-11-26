@@ -5,6 +5,8 @@
 
 pub(crate) mod curation;
 pub(crate) mod curation_contract;
+#[cfg(test)]
+mod f3_admission_tests;
 pub(crate) mod review;
 pub(crate) mod review_contract;
 pub(crate) mod search;
@@ -64,7 +66,9 @@ pub fn decode_searchable_text(bytes: &[u8]) -> Result<DecodedText<'_>, std::str:
 /// Bumped to 7: the natural-language label exemption no longer admits
 /// Diceware-style multi-word or long Title-Case mashed passphrases under
 /// credential keys, so a v6 manifest admits files v7 withholds.
-pub const SECRET_POLICY_VERSION: u32 = 8;
+/// Bumped to 10: invalidate admissions from the candidate v9 Python lookup
+/// exception, which did not establish receiver provenance.
+pub const SECRET_POLICY_VERSION: u32 = 10;
 pub const SECRET_SCAN_MAX_BYTES: usize = crate::domain::index::METADATA_ONLY_CODE_BYTES as usize;
 /// The one reserved rule id every [`DetectorFailure`] collapses onto. Public so
 /// the disclosure gate can tell an indeterminate verdict — which a reindex

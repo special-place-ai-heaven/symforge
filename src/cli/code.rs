@@ -197,12 +197,21 @@ fn run_with_resolved_backend<T>(
             "symforge-code-cli",
             Some(std::process::id()),
         ));
-        if let Ok(Some(session)) = attached {
-            let daemon_backend =
-                DaemonCodeBackend::new_ephemeral(rt.handle().clone(), session, project);
-            let out = work(&daemon_backend, "daemon");
-            daemon_backend.close_best_effort();
-            return Ok(out);
+        match attached {
+            Ok(Some(session)) => {
+                let daemon_backend =
+                    DaemonCodeBackend::new_ephemeral(rt.handle().clone(), session, project);
+                let out = work(&daemon_backend, "daemon");
+                daemon_backend.close_best_effort();
+                return Ok(out);
+            }
+            Ok(None) => {}
+            Err(error) if project.is_some() => {
+                return Err(error.context("cannot resolve --project without a compatible daemon"));
+            }
+            // These commands return before tracing is set up. Keep JSON/script
+            // output on stdout and explain the local fallback on stderr.
+            Err(error) => eprintln!("symforge: daemon attach failed; using local mode: {error:#}"),
         }
     }
 
@@ -375,20 +384,27 @@ pub fn run_query_cli(args: QueryCliArgs) -> anyhow::Result<MainExit> {
     let root = resolve_target_root(args.root.as_deref())?;
     let started = std::time::Instant::now();
     let result = run_with_resolved_backend(&root, args.project, |backend, _lane| {
-        backend.execute_op(op, kwargs as Map<String, Value>)
+        backend.execute_op_with_completeness(op, kwargs as Map<String, Value>)
     })?;
     let duration_ms = started.elapsed().as_millis() as u64;
 
     let (payload, exit) = match result {
-        Ok(value) => (
-            json!({
+        Ok(result) => {
+            let mut payload = json!({
                 "status": "ok",
                 "op": op.as_str(),
-                "value": value,
+                "value": result.value,
                 "duration_ms": duration_ms,
-            }),
-            MainExit::Success,
-        ),
+            });
+            if !result.completeness.is_empty() {
+                payload["notices"] = json!([crate::codemode::CodeReadNotice {
+                    call: 1,
+                    op,
+                    completeness: result.completeness,
+                }]);
+            }
+            (payload, MainExit::Success)
+        }
         Err(err) => (
             json!({
                 "status": "error",

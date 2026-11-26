@@ -33,6 +33,7 @@ use crate::protocol::edit::{
     InsertSymbolInput, ReplaceSymbolBodyInput,
 };
 use crate::protocol::read_tools::SymforgeRetrieveInput;
+use crate::protocol::result_status::{PROJECT_EVIDENCE_HEADER, ProjectEvidence};
 use crate::protocol::tools::{
     AnalyzeFileImpactInput, CheckpointNowInput, CurateKnowledgeInput, DetectImpactInput,
     DiffSymbolsInput, EditPlanInput, ExploreInput, FindDependentsInput, FindReferencesInput,
@@ -1170,6 +1171,38 @@ pub struct ProjectHealth {
 
 fn default_project_freshness() -> FreshnessStatus {
     FreshnessStatus::Current
+}
+
+// Bump when Code Mode read semantics change incompatibly, even at the same
+// package version. Never use this marker to authorize process replacement.
+const CODE_QUERY_REVISION_HEADER: &str = "x-symforge-code-query-revision";
+const CODE_QUERY_REVISION: &str = "2";
+
+fn check_code_query_revision(headers: &HeaderMap) -> anyhow::Result<()> {
+    let revisions = headers.get_all(CODE_QUERY_REVISION_HEADER);
+    let mut values = revisions.iter();
+    let received = match (values.next(), values.next()) {
+        (None, _) => "missing (legacy peer)",
+        (Some(_), Some(_)) => "multiple values",
+        (Some(value), None) => value.to_str().unwrap_or("invalid header value"),
+    };
+    anyhow::ensure!(
+        received == CODE_QUERY_REVISION,
+        "Code Mode daemon protocol mismatch: expected revision {CODE_QUERY_REVISION}, got {received}"
+    );
+    Ok(())
+}
+
+fn code_query_revision_headers() -> [(&'static str, &'static str); 1] {
+    [(CODE_QUERY_REVISION_HEADER, CODE_QUERY_REVISION)]
+}
+
+fn check_daemon_code_query_revision(headers: &HeaderMap, endpoint: &str) -> anyhow::Result<()> {
+    check_code_query_revision(headers).map_err(|error| {
+        anyhow::anyhow!(
+            "{error} from {endpoint}. Use local mode or stop the recorded daemon and start one from the matching SymForge build."
+        )
+    })
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -2621,13 +2654,21 @@ impl DaemonState {
         })
     }
 
+    fn render_session_project_inventory(&self, session_id: &str) -> Option<String> {
+        self.session_project_inventory(session_id)
+            .map(|(text, _)| text)
+    }
+
     /// Task 7: render the session's open-project inventory — one row per open
     /// project with deterministic ID, display name/root, home marker, published
     /// counts and index state, current generation, opened timestamp, and
     /// snapshot presence — plus the session's last-seen evidence. `project_name`
     /// is display text, never a persistent alias. Returns `None` for an unknown
     /// session.
-    fn render_session_project_inventory(&self, session_id: &str) -> Option<String> {
+    fn session_project_inventory(
+        &self,
+        session_id: &str,
+    ) -> Option<(String, Option<ProjectEvidence>)> {
         let session = self.sessions.read().get(session_id).cloned()?;
         let open_ids: Vec<String> = session
             .working_set
@@ -2636,6 +2677,7 @@ impl DaemonState {
             .map(|entry| entry.project_id.clone())
             .collect();
         let mut lines = vec!["── projects ──".to_string()];
+        let mut evidence = None;
         {
             let projects = self.projects.read();
             for id in &open_ids {
@@ -2649,6 +2691,21 @@ impl DaemonState {
                 // SF-DOG-04: one published generation for the row's index
                 // fields and its trust headline.
                 let generation = meta.index.data_plane().published_generation();
+                // A singleton can attest exactly the publication rendered in
+                // its one row. A multi-project inventory isn't evidence for a
+                // single project, even when it marks one of them active.
+                if open_ids.len() == 1
+                    && *id == session.active_project_id
+                    && session.servers.contains_key(id)
+                    && meta.index.acquire().is_ok()
+                {
+                    evidence = Some(project_evidence_for_publication(
+                        id,
+                        &meta.project_name,
+                        &meta.canonical_root,
+                        &generation,
+                    ));
+                }
                 let published = &generation.health;
                 let headline = crate::live_index::store::TrustHeadline::of(&generation);
                 let trust = if headline == crate::live_index::store::TrustHeadline::Ready {
@@ -2703,7 +2760,7 @@ impl DaemonState {
             unix_seconds(session.last_seen_at_time()),
             session_ttl_from_env().as_secs()
         ));
-        Some(lines.join("\n"))
+        Some((lines.join("\n"), evidence))
     }
 
     /// The inventory above, but only when the session holds MORE than one open
@@ -3273,12 +3330,24 @@ impl DaemonSessionClient {
         Result<serde_json::Value, crate::codemode::CodeBackendError>,
         Option<crate::protocol::result_status::ProjectEvidence>,
     )> {
+        let (result, evidence) = self.call_code_query_with_completeness(query).await?;
+        Ok((result.map(|result| result.value), evidence))
+    }
+
+    pub(crate) async fn call_code_query_with_completeness(
+        &self,
+        query: &crate::codemode::DaemonCodeQueryRequest,
+    ) -> anyhow::Result<(
+        Result<crate::codemode::CodeReadResult, crate::codemode::CodeBackendError>,
+        Option<crate::protocol::result_status::ProjectEvidence>,
+    )> {
         let request = self
             .http_client
             .post(format!(
                 "{}/v1/sessions/{}/code-query",
                 self.base_url, self.session_id
             ))
+            .header(CODE_QUERY_REVISION_HEADER, CODE_QUERY_REVISION)
             .json(query);
         let request = apply_daemon_auth_header(request, self.auth_token.as_deref()).header(
             crate::protocol::surface_probe::CONNECTION_SURFACE_HEADER,
@@ -3286,10 +3355,11 @@ impl DaemonSessionClient {
                 crate::protocol::surface_probe::surface_profile_from_env(),
             ),
         );
-        let response = request
-            .send()
-            .await
-            .context("calling daemon code-query")?
+        let response = request.send().await.context("calling daemon code-query")?;
+        if response.status().is_success() || response.status() == StatusCode::CONFLICT {
+            check_daemon_code_query_revision(response.headers(), response.url().as_str())?;
+        }
+        let response = response
             .error_for_status()
             .context("daemon code-query status")?;
         let project_evidence = if let Some(header) = response
@@ -3308,7 +3378,13 @@ impl DaemonSessionClient {
             .await
             .context("decoding daemon code-query body")?;
         let result = match reply {
-            crate::codemode::DaemonCodeQueryResponse::Ok { value } => Ok(value),
+            crate::codemode::DaemonCodeQueryResponse::Ok {
+                value,
+                completeness,
+            } => Ok(crate::codemode::CodeReadResult {
+                value,
+                completeness,
+            }),
             crate::codemode::DaemonCodeQueryResponse::Error { error } => Err(error),
         };
         Ok((result, project_evidence))
@@ -3396,9 +3472,9 @@ pub async fn connect_or_spawn_session(
 
 /// Attach to an ALREADY-RUNNING compatible local daemon without spawning one.
 ///
-/// Returns `Ok(None)` when no compatible daemon is recorded or reachable so
-/// `symforge code` / `symforge q` can fall back cleanly to read-only local
-/// snapshot load without leaving a background daemon behind.
+/// Absence is `Ok(None)`; an incompatible Code Mode revision is an error with
+/// restart guidance. `symforge code` / `symforge q` can fall back to read-only
+/// local load without leaving a background daemon behind.
 pub async fn connect_existing_session(
     project_root: &Path,
     client_name: &str,
@@ -3424,11 +3500,13 @@ pub async fn connect_existing_session_at(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("canonical project root is not valid UTF-8"))?;
     let identity = current_daemon_identity();
-    let Some(port) = daemon_port_if_compatible_at(control_state_dir, &identity).await? else {
+    let Some((port, peer)) = daemon_peer_if_compatible_at(control_state_dir, &identity).await?
+    else {
         return Ok(None);
     };
     let expected_project_id = project_key(&canonical_project_root);
     let base_url = format!("http://{}:{port}", std::net::Ipv4Addr::LOCALHOST);
+    check_daemon_code_query_revision(&peer.headers, &base_url)?;
     let http_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(30))
@@ -3443,20 +3521,18 @@ pub async fn connect_existing_session_at(
             client_name: client_name.to_string(),
             pid,
         });
-    let opened = match apply_daemon_auth_header(open_request, auth_token.as_deref())
+    let response = match apply_daemon_auth_header(open_request, auth_token.as_deref())
         .send()
         .await
     {
         Ok(resp) => match resp.error_for_status() {
-            Ok(ok_resp) => ok_resp
-                .json::<OpenProjectResponse>()
-                .await
-                .context("daemon session open body")?,
+            Ok(ok_resp) => ok_resp,
             Err(_) => return Ok(None),
         },
         Err(_) => return Ok(None),
     };
-    if opened.project_id != expected_project_id {
+    let (opened, revision) = decode_daemon_session_open(response).await?;
+    if revision.is_err() || opened.project_id != expected_project_id {
         close_current_session(
             DaemonSessionClient::new_with_auth_token(
                 base_url,
@@ -3470,6 +3546,7 @@ pub async fn connect_existing_session_at(
             SESSION_CLOSE_TIMEOUT,
         )
         .await;
+        revision?;
         return Ok(None);
     }
     let daemon_started_at = daemon_health(port)
@@ -3508,8 +3585,11 @@ async fn connect_or_spawn_session_at(
         )
     })?;
     let expected_project_id = project_key(&canonical_project_root);
-    let port = ensure_daemon_running_at(control_state_dir).await?;
+    let (port, peer) = ensure_daemon_running_at(control_state_dir).await?;
     let base_url = format!("http://127.0.0.1:{port}");
+    // Compatibility is checked after discovery: a stale Code Mode revision
+    // on a same-identity daemon is never grounds for process replacement.
+    check_daemon_code_query_revision(&peer.headers, &base_url)?;
     let http_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(60))
@@ -3527,16 +3607,14 @@ async fn connect_or_spawn_session_at(
             client_name: client_name.to_string(),
             pid,
         });
-    let opened = apply_daemon_auth_header(open_request, auth_token.as_deref())
+    let response = apply_daemon_auth_header(open_request, auth_token.as_deref())
         .send()
         .await
         .context("opening daemon session")?
         .error_for_status()
-        .context("daemon session open status")?
-        .json::<OpenProjectResponse>()
-        .await
-        .context("daemon session open body")?;
-    if opened.project_id != expected_project_id {
+        .context("daemon session open status")?;
+    let (opened, revision) = decode_daemon_session_open(response).await?;
+    if revision.is_err() || opened.project_id != expected_project_id {
         // The daemon already holds this session; close it before refusing so
         // it is not left to the reaper.
         close_current_session(
@@ -3552,6 +3630,7 @@ async fn connect_or_spawn_session_at(
             SESSION_CLOSE_TIMEOUT,
         )
         .await;
+        revision?;
         anyhow::bail!(
             "daemon opened a project identity that does not match the canonical requested root"
         );
@@ -3576,7 +3655,25 @@ async fn connect_or_spawn_session_at(
     .with_daemon_started_at(daemon_started_at))
 }
 
-async fn ensure_daemon_running_at(control_state_dir: &ControlStateDir) -> anyhow::Result<u16> {
+async fn decode_daemon_session_open(
+    response: reqwest::Response,
+) -> anyhow::Result<(OpenProjectResponse, anyhow::Result<()>)> {
+    // Discovery and session open are separate requests. Recheck the peer that
+    // actually opened the session. Return a decodable receipt even on mismatch
+    // so the caller can close only the session it just opened.
+    let revision = check_daemon_code_query_revision(response.headers(), response.url().as_str());
+    match response.json().await {
+        Ok(opened) => Ok((opened, revision)),
+        Err(error) => {
+            revision?;
+            Err(error).context("daemon session open body")
+        }
+    }
+}
+
+async fn ensure_daemon_running_at(
+    control_state_dir: &ControlStateDir,
+) -> anyhow::Result<(u16, DaemonHealthProbe)> {
     ensure_daemon_running_as(control_state_dir, &current_daemon_identity(), None).await
 }
 
@@ -3618,7 +3715,8 @@ async fn ensure_installed_daemon_running_at(
             "a newer daemon ({newer}) owns this SymForge home"
         )));
     }
-    let port = ensure_daemon_running_as(control_state_dir, &identity, Some(executable)).await?;
+    let (port, _) =
+        ensure_daemon_running_as(control_state_dir, &identity, Some(executable)).await?;
     Ok(InstalledDaemon::Running {
         port,
         started: true,
@@ -3641,10 +3739,10 @@ async fn ensure_daemon_running_as(
     control_state_dir: &ControlStateDir,
     identity: &DaemonIdentity,
     executable: Option<&Path>,
-) -> anyhow::Result<u16> {
-    if let Some(port) = daemon_port_if_compatible_at(control_state_dir, identity).await? {
+) -> anyhow::Result<(u16, DaemonHealthProbe)> {
+    if let Some((port, peer)) = daemon_peer_if_compatible_at(control_state_dir, identity).await? {
         tracing::debug!("daemon already running on port {port}");
-        return Ok(port);
+        return Ok((port, peer));
     }
 
     // `symforge update` leaves sessions of the previous release running. When
@@ -3677,9 +3775,11 @@ async fn ensure_daemon_running_as(
     }
 
     if let Some(lock) = try_acquire_start_lock_at(control_state_dir)? {
-        if let Some(port) = daemon_port_if_compatible_at(control_state_dir, identity).await? {
+        if let Some((port, peer)) =
+            daemon_peer_if_compatible_at(control_state_dir, identity).await?
+        {
             tracing::debug!("daemon became ready while acquiring lock, port {port}");
-            return Ok(port);
+            return Ok((port, peer));
         }
         tracing::info!("acquired start lock, spawning new daemon");
         stop_incompatible_recorded_daemon_at(control_state_dir, identity).await?;
@@ -3756,6 +3856,15 @@ async fn daemon_port_if_compatible_at(
     control_state_dir: &ControlStateDir,
     identity: &DaemonIdentity,
 ) -> anyhow::Result<Option<u16>> {
+    Ok(daemon_peer_if_compatible_at(control_state_dir, identity)
+        .await?
+        .map(|(port, _)| port))
+}
+
+async fn daemon_peer_if_compatible_at(
+    control_state_dir: &ControlStateDir,
+    identity: &DaemonIdentity,
+) -> anyhow::Result<Option<(u16, DaemonHealthProbe)>> {
     let port = match read_daemon_port_file_at(control_state_dir) {
         Ok(port) => port,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -3766,9 +3875,9 @@ async fn daemon_port_if_compatible_at(
         Err(error) => return Err(error).context("reading daemon port file"),
     };
 
-    match daemon_health(port).await {
-        Some(health) if daemon_health_matches(&health, identity) => Ok(Some(port)),
-        Some(health) => {
+    match daemon_health_probe(port).await {
+        Some(peer) if daemon_health_matches(&peer.health, identity) => Ok(Some((port, peer))),
+        Some(DaemonHealthProbe { health, .. }) => {
             tracing::warn!(
                 recorded_port = port,
                 recorded_version = %health.daemon_version,
@@ -3798,11 +3907,11 @@ async fn newer_recorded_daemon_version_at(
 async fn wait_for_daemon_ready_at(
     control_state_dir: &ControlStateDir,
     identity: &DaemonIdentity,
-) -> anyhow::Result<u16> {
+) -> anyhow::Result<(u16, DaemonHealthProbe)> {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
-        if let Some(port) = daemon_port_if_compatible_at(control_state_dir, identity).await? {
-            return Ok(port);
+        if let Some(peer) = daemon_peer_if_compatible_at(control_state_dir, identity).await? {
+            return Ok(peer);
         }
 
         if tokio::time::Instant::now() >= deadline {
@@ -3814,21 +3923,31 @@ async fn wait_for_daemon_ready_at(
 }
 
 async fn daemon_health(port: u16) -> Option<DaemonHealth> {
+    daemon_health_probe(port).await.map(|peer| peer.health)
+}
+
+#[derive(Debug)]
+struct DaemonHealthProbe {
+    health: DaemonHealth,
+    headers: HeaderMap,
+}
+
+async fn daemon_health_probe(port: u16) -> Option<DaemonHealthProbe> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
         .build()
         .ok()?;
-    client
+    let response = client
         .get(format!("http://127.0.0.1:{port}/health"))
         .send()
         .await
         .ok()?
         .error_for_status()
-        .ok()?
-        .json::<DaemonHealth>()
-        .await
-        .ok()
+        .ok()?;
+    let headers = response.headers().clone();
+    let health = response.json::<DaemonHealth>().await.ok()?;
+    Some(DaemonHealthProbe { health, headers })
 }
 
 async fn daemon_health_ok(port: u16) -> bool {
@@ -5798,8 +5917,10 @@ pub async fn run_daemon_until_shutdown(bind_host: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn daemon_health_handler(State(state): State<SharedDaemonState>) -> Json<DaemonHealth> {
-    Json(state.health())
+async fn daemon_health_handler(
+    State(state): State<SharedDaemonState>,
+) -> impl axum::response::IntoResponse {
+    (code_query_revision_headers(), Json(state.health()))
 }
 
 async fn list_projects_handler(
@@ -5838,7 +5959,7 @@ async fn open_project_session_handler(
     State(state): State<SharedDaemonState>,
     headers: HeaderMap,
     Json(request): Json<OpenProjectRequest>,
-) -> Result<Json<OpenProjectResponse>, (StatusCode, String)> {
+) -> Result<impl axum::response::IntoResponse, (StatusCode, String)> {
     let _activity = authorize_daemon_request(&state, &headers).map_err(daemon_auth_error)?;
     let state_for_load = Arc::clone(&state);
     let response =
@@ -5846,7 +5967,7 @@ async fn open_project_session_handler(
             .await
             .map_err(internal_error)?
             .map_err(bad_request)?;
-    Ok(Json(response))
+    Ok((code_query_revision_headers(), Json(response)))
 }
 
 /// Resolve the [`crate::protocol::surface_probe::CONNECTION_SURFACE_HEADER`] on a
@@ -5979,6 +6100,44 @@ fn project_routing_response(
     }
     response
 }
+
+fn project_evidence_for_publication(
+    project_id: &str,
+    project_name: &str,
+    canonical_root: &Path,
+    generation: &live_index::PublishedGeneration,
+) -> ProjectEvidence {
+    ProjectEvidence {
+        project_id: project_id.to_string(),
+        project_name: project_name.to_string(),
+        canonical_root: Some(normalized_path_string(canonical_root)),
+        // Receipt equality must distinguish ordinary immutable publication
+        // changes; project_generation stays stable across content-only publishes.
+        generation: generation.publication_generation,
+        index_state: generation.health.status_label().to_string(),
+        trust: crate::live_index::store::TrustHeadline::of(generation)
+            .label()
+            .to_string(),
+        load_source: generation.live.load_source().label().to_string(),
+        index_files: generation.health.file_count,
+        index_symbols: generation.health.symbol_count,
+    }
+}
+
+fn attach_daemon_project_evidence(
+    response: &mut axum::response::Response,
+    evidence: Option<&ProjectEvidence>,
+) {
+    if let Some(evidence) = evidence
+        && let Ok(json) = serde_json::to_string(evidence)
+        && let Ok(value) = axum::http::HeaderValue::try_from(json)
+    {
+        response
+            .headers_mut()
+            .insert(PROJECT_EVIDENCE_HEADER, value);
+    }
+}
+
 async fn call_tool_handler(
     State(state): State<SharedDaemonState>,
     headers: HeaderMap,
@@ -6217,15 +6376,20 @@ async fn call_tool_handler(
         let peek: DetailPeek =
             serde_json::from_value(params.clone()).unwrap_or(DetailPeek { detail: None });
         if peek.detail.as_deref() == Some("projects") {
-            return state
-                .render_session_project_inventory(&session_id)
-                .ok_or_else(|| {
-                    (
-                        StatusCode::NOT_FOUND,
-                        format!("unknown session '{session_id}'"),
-                    )
-                })
-                .map(|text| text.into_response());
+            let Some((text, evidence)) = state.session_project_inventory(&session_id) else {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("unknown session '{session_id}'"),
+                ));
+            };
+            let mut response = text.into_response();
+            let evidence = evidence.as_ref().filter(|evidence| {
+                private_project_route_pin
+                    .as_deref()
+                    .is_none_or(|pin| pin == evidence.project_id)
+            });
+            attach_daemon_project_evidence(&mut response, evidence);
+            return Ok(response);
         }
     }
 
@@ -6337,27 +6501,17 @@ async fn call_tool_handler(
         // project-generation counter is not consulted, so the evidence cannot
         // pair a newer generation number with an older publication's counts.
         let generation = evidence_runtime.index.data_plane().published_generation();
-        Some(crate::protocol::result_status::ProjectEvidence {
-            project_id: evidence_runtime.project_id.clone(),
-            project_name: evidence_runtime
-                .canonical_root
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("project")
-                .to_string(),
-            canonical_root: Some(normalized_path_string(&evidence_runtime.canonical_root)),
-            // Receipt equality must distinguish ordinary immutable publication
-            // changes; project_generation intentionally stays stable across
-            // content-only publishes.
-            generation: generation.publication_generation,
-            index_state: generation.health.status_label().to_string(),
-            trust: crate::live_index::store::TrustHeadline::of(&generation)
-                .label()
-                .to_string(),
-            load_source: generation.live.load_source().label().to_string(),
-            index_files: generation.health.file_count,
-            index_symbols: generation.health.symbol_count,
-        })
+        let project_name = evidence_runtime
+            .canonical_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("project");
+        Some(project_evidence_for_publication(
+            &evidence_runtime.project_id,
+            project_name,
+            &evidence_runtime.canonical_root,
+            &generation,
+        ))
     };
 
     let tool_name_owned = tool_name.clone();
@@ -6480,15 +6634,7 @@ async fn call_tool_handler(
             if has_explicit_project_set {
                 response_evidence = None;
             }
-            if let Some(evidence) = response_evidence
-                && let Ok(json) = serde_json::to_string(&evidence)
-                && let Ok(value) = axum::http::HeaderValue::try_from(json)
-            {
-                response.headers_mut().insert(
-                    crate::protocol::result_status::PROJECT_EVIDENCE_HEADER,
-                    value,
-                );
-            }
+            attach_daemon_project_evidence(&mut response, response_evidence.as_ref());
             if let Some(outcome) = read_outcome
                 && let Ok(json) = serde_json::to_string(&outcome)
                 && let Ok(value) = axum::http::HeaderValue::try_from(json)
@@ -6526,6 +6672,14 @@ async fn code_query_handler(
     use axum::response::IntoResponse;
 
     let _activity = authorize_daemon_request(&state, &headers).map_err(daemon_auth_error)?;
+    if let Err(error) = check_code_query_revision(&headers) {
+        return Ok((
+            StatusCode::CONFLICT,
+            code_query_revision_headers(),
+            format!("{error}. Use a SymForge client from the matching build."),
+        )
+            .into_response());
+    }
     let _connection_surface = connection_surface_from_headers(&headers);
     let selector = req
         .project
@@ -6542,10 +6696,13 @@ async fn code_query_handler(
             return Err((StatusCode::NOT_FOUND, msg));
         }
         Err(msg) => {
-            return Ok(Json(crate::codemode::DaemonCodeQueryResponse::Error {
-                error: crate::codemode::CodeBackendError::refusal("project_routing", msg),
-            })
-            .into_response());
+            return Ok((
+                code_query_revision_headers(),
+                Json(crate::codemode::DaemonCodeQueryResponse::Error {
+                    error: crate::codemode::CodeBackendError::refusal("project_routing", msg),
+                }),
+            )
+                .into_response());
         }
     };
     let op = req.op;
@@ -6596,7 +6753,7 @@ async fn code_query_handler(
             .map_err(|join_err| anyhow::anyhow!("code-query task panicked: {join_err}"))?;
             Ok::<
                 (
-                    Result<serde_json::Value, crate::codemode::CodeBackendError>,
+                    Result<crate::codemode::CodeReadResult, crate::codemode::CodeBackendError>,
                     crate::protocol::result_status::ProjectEvidence,
                 ),
                 anyhow::Error,
@@ -6605,8 +6762,11 @@ async fn code_query_handler(
         .await;
 
     let (body, response_evidence) = match outcome {
-        Ok(Ok((Ok(value), evidence))) => (
-            crate::codemode::DaemonCodeQueryResponse::Ok { value },
+        Ok(Ok((Ok(result), evidence))) => (
+            crate::codemode::DaemonCodeQueryResponse::Ok {
+                value: result.value,
+                completeness: result.completeness,
+            },
             Some(evidence),
         ),
         Ok(Ok((Err(error), evidence))) => (
@@ -6633,7 +6793,7 @@ async fn code_query_handler(
         ),
     };
 
-    let mut response = Json(body).into_response();
+    let mut response = (code_query_revision_headers(), Json(body)).into_response();
     if let Some(evidence) = response_evidence
         && let Ok(json_str) = serde_json::to_string(&evidence)
         && let Ok(header_val) = axum::http::HeaderValue::try_from(json_str)
@@ -8376,6 +8536,9 @@ fn unix_seconds(time: SystemTime) -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+
+#[cfg(test)]
+mod code_query_revision_tests;
 
 #[cfg(test)]
 mod tests {

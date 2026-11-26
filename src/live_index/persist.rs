@@ -51,7 +51,9 @@ use crate::domain::ParseDiagnostic;
 // dismissal digest, so treating it as stale is the honest outcome and a
 // one-time cold parse per user is acceptable.
 // Format 11 appends a SHA-256 checksum covering every serialized snapshot field.
-const CURRENT_VERSION: u32 = 11;
+// Format 12 requires a fresh parse: serialized JSX/callable xrefs and JS/TS
+// symbol item ranges changed even though the postcard field layout did not.
+const CURRENT_VERSION: u32 = 12;
 
 /// The on-disk snapshot format version this engine writes and restores
 /// (embed `engine_info` reporting; a mismatched snapshot fails soft to a
@@ -2938,6 +2940,7 @@ fn hydrate_snapshot_with_proof(
         load_source: IndexLoadSource::SnapshotRestore,
         snapshot_verify_state: SnapshotVerifyState::Pending,
         reverse_index: HashMap::new(),
+        callable_values: Default::default(),
         files_by_basename: HashMap::new(),
         files_by_dir_component: HashMap::new(),
         trigram_index,
@@ -4995,6 +4998,7 @@ mod tests {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index,
@@ -8671,6 +8675,7 @@ mod tests {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index,
@@ -8720,7 +8725,7 @@ mod tests {
     #[test]
     fn test_persist_format_version_is_pinned() {
         assert_eq!(
-            CURRENT_VERSION, 11,
+            CURRENT_VERSION, 12,
             "persist format version changed — a format bump breaks every existing \
              user's .symforge/index.bin and requires orchestrator approval"
         );
@@ -8857,6 +8862,7 @@ mod tests {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index,
@@ -9859,6 +9865,7 @@ mod tests {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index,
@@ -9928,6 +9935,7 @@ mod tests {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index,
@@ -10191,6 +10199,7 @@ mod tests {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index,
@@ -10255,6 +10264,7 @@ mod tests {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index,

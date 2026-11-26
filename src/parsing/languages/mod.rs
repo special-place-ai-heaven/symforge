@@ -183,6 +183,63 @@ pub(super) fn push_symbol(
     sink: &mut SymbolSink<'_, '_>,
 ) {
     let doc_byte_range = scan_doc_range(node, sink.source, sink.doc_spec);
+    push_symbol_with_item(node, name, kind, depth, doc_byte_range, None, sink);
+}
+
+/// JS/TS read the whole enclosing statement, while mutation continues to
+/// resolve and splice the original declaration/declarator node.
+pub(super) fn push_js_declaration(
+    node: &Node,
+    declaration: &Node,
+    following_declarator: bool,
+    name: String,
+    kind: SymbolKind,
+    depth: u32,
+    sink: &mut SymbolSink<'_, '_>,
+) {
+    let mut item = *declaration;
+    while let Some(parent) = item.parent() {
+        if parent.kind() == "ambient_declaration"
+            || (parent.kind() == "export_statement"
+                && parent.child_by_field_name("declaration") == Some(item))
+        {
+            item = parent;
+        } else {
+            break;
+        }
+    }
+    let doc_byte_range = if following_declarator {
+        // The first binding can still own the statement docs. Inheriting
+        // those docs for a later binding would make its edit cross siblings.
+        scan_doc_range_direct(node, sink.source, sink.doc_spec)
+    } else {
+        scan_doc_range(node, sink.source, sink.doc_spec)
+    };
+    let item_byte_range = (item != *node).then(|| {
+        let start = scan_doc_range_direct(&item, sink.source, sink.doc_spec)
+            .map_or(item.start_byte() as u32, |(start, _)| start);
+        (start, item.end_byte() as u32)
+    });
+    push_symbol_with_item(
+        node,
+        name,
+        kind,
+        depth,
+        doc_byte_range,
+        item_byte_range,
+        sink,
+    );
+}
+
+fn push_symbol_with_item(
+    node: &Node,
+    name: String,
+    kind: SymbolKind,
+    depth: u32,
+    doc_byte_range: Option<(u32, u32)>,
+    item_byte_range: Option<(u32, u32)>,
+    sink: &mut SymbolSink<'_, '_>,
+) {
     let byte_range = (node.start_byte() as u32, node.end_byte() as u32);
     sink.symbols.push(SymbolRecord {
         name,
@@ -195,7 +252,7 @@ pub(super) fn push_symbol(
             node.end_position().row as u32,
         ),
         doc_byte_range,
-        item_byte_range: Some(byte_range),
+        item_byte_range: item_byte_range.or(Some(byte_range)),
     });
     *sink.sort_order += 1;
 }

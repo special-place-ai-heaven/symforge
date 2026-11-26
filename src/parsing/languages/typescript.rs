@@ -1,7 +1,7 @@
 use tree_sitter::Node;
 
 use super::{
-    DocCommentSpec, SymbolSink, collect_symbols, find_first_named_child, push_named_symbol,
+    DocCommentSpec, SymbolSink, collect_symbols, find_first_named_child, push_js_declaration,
     push_symbol, walk_children,
 };
 
@@ -77,15 +77,11 @@ fn walk_node(
         _ => None,
     };
 
+    if let Some(kind) = kind
+        && let Some(name) = find_name(node, source)
     {
         let mut sink = SymbolSink::new(source, sort_order, symbols, &DOC_SPEC);
-        push_named_symbol(
-            node,
-            depth,
-            kind,
-            |node, source, _| find_name(node, source),
-            &mut sink,
-        );
+        push_js_declaration(node, node, false, name, kind, depth, &mut sink);
     }
     walk_children(node, source, depth, sort_order, symbols, kind, walk_node);
 }
@@ -98,10 +94,12 @@ fn extract_variable_declarations(
     symbols: &mut Vec<SymbolRecord>,
 ) {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "variable_declarator"
-            && let Some(name) = find_name(&child, source)
-        {
+    for (i, child) in node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "variable_declarator")
+        .enumerate()
+    {
+        if let Some(name) = find_name(&child, source) {
             let kind = if has_function_initializer(&child) {
                 SymbolKind::Function
             } else if is_const_declaration(node) {
@@ -110,7 +108,7 @@ fn extract_variable_declarations(
                 SymbolKind::Variable
             };
             let mut sink = SymbolSink::new(source, sort_order, symbols, &DOC_SPEC);
-            push_symbol(&child, name, kind, depth, &mut sink);
+            push_js_declaration(&child, node, i > 0, name, kind, depth, &mut sink);
         }
     }
 }

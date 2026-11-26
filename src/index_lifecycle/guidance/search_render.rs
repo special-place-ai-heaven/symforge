@@ -424,7 +424,7 @@ pub(crate) fn append_unparsed_note(message: String, unparsed: usize) -> String {
         return message;
     }
     let noun = if unparsed == 1 { "file" } else { "files" };
-    format!("{message}\nThis search skipped {unparsed} {noun} whose parse was cancelled or failed.")
+    format!("{message}\nThis search skipped {unparsed} {noun} (grammar, parse or work budget).")
 }
 
 pub(crate) fn append_withheld_admission_note(

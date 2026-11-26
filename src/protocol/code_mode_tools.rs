@@ -65,7 +65,7 @@ impl SymForgeServer {
 
     #[tool(
         name = "code_execute",
-        description = "Run one zero-egress Python script chaining read-only index queries; returns the final value as lean text (tables, raw strings).",
+        description = "Run one zero-egress Python script chaining read-only index queries; returns the final value as lean text (tables, raw strings), followed by notices when results are capped or withheld.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn code_execute_tool(
@@ -338,10 +338,17 @@ fn render_execute_call_result(
             }
         }
     };
-    let text = outcome.lean_text.take().unwrap_or_else(|| {
+    let text = if let Some(mut text) = outcome.lean_text.take() {
+        if !outcome.notices.is_empty() {
+            // Keep notices visible even in clients that display only the first text block.
+            text.push_str("\n\nHost-call completeness: ");
+            text.push_str(&serde_json::json!({"notices": outcome.notices}).to_string());
+        }
+        text
+    } else {
         serde_json::to_string(&outcome)
             .unwrap_or_else(|e| format!("{{\"status\":\"error\",\"message\":\"{e}\"}}"))
-    });
+    };
     let mut result = ResultStatus::new(class).into_call_tool_result(text);
     if let Some(meta) = result.meta.as_mut() {
         meta.0.insert(

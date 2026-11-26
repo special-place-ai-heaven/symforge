@@ -178,11 +178,30 @@ pub fn structural_search_with_compiled(
     structural_search_within(source, compiled, super::PARSE_DEADLINE)
 }
 
+pub(crate) fn structural_search_bounded(
+    source: &str,
+    compiled: &CompiledStructuralPattern,
+    deadline: Duration,
+    match_limit: usize,
+) -> Result<Vec<StructuralMatch>, String> {
+    structural_search_impl(source, compiled, deadline, Some(match_limit))
+}
+
 fn structural_search_within(
     source: &str,
     compiled: &CompiledStructuralPattern,
     deadline: Duration,
 ) -> Result<Vec<StructuralMatch>, String> {
+    structural_search_impl(source, compiled, deadline, None)
+}
+
+fn structural_search_impl(
+    source: &str,
+    compiled: &CompiledStructuralPattern,
+    deadline: Duration,
+    match_limit: Option<usize>,
+) -> Result<Vec<StructuralMatch>, String> {
+    let started = std::time::Instant::now();
     let mut parser = Parser::new();
     parser
         .set_language(&compiled.lang.get_ts_language())
@@ -194,28 +213,57 @@ fn structural_search_within(
         tree,
     });
 
-    Ok(root
-        .root()
+    let clip = |text: &str, bytes: usize| -> String {
+        if text.len() <= bytes {
+            text.to_owned()
+        } else {
+            format!("{}...", &text[..text.floor_char_boundary(bytes)])
+        }
+    };
+    root.root()
         .find_all(&compiled.pattern)
-        .map(|node_match| {
+        .enumerate()
+        .map(|(i, node_match)| {
+            if let Some(limit) = match_limit
+                && (i >= limit || started.elapsed() >= deadline)
+            {
+                // Discard this file, rather than publishing a partial per-file count.
+                return Err("structural search exceeded the file match budget".to_owned());
+            }
             let start = node_match.start_pos();
-            let text = node_match.text().to_string();
+            let text = node_match.text();
+            let text = if match_limit.is_some() {
+                clip(text.lines().next().unwrap_or(text.as_ref()), 1024)
+            } else {
+                text.to_string()
+            };
 
-            // Extract metavariable captures
+            let capture = |text: &str| {
+                if match_limit.is_some() {
+                    clip(text, 40)
+                } else {
+                    text.to_owned()
+                }
+            };
             let env = node_match.get_env();
             let captures: Vec<(String, String)> = env
                 .get_matched_variables()
                 .filter_map(|var| match var {
                     MetaVariable::Capture(name, _) => {
-                        env.get_match(&name).map(|n| (name, n.text().to_string()))
+                        env.get_match(&name).map(|n| (name, capture(&n.text())))
                     }
                     MetaVariable::MultiCapture(name) => {
                         let nodes = env.get_multiple_matches(&name);
-                        let combined: String = nodes
-                            .iter()
-                            .map(|n| n.text().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                        let mut combined = String::new();
+                        for (i, node) in nodes.iter().enumerate() {
+                            if i != 0 {
+                                combined.push_str(", ");
+                            }
+                            combined.push_str(&capture(&node.text()));
+                            if match_limit.is_some() && combined.len() > 40 {
+                                break;
+                            }
+                        }
                         if combined.is_empty() {
                             None
                         } else {
@@ -226,16 +274,25 @@ fn structural_search_within(
                 })
                 .collect();
 
-            StructuralMatch {
+            Ok(StructuralMatch {
                 start_byte: node_match.range().start,
                 end_byte: node_match.range().end,
                 start_line: start.line(),
                 start_col: start.byte_point().1,
                 text,
                 captures,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|matches| {
+            // `find_all` can spend time before yielding its next (or final)
+            // match. Treat that file as incomplete if it exceeded the budget.
+            if match_limit.is_some() && started.elapsed() >= deadline {
+                Err("structural search exceeded the file match budget".to_owned())
+            } else {
+                Ok(matches)
             }
         })
-        .collect())
 }
 
 /// Rewrite every match of `compiled` in `source` with ast-grep's own template
