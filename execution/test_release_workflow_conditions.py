@@ -313,7 +313,9 @@ class ReleaseVerifySkipsOnlyNonPublishingPushes(unittest.TestCase):
         resolve = job_block(self.text, "resolve-release-ref")
         self.assertIn("      can_publish: ${{ steps.publish-scope.outputs.can_publish }}", resolve)
         self.assertIn("      full_verify: ${{ steps.publish-scope.outputs.full_verify }}", resolve)
-        step_with_id(job_steps(resolve), "publish-scope")
+        scope = step_with_id(job_steps(resolve), "publish-scope")
+        self.assertIn("          WORKFLOW_EVENT: ${{ github.event_name }}\n", scope)
+        self.assertNotIn("github.event_name", run_script(scope))
 
     def test_heavy_steps_carry_exactly_the_full_verify_condition(self) -> None:
         for name in HEAVY_STEPS:
@@ -479,7 +481,7 @@ class PublishScopeScriptBehaviour(unittest.TestCase):
         self.git("commit", "-q", "--allow-empty", "-m", f"chore: {version}")
         return self.git("rev-parse", "HEAD")
 
-    def scope(self, *, manual_tag: str = "", lifecycle: str = "false") -> dict[str, str]:
+    def scope(self, *, manual_tag: str = "", lifecycle: str = "false", event: str = "push") -> dict[str, str]:
         output = self.repo / "out.txt"
         output.write_bytes(b"")
         env = {
@@ -487,6 +489,7 @@ class PublishScopeScriptBehaviour(unittest.TestCase):
             "GITHUB_OUTPUT": str(output),
             "MANUAL_TAG": manual_tag,
             "LIFECYCLE_GATE_ACTIVE": lifecycle,
+            "WORKFLOW_EVENT": event,
             "RELEASE_REF": self.git("rev-parse", "HEAD"),
         }
         subprocess.run([self.bash, "scope.sh"], cwd=self.repo, env=env, check=True, capture_output=True)
@@ -516,6 +519,15 @@ class PublishScopeScriptBehaviour(unittest.TestCase):
             self.assertEqual(
                 self.scope(lifecycle=lifecycle), {"can_publish": "false", "full_verify": "true"}
             )
+
+    def test_manual_dispatch_forces_full_verification(self) -> None:
+        self.commit("1.0.0")
+        self.git("tag", "v1.0.0")
+        self.commit("1.0.0")
+        self.assertEqual(
+            self.scope(event="workflow_dispatch"), {"can_publish": "false", "full_verify": "true"}
+        )
+        self.assertEqual(self.scope(event="push"), {"can_publish": "false", "full_verify": "false"})
 
     def test_manual_tag_can_publish(self) -> None:
         self.commit("1.0.0")

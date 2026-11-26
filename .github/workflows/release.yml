@@ -244,6 +244,7 @@ jobs:
           LIFECYCLE_GATE_ACTIVE: ${{ steps.lifecycle-requirements.outputs.active }}
           MANUAL_TAG: ${{ inputs.tag }}
           RELEASE_REF: ${{ steps.resolve.outputs.release_ref }}
+          WORKFLOW_EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           CAN_PUBLISH=true
@@ -258,7 +259,7 @@ jobs:
             fi
           fi
           FULL_VERIFY="$CAN_PUBLISH"
-          if [[ "$LIFECYCLE_GATE_ACTIVE" != "false" ]]; then
+          if [[ "$LIFECYCLE_GATE_ACTIVE" != "false" || "$WORKFLOW_EVENT" == "workflow_dispatch" ]]; then
             FULL_VERIFY=true
           fi
           echo "can_publish=$CAN_PUBLISH" >> "$GITHUB_OUTPUT"
