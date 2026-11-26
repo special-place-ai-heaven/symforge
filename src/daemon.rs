@@ -8538,6 +8538,7 @@ fn unix_seconds(time: SystemTime) -> u64 {
 }
 
 #[cfg(test)]
+#[path = "daemon/code_query_revision_tests.rs"]
 mod code_query_revision_tests;
 
 #[cfg(test)]
