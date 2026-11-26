@@ -2776,6 +2776,8 @@ impl LiveIndex {
             a.trait_name
                 .cmp(&b.trait_name)
                 .then(a.implementor.cmp(&b.implementor))
+                .then(a.file_path.cmp(&b.file_path))
+                .then(a.line.cmp(&b.line))
         });
 
         ImplementationsView { entries }
