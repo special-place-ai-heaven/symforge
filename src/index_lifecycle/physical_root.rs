@@ -2021,6 +2021,32 @@ mod capability_read_tests {
         assert!(list_directory_beneath(&lease, Path::new("nested"), 0).is_err());
     }
 
+    #[cfg(any(feature = "server", feature = "embed"))]
+    #[test]
+    fn anchored_directory_listing_reports_the_entry_metadata_lookup() {
+        let root = tempfile::tempdir().expect("temporary root");
+        std::fs::create_dir(root.path().join("nested")).expect("nested directory");
+        std::fs::write(root.path().join("top.rs"), b"fn top() {}").expect("top source");
+        std::fs::write(root.path().join("nested/file.rs"), b"fn example() {}")
+            .expect("nested source");
+        let lease = PhysicalRootLease::take(root.path());
+
+        for (directory, file) in [(".", "top.rs"), ("nested", "nested/file.rs")] {
+            let listed = list_directory_beneath(&lease, Path::new(directory), 4)
+                .expect("listing")
+                .expect("directory");
+            let entry = listed
+                .iter()
+                .find(|entry| entry.relative == Path::new(file))
+                .expect("listed file");
+            let direct = entry_metadata_beneath(&lease, Path::new(file))
+                .expect("metadata")
+                .expect("present");
+            assert_eq!(entry.len, direct.len);
+            assert_eq!(entry.modified_secs, Some(direct.modified_secs));
+        }
+    }
+
     #[cfg(feature = "embed")]
     #[test]
     fn streamed_digest_covers_large_regular_file_and_refuses_invalid_targets() {

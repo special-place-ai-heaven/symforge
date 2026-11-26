@@ -6733,7 +6733,7 @@ mod tests {
                     verdict(positions[path])
                 })
             },
-            || Ok(Vec::new()),
+            || Ok(DiscoveredSource::default()),
         )
         .expect("not stopped");
         assert_eq!(batches.get(), 3);
@@ -6752,11 +6752,227 @@ mod tests {
                     observed.set(true);
                     paths.iter().map(|_| Ok(None)).collect()
                 },
-                || Ok(Vec::new()),
+                || Ok(DiscoveredSource::default()),
             )
             .is_none()
         );
         assert!(!observed.get(), "a stopped pass observes nothing");
+    }
+
+    #[test]
+    fn stat_pass_takes_walk_observations_and_observes_only_the_rest() {
+        let names: Vec<String> = (0..SNAPSHOT_VERIFY_STOP_EVERY + 11)
+            .map(|i| format!("f{i:05}.rs"))
+            .collect();
+        let index = make_live_index_with_files(
+            names
+                .iter()
+                .map(|name| (name.as_str(), b"fn f() {}\n".as_slice()))
+                .collect(),
+        );
+        let view = capture_verify_view(&index);
+        let snapshot_mtimes: HashMap<String, u64> = view
+            .files
+            .iter()
+            .map(|file| (file.relative_path.clone(), 100))
+            .collect();
+        let positions: HashMap<&str, usize> = view
+            .files
+            .iter()
+            .enumerate()
+            .map(|(position, file)| (file.relative_path.as_str(), position))
+            .collect();
+        let disk = |position: usize| -> Option<(u64, u64)> {
+            let len = view.files[position].byte_len;
+            match position % 6 {
+                1 => Some((len + 1, 100)),
+                2 => Some((len, 101)),
+                3 => None,
+                _ => Some((len, 100)),
+            }
+        };
+        let walked_files: Vec<String> = view
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| disk(*position).is_some())
+            .map(|(_, file)| file.relative_path.clone())
+            .chain(["new/one.rs".to_string(), "new/two.rs".to_string()])
+            .collect();
+        let walked_metadata: HashMap<String, (u64, u64)> = view
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| position % 4 != 1)
+            .filter_map(|(position, file)| {
+                disk(position).map(|observed| (file.relative_path.clone(), observed))
+            })
+            .collect();
+
+        let all_observed = stat_check_files_from_view_with(
+            &view,
+            &snapshot_mtimes,
+            &|| false,
+            |paths| paths.iter().map(|path| Ok(disk(positions[path]))).collect(),
+            || {
+                Ok(DiscoveredSource {
+                    files: walked_files.clone(),
+                    observed: HashMap::new(),
+                })
+            },
+        )
+        .expect("not stopped");
+
+        let individually = std::cell::RefCell::new(Vec::new());
+        let reused = stat_check_files_from_view_with(
+            &view,
+            &snapshot_mtimes,
+            &|| false,
+            |paths| {
+                individually
+                    .borrow_mut()
+                    .extend(paths.iter().map(|path| path.to_string()));
+                paths.iter().map(|path| Ok(disk(positions[path]))).collect()
+            },
+            || {
+                Ok(DiscoveredSource {
+                    files: walked_files.clone(),
+                    observed: walked_metadata.clone(),
+                })
+            },
+        )
+        .expect("not stopped");
+
+        let expected_individual: Vec<String> = view
+            .files
+            .iter()
+            .filter(|file| !walked_metadata.contains_key(&file.relative_path))
+            .map(|file| file.relative_path.clone())
+            .collect();
+        assert!(!expected_individual.is_empty());
+        assert!(expected_individual.len() < view.files.len());
+        assert_eq!(individually.into_inner(), expected_individual);
+        assert_eq!(reused.changed, all_observed.changed);
+        assert_eq!(reused.deleted, all_observed.deleted);
+        assert_eq!(reused.new_files, all_observed.new_files);
+        assert_eq!(reused.discovery_error, all_observed.discovery_error);
+        assert!(!reused.deleted.is_empty());
+        assert!(
+            reused
+                .changed
+                .iter()
+                .any(|path| positions[path.as_str()] % 6 == 1)
+        );
+        assert!(
+            reused
+                .changed
+                .iter()
+                .any(|path| positions[path.as_str()] % 6 == 2)
+        );
+        assert_eq!(reused.new_files, vec!["new/one.rs", "new/two.rs"]);
+        assert_eq!(reused.discovery_error, None);
+    }
+
+    #[test]
+    fn stat_pass_observes_every_file_when_discovery_fails() {
+        let names: Vec<String> = (0..SNAPSHOT_VERIFY_STOP_EVERY + 5)
+            .map(|i| format!("f{i:05}.rs"))
+            .collect();
+        let index = make_live_index_with_files(
+            names
+                .iter()
+                .map(|name| (name.as_str(), b"fn f() {}\n".as_slice()))
+                .collect(),
+        );
+        let view = capture_verify_view(&index);
+        let observed = std::cell::Cell::new(0usize);
+        let result = stat_check_files_from_view_with(
+            &view,
+            &HashMap::new(),
+            &|| false,
+            |paths| {
+                observed.set(observed.get() + paths.len());
+                paths.iter().map(|_| Ok(None)).collect()
+            },
+            || {
+                Err(AnchoredDiscoveryError::Failed(
+                    "the walk failed".to_string(),
+                ))
+            },
+        )
+        .expect("not stopped");
+        assert_eq!(observed.get(), view.files.len());
+        assert_eq!(result.deleted.len(), view.files.len());
+        assert!(result.new_files.is_empty());
+        assert_eq!(result.discovery_error.as_deref(), Some("the walk failed"));
+    }
+
+    #[cfg(any(feature = "server", feature = "embed"))]
+    #[test]
+    fn level_parallel_discovery_matches_the_serial_walk() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let wide: Vec<String> = (0..SOURCE_ANCHOR_READ_BATCH + 3)
+            .map(|i| format!("wide/d{i:03}/x.rs"))
+            .collect();
+        let fixed = [
+            "a.rs",
+            "src/b.rs",
+            "src/deep/c.rs",
+            "src/deep/deeper/d.rs",
+            "ignored/e.rs",
+            "notes.txt",
+        ];
+        for relative in fixed.iter().copied().chain(wide.iter().map(String::as_str)) {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("// {relative}\n")).unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(root.join("src"), root.join("linked"));
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_dir(root.join("src"), root.join("linked"));
+
+        let index =
+            crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(Vec::new()));
+        let authority = crate::index_lifecycle::activation::ProjectSourceAuthority::for_root(root);
+        let walk = || match discover_files_from_source_anchor(root, &index, &authority, &|| false) {
+            Ok(discovered) => discovered,
+            Err(_) => panic!("the walk must succeed"),
+        };
+        let parallel = walk();
+        let serial = crate::live_index::store::with_serial_oracle(walk);
+        assert_eq!(parallel.files, serial.files);
+        assert_eq!(parallel.observed, serial.observed);
+
+        let mut expected: Vec<String> =
+            ["a.rs", "src/b.rs", "src/deep/c.rs", "src/deep/deeper/d.rs"]
+                .iter()
+                .map(|path| path.to_string())
+                .chain(wide.iter().cloned())
+                .collect();
+        expected.sort();
+        assert_eq!(parallel.files, expected);
+        assert!(parallel.observed.contains_key("ignored/e.rs"));
+        assert!(!parallel.observed.contains_key("notes.txt"));
+        for relative in &parallel.files {
+            let metadata = std::fs::metadata(root.join(relative)).unwrap();
+            let modified = metadata
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            assert_eq!(parallel.observed[relative], (metadata.len(), modified));
+        }
+
+        let stops = std::cell::Cell::new(0usize);
+        let cancelled = discover_files_from_source_anchor(root, &index, &authority, &|| {
+            stops.set(stops.get() + 1);
+            stops.get() > 2
+        });
+        assert!(matches!(cancelled, Err(AnchoredDiscoveryError::Cancelled)));
     }
 
     #[test]
