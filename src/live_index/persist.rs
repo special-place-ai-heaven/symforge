@@ -7008,7 +7008,7 @@ mod tests {
         .collect();
         expected.sort();
         assert_eq!(parallel.files, expected);
-        assert!(parallel.observed.contains_key("ignored/e.rs"));
+        assert!(!parallel.observed.contains_key("ignored/e.rs"));
         for relative in &parallel.files {
             let metadata = std::fs::metadata(root.join(relative)).unwrap();
             let modified = metadata
@@ -7026,6 +7026,48 @@ mod tests {
             stops.get() > 2
         });
         assert!(matches!(cancelled, Err(AnchoredDiscoveryError::Cancelled)));
+    }
+
+    #[cfg(any(feature = "server", feature = "embed"))]
+    #[test]
+    fn discovery_does_not_list_ignored_directories_and_honours_nested_reinclusion() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        for relative in [
+            "a.rs",
+            "build/y.rs",
+            "src/b.rs",
+            "src/gen/g.rs",
+            "src/gen/inner/h.rs",
+            "src/build/x.rs",
+        ] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("// {relative}\n")).unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "build/\n").unwrap();
+        std::fs::write(root.join("src/.gitignore"), "gen/\n!build/\n").unwrap();
+        std::fs::write(root.join("src/gen/.gitignore"), "!inner/\n").unwrap();
+
+        let index =
+            crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(Vec::new()));
+        let authority = crate::index_lifecycle::activation::ProjectSourceAuthority::for_root(root);
+        let walk = || match discover_files_from_source_anchor(root, &index, &authority, &|| false) {
+            Ok(discovered) => discovered,
+            Err(_) => panic!("the walk must succeed"),
+        };
+        let parallel = walk();
+        let serial = crate::live_index::store::with_serial_oracle(walk);
+        assert_eq!(parallel.files, serial.files);
+        assert_eq!(parallel.observed, serial.observed);
+
+        assert_eq!(
+            parallel.files,
+            vec![".gitignore", "a.rs", "src/.gitignore", "src/b.rs", "src/build/x.rs"]
+        );
+        let mut observed: Vec<&str> = parallel.observed.keys().map(String::as_str).collect();
+        observed.sort();
+        assert_eq!(observed, parallel.files);
     }
 
     #[test]
