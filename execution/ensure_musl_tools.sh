@@ -10,8 +10,8 @@ if sudo -n true >/dev/null 2>&1; then
 fi
 prefix="${HOME}/.local/musl-native"
 if [ ! -x "${prefix}/bin/musl-gcc" ]; then
-  version="1.2.5"
-  sha256="a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4"
+  version="1.2.6"
+  sha256="d585fd3b613c66151fc3249e8ed44f77020cb5e6c1e635a616d3f9f82460512a"
   tmp="$(mktemp -d)"
   curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused -o "${tmp}/musl.tar.gz" "https://musl.libc.org/releases/musl-${version}.tar.gz"
   echo "${sha256}  ${tmp}/musl.tar.gz" | sha256sum -c -
