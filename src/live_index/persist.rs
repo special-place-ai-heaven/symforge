@@ -3084,8 +3084,6 @@ fn discover_files_from_source_anchor(
     authority: &crate::index_lifecycle::activation::ProjectSourceAuthority,
     stop: &dyn Fn() -> bool,
 ) -> Result<DiscoveredSource, AnchoredDiscoveryError> {
-    use crate::index_lifecycle::physical_root::{AnchoredEntryKind, list_directory_beneath};
-
     #[cfg(test)]
     if test_discovery_failure_root().lock().as_deref() == Some(root) {
         return Err(format!("injected discovery failure under {}", root.display()).into());
@@ -3095,6 +3093,19 @@ fn discover_files_from_source_anchor(
     let max_entries = usize::try_from(limits.max_files)
         .unwrap_or(usize::MAX)
         .min(200_000);
+    discover_files_from_source_anchor_within(root, index, authority, stop, max_entries)
+}
+
+#[cfg(any(feature = "server", feature = "embed"))]
+fn discover_files_from_source_anchor_within(
+    root: &Path,
+    index: &crate::live_index::store::SharedIndex,
+    authority: &crate::index_lifecycle::activation::ProjectSourceAuthority,
+    stop: &dyn Fn() -> bool,
+    max_entries: usize,
+) -> Result<DiscoveredSource, AnchoredDiscoveryError> {
+    use crate::index_lifecycle::physical_root::{AnchoredEntryKind, list_directory_beneath};
+
     let exclusions = index.source_exclusions();
     let unlisted = || "the admitted source directory could not be listed".to_string();
     let mut level = vec![PathBuf::from(".")];
@@ -3114,7 +3125,12 @@ fn discover_files_from_source_anchor(
                 .with_source_anchor_read(|lease| {
                     Ok(crate::live_index::store::ordered_parallel_map(
                         batch,
-                        |directory| list_directory_beneath(lease, directory, max_entries),
+                        |directory| {
+                            #[cfg(test)]
+                            test_anchor_listings()
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            list_directory_beneath(lease, directory, max_entries)
+                        },
                     ))
                 })
                 .map_err(|_| unlisted())?;
@@ -3366,6 +3382,12 @@ fn publish_snapshot_verify_from_source_anchor(
 fn test_discovery_failure_root() -> &'static parking_lot::Mutex<Option<PathBuf>> {
     static ROOT: parking_lot::Mutex<Option<PathBuf>> = parking_lot::Mutex::new(None);
     &ROOT
+}
+
+#[cfg(all(test, any(feature = "server", feature = "embed")))]
+fn test_anchor_listings() -> &'static std::sync::atomic::AtomicUsize {
+    static LISTINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    &LISTINGS
 }
 
 /// Files a stat pass or spot check handles between two stop checks.
@@ -7082,6 +7104,48 @@ mod tests {
         let mut observed: Vec<&str> = parallel.observed.keys().map(String::as_str).collect();
         observed.sort();
         assert_eq!(observed, parallel.files);
+    }
+
+    #[cfg(any(feature = "server", feature = "embed"))]
+    #[test]
+    fn discovery_stops_listing_once_the_entry_bound_is_crossed() {
+        use std::sync::atomic::Ordering;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        for directory in 0..200 {
+            for file in 0..3 {
+                let path = root.join(format!("wide/d{directory:03}/f{file}.rs"));
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "// f\n").unwrap();
+            }
+        }
+        let index =
+            crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(Vec::new()));
+        let authority = crate::index_lifecycle::activation::ProjectSourceAuthority::for_root(root);
+        let walk = || {
+            test_anchor_listings().store(0, Ordering::SeqCst);
+            let outcome = match discover_files_from_source_anchor_within(
+                root,
+                &index,
+                &authority,
+                &|| false,
+                250,
+            ) {
+                Ok(_) => panic!("the walk must cross its bound"),
+                Err(AnchoredDiscoveryError::Failed(error)) => error,
+                Err(AnchoredDiscoveryError::Cancelled) => panic!("the walk was not stopped"),
+            };
+            (outcome, test_anchor_listings().load(Ordering::SeqCst))
+        };
+        let (parallel_error, parallel_listings) = walk();
+        let (serial_error, serial_listings) = crate::live_index::store::with_serial_oracle(walk);
+        assert_eq!(serial_error, "admitted source discovery exceeds its file bound");
+        assert_eq!(parallel_error, serial_error);
+        assert_eq!(serial_listings, 19);
+        assert!(
+            parallel_listings < 200,
+            "listed {parallel_listings} directories past the bound"
+        );
     }
 
     #[test]
