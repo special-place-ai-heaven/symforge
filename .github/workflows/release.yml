@@ -35,6 +35,8 @@ jobs:
       tag_name: ${{ steps.resolve.outputs.tag_name }}
       lifecycle_gate_active: ${{ steps.lifecycle-requirements.outputs.active }}
       lifecycle_requirements_sha256: ${{ steps.lifecycle-requirements.outputs.sha256 }}
+      can_publish: ${{ steps.publish-scope.outputs.can_publish }}
+      full_verify: ${{ steps.publish-scope.outputs.full_verify }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -235,6 +237,33 @@ jobs:
 
           echo "release_ref=$RELEASE_REF" >> "$GITHUB_OUTPUT"
 
+      - id: publish-scope
+        name: Decide whether this run can publish
+        shell: bash
+        env:
+          LIFECYCLE_GATE_ACTIVE: ${{ steps.lifecycle-requirements.outputs.active }}
+          MANUAL_TAG: ${{ inputs.tag }}
+          RELEASE_REF: ${{ steps.resolve.outputs.release_ref }}
+        run: |
+          set -euo pipefail
+          CAN_PUBLISH=true
+          if [[ -z "$MANUAL_TAG" ]]; then
+            VERSION="$(git show "$RELEASE_REF:.github/.release-please-manifest.json" | python -I -c 'import json, sys; v = json.load(sys.stdin).get("."); print(v) if isinstance(v, str) and v else sys.exit("release manifest version is unavailable")')"
+            TAG_NAME="v$VERSION"
+            if git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null; then
+              TAG_COMMIT="$(git rev-parse --verify --end-of-options "refs/tags/${TAG_NAME}^{commit}")"
+              if [[ "$TAG_COMMIT" != "$RELEASE_REF" ]] && git merge-base --is-ancestor "$TAG_COMMIT" "$RELEASE_REF"; then
+                CAN_PUBLISH=false
+              fi
+            fi
+          fi
+          FULL_VERIFY="$CAN_PUBLISH"
+          if [[ "$LIFECYCLE_GATE_ACTIVE" != "false" ]]; then
+            FULL_VERIFY=true
+          fi
+          echo "can_publish=$CAN_PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "full_verify=$FULL_VERIFY" >> "$GITHUB_OUTPUT"
+
   verify-release-ref:
     needs: resolve-release-ref
     runs-on: ubuntu-latest
@@ -269,7 +298,7 @@ jobs:
 
       # Free disk space for Rust builds on GitHub-hosted runners.
       - name: Free disk space for Rust builds
-        if: runner.environment == 'github-hosted'
+        if: runner.environment == 'github-hosted' && needs.resolve-release-ref.outputs.full_verify == 'true'
         run: bash execution/free_runner_disk.sh
 
       - name: Install GitHub CLI
@@ -326,15 +355,19 @@ jobs:
       # rust-toolchain.toml is the single source of truth for the toolchain
       # version; rustup resolves it natively (channel + components).
       - name: Install Rust toolchain (rust-toolchain.toml)
+        if: needs.resolve-release-ref.outputs.full_verify == 'true'
         run: bash execution/ensure_rustup.sh
 
       - name: Run cargo check
+        if: needs.resolve-release-ref.outputs.full_verify == 'true'
         run: cargo check
 
       - name: Clone phase0 golden-replay corpora
+        if: needs.resolve-release-ref.outputs.full_verify == 'true'
         run: bash execution/clone_phase0_corpora.sh
 
       - name: Run Rust tests
+        if: needs.resolve-release-ref.outputs.full_verify == 'true'
         # `--lib --bins --tests`, not `--all-targets`: the trailing libtest
         # flag is forwarded to EVERY selected binary, and the criterion
         # bench target (harness = false, T068) rejects `--test-threads`.
@@ -342,9 +375,11 @@ jobs:
         run: cargo test --lib --bins --tests -- --test-threads=1
 
       - name: Smoke the observed-refresh benchmark (criterion --test mode)
+        if: needs.resolve-release-ref.outputs.full_verify == 'true'
         run: cargo bench --bench observed_refresh_gate_v1 -- --test
 
       - name: Build release binary on main pushes
+        if: needs.resolve-release-ref.outputs.full_verify == 'true'
         run: cargo build --release
 
       # Engine-only build for library embedders (e.g. AAP). ci.yml runs the same
@@ -352,12 +387,15 @@ jobs:
       # `#[cfg(unix)]` path cfg'd out on the contributor's OS) can never reach an
       # embedder via main.
       - name: Build engine-only embed feature
+        if: needs.resolve-release-ref.outputs.full_verify == 'true'
         run: cargo build --no-default-features --features embed
 
       - name: Run embed-feature lib tests
+        if: needs.resolve-release-ref.outputs.full_verify == 'true'
         run: cargo test --no-default-features --features embed --lib -- --test-threads=1
 
       - name: Run embed parity and replay contracts
+        if: needs.resolve-release-ref.outputs.full_verify == 'true'
         run: |
           set -euo pipefail
           cargo test --no-default-features --features embed,__test-internals --test embed_parity --test embed_replay_v1 -- --test-threads=1 2>&1 | tee /tmp/embed-parity-replay.log
@@ -369,10 +407,12 @@ jobs:
           test "$matches" -ge 2
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: needs.resolve-release-ref.outputs.full_verify == 'true'
         with:
           node-version: 26
 
       - name: Test npm package
+        if: needs.resolve-release-ref.outputs.full_verify == 'true'
         working-directory: npm
         run: npm test
 
@@ -382,9 +422,11 @@ jobs:
       # Node set up above and the release binary built at "Build release binary
       # on main pushes". ripgrep backs the harness grep oracle (not on ubuntu).
       - name: Install ripgrep (harness grep oracle)
+        if: needs.resolve-release-ref.outputs.full_verify == 'true'
         run: bash execution/ensure_ripgrep.sh
 
       - name: Verify tool correctness (both fixtures)
+        if: needs.resolve-release-ref.outputs.full_verify == 'true'
         run: |
           node scripts/verify-tools.cjs --bin target/release/symforge
           node scripts/verify-tools.cjs --fixture verify-tools-real --bin target/release/symforge
@@ -2195,6 +2237,7 @@ jobs:
         shell: bash
         env:
           MANUAL_TAG: ${{ needs.resolve-release-ref.outputs.tag_name }}
+          RESOLVED_CAN_PUBLISH: ${{ needs.resolve-release-ref.outputs.can_publish }}
           GATED_RELEASE_REF: ${{ needs.gate-release-ref.outputs.release_ref }}
         run: |
           set -euo pipefail
@@ -2255,6 +2298,11 @@ jobs:
             exit 1
           else
             RELEASE_READY=true
+          fi
+
+          if [[ "$RELEASE_READY" == "true" && "$RESOLVED_CAN_PUBLISH" != "true" ]]; then
+            echo "::error::This run skipped full verification but now resolves to a publishable release."
+            exit 1
           fi
 
           echo "release_created=$RELEASE_READY" >> "$GITHUB_OUTPUT"
