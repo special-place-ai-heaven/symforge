@@ -162,6 +162,52 @@ counts = search_text(query="target::witness_target()", structural=True, group_by
 }
 
 #[test]
+fn structural_recovery_skips_whole_file_and_notices_survive_empty_and_count_results() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(
+        repo.path().join("partial.rs"),
+        "fn intact() { recovery_target(); }\nfn unfinished() {\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("valid.rs"),
+        "fn valid() { recovery_target(); }\n",
+    )
+    .unwrap();
+    let output = run(
+        &repo,
+        r#"
+rows = search_text(query="recovery_target()", structural=True, language="rust")
+counts = search_text(query="recovery_target()", structural=True, language="rust", group_by="count")
+empty = search_text(query="absent_target()", structural=True, language="rust")
+empty_counts = search_text(query="absent_target()", structural=True, language="rust", group_by="count")
+{"paths": [row["path"] for row in rows], "counts": counts, "empty": empty, "empty_counts": empty_counts}
+"#,
+    );
+    assert_eq!(
+        output["value"],
+        json!({
+            "paths": ["valid.rs"],
+            "counts": [{"path": "valid.rs", "count": 1}],
+            "empty": [],
+            "empty_counts": [],
+        })
+    );
+    let notices: Vec<Value> = (1..=4)
+        .map(|call| {
+            let mut item = notice(call, "search_text", 0, 0);
+            item["unparsed_files"] = json!(1);
+            item["omitted_rows_inexact"] = json!(true);
+            item
+        })
+        .collect();
+    assert_eq!(output["notices"], json!(notices));
+    let serialized = output.to_string();
+    assert!(!serialized.contains("partial.rs"));
+    assert!(!serialized.contains("unfinished"));
+}
+
+#[test]
 fn scalar_and_bare_empty_list_both_keep_notices() {
     let repo = fixture();
     let empty = run(

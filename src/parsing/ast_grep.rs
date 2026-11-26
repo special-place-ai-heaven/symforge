@@ -169,8 +169,8 @@ pub fn compile_structural_pattern(
 }
 
 /// Search `source` using an already compiled ast-grep pattern. The parse is
-/// bounded by the indexer's deadline; a cancelled parse is an error, not an
-/// empty match list.
+/// bounded by the indexer's deadline. A cancelled or recovered parse is an
+/// error, not an empty or partial match list.
 pub fn structural_search_with_compiled(
     source: &str,
     compiled: &CompiledStructuralPattern,
@@ -207,6 +207,11 @@ fn structural_search_impl(
         .set_language(&compiled.lang.get_ts_language())
         .map_err(|e| format!("failed to set tree-sitter language: {e}"))?;
     let tree = super::parse_within(&mut parser, source, deadline)?;
+    // Recovery can keep some matching nodes while losing others. Do not
+    // publish hits or counts from an incomplete source tree.
+    if tree.root_node().has_error() {
+        return Err("structural search source contains syntax errors".to_owned());
+    }
     let root = AstGrep::doc(StrDoc {
         src: source.to_string(),
         lang: compiled.lang.clone(),
@@ -372,7 +377,8 @@ pub fn structural_rewrite_with_compiled(
 
 /// Search `source` for occurrences of an ast-grep `pattern` in the given language.
 ///
-/// Returns an error string if the pattern cannot be compiled (e.g., syntax error).
+/// Returns an error if the pattern cannot be compiled or the source cannot be
+/// parsed completely.
 pub fn structural_search(
     source: &str,
     pattern_str: &str,
@@ -521,10 +527,9 @@ struct Bar {
 
     #[test]
     fn test_structural_search_tsx_jsx_component() {
-        // A JSX component body only parses under the TSX grammar. With the plain
-        // TypeScript grammar this yields a partial parse and the structural
-        // pattern matches nothing; with the TSX grammar (is_tsx=true) the
-        // function declaration is matched.
+        // A JSX component body only parses under the TSX grammar. With the
+        // plain TypeScript grammar this yields a partial parse and the file is
+        // skipped; with TSX the function declaration is matched.
         let source = r#"
 export function App() {
   return (

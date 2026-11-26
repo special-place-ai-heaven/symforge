@@ -1757,6 +1757,7 @@ fn search_structural_impl(
 
         for (&(path, lang, _), scan) in round.iter().zip(scans) {
             let Some(structural_matches) = scan else {
+                // Source parse and budget failures are not query/grammar incompatibilities.
                 unparsed_files += 1;
                 continue;
             };
@@ -4378,7 +4379,7 @@ mod tests {
         //   * every candidate was in a language ast-grep does not support —
         //     propagate as UnsupportedStructuralLanguage (index/filter bug).
         // Conflating the two was the original Unit 5 bug; split buckets fix it.
-        let mut any_parse_succeeded = false;
+        let mut any_grammar_compiled = false;
         let mut unparsed_files = 0usize;
         let mut first_syntax_error: Option<String> = None;
         let mut first_unsupported_error: Option<String> = None;
@@ -4407,15 +4408,14 @@ mod tests {
                 .or_insert_with(|| compile_pattern(pattern, lang, is_tsx));
             let structural_matches = match compiled {
                 Ok(compiled_pattern) => {
-                    any_parse_succeeded = true;
+                    any_grammar_compiled = true;
                     match crate::parsing::ast_grep::structural_search_with_compiled(
                         &content_str,
                         compiled_pattern,
                     ) {
                         Ok(found) => found,
                         Err(_) => {
-                            // Parse cancelled at the deadline (or failed): the
-                            // file was not searched, so count it, never match it.
+                            // An incomplete source parse yields no rows.
                             unparsed_files += 1;
                             continue;
                         }
@@ -4534,7 +4534,7 @@ mod tests {
         // Syntax errors win over "unsupported language" because a syntax error
         // means the USER has a bug in their pattern; the language-unsupported
         // bucket only matters when every candidate was in a config language.
-        if !any_parse_succeeded {
+        if !any_grammar_compiled {
             if let Some(error) = first_syntax_error {
                 return Err(TextSearchError::InvalidStructuralPattern {
                     pattern: pattern.to_string(),
@@ -4595,6 +4595,11 @@ mod tests {
         let mut json = make_file("data/config.json", "{\"index\": 1}\n", vec![]);
         json.1.language = LanguageId::Json;
         files.push(json);
+        files.push(make_file(
+            "src/partial.rs",
+            "fn intact() { g().unwrap(); }\nfn unfinished() {\n",
+            vec![],
+        ));
         make_index(files)
     }
 

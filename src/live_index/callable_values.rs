@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::domain::{LanguageId, ReferenceRecord};
+use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord};
 use crate::parsing::xref::callable_values::{self, CallableFacts};
 
 use super::query::import_languages_compatible;
@@ -20,23 +20,37 @@ pub(super) struct ResolvedValue<'a> {
     pub(super) path: &'a str,
     pub(super) reference: &'a ReferenceRecord,
     pub(super) definition_path: &'a str,
-    pub(super) definition_offset: u32,
+    pub(super) definition_range: (u32, u32),
+}
+
+pub(super) fn uses_callable_value_bindings(language: LanguageId) -> bool {
+    matches!(
+        language,
+        LanguageId::Python | LanguageId::JavaScript | LanguageId::TypeScript
+    )
 }
 
 pub(super) fn file_facts(file: &IndexedFile) -> Option<Arc<CallableFacts>> {
     // Match the source-evidence lane's bound; never read a file from disk or
     // try to recover callable bindings from damaged syntax.
-    if file.content.len() > 2 * 1024 * 1024 || file.parse_status != ParseStatus::Parsed {
+    if !uses_callable_value_bindings(file.language)
+        || file.content.len() > 2 * 1024 * 1024
+        || file.parse_status != ParseStatus::Parsed
+    {
         return None;
     }
     let source = std::str::from_utf8(&file.content).ok()?;
-    let useful = match file.language {
-        LanguageId::Python => source.contains("import") || source.contains("def "),
-        LanguageId::JavaScript | LanguageId::TypeScript => {
-            source.contains("import") || source.contains("export")
-        }
-        _ => false,
+    let export_marker = if file.language == LanguageId::Python {
+        "def "
+    } else {
+        "export"
     };
+    let useful = source.contains("import")
+        || source.contains(export_marker)
+        || file
+            .references
+            .iter()
+            .any(|reference| reference.kind == ReferenceKind::ValueUse);
     if !useful {
         return None;
     }
@@ -51,7 +65,7 @@ pub(super) fn file_facts(file: &IndexedFile) -> Option<Arc<CallableFacts>> {
         return None;
     }
     let mut facts = callable_values::facts(root, source, file.language);
-    if facts.uses.is_empty() && facts.exports.is_empty() {
+    if facts.uses.is_empty() && facts.exports.is_empty() && facts.locals.is_empty() {
         return None;
     }
     let lines: Vec<_> = facts
@@ -67,6 +81,18 @@ pub(super) fn file_facts(file: &IndexedFile) -> Option<Arc<CallableFacts>> {
 }
 
 impl LiveIndex {
+    pub(super) fn local_callable_declaration(
+        &self,
+        path: &str,
+        reference: &ReferenceRecord,
+    ) -> Option<(u32, u32)> {
+        self.callable_values
+            .get(path)?
+            .locals
+            .get(&reference.byte_range)
+            .copied()
+    }
+
     /// Resolve candidates to a unique declaration in the current generation.
     pub(super) fn imported_callable_values<'a>(
         &'a self,
@@ -89,7 +115,7 @@ impl LiveIndex {
                     if target_path.is_some_and(|target| target != definition_path) {
                         return None;
                     }
-                    let (canonical, offset) = self
+                    let (canonical, definition_range) = self
                         .callable_values
                         .get(definition_path)?
                         .exports
@@ -104,7 +130,7 @@ impl LiveIndex {
                         path,
                         reference: &candidate.reference,
                         definition_path,
-                        definition_offset: *offset,
+                        definition_range: *definition_range,
                     })
                 })
             })

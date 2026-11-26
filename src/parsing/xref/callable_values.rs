@@ -5,7 +5,7 @@ use tree_sitter::Node;
 use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord};
 
 mod imports;
-use imports::{Imports, collect_export, collect_imports, finish_imports};
+use imports::{collect_export, collect_imports, finish_imports, python_value_context};
 
 /// Collect JSX invocations and statically recognizable callable values. Using
 /// the parsed node kinds keeps JSX out of the plain TypeScript grammar.
@@ -26,11 +26,15 @@ pub(crate) struct ImportedValue {
     pub(crate) reference: ReferenceRecord,
 }
 
+type ByteRange = (u32, u32);
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CallableFacts {
     pub(crate) uses: Vec<ImportedValue>,
-    // Exported spelling -> (canonical declaration name, exact name-token start).
-    pub(crate) exports: HashMap<String, (String, u32)>,
+    // Use token range -> lexical declaration's core range in the same file.
+    pub(crate) locals: HashMap<ByteRange, ByteRange>,
+    // Exported spelling -> (canonical declaration name, declaration core range).
+    pub(crate) exports: HashMap<String, (String, ByteRange)>,
 }
 
 pub(crate) fn facts(root: Node<'_>, source: &str, language: LanguageId) -> CallableFacts {
@@ -95,10 +99,23 @@ fn walk(
                                         && !has_child_kind(node, "set")
                                         && name.utf8_text(src) != Ok("constructor")
                                 };
-                                bind(&mut methods, class, name, callable, src);
+                                let definition = if python {
+                                    node.parent()
+                                        .filter(|n| n.kind() == "decorated_definition")
+                                        .unwrap_or(node)
+                                } else {
+                                    node
+                                };
+                                bind(
+                                    &mut methods,
+                                    class,
+                                    name,
+                                    callable.then_some(definition),
+                                    src,
+                                );
                             }
                             if python {
-                                bind(&mut bindings, class, name, false, src);
+                                bind(&mut bindings, class, name, None, src);
                             }
                         } else if node.kind() != "method_definition"
                             && let Some(scope) = enclosing_scope(node, python)
@@ -107,7 +124,7 @@ fn walk(
                                 || node
                                     .parent()
                                     .is_none_or(|p| p.kind() != "decorated_definition");
-                            bind(&mut bindings, scope, name, callable, src);
+                            bind(&mut bindings, scope, name, callable.then_some(node), src);
                             if callable && facts.is_some() {
                                 collect_export(root, node, name, python, src, &mut exports);
                             }
@@ -118,7 +135,7 @@ fn walk(
                 "arrow_function" | "function_expression" | "generator_function" | "lambda" => {
                     bind_parameters(&mut bindings, node, src);
                     if let Some(name) = node.child_by_field_name("name") {
-                        bind(&mut bindings, node, name, true, src);
+                        bind(&mut bindings, node, name, Some(node), src);
                     }
                 }
                 "assignment" | "assignment_expression" | "variable_declarator" => {
@@ -148,10 +165,10 @@ fn walk(
                             )
                         });
                         if lhs.kind() == "identifier" {
-                            bind(&mut bindings, scope, lhs, callable, src);
+                            bind(&mut bindings, scope, lhs, callable.then_some(node), src);
                             if python && scope.kind() == "class_definition" {
                                 // A class namespace assignment can replace a method.
-                                bind(&mut methods, scope, lhs, false, src);
+                                bind(&mut methods, scope, lhs, None, src);
                             }
                             if callable && facts.is_some() && var_decl {
                                 collect_export(root, node, lhs, python, src, &mut exports);
@@ -200,13 +217,13 @@ fn walk(
                     if let Some(local) = node.named_child(0).filter(|n| n.kind() == "identifier")
                         && let Some(scope) = enclosing_scope(node, python)
                     {
-                        bind(&mut bindings, scope, local, false, src);
+                        bind(&mut bindings, scope, local, None, src);
                     }
                 }
                 "class" if !python => {
                     // A named class expression binds its name only inside itself.
                     if let Some(name) = node.child_by_field_name("name") {
-                        bind(&mut bindings, node, name, false, src);
+                        bind(&mut bindings, node, name, None, src);
                     }
                 }
                 "type_alias_statement" if python => {
@@ -222,7 +239,7 @@ fn walk(
                         if let Some(name) = name.filter(|n| n.kind() == "identifier")
                             && let Some(scope) = enclosing_scope(node, true)
                         {
-                            bind(&mut bindings, scope, name, false, src);
+                            bind(&mut bindings, scope, name, None, src);
                         }
                     }
                 }
@@ -235,7 +252,7 @@ fn walk(
                     if let Some(name) = node.child_by_field_name("name")
                         && let Some(scope) = enclosing_scope(node, python)
                     {
-                        bind(&mut bindings, scope, name, false, src);
+                        bind(&mut bindings, scope, name, None, src);
                     }
                 }
                 "for_statement" if python => {
@@ -359,10 +376,24 @@ fn walk(
                                     .get(scope)
                                     .is_some_and(|names| names.contains_key(text))
                             }) {
-                                bind(&mut bindings, scope, name, false, src);
+                                bind(&mut bindings, scope, name, None, src);
                             }
                         });
                     }
+                    finish_values(
+                        candidates
+                            .iter()
+                            .copied()
+                            .filter(|&candidate| !python || python_value_context(candidate)),
+                        &bindings,
+                        &methods,
+                        src,
+                        python,
+                        &opaque_import_scopes,
+                        |name, _, definition| {
+                            facts.locals.insert(byte_range(name), definition);
+                        },
+                    );
                     finish_imports(
                         candidates,
                         &bindings,
@@ -372,18 +403,31 @@ fn walk(
                         python,
                         facts,
                     );
-                    for (exported, name, offset) in exports {
+                    for (exported, name, definition) in exports {
                         if !opaque_import_scopes.contains(&root)
                             && bindings.get(&root).and_then(|map| map.get(name))
-                                == Some(&Binding::Callable)
+                                == Some(&Binding::Callable(definition))
                         {
                             facts
                                 .exports
-                                .insert(exported.to_owned(), (name.to_owned(), offset));
+                                .insert(exported.to_owned(), (name.to_owned(), definition));
                         }
                     }
                 } else {
-                    finish_values(candidates, &bindings, &imports, &methods, refs, src, python);
+                    let mut seen: HashSet<_> = refs.iter().map(|r| r.byte_range).collect();
+                    finish_values(
+                        candidates,
+                        &bindings,
+                        &methods,
+                        src,
+                        python,
+                        &opaque_import_scopes,
+                        |name, qualifier, _| {
+                            if seen.insert(byte_range(name)) {
+                                push_ref(refs, name, src, qualifier, ReferenceKind::ValueUse);
+                            }
+                        },
+                    );
                 }
                 return;
             }
@@ -412,7 +456,8 @@ fn jsx_component<'tree, 'src>(
 // falling through to a callable with the same name in an outer scope.
 #[derive(PartialEq, Eq)]
 enum Binding {
-    Callable,
+    Callable(ByteRange),
+    Imported,
     Parameter,
     Blocked,
 }
@@ -422,18 +467,14 @@ fn bind<'tree, 'src>(
     bindings: &mut Bindings<'tree, 'src>,
     scope: Node<'tree>,
     name: Node<'tree>,
-    callable: bool,
+    definition: Option<Node<'tree>>,
     src: &'src [u8],
 ) {
     bind_kind(
         bindings,
         scope,
         name,
-        if callable {
-            Binding::Callable
-        } else {
-            Binding::Blocked
-        },
+        definition.map_or(Binding::Blocked, |node| Binding::Callable(byte_range(node))),
         src,
     );
 }
@@ -485,7 +526,7 @@ fn block_pattern<'tree, 'src>(
     pattern: Node<'tree>,
     src: &'src [u8],
 ) {
-    visit_pattern(pattern, |name| bind(bindings, scope, name, false, src));
+    visit_pattern(pattern, |name| bind(bindings, scope, name, None, src));
 }
 
 fn visit_pattern<'tree>(pattern: Node<'tree>, mut visit: impl FnMut(Node<'tree>)) {
@@ -528,10 +569,10 @@ fn block_case_pattern<'tree, 'src>(
             // A bare name captures, a qualified name is a value pattern.
             "dotted_name" if node.named_child_count() == 1 => {
                 if let Some(name) = node.named_child(0) {
-                    bind(bindings, scope, name, false, src);
+                    bind(bindings, scope, name, None, src);
                 }
             }
-            "identifier" => bind(bindings, scope, node, false, src),
+            "identifier" => bind(bindings, scope, node, None, src),
             "case_pattern" | "union_pattern" | "tuple_pattern" | "list_pattern" | "as_pattern"
             | "splat_pattern" => todo.extend(node.named_children(&mut node.walk())),
             "class_pattern" => todo.extend(node.named_children(&mut node.walk()).skip(1)),
@@ -562,21 +603,21 @@ fn apply_python_directives<'tree, 'src>(
             .is_some_and(|names| names.contains_key(text))
         {
             if global {
-                bind(bindings, root, name, false, src);
+                bind(bindings, root, name, None, src);
             } else {
                 for outer in lexical_scopes(scope, true).filter(|n| is_function(n.kind())) {
                     if bindings
                         .get(&outer)
                         .is_some_and(|names| names.contains_key(text))
                     {
-                        bind(bindings, outer, name, false, src);
+                        bind(bindings, outer, name, None, src);
                     }
                 }
             }
         }
     }
     for &(scope, name, _) in directives {
-        bind(bindings, scope, name, false, src);
+        bind(bindings, scope, name, None, src);
     }
 }
 
@@ -709,12 +750,16 @@ fn resolve_binding<'tree>(
     name: &str,
     bindings: &Bindings<'tree, '_>,
     python: bool,
-) -> Option<Node<'tree>> {
+    opaque_scopes: &HashSet<Node<'tree>>,
+) -> Option<ByteRange> {
     lexical_scopes(value, python).find_map(|scope| {
-        bindings
-            .get(&scope)?
-            .get(name)
-            .map(|binding| (*binding == Binding::Callable).then_some(scope))
+        if opaque_scopes.contains(&scope) {
+            return Some(None);
+        }
+        Some(match bindings.get(&scope)?.get(name)? {
+            Binding::Callable(definition) => Some(*definition),
+            _ => None,
+        })
     })?
 }
 
@@ -729,47 +774,35 @@ fn lexical_scopes<'tree>(value: Node<'tree>, python: bool) -> impl Iterator<Item
     })
 }
 
-fn finish_values<'tree, 'src>(
-    candidates: Vec<Node<'tree>>,
-    bindings: &Bindings<'tree, 'src>,
-    imports: &Imports<'tree, 'src>,
-    methods: &Bindings<'tree, 'src>,
-    refs: &mut Vec<ReferenceRecord>,
-    src: &'src [u8],
+fn finish_values<'tree>(
+    candidates: impl IntoIterator<Item = Node<'tree>>,
+    bindings: &Bindings<'tree, '_>,
+    methods: &Bindings<'tree, '_>,
+    src: &[u8],
     python: bool,
+    opaque_scopes: &HashSet<Node<'tree>>,
+    mut emit: impl FnMut(Node<'tree>, Option<&str>, ByteRange),
 ) {
-    let mut seen: HashSet<_> = refs.iter().map(|r| r.byte_range).collect();
     for value in candidates {
-        let (name, qualifier) = match value.kind() {
+        match value.kind() {
             "identifier" | "shorthand_property_identifier" => {
                 let Ok(name) = value.utf8_text(src) else {
                     continue;
                 };
-                let Some(scope) = resolve_binding(value, name, bindings, python) else {
-                    continue;
-                };
-                if imports.contains_key(&(scope, name)) {
-                    continue;
+                if let Some(definition) =
+                    resolve_binding(value, name, bindings, python, opaque_scopes)
+                {
+                    emit(value, None, definition);
                 }
-                (value, None)
             }
             "attribute" | "member_expression" => {
-                let Some((name, qualifier)) = resolve_method(value, bindings, methods, src, python)
-                else {
-                    continue;
-                };
-                (name, Some(qualifier))
+                if let Some((name, qualifier, definition)) =
+                    resolve_method(value, bindings, methods, src, python)
+                {
+                    emit(name, Some(&qualifier), definition);
+                }
             }
-            _ => continue,
-        };
-        if seen.insert((name.start_byte() as u32, name.end_byte() as u32)) {
-            push_ref(
-                refs,
-                name,
-                src,
-                qualifier.as_deref(),
-                ReferenceKind::ValueUse,
-            );
+            _ => {}
         }
     }
 }
@@ -780,7 +813,7 @@ fn resolve_method<'tree>(
     methods: &Bindings<'tree, '_>,
     src: &[u8],
     python: bool,
-) -> Option<(Node<'tree>, String)> {
+) -> Option<(Node<'tree>, String, ByteRange)> {
     let receiver = value.child_by_field_name("object")?;
     let name = value.child_by_field_name(if python { "attribute" } else { "property" })?;
     let enclosing = std::iter::successors(value.parent(), |n| n.parent())
@@ -806,11 +839,15 @@ fn resolve_method<'tree>(
         return None;
     }
     let method = name.utf8_text(src).ok()?;
-    if methods.get(&class)?.get(method) != Some(&Binding::Callable) {
+    let Binding::Callable(definition) = methods.get(&class)?.get(method)? else {
         return None;
-    }
+    };
     let class_name = class.child_by_field_name("name")?.utf8_text(src).ok()?;
-    Some((name, format!("{class_name}.{method}")))
+    Some((name, format!("{class_name}.{method}"), *definition))
+}
+
+fn byte_range(node: Node<'_>) -> ByteRange {
+    (node.start_byte() as u32, node.end_byte() as u32)
 }
 
 fn push_ref(
@@ -827,7 +864,7 @@ fn push_ref(
             name: name.to_owned(),
             qualified_name: qualifier.map(str::to_owned),
             kind,
-            byte_range: (node.start_byte() as u32, node.end_byte() as u32),
+            byte_range: byte_range(node),
             line_range: (
                 node.start_position().row as u32,
                 node.end_position().row as u32,

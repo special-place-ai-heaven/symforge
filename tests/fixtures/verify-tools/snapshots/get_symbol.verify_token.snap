@@ -5,4 +5,4 @@
         }
         self.keys.iter().any(|k| k.verify(token))
     }
-[fn, lines 26-31, 255 bytes]
+[fn, lines 25-31, 255 bytes]

@@ -521,6 +521,7 @@ fn execute_value_on_generation(
             let source_row = |path: &str,
                               name: &str,
                               kind: &str,
+                              symbol_line: Option<u32>,
                               content: &[u8],
                               (start, end): (usize, usize)| {
                 let start = start.min(content.len());
@@ -532,16 +533,12 @@ fn execute_value_on_generation(
                 } else {
                     false
                 };
-                let start_line = 1 + content[..start].iter().filter(|&&b| b == b'\n').count();
-                // A final newline terminates the last returned line; it does
-                // not make the next, unreturned line part of the range.
-                let end_line = start_line
-                    + source
-                        .strip_suffix('\n')
-                        .unwrap_or(&source)
-                        .bytes()
-                        .filter(|&b| b == b'\n')
-                        .count();
+                let (start_line, end_line) =
+                    crate::index_lifecycle::guidance::symbol_read::displayed_line_range(
+                        content,
+                        start,
+                        source.as_bytes(),
+                    );
                 let mut row = json!({
                     "path": path,
                     "name": name,
@@ -552,6 +549,9 @@ fn execute_value_on_generation(
                     "refusal": Value::Null,
                     "withheld_reason": Value::Null,
                 });
+                if let Some(symbol_line) = symbol_line {
+                    row["symbol_line"] = json!(symbol_line);
+                }
                 if truncated {
                     row["truncated"] = json!(true);
                 }
@@ -614,15 +614,12 @@ fn execute_value_on_generation(
                         target.symbol_line,
                     ) {
                         SymbolSelectorMatch::Selected(_idx, sym) => {
-                            let span =
-                                crate::index_lifecycle::guidance::symbol_read::symbol_display_span(
-                                    Some(file.language),
-                                    sym,
-                                );
+                            let span = sym.display_span(Some(file.language));
                             results.push(source_row(
                                 &norm_path,
                                 &sym.name,
                                 &sym.kind.to_string(),
+                                Some(sym.line_range.0 + 1),
                                 &file.content,
                                 span,
                             ));
@@ -658,6 +655,7 @@ fn execute_value_on_generation(
                         &norm_path,
                         "",
                         "slice",
+                        None,
                         &file.content,
                         (sb as usize, end),
                     ));

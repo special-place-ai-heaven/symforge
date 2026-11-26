@@ -2931,24 +2931,30 @@ impl LiveIndex {
             .position(|symbol| symbol.byte_range == target_symbol.byte_range)
             .map(|idx| idx as u32);
 
+        let uses_callable_bindings =
+            super::callable_values::uses_callable_value_bindings(file.language);
+        let python_class_value = file.language == LanguageId::Python
+            && target_symbol.kind == SymbolKind::Class
+            && !file.symbols.iter().any(|symbol| {
+                symbol.name == target_name && symbol.byte_range != target_symbol.byte_range
+            });
         let mut refs: Vec<(&str, &ReferenceRecord, &'static str)> = file
             .references
             .iter()
             .filter(|reference| {
-                if reference.kind == ReferenceKind::ValueUse
-                    && matches!(
-                        file.language,
-                        LanguageId::Python | LanguageId::JavaScript | LanguageId::TypeScript
-                    )
-                    && let Some(qualifier) = reference.qualified_name.as_deref()
-                    && target_container.as_ref().is_none_or(|(owner, _)| {
-                        qualifier
-                            .strip_suffix(target_name)
-                            .and_then(|head| head.strip_suffix('.'))
-                            != Some(owner.as_str())
-                    })
-                {
-                    return false;
+                if uses_callable_bindings && reference.kind == ReferenceKind::ValueUse {
+                    if let Some(declaration) = self.local_callable_declaration(path, reference) {
+                        // The outer same-named symbol may contain the declaration.
+                        return matches!(kind_filter, None | Some(ReferenceKind::ValueUse))
+                            && reference.name == target_name
+                            && declaration == target_symbol.byte_range;
+                    }
+                    // Python separately emits class-name value uses (e.g.
+                    // `isinstance(obj, Model)`). Keep that path for classes,
+                    // but never fall back to spelling for a callback target.
+                    if !python_class_value || reference.qualified_name.is_some() {
+                        return false;
+                    }
                 }
                 if reference.kind == ReferenceKind::Call
                     && target_symbol_index.is_some()
@@ -2978,10 +2984,14 @@ impl LiveIndex {
             })
             .map(|reference| (path, reference, "exact"))
             .collect();
-        if matches!(kind_filter, None | Some(ReferenceKind::ValueUse)) {
+        let mut seen: HashSet<_> = refs
+            .iter()
+            .map(|(ref_path, reference, _)| (*ref_path, reference.byte_range))
+            .collect();
+        if uses_callable_bindings && matches!(kind_filter, None | Some(ReferenceKind::ValueUse)) {
             for value in self.imported_callable_values(target_name, Some(path)) {
-                if target_symbol.byte_range.0 <= value.definition_offset
-                    && value.definition_offset < target_symbol.byte_range.1
+                if target_symbol.byte_range == value.definition_range
+                    && seen.insert((value.path, value.reference.byte_range))
                 {
                     refs.push((value.path, value.reference, "exact"));
                 }
@@ -2997,12 +3007,7 @@ impl LiveIndex {
                 if !import_languages_compatible(&ref_file.language, &file.language) {
                     return None;
                 }
-                if ref_record.kind == ReferenceKind::ValueUse
-                    && matches!(
-                        file.language,
-                        LanguageId::Python | LanguageId::JavaScript | LanguageId::TypeScript
-                    )
-                {
+                if uses_callable_bindings && ref_record.kind == ReferenceKind::ValueUse {
                     // Already joined to a specific import binding above. An
                     // unrelated same-name local value in a dependent file is
                     // not evidence of a use of this symbol.
@@ -3096,23 +3101,23 @@ impl LiveIndex {
             };
 
         for (file_path, reference) in dependent_refs {
-            if let Some(conf) = evaluate_cross_file(file_path, reference) {
+            if let Some(conf) = evaluate_cross_file(file_path, reference)
+                && seen.insert((file_path, reference.byte_range))
+            {
                 refs.push((file_path, reference, conf));
             }
         }
 
-        for (ref_path, ref_record) in self.find_references_for_name(target_name, kind_filter, false)
+        // The exact import join has already run with the selected declaration.
+        for (ref_path, ref_record) in
+            self.find_references_for_name_impl(target_name, kind_filter, false, false)
         {
-            if ref_path == path {
-                continue;
-            }
-            if refs
-                .iter()
-                .any(|(p, r, _)| *p == ref_path && r.byte_range == ref_record.byte_range)
-            {
+            let key = (ref_path, ref_record.byte_range);
+            if ref_path == path || seen.contains(&key) {
                 continue;
             }
             if let Some(conf) = evaluate_cross_file(ref_path, ref_record) {
+                seen.insert(key);
                 refs.push((ref_path, ref_record, conf));
             }
         }
@@ -3715,6 +3720,16 @@ impl LiveIndex {
         kind_filter: Option<ReferenceKind>,
         include_filtered: bool,
     ) -> Vec<(&str, &ReferenceRecord)> {
+        self.find_references_for_name_impl(name, kind_filter, include_filtered, true)
+    }
+
+    fn find_references_for_name_impl(
+        &self,
+        name: &str,
+        kind_filter: Option<ReferenceKind>,
+        include_filtered: bool,
+        include_imported_values: bool,
+    ) -> Vec<(&str, &ReferenceRecord)> {
         let is_qualified = name.contains("::") || name.contains('.');
 
         let mut results: Vec<(&str, &ReferenceRecord)> = Vec::new();
@@ -3748,19 +3763,20 @@ impl LiveIndex {
 
             // Alias resolution: find any alias that resolves to `name`.
             // e.g. alias_map["Map"] = "HashMap" means we also look up "Map".
-            // Collect aliases first to avoid re-borrowing self during mutation of results.
-            let aliases: Vec<String> = self
+            // Query each alias key once even when many importers use it.
+            let mut seen_aliases = HashSet::new();
+            let aliases = self
                 .files
                 .values()
                 .flat_map(|file| {
                     file.alias_map
                         .iter()
                         .filter(|(_alias, original)| original.as_str() == name)
-                        .map(|(alias, _)| alias.clone())
+                        .map(|(alias, _)| alias.as_str())
                 })
-                .collect();
+                .filter(|&alias| seen_aliases.insert(alias));
 
-            for alias in &aliases {
+            for alias in aliases {
                 let mut alias_hits = Vec::new();
                 self.collect_refs_for_key(alias, kind_filter, include_filtered, &mut alias_hits);
                 // A proven value is associated with its lexical binding, not
@@ -3863,8 +3879,11 @@ impl LiveIndex {
             }
         }
 
-        if !is_qualified && matches!(kind_filter, None | Some(ReferenceKind::ValueUse)) {
-            let already: HashSet<_> = results
+        if include_imported_values
+            && !is_qualified
+            && matches!(kind_filter, None | Some(ReferenceKind::ValueUse))
+        {
+            let mut already: HashSet<_> = results
                 .iter()
                 .map(|(path, reference)| (*path, reference.byte_range))
                 .collect();
@@ -3872,11 +3891,11 @@ impl LiveIndex {
                 self.imported_callable_values(name, None)
                     .into_iter()
                     .filter(|value| {
-                        !already.contains(&(value.path, value.reference.byte_range))
-                            && (include_filtered
-                                || self.get_file(value.path).is_some_and(|file| {
-                                    !is_filtered_name(&value.reference.name, &file.language)
-                                }))
+                        (include_filtered
+                            || self.get_file(value.path).is_some_and(|file| {
+                                !is_filtered_name(&value.reference.name, &file.language)
+                            }))
+                            && already.insert((value.path, value.reference.byte_range))
                     })
                     .map(|value| (value.path, value.reference)),
             );

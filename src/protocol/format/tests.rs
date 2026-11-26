@@ -231,10 +231,10 @@ fn test_symbol_detail_kind_filter_matches() {
     let content = b"fn foo() {} struct foo {}";
     let (key, file) = make_file("src/lib.rs", content, symbols);
     let index = make_index(vec![(key, file)]);
-    // Filter for struct kind (0-based 4-9 displays as 1-based 5-10)
+    // Kind selects the struct; the displayed bytes are on line one.
     let result = symbol_detail(&index, "src/lib.rs", "foo", Some("struct"));
     assert!(
-        result.contains("[struct, lines 5-10"),
+        result.contains("[struct, lines 1-1,"),
         "footer should show struct kind"
     );
 }

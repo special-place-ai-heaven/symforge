@@ -159,10 +159,7 @@ impl LiveIndex {
             }
         };
 
-        let (start, end) = crate::index_lifecycle::guidance::symbol_read::symbol_context_span(
-            file.language,
-            sym_rec,
-        );
+        let (start, end) = sym_rec.context_span(file.language);
         let clamped_end = end.min(file.content.len());
         let clamped_start = start.min(clamped_end);
         let body = String::from_utf8_lossy(&file.content[clamped_start..clamped_end]).into_owned();

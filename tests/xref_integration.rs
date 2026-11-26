@@ -150,6 +150,108 @@ def shadowed(process):
 }
 
 #[test]
+fn exact_same_file_callbacks_follow_the_selected_declaration() {
+    let path = "local.js";
+    let source = "function callback() {\n    function callback() {}\n    install(callback);\n}\ninstall(callback);\nconst alias = function callback() { install(callback); };\n";
+    let (_dir, shared) = build_index(&[(path, source)]);
+    let index = shared.read();
+    let kind = Some(ReferenceKind::ValueUse);
+    // The unindexed name of the function expression is discoverable by name,
+    // but must not count as a use of either indexed function.
+    assert_eq!(
+        index
+            .find_references_for_name("callback", kind, false)
+            .len(),
+        3
+    );
+    assert!(
+        index
+            .find_exact_references_for_symbol(path, "callback", None, None, kind)
+            .is_err()
+    );
+    let sites: Vec<_> = source
+        .match_indices("install(callback)")
+        .map(|(start, _)| (start + "install(".len()) as u32)
+        .collect();
+    for (declaration_line, site) in [(1, sites[1]), (2, sites[0])] {
+        let exact = index
+            .find_exact_references_for_symbol(path, "callback", None, Some(declaration_line), kind)
+            .unwrap();
+        let actual: Vec<_> = exact
+            .iter()
+            .map(|(path, reference)| (*path, reference.byte_range))
+            .collect();
+        assert_eq!(actual, [(path, (site, site + "callback".len() as u32))]);
+    }
+}
+
+#[test]
+fn exact_python_class_value_uses_do_not_require_callback_evidence() {
+    let path = "model.py";
+    let source = "class Model:\n    pass\n\nisinstance(obj, Model)\n";
+    let (_dir, shared) = build_index(&[(path, source)]);
+    let index = shared.read();
+    let hits = index
+        .find_exact_references_for_symbol(
+            path,
+            "Model",
+            None,
+            Some(1),
+            Some(ReferenceKind::ValueUse),
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].1.line_range, (3, 3));
+}
+
+#[test]
+fn exact_callback_high_fanout_has_one_hit_per_source_site() {
+    const IMPORTERS: usize = 8;
+    const SITES_PER_IMPORTER: usize = 128;
+    let provider = "web/provider.js";
+    let consumer = format!(
+        "import {{ callback }} from './provider';\n{}",
+        "install(callback);\ncallback();\n".repeat(SITES_PER_IMPORTER)
+    );
+    let paths: Vec<_> = (0..IMPORTERS)
+        .map(|i| format!("web/consumer{i}.js"))
+        .collect();
+    let mut files = vec![(provider, "export function callback() {}\n")];
+    files.extend(paths.iter().map(|path| (path.as_str(), consumer.as_str())));
+    let (_dir, shared) = build_index(&files);
+    let index = shared.read();
+    let hits = index
+        .find_exact_references_for_symbol(provider, "callback", None, Some(1), None)
+        .unwrap();
+    for (kind, prefix) in [
+        (ReferenceKind::ValueUse, "install(callback)"),
+        (ReferenceKind::Call, "callback();"),
+    ] {
+        let prefix_len = if kind == ReferenceKind::ValueUse {
+            "install(".len()
+        } else {
+            0
+        };
+        let expected: Vec<_> = paths
+            .iter()
+            .flat_map(|path| {
+                consumer.match_indices(prefix).map(move |(start, _)| {
+                    let start = (start + prefix_len) as u32;
+                    (path.as_str(), (start, start + "callback".len() as u32))
+                })
+            })
+            .collect();
+        let actual: Vec<_> = hits
+            .iter()
+            .filter(|(_, hit)| hit.kind == kind)
+            .map(|(path, hit)| (*path, hit.byte_range))
+            .collect();
+        assert_eq!(expected.len(), IMPORTERS * SITES_PER_IMPORTER);
+        assert_eq!(actual, expected, "{kind:?}");
+    }
+}
+
+#[test]
 fn imported_callback_xrefs_require_callable_exports() {
     let provider = "def _default(value):\n    return value\n\nmetadata = 42\n";
     let consumer = r#"from .provider import _default as fallback, metadata

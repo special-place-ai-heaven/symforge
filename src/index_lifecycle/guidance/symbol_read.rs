@@ -5,26 +5,40 @@ use crate::domain::{LanguageId, SymbolRecord};
 use crate::live_index::SymbolDetailView;
 use crate::live_index::{IndexedFile, InspectMatchView, LiveIndex};
 
-/// A display span is not an edit footprint or a `symbol_line` selector.
-pub(crate) fn symbol_display_span(
-    lang: Option<LanguageId>,
-    symbol: &SymbolRecord,
-) -> (usize, usize) {
-    let (mut start, mut end) = (symbol.effective_start(), symbol.byte_range.1);
-    if matches!(lang, Some(LanguageId::JavaScript | LanguageId::TypeScript))
-        && let Some((item_start, item_end)) = symbol.item_byte_range
-    {
-        start = start.min(item_start);
-        end = end.max(item_end);
-    }
-    (start as usize, end as usize)
+/// The 1-based inclusive lines covered by source starting at `start`.
+pub(crate) fn displayed_line_range(content: &[u8], start: usize, source: &[u8]) -> (usize, usize) {
+    let newline_count = |bytes: &[u8]| bytes.iter().filter(|&&b| b == b'\n').count();
+    let first = 1 + newline_count(&content[..start]);
+    // A terminating newline belongs to the last returned line, not the next one.
+    let last = first + newline_count(source.strip_suffix(b"\n").unwrap_or(source));
+    (first, last)
 }
 
-/// Context readers historically include the editable item tail (e.g. config
-/// entries), in addition to the JS/TS enclosing declaration used by body reads.
-pub(crate) fn symbol_context_span(lang: LanguageId, symbol: &SymbolRecord) -> (usize, usize) {
-    let (start, end) = symbol_display_span(Some(lang), symbol);
-    (start, end.max(symbol.item_end() as usize))
+fn render_selected_symbol_body(
+    content: &[u8],
+    lang: Option<LanguageId>,
+    symbol: &SymbolRecord,
+    line_numbers: Option<bool>,
+) -> String {
+    let (start, end) = symbol.display_span(lang);
+    let (start, end) = clamp_code_slice_range(content.len(), start, Some(end));
+    let bytes = &content[start..end];
+    let (first_line, last_line) = displayed_line_range(content, start, bytes);
+    let mut body = String::from_utf8_lossy(bytes);
+    if line_numbers.unwrap_or_else(|| body.lines().count() > NUMBERED_BODY_MIN_LINES) {
+        body = body
+            .lines()
+            .enumerate()
+            .map(|(offset, line)| format!("{}: {line}", first_line + offset))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
+    }
+    format!(
+        "{body}\n[{}, lines {first_line}-{last_line}, {} bytes]",
+        symbol.kind,
+        bytes.len(),
+    )
 }
 
 /// Return the full source body for a named symbol plus a footer.
@@ -72,32 +86,7 @@ pub fn symbol_detail_from_indexed_file_with(
 
     match resolve_symbol_selector(file, name, kind_filter, symbol_line) {
         SymbolSelectorMatch::Selected(_idx, sym) => {
-            let (start, end) = symbol_display_span(Some(file.language), sym);
-            let clamped_end = end.min(file.content.len());
-            let clamped_start = start.min(clamped_end);
-            let mut body =
-                String::from_utf8_lossy(&file.content[clamped_start..clamped_end]).into_owned();
-            if line_numbers.unwrap_or_else(|| body.lines().count() > NUMBERED_BODY_MIN_LINES) {
-                let first_line = 1 + file.content[..clamped_start]
-                    .iter()
-                    .filter(|b| **b == b'\n')
-                    .count();
-                body = body
-                    .lines()
-                    .enumerate()
-                    .map(|(offset, line)| format!("{}: {line}", first_line + offset))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-            }
-            let byte_count = end.saturating_sub(start);
-            format!(
-                "{}\n[{}, lines {}-{}, {} bytes]",
-                body,
-                sym.kind,
-                sym.line_range.0 + 1,
-                sym.line_range.1 + 1,
-                byte_count
-            )
+            render_selected_symbol_body(&file.content, Some(file.language), sym, line_numbers)
         }
         SymbolSelectorMatch::NotFound => {
             // D18: loud not-found. Do NOT silently substitute a content-anchored
@@ -159,18 +148,11 @@ fn render_symbol_detail(
     match matching.first() {
         None => render_not_found_symbol(relative_path, symbols, name),
         Some(s) => {
-            let (start, end) = symbol_display_span(LanguageId::from_path(relative_path), s);
-            let clamped_end = end.min(content.len());
-            let clamped_start = start.min(clamped_end);
-            let body = String::from_utf8_lossy(&content[clamped_start..clamped_end]).into_owned();
-            let byte_count = end.saturating_sub(start);
-            let mut result = format!(
-                "{}\n[{}, lines {}-{}, {} bytes]",
-                body,
-                s.kind,
-                s.line_range.0 + 1,
-                s.line_range.1 + 1,
-                byte_count
+            let mut result = render_selected_symbol_body(
+                content,
+                LanguageId::from_path(relative_path),
+                s,
+                Some(false),
             );
             if matching.len() > 1 {
                 let others = matching.len() - 1;

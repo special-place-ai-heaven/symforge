@@ -1,6 +1,6 @@
 use super::{
-    Binding, Bindings, CallableFacts, ImportedValue, bind, has_child_kind, is_function,
-    lexical_scopes,
+    Binding, Bindings, ByteRange, CallableFacts, ImportedValue, bind_kind, byte_range,
+    has_child_kind, is_function, lexical_scopes,
 };
 use crate::domain::{ReferenceKind, ReferenceRecord};
 use std::collections::{HashMap, HashSet};
@@ -19,7 +19,12 @@ pub(super) fn collect_imports<'tree, 'src>(
 ) {
     let mut add = |local: Node<'tree>, module: Option<&'src str>, exported: Option<&'src str>| {
         let target = module.zip(exported);
-        bind(bindings, scope, local, target.is_some(), src);
+        let binding = if target.is_some() {
+            Binding::Imported
+        } else {
+            Binding::Blocked
+        };
+        bind_kind(bindings, scope, local, binding, src);
         if let Some((module, exported)) = target
             && let Ok(local) = local.utf8_text(src)
         {
@@ -99,7 +104,7 @@ pub(super) fn collect_export<'src>(
     name: Node<'_>,
     python: bool,
     src: &'src [u8],
-    exports: &mut Vec<(&'src str, &'src str, u32)>,
+    exports: &mut Vec<(&'src str, &'src str, ByteRange)>,
 ) {
     let Ok(text) = name.utf8_text(src) else {
         return;
@@ -131,7 +136,7 @@ pub(super) fn collect_export<'src>(
             text
         }
     };
-    exports.push((exported, text, name.start_byte() as u32));
+    exports.push((exported, text, byte_range(node)));
 }
 
 pub(super) fn finish_imports<'tree, 'src>(
@@ -163,7 +168,7 @@ pub(super) fn finish_imports<'tree, 'src>(
                 bindings
                     .get(&scope)?
                     .get(local)
-                    .map(|binding| (*binding == Binding::Callable).then_some(scope))
+                    .map(|binding| (*binding == Binding::Imported).then_some(scope))
             })
             .flatten()
         else {
@@ -182,7 +187,7 @@ pub(super) fn finish_imports<'tree, 'src>(
                 name: local.to_owned(),
                 qualified_name: None,
                 kind: ReferenceKind::ValueUse,
-                byte_range: (node.start_byte() as u32, node.end_byte() as u32),
+                byte_range: byte_range(node),
                 line_range: (
                     node.start_position().row as u32,
                     node.end_position().row as u32,
@@ -193,7 +198,7 @@ pub(super) fn finish_imports<'tree, 'src>(
     }
 }
 
-fn python_value_context(mut value: Node<'_>) -> bool {
+pub(super) fn python_value_context(mut value: Node<'_>) -> bool {
     while let Some(parent) = value.parent() {
         // Comprehension targets have their own scope, and function/class
         // headers run outside the body. Do not infer imports in these contexts.

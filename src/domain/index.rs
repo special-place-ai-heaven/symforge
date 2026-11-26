@@ -1285,6 +1285,26 @@ pub struct KnowledgeUnit {
 }
 
 impl SymbolRecord {
+    /// Source body for display. This is not an edit range or declaration selector.
+    pub(crate) fn display_span(&self, language: Option<LanguageId>) -> (usize, usize) {
+        let (mut start, mut end) = (self.effective_start(), self.byte_range.1);
+        if matches!(
+            language,
+            Some(LanguageId::JavaScript | LanguageId::TypeScript)
+        ) && let Some((item_start, item_end)) = self.item_byte_range
+        {
+            start = start.min(item_start);
+            end = end.max(item_end);
+        }
+        (start as usize, end as usize)
+    }
+
+    /// Context bundles also include the tail of the enclosing editable item.
+    pub(crate) fn context_span(&self, language: LanguageId) -> (usize, usize) {
+        let (start, end) = self.display_span(Some(language));
+        (start, end.max(self.item_end() as usize))
+    }
+
     /// Returns the start byte of the full editable item when available.
     pub fn item_start(&self) -> u32 {
         self.item_byte_range.map_or_else(

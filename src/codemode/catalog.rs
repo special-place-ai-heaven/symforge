@@ -235,7 +235,7 @@ pub const CODE_READ_OPS: &[CodeOpDescriptor] = &[
             },
         ],
         return_type: "list[SymbolBody]",
-        typed_dicts: "class SymbolBody(TypedDict):\n    path: str\n    name: str\n    kind: str\n    start_line: int  # First line of returned source, including attached docs; not the symbol_line selector.\n    end_line: int  # Last line returned (inclusive).\n    source: str | None\n    truncated: NotRequired[bool]\n    refusal: str | None\n    withheld_reason: str | None",
+        typed_dicts: "class SymbolBody(TypedDict):\n    path: str\n    name: str\n    kind: str\n    symbol_line: NotRequired[int]  # 1-based selector for a resolved named symbol; absent for slices and refusals.\n    start_line: int  # First line of returned source, including attached docs; not the symbol_line selector.\n    end_line: int  # Last line returned (inclusive).\n    source: str | None\n    truncated: NotRequired[bool]\n    refusal: str | None\n    withheld_reason: str | None",
         keywords: &[
             "symbol",
             "body",

@@ -1682,7 +1682,7 @@ fn symbol_source(
 ) -> Result<QuerySymbol, QueryRefusalKind> {
     let mut row = symbol_row(file, index, symbol)?;
     budget.required(symbol_size(&row))?;
-    let (start, end) = super::guidance::symbol_read::symbol_context_span(file.language, symbol);
+    let (start, end) = symbol.context_span(file.language);
     let bytes = file
         .content
         .get(start..end)
