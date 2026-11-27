@@ -1804,6 +1804,13 @@ pub fn load_gitignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
     use std::collections::VecDeque;
 
     let mut builder = GitignoreBuilder::new(root);
+    let info_exclude = std::fs::read_to_string(root.join(".git/info/exclude")).ok();
+    add_repository_excludes(
+        &mut builder,
+        root,
+        info_exclude.as_deref(),
+        global_excludes_path().as_deref(),
+    );
 
     // BFS to find nested .gitignore files (max depth 6)
     let max_depth: usize = 6;
@@ -1850,6 +1857,34 @@ pub fn load_gitignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
 /// file's patterns relative to the directory holding it; fed to the root
 /// matcher unchanged they would apply at the repository root instead, so each
 /// one is re-anchored beneath `dir` first.
+pub(crate) fn global_excludes_path() -> Option<PathBuf> {
+    ignore::gitignore::gitconfig_excludes_path()
+}
+
+pub(crate) fn add_repository_excludes(
+    builder: &mut ignore::gitignore::GitignoreBuilder,
+    root: &Path,
+    info_exclude: Option<&str>,
+    global_excludes: Option<&Path>,
+) {
+    if !root.join(".git").exists() {
+        return;
+    }
+    if let Some(global) = global_excludes.filter(|path| path.is_file())
+        && let Some(err) = builder.add(global)
+    {
+        tracing::debug!("failed to load {:?}: {}", global, err);
+    }
+    if let Some(contents) = info_exclude {
+        add_gitignore_contents(
+            builder,
+            Path::new(""),
+            &root.join(".git/info/exclude"),
+            contents,
+        );
+    }
+}
+
 fn add_gitignore_file(
     builder: &mut ignore::gitignore::GitignoreBuilder,
     root: &Path,
@@ -3641,6 +3676,65 @@ mod tests {
     /// Nested `.gitignore` rules apply relative to their own directory, as git
     /// applies them. A root-anchored matcher fed the nested file would ignore
     /// the root `needle.txt` and index `sub/needle.txt` instead.
+    #[test]
+    fn load_gitignore_honours_the_repository_and_global_exclude_files() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let init = crate::process_util::hidden_command("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .output()
+            .expect("git init");
+        assert!(init.status.success(), "git init failed");
+        std::fs::write(root.join(".git/info/exclude"), "hidden/\n").unwrap();
+        create_file(&root, "src/.gitignore", "gen/\n");
+        let gitignore = load_gitignore(&root).expect("rules were loaded");
+        for (path, ignored) in [
+            ("hidden/new.rs", true),
+            ("src/gen/g.rs", true),
+            ("src/a.rs", false),
+        ] {
+            assert_eq!(
+                gitignore
+                    .matched_path_or_any_parents(path, false)
+                    .is_ignore(),
+                ignored,
+                "{path}"
+            );
+        }
+
+        let global = tmp.path().join("global-ignore");
+        std::fs::write(&global, "*.secret\n").unwrap();
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(&root);
+        add_repository_excludes(&mut builder, &root, Some("hidden/\n"), Some(&global));
+        let seeded = builder.build().unwrap();
+        assert!(
+            seeded
+                .matched_path_or_any_parents("src/key.secret", false)
+                .is_ignore()
+        );
+        assert!(
+            seeded
+                .matched_path_or_any_parents("hidden/x.rs", false)
+                .is_ignore()
+        );
+        assert!(
+            !seeded
+                .matched_path_or_any_parents("src/a.rs", false)
+                .is_ignore()
+        );
+
+        let outside = tmp.path().join("plain");
+        std::fs::create_dir_all(&outside).unwrap();
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(&outside);
+        add_repository_excludes(&mut builder, &outside, Some("hidden/\n"), Some(&global));
+        assert!(
+            builder.build().unwrap().is_empty(),
+            "no repository, no git excludes"
+        );
+    }
+
     #[test]
     fn nested_gitignore_matches_like_git_check_ignore() {
         let tmp = TempDir::new().unwrap();

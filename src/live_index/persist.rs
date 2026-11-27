@@ -3189,7 +3189,26 @@ fn discover_files_from_source_anchor_within(
     let mut files = Vec::new();
     let mut observed = HashMap::new();
     let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
-    let mut matcher = ignore::gitignore::Gitignore::empty();
+    let info_exclude = authority
+        .with_source_anchor_read(|lease| {
+            crate::index_lifecycle::physical_root::read_regular_beneath(
+                lease,
+                Path::new(".git/info/exclude"),
+                256 * 1024,
+            )
+        })
+        .ok()
+        .flatten()
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    crate::discovery::add_repository_excludes(
+        &mut builder,
+        root,
+        info_exclude.as_deref(),
+        crate::discovery::global_excludes_path().as_deref(),
+    );
+    let mut matcher = builder
+        .build()
+        .map_err(|_| "admitted ignore rules could not be compiled".to_string())?;
     let mut visited = 0usize;
     while !level.is_empty() {
         let mut next_level = Vec::new();
@@ -7313,6 +7332,49 @@ mod tests {
             stops.get() > 2
         });
         assert!(matches!(cancelled, Err(AnchoredDiscoveryError::Cancelled)));
+    }
+
+    #[cfg(any(feature = "server", feature = "embed"))]
+    #[test]
+    fn discovery_honours_the_repository_exclude_file_like_the_cold_walk() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        for relative in ["src/a.rs", "hidden/b.rs", "src/gen/g.rs", "src/keep/k.rs"] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "fn f() {}\n").unwrap();
+        }
+        let init = crate::process_util::hidden_command("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .output()
+            .expect("git init");
+        assert!(init.status.success(), "git init failed");
+        std::fs::write(root.join(".git/info/exclude"), "hidden/\n").unwrap();
+        std::fs::write(root.join("src/.gitignore"), "gen/\n").unwrap();
+        let index =
+            crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(Vec::new()));
+        let authority = crate::index_lifecycle::activation::ProjectSourceAuthority::for_root(root);
+        let Ok(discovered) = discover_files_from_source_anchor(root, &index, &authority, &|| false)
+        else {
+            panic!("the walk must succeed");
+        };
+        let cold: Vec<String> = crate::discovery::discover_files(root)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.relative_path)
+            .filter(|path| path.ends_with(".rs"))
+            .collect();
+        let mut cold = cold;
+        cold.sort();
+        let anchored: Vec<String> = discovered
+            .files
+            .iter()
+            .filter(|path| path.ends_with(".rs"))
+            .cloned()
+            .collect();
+        assert_eq!(anchored, ["src/a.rs", "src/keep/k.rs"]);
+        assert_eq!(anchored, cold);
     }
 
     #[cfg(any(feature = "server", feature = "embed"))]
