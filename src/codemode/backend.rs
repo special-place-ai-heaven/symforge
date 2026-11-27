@@ -2271,3 +2271,88 @@ impl CodeReadBackend for DaemonCodeBackend {
         result
     }
 }
+
+#[cfg(test)]
+mod refusal_predicate_tests {
+    use super::*;
+    use crate::domain::{FileDisposition, MetadataOnlyReason};
+    use crate::live_index::store::{SnapshotVerifyReport, SnapshotVerifyState};
+
+    #[test]
+    fn bulk_search_refusal_agrees_with_the_read_gate_for_every_refusal_reason() {
+        let repo = tempfile::tempdir().unwrap();
+        let key_marker = format!("// -----BEGIN {} KEY-----\n", "PRIVATE");
+        let files = [
+            ("src/lib.rs", "pub fn ok() {}\n"),
+            ("src/held.rs", "pub fn held() {}\n"),
+            ("src/indeterminate.rs", "pub fn unsure() {}\n"),
+            ("src/key.rs", key_marker.as_str()),
+            (".env", "NAME=placeholder\n"),
+            ("config/id_rsa", "placeholder\n"),
+            ("docs/plain.md", "# plain\n"),
+        ];
+        for (path, body) in files {
+            let path = repo.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let shared = LiveIndex::load(repo.path()).unwrap();
+        let mut live = shared.write();
+        live.snapshot_verify_state = SnapshotVerifyState::Completed(
+            SnapshotVerifyReport::from_mismatched_paths(vec!["src/held.rs".to_string()])
+                .with_unverified(std::collections::BTreeMap::from([(
+                    "src/held.rs".to_string(),
+                    "it could not be read".to_string(),
+                )])),
+        );
+        for entry in live.manifest_entries.iter_mut() {
+            if entry.path.normalized_utf8.as_deref() == Some("src/indeterminate.rs") {
+                entry.disposition = FileDisposition::MetadataOnly {
+                    reason: MetadataOnlyReason::SensitiveContent {
+                        rule_ids: vec![crate::knowledge::INDETERMINATE_RULE_ID.to_string()],
+                        finding_count: 0,
+                    },
+                };
+            }
+        }
+        let live: &LiveIndex = &live;
+        let mut probes: std::collections::BTreeSet<String> = live
+            .manifest_entries
+            .iter()
+            .filter_map(|entry| entry.path.normalized_utf8.clone())
+            .chain(live.all_files().map(|(path, _)| path.clone()))
+            .collect();
+        probes.extend(
+            [
+                ".git/config",
+                ".symforge/state.json",
+                "src/.env",
+                "src/missing.rs",
+                "./src/key.rs",
+                "src\\key.rs",
+            ]
+            .map(str::to_string),
+        );
+        let refuse = search_refusal_predicate(live);
+        for probe in &probes {
+            let gate_path =
+                crate::index_lifecycle::guidance::read_gate::normalize_requested_path(probe);
+            assert_eq!(
+                refuse(probe),
+                check_secret_or_scope_refusal(live, &gate_path).is_some(),
+                "bulk predicate and read gate disagree on {probe}"
+            );
+        }
+        for refused in [
+            "src/held.rs",
+            "src/indeterminate.rs",
+            "src/key.rs",
+            ".env",
+            "config/id_rsa",
+            ".git/config",
+        ] {
+            assert!(refuse(refused), "{refused} must be refused");
+        }
+        assert!(!refuse("src/lib.rs"));
+    }
+}
