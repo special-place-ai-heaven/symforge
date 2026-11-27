@@ -611,14 +611,17 @@ pub(crate) fn repo_map_text_scoped(
                 .collect();
             #[cfg(test)]
             MAP_DEPENDENT_LOOKUPS.with(|count| count.set(count.get() + candidate_paths.len()));
-            let counts = crate::live_index::store::ordered_parallel_map(&candidate_paths, |path| {
-                guard
-                    .find_dependents_for_file(path)
-                    .into_iter()
-                    .map(|(file_path, _)| file_path)
-                    .collect::<std::collections::HashSet<&str>>()
-                    .len()
-            });
+            let counts: Vec<usize> = guard
+                .find_dependents_for_files(&candidate_paths)
+                .into_iter()
+                .map(|dependents| {
+                    dependents
+                        .into_iter()
+                        .map(|(file_path, _)| file_path)
+                        .collect::<std::collections::HashSet<&str>>()
+                        .len()
+                })
+                .collect();
             let dep_counts: std::collections::HashMap<String, usize> = candidate_paths
                 .iter()
                 .map(|path| path.to_string())
@@ -1521,6 +1524,73 @@ mod tests {
             ],
             "{parallel}"
         );
+    }
+
+    #[test]
+    fn compact_map_text_is_identical_with_batch_and_per_file_dependent_counts() {
+        let root = TempDir::new().unwrap();
+        let files = [
+            (
+                "src/lib.rs",
+                "pub mod core;\npub mod store;\npub mod api;\npub use core::Engine;\n",
+            ),
+            ("src/core.rs", "pub struct Engine;\npub trait Runner {}\n"),
+            (
+                "src/store.rs",
+                "use crate::core::Engine;\npub struct Store {\n    engine: Engine,\n}\n",
+            ),
+            (
+                "src/api.rs",
+                "use crate::core::Engine;\nuse crate::store::Store;\npub enum Route {\n    Home,\n}\npub fn serve(e: &Engine, s: &Store) {}\n",
+            ),
+            (
+                "web/src/user.service.ts",
+                "export class UserService {}\nexport interface UserRecord {\n  id: string;\n}\n",
+            ),
+            (
+                "web/src/app.ts",
+                "import { UserService, UserRecord } from './user.service';\nexport class App {\n  service = new UserService();\n  record?: UserRecord;\n}\n",
+            ),
+            (
+                "web/src/shell.ts",
+                "import { App } from './app';\nimport { UserService } from './user.service';\nexport class Shell {\n  app = new App();\n  users = new UserService();\n}\n",
+            ),
+            (
+                "web/test/app.test.ts",
+                "import { App } from '../src/app';\nexport class AppTest {\n  app = new App();\n}\n",
+            ),
+        ];
+        for (rel, content) in files {
+            let path = root.path().join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let published = shared.published_generation();
+
+        for (scope, depth) in [
+            (None, None),
+            (Some("web"), None),
+            (None, Some(1)),
+            (Some("src"), Some(1)),
+            (Some("web/src"), Some(3)),
+        ] {
+            MAP_DEPENDENT_LOOKUPS.with(|count| count.set(0));
+            let batch = repo_map_text_scoped(&published, scope, depth);
+            let batch_lookups = MAP_DEPENDENT_LOOKUPS.with(|count| count.get());
+            MAP_DEPENDENT_LOOKUPS.with(|count| count.set(0));
+            let per_file = crate::live_index::query::with_per_file_dependents(|| {
+                repo_map_text_scoped(&published, scope, depth)
+            });
+            let per_file_lookups = MAP_DEPENDENT_LOOKUPS.with(|count| count.get());
+
+            assert_eq!(batch, per_file, "scope {scope:?} depth {depth:?}");
+            assert_eq!(batch_lookups, per_file_lookups);
+            assert!(batch_lookups > 0, "{batch}");
+            assert!(batch.contains("Key types:"), "{batch}");
+        }
+        let unscoped = repo_map_text_scoped(&published, None, None);
+        assert!(unscoped.contains("(\u{2192}"), "{unscoped}");
     }
 
     #[test]
