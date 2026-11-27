@@ -1039,13 +1039,18 @@ pub(crate) fn execute_batch_edit(
                         .rposition(|&b| b == b'\n')
                         .map(|p| p + 1)
                         .unwrap_or(0);
-                    let line_start =
-                        extend_past_orphaned_docs(&content, raw_line_start, &r.sym) as u32;
-                    let indent = detect_indentation(&content, r.sym.byte_range.0);
                     let normalized = normalize_line_endings(new_body.as_bytes(), line_ending);
-                    let normalized_str = std::str::from_utf8(&normalized).unwrap_or(new_body);
-                    let indented = apply_indentation(normalized_str, &indent, line_ending);
-                    content = apply_splice(&content, (line_start, r.sym.byte_range.1), &indented);
+                    if crate::edit_safety::structural::inline_list_member(&content, &r.sym) {
+                        content = apply_splice(&content, r.sym.byte_range, &normalized);
+                    } else {
+                        let line_start =
+                            extend_past_orphaned_docs(&content, raw_line_start, &r.sym) as u32;
+                        let indent = detect_indentation(&content, r.sym.byte_range.0);
+                        let normalized_str = std::str::from_utf8(&normalized).unwrap_or(new_body);
+                        let indented = apply_indentation(normalized_str, &indent, line_ending);
+                        content =
+                            apply_splice(&content, (line_start, r.sym.byte_range.1), &indented);
+                    }
                     file_summaries.push(super::edit_format::format_replace(
                         path,
                         &r.sym.name,
@@ -1075,6 +1080,7 @@ pub(crate) fn execute_batch_edit(
                     ));
                 }
                 EditOperation::InsertAfter { content: code } => {
+                    crate::edit_safety::structural::refuse_inline_list_member(&content, &r.sym)?;
                     content = build_insert_after(&content, &r.sym, code, line_ending);
                     file_summaries.push(super::edit_format::format_insert(
                         path,
@@ -1878,6 +1884,10 @@ pub(crate) fn execute_batch_insert(
                     )
                 }
                 InsertPosition::After => {
+                    crate::edit_safety::structural::refuse_inline_list_member(
+                        &content,
+                        &target.sym,
+                    )?;
                     build_insert_after(&content, &target.sym, &input.content, line_ending)
                 }
             };

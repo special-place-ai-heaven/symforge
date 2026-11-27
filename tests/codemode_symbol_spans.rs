@@ -103,7 +103,7 @@ fn javascript_family_returns_complete_declarations_without_moving_selectors() {
         }
         let cells = file.symbols.iter().find(|sym| sym.name == "cells").unwrap();
         let (start, end) = cells.core_range();
-        assert_eq!(&source[start as usize..end as usize], "cells = 4");
+        assert_eq!(&source[start as usize..end as usize], "const cells = 4;");
     }
 }
 
@@ -132,9 +132,10 @@ async fn multi_declarator_display_does_not_widen_edit_within_to_sibling() {
     let path = "palette.ts";
     let declaration = "/** Two colors. */\nexport const first = 'red',\n    second = 'blue';";
     let source = format!("{declaration}\n");
-    for (name, selector, own_text, sibling_text) in
-        [("first", 2, "red", "blue"), ("second", 3, "blue", "red")]
-    {
+    for (name, selector, own_text, sibling_text, shown) in [
+        ("first", 2, "red", "blue", "first = 'red'"),
+        ("second", 3, "blue", "red", "second = 'blue'"),
+    ] {
         let (root, index) = fixture(path, &source);
         let view = index.read().capture_symbol_detail_view(path).unwrap();
         let server = SymForgeServer::new(
@@ -147,15 +148,15 @@ async fn multi_declarator_display_does_not_widen_edit_within_to_sibling() {
         let backend = LocalCodeBackend::new(index, Some(root.path().into()), "symbol-spans", None);
         let rows = read(&backend, json!({"path": path, "name": name}));
         let row = &rows[0];
-        assert_eq!(row["source"], declaration);
-        assert_eq!(row["start_line"], 1);
-        assert_eq!(row["end_line"], 3);
+        assert_eq!(row["source"], shown);
+        assert_eq!(row["start_line"], selector);
+        assert_eq!(row["end_line"], selector);
         assert_eq!(row["symbol_line"], selector);
         assert_eq!(
             symbol_detail_view(&view, name, None),
             format!(
-                "{declaration}\n[const, lines 1-3, {} bytes]",
-                declaration.len()
+                "{shown}\n[const, lines {selector}-{selector}, {} bytes]",
+                shown.len()
             ),
         );
 
@@ -244,4 +245,179 @@ fn symbol_and_raw_slice_report_returned_line_span_and_utf8_truncation() {
     let missing = read(&backend, json!({"path": path, "name": "missing"}));
     assert_eq!(missing[0]["refusal"], "not_found");
     assert!(missing[0].get("symbol_line").is_none());
+}
+
+const TS_ITEMS: &str = "/** Adds one. */\nexport function addOne(n: number): number {\n    return n + 1;\n}\n\nexport const alpha = (n: number): number => {\n    return n * 2;\n};\n\nconst plain = 3;\n\n/** Two values. */\nexport const beta = 1, gamma = (n: number) => n * 20;\n\nexport class Box {\n    size(): number {\n        return 1;\n    }\n}\n";
+const JS_ITEMS: &str = "/** Adds one. */\nexport function addOne(n) {\n    return n + 1;\n}\n\nexport const alpha = (n) => {\n    return n * 2;\n};\n\nconst plain = 3;\n\n/** Two values. */\nexport const beta = 1, gamma = (n) => n * 20;\n\nexport class Box {\n    size() {\n        return 1;\n    }\n}\n";
+
+fn item_server(root: &TempDir, index: &SharedIndex) -> SymForgeServer {
+    SymForgeServer::new(
+        index.clone(),
+        "symbol-spans".to_owned(),
+        Arc::new(Mutex::new(WatcherInfo::default())),
+        Some(root.path().into()),
+        None,
+    )
+}
+
+async fn call(server: &SymForgeServer, tool: &str, args: Value) -> (bool, String) {
+    let result = server
+        .dispatch_tool_result_for_tests(tool, args)
+        .await
+        .unwrap();
+    let text = result
+        .content
+        .iter()
+        .filter_map(|content| content.as_text().map(|text| text.text.clone()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (result.is_error == Some(true), text)
+}
+
+#[tokio::test]
+async fn displayed_js_items_paste_back_into_replace_unchanged() {
+    for (path, source) in [("items.ts", TS_ITEMS), ("items.js", JS_ITEMS)] {
+        for (name, shown_start, shown_end) in [
+            (
+                "addOne",
+                "/** Adds one. */\nexport function addOne",
+                "return n + 1;\n}",
+            ),
+            ("alpha", "export const alpha", "return n * 2;\n};"),
+            ("plain", "const plain = 3;", "const plain = 3;"),
+            ("beta", "beta = 1", "beta = 1"),
+            ("gamma", "gamma = (n", "n * 20"),
+            ("size", "size()", "return 1;\n    }"),
+        ] {
+            let (root, index) = fixture(path, source);
+            let backend = LocalCodeBackend::new(
+                index.clone(),
+                Some(root.path().into()),
+                "symbol-spans",
+                None,
+            );
+            let rows = read(&backend, json!({"path": path, "name": name}));
+            let shown = rows[0]["source"].as_str().unwrap().to_owned();
+            assert!(
+                shown.starts_with(shown_start) && shown.ends_with(shown_end),
+                "{path} {name}: {shown:?}"
+            );
+            let server = item_server(&root, &index);
+            let (error, text) = call(
+                &server,
+                "symforge_edit",
+                json!({"path": path, "symbol": name, "op": "replace", "body": shown, "apply": true}),
+            )
+            .await;
+            assert!(!error, "{path} {name}: {text}");
+            assert_eq!(
+                std::fs::read_to_string(root.path().join(path)).unwrap(),
+                source,
+                "{path} {name}: {text}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn edits_to_one_declarator_never_touch_its_sibling() {
+    for (path, source) in [("items.ts", TS_ITEMS), ("items.js", JS_ITEMS)] {
+        let gamma = if path.ends_with(".ts") {
+            "gamma = (n: number) => n * 20"
+        } else {
+            "gamma = (n) => n * 20"
+        };
+        let cases = [
+            (
+                "symforge_edit",
+                json!({"path": path, "symbol": "beta", "op": "replace", "body": "beta = 2", "apply": true}),
+                source.replacen("beta = 1", "beta = 2", 1),
+            ),
+            (
+                "symforge_edit",
+                json!({"path": path, "symbol": "gamma", "op": "replace", "body": gamma.replace("20", "30"), "apply": true}),
+                source.replacen("n * 20", "n * 30", 1),
+            ),
+            (
+                "delete_symbol",
+                json!({"path": path, "name": "beta"}),
+                source.replacen("beta = 1, ", "", 1),
+            ),
+            (
+                "delete_symbol",
+                json!({"path": path, "name": "gamma"}),
+                source.replacen(&format!(", {gamma}"), "", 1),
+            ),
+            (
+                "insert_symbol",
+                json!({"path": path, "name": "beta", "position": "after", "content": "const extra = 1;"}),
+                source.to_owned(),
+            ),
+        ];
+        for (tool, args, expected) in cases {
+            let (root, index) = fixture(path, source);
+            let server = item_server(&root, &index);
+            let (_, text) = call(&server, tool, args.clone()).await;
+            assert_eq!(
+                std::fs::read_to_string(root.path().join(path)).unwrap(),
+                expected,
+                "{path} {tool} {args}: {text}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn insert_after_a_sole_declarator_lands_after_its_semicolon() {
+    for (path, source) in [("items.ts", TS_ITEMS), ("items.js", JS_ITEMS)] {
+        let (root, index) = fixture(path, source);
+        let server = item_server(&root, &index);
+        let (error, text) = call(
+            &server,
+            "insert_symbol",
+            json!({"path": path, "name": "alpha", "position": "after", "content": "const extra = 1;"}),
+        )
+        .await;
+        assert!(!error, "{path}: {text}");
+        let written = std::fs::read_to_string(root.path().join(path)).unwrap();
+        let alpha_end =
+            written.find("    return n * 2;\n};").unwrap() + "    return n * 2;\n};".len();
+        let extra = written.find("const extra = 1;").unwrap();
+        assert!(extra > alpha_end, "{path}: {written}");
+        assert_eq!(written.matches(";;").count(), 0, "{path}: {written}");
+    }
+}
+
+#[tokio::test]
+async fn an_edit_that_breaks_the_syntax_is_refused_and_not_written() {
+    for (path, source) in [("items.ts", TS_ITEMS), ("items.js", JS_ITEMS)] {
+        for (tool, args) in [
+            (
+                "symforge_edit",
+                json!({"path": path, "symbol": "alpha", "op": "replace", "body": "export const alpha = (;", "apply": true}),
+            ),
+            (
+                "edit_within_symbol",
+                json!({"path": path, "name": "plain", "old_text": "= 3", "new_text": "= (3"}),
+            ),
+            (
+                "insert_symbol",
+                json!({"path": path, "name": "plain", "position": "after", "content": "const broken = ;"}),
+            ),
+        ] {
+            let (root, index) = fixture(path, source);
+            let server = item_server(&root, &index);
+            let (_, text) = call(&server, tool, args.clone()).await;
+            assert_eq!(
+                std::fs::read_to_string(root.path().join(path)).unwrap(),
+                source,
+                "{path} {tool}: {text}"
+            );
+            assert!(
+                text.contains("syntax error; nothing was written")
+                    && !text.contains("Write mode: committed"),
+                "{path} {tool}: {text}"
+            );
+        }
+    }
 }

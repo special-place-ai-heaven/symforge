@@ -91,11 +91,12 @@ fn extract_variable_declarations(
     symbols: &mut Vec<SymbolRecord>,
 ) {
     let mut cursor = node.walk();
-    for (i, child) in node
+    let declarators: Vec<_> = node
         .named_children(&mut cursor)
         .filter(|child| child.kind() == "variable_declarator")
-        .enumerate()
-    {
+        .collect();
+    let sole = declarators.len() == 1;
+    for child in declarators {
         if let Some(name) = find_name(&child, source) {
             let kind = if has_function_initializer(&child) {
                 SymbolKind::Function
@@ -105,7 +106,11 @@ fn extract_variable_declarations(
                 SymbolKind::Variable
             };
             let mut sink = SymbolSink::new(source, sort_order, symbols, &DOC_SPEC);
-            push_js_declaration(&child, node, i > 0, name, kind, depth, &mut sink);
+            if sole {
+                push_js_declaration(node, node, false, name, kind, depth, &mut sink);
+            } else {
+                push_js_declaration(&child, &child, true, name, kind, depth, &mut sink);
+            }
         }
     }
 }

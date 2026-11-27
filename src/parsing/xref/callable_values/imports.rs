@@ -166,7 +166,7 @@ pub(super) fn collect_export<'src>(
             text
         }
     };
-    exports.push((exported, text, byte_range(node)));
+    exports.push((exported, text, byte_range(super::sole_declaration(node))));
 }
 
 pub(super) fn finish_imports<'tree, 'src>(

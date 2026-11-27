@@ -186,8 +186,8 @@ pub(super) fn push_symbol(
     push_symbol_with_item(node, name, kind, depth, doc_byte_range, None, sink);
 }
 
-/// JS/TS read the whole enclosing statement, while mutation continues to
-/// resolve and splice the original declaration/declarator node.
+/// JS/TS symbols read and edit one span: the whole statement for a sole
+/// declarator or declaration, and the declarator alone when it has siblings.
 pub(super) fn push_js_declaration(
     node: &Node,
     declaration: &Node,

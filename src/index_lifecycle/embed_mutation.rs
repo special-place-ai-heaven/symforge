@@ -265,6 +265,8 @@ fn prepare_structural(
             .map_err(|_| EditErrorKind::InvalidReplacement)?
         }
         StructuralOperation::Insert(InsertPosition::After, content) => {
+            crate::edit_safety::structural::refuse_inline_list_member(&file.content, symbol)
+                .map_err(|_| EditErrorKind::InvalidReplacement)?;
             crate::edit_safety::structural::build_insert_after(
                 &file.content,
                 symbol,

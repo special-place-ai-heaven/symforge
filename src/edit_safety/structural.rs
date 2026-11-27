@@ -18,7 +18,11 @@ pub(crate) fn prepare_replace(
     let line_ending = detect_line_ending(file_content);
     let normalized = normalize_line_endings(new_body.as_bytes(), line_ending);
     let normalized_str = std::str::from_utf8(&normalized).unwrap_or(new_body);
-    let indented = apply_indentation(normalized_str, &indent, line_ending);
+    let indented = if inline_list_member(file_content, symbol) {
+        normalized
+    } else {
+        apply_indentation(normalized_str, &indent, line_ending)
+    };
     let new_content = apply_splice(file_content, (splice_start, end), &indented);
     Ok(PreparedReplace {
         new_content,
@@ -38,6 +42,9 @@ pub(crate) fn replacement_splice_range(
     if start > end || end as usize > file_content.len() || symbol.effective_start() > start {
         return Err("symbol span is outside the captured file");
     }
+    if inline_list_member(file_content, symbol) {
+        return Ok((start, end));
+    }
     let new_body_supplies_docs = body_starts_with_doc_comment(new_body);
     let effective = if new_body_supplies_docs {
         symbol.effective_start() as usize
@@ -55,6 +62,55 @@ pub(crate) fn replacement_splice_range(
         docless_replacement_splice_start(file_content, raw_line_start, start as usize)
     };
     Ok((splice_start as u32, end))
+}
+
+pub(crate) fn syntax_regression(
+    language: &crate::domain::LanguageId,
+    path: &str,
+    before: &[u8],
+    after: &[u8],
+) -> Option<String> {
+    let broken = |bytes: &[u8]| {
+        let source = std::str::from_utf8(bytes).ok()?;
+        let tsx = crate::domain::LanguageId::is_tsx_path(path);
+        let tree = crate::parsing::parse_source_tree(source, language, tsx).ok()?;
+        Some(tree.root_node().has_error())
+    };
+    (broken(before) == Some(false) && broken(after) == Some(true)).then(|| {
+        format!("Error: this edit would leave `{path}` with a syntax error; nothing was written.")
+    })
+}
+
+pub(crate) fn inline_list_member(file_content: &[u8], symbol: &SymbolRecord) -> bool {
+    let (start, end) = (
+        symbol.effective_start() as usize,
+        symbol.byte_range.1 as usize,
+    );
+    if start > end || end > file_content.len() {
+        return false;
+    }
+    let line_start = file_content[..start]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |position| position + 1);
+    let before = file_content[line_start..start].trim_ascii_end();
+    let after = file_content[end..]
+        .iter()
+        .find(|byte| !matches!(byte, b' ' | b'\t'));
+    !before.is_empty() && (before.ends_with(b",") || after == Some(&b','))
+}
+
+pub(crate) fn refuse_inline_list_member(
+    file_content: &[u8],
+    symbol: &SymbolRecord,
+) -> Result<(), String> {
+    if inline_list_member(file_content, symbol) {
+        return Err(format!(
+            "Cannot insert next to `{}`: it shares one declaration with its siblings; insert relative to a whole statement instead",
+            symbol.name
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +379,7 @@ pub(crate) fn insert_before_position(
         .iter()
         .rposition(|&byte| byte == b'\n')
         .map_or(0, |position| position + 1);
+    refuse_inline_list_member(file_content, sym)?;
     if *language == crate::domain::LanguageId::Rust
         && !prefix[line_start..].iter().all(u8::is_ascii_whitespace)
     {
@@ -548,6 +605,9 @@ pub(crate) fn delete_source_range(
     sym: &SymbolRecord,
     line_ending: LineEnding,
 ) -> (u32, u32) {
+    if inline_list_member(file_content, sym) {
+        return inline_member_delete_range(file_content, sym);
+    }
     // Extend to start of line (include leading whitespace, attached attributes,
     // and orphaned doc comments).
     let start = {
@@ -595,6 +655,29 @@ pub(crate) fn delete_source_range(
         pos as u32
     };
     (start, end)
+}
+
+fn inline_member_delete_range(file_content: &[u8], sym: &SymbolRecord) -> (u32, u32) {
+    let (start, end) = (sym.byte_range.0 as usize, sym.byte_range.1 as usize);
+    let blank = |byte: &u8| matches!(byte, b' ' | b'\t');
+    let after = end + file_content[end..].iter().take_while(|b| blank(b)).count();
+    if file_content.get(after) == Some(&b',') {
+        let next = after
+            + 1
+            + file_content[after + 1..]
+                .iter()
+                .take_while(|b| blank(b))
+                .count();
+        return (start as u32, next as u32);
+    }
+    let before = start
+        - file_content[..start]
+            .iter()
+            .rev()
+            .take_while(|b| blank(b))
+            .count();
+    let comma = before.saturating_sub(1);
+    (comma as u32, end as u32)
 }
 
 #[derive(Clone, Copy, Debug)]

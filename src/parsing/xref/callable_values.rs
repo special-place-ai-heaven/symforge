@@ -9,7 +9,6 @@ mod member_key;
 #[cfg(test)]
 mod rebinding_tests;
 use imports::{collect_export, collect_imports, finish_imports, python_value_context};
-
 /// Collect JSX invocations and statically recognizable callable values. Using
 /// the parsed node kinds keeps JSX out of the plain TypeScript grammar.
 pub(super) fn extract(
@@ -206,7 +205,14 @@ fn walk(
                             )
                         });
                         if lhs.kind() == "identifier" {
-                            bind(&mut bindings, scope, lhs, callable.then_some(node), src);
+                            let definition = sole_declaration(node);
+                            bind(
+                                &mut bindings,
+                                scope,
+                                lhs,
+                                callable.then_some(definition),
+                                src,
+                            );
                             if python && scope.kind() == "class_definition" {
                                 // A class namespace assignment can replace a method.
                                 bind(&mut methods, scope, lhs, None, src);
@@ -682,6 +688,23 @@ fn block_class_methods<'tree, 'src>(
             bind(methods, class, method, None, src);
         }
     }
+}
+
+fn sole_declaration(node: Node<'_>) -> Node<'_> {
+    node.parent()
+        .filter(|parent| {
+            node.kind() == "variable_declarator"
+                && matches!(
+                    parent.kind(),
+                    "lexical_declaration" | "variable_declaration"
+                )
+                && parent
+                    .named_children(&mut parent.walk())
+                    .filter(|n| n.kind() == "variable_declarator")
+                    .count()
+                    == 1
+        })
+        .unwrap_or(node)
 }
 
 fn is_class_field(node: Node<'_>) -> bool {

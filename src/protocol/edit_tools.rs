@@ -1183,6 +1183,14 @@ impl SymForgeServer {
         let old_bytes = prepared.old_bytes;
         let inserted_bytes = prepared.inserted_bytes;
         let new_content = prepared.new_content;
+        if let Some(message) = crate::edit_safety::structural::syntax_regression(
+            &file.language,
+            &params.0.path,
+            &file.content,
+            &new_content,
+        ) {
+            return fail_and_return_bound_mutation_replay(&idempotency, message);
+        }
         // TR-06 / FR-009 (design D1): re-verify the `if_match` guard against the
         // bytes ACTUALLY on disk, in the same per-path-locked critical section
         // as the write. `file.content` is the exact base the splice in
@@ -1473,8 +1481,24 @@ impl SymForgeServer {
                 }
             }
         } else {
+            if let Err(message) =
+                crate::edit_safety::structural::refuse_inline_list_member(&file.content, &sym)
+            {
+                return fail_and_return_bound_mutation_replay(
+                    &idempotency,
+                    format!("Error: {message}"),
+                );
+            }
             edit::build_insert_after(&file.content, &sym, &params.0.content, line_ending)
         };
+        if let Some(message) = crate::edit_safety::structural::syntax_regression(
+            &file.language,
+            &params.0.path,
+            &file.content,
+            &new_content,
+        ) {
+            return fail_and_return_bound_mutation_replay(&idempotency, message);
+        }
         let write_report = match edit::atomic_write_file(
             &repo_root,
             project_state.as_ref(),
@@ -1691,6 +1715,14 @@ impl SymForgeServer {
         let deleted_bytes = (sym.byte_range.1 - sym.byte_range.0) as usize;
         let line_ending = edit::detect_line_ending(&file.content);
         let new_content = edit::build_delete(&file.content, &sym, line_ending);
+        if let Some(message) = crate::edit_safety::structural::syntax_regression(
+            &file.language,
+            &params.0.path,
+            &file.content,
+            &new_content,
+        ) {
+            return fail_and_return_bound_mutation_replay(&idempotency, message);
+        }
         let write_report = match edit::atomic_write_file(
             &repo_root,
             project_state.as_ref(),
@@ -1945,6 +1977,14 @@ impl SymForgeServer {
         let old_sym_bytes = sym_end - sym_start;
         let effective_range = (sym.effective_start(), sym.byte_range.1);
         let new_content = edit::apply_splice(&file.content, effective_range, new_body.as_bytes());
+        if let Some(message) = crate::edit_safety::structural::syntax_regression(
+            &file.language,
+            &params.0.path,
+            &file.content,
+            &new_content,
+        ) {
+            return fail_and_return_bound_mutation_replay(&idempotency, message);
+        }
         let write_report = match edit::atomic_write_file(
             &repo_root,
             project_state.as_ref(),
