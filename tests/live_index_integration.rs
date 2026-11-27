@@ -1176,9 +1176,8 @@ fn test_persist_round_trip() {
         .expect("snapshot should be loadable after serialize");
 
     assert_eq!(
-        snapshot.version, 11,
-        "snapshot format 11 includes the payload checksum trailer — see \
-         src/live_index/persist.rs::CURRENT_VERSION"
+        snapshot.version, 12,
+        "checkpoint must write format 12 with the refreshed xrefs and symbol ranges"
     );
     assert_eq!(snapshot.files.len(), 2, "snapshot should contain 2 files");
     assert!(

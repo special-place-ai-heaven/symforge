@@ -14,7 +14,7 @@
         "new_body": "pub fn target(x: u32) -> u32 {\n    x\n}",
         "dry_run": true
       },
-      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:3`\n[DRY RUN] Would replace `target` in src/lib.rs (old: 32 bytes -> new: 38 bytes)"
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:3`\n[DRY RUN] Would replace `target` in src/lib.rs (old: 32 bytes -> new: 38 bytes)\nSyntax check: passed"
     },
     {
       "name": "replace apply with stale references",
@@ -24,7 +24,7 @@
         "name": "target",
         "new_body": "pub fn target(x: u32) -> u32 {\n    x\n}"
       },
-      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:3`\nsrc/lib.rs — replaced fn `target` (32 → 38 bytes)\n[!] Signature of `target` may have changed — 2 reference(s) to check:\n  src/other.rs:1\n  src/other.rs:4 (in user)\n\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 1 dependents]"
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:3`\nsrc/lib.rs — replaced fn `target` (32 → 38 bytes)\nSyntax check: passed\n[!] Signature of `target` may have changed — 2 reference(s) to check:\n  src/other.rs:1\n  src/other.rs:4 (in user)\n\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 1 dependents]"
     },
     {
       "name": "insert preview",
@@ -36,7 +36,7 @@
         "position": "after",
         "dry_run": true
       },
-      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:11`\n[DRY RUN] Would insert after `spare` in src/lib.rs (17 bytes of content)"
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:11`\n[DRY RUN] Would insert after `spare` in src/lib.rs (17 bytes of content)\nSyntax check: passed"
     },
     {
       "name": "insert apply",
@@ -47,7 +47,7 @@
         "content": "pub fn added() {}",
         "position": "after"
       },
-      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:11`\nsrc/lib.rs — inserted after `spare` (17 bytes)\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 1 dependents]"
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:11`\nsrc/lib.rs — inserted after `spare` (17 bytes)\nSyntax check: passed\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 1 dependents]"
     },
     {
       "name": "delete preview",
@@ -57,7 +57,7 @@
         "name": "spare",
         "dry_run": true
       },
-      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:11`\n[DRY RUN] Would delete `spare` in src/lib.rs (17 bytes)"
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:11`\n[DRY RUN] Would delete `spare` in src/lib.rs (17 bytes)\nSyntax check: passed"
     },
     {
       "name": "delete apply",
@@ -66,7 +66,7 @@
         "path": "src/lib.rs",
         "name": "spare"
       },
-      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:11`\nsrc/lib.rs — deleted fn `spare` (17 bytes)\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 1 dependents]"
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:11`\nsrc/lib.rs — deleted fn `spare` (17 bytes)\nSyntax check: passed\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 1 dependents]"
     },
     {
       "name": "edit within preview with first-of-several note",
@@ -78,7 +78,7 @@
         "new_text": "target() * 2",
         "dry_run": true
       },
-      "expected": "Edit safety: text-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:7`\n[DRY RUN] Would edit within `caller` in src/lib.rs (1 replacement(s))\nNote: `old_text` occurs 2 times within `caller`; this targets the FIRST. Pass `occurrence: N` or `near_line: L` to pick another."
+      "expected": "Edit safety: text-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:7`\n[DRY RUN] Would edit within `caller` in src/lib.rs (1 replacement(s))\nNote: `old_text` occurs 2 times within `caller`; this targets the FIRST. Pass `occurrence: N` or `near_line: L` to pick another.\nSyntax check: passed"
     },
     {
       "name": "edit within apply with first-of-several note",
@@ -89,7 +89,7 @@
         "old_text": "target()",
         "new_text": "target() * 2"
       },
-      "expected": "Edit safety: text-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:7`\nsrc/lib.rs — edited within `caller` (1 replacement(s), 50 → 54 bytes)\nNote: `old_text` occurred 2 times within `caller`; edited the FIRST. Pass `occurrence: N` or `near_line: L` to target another.\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 1 dependents]"
+      "expected": "Edit safety: text-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:7`\nsrc/lib.rs — edited within `caller` (1 replacement(s), 50 → 54 bytes)\nNote: `old_text` occurred 2 times within `caller`; edited the FIRST. Pass `occurrence: N` or `near_line: L` to target another.\nSyntax check: passed\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 1 dependents]"
     },
     {
       "name": "batch edit preview",
@@ -208,7 +208,7 @@
         "name": "Widget::size",
         "new_body": "pub fn size(&self, scale: u32) -> u32 {\n    scale\n}"
       },
-      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/widget.rs:4`\nsrc/widget.rs — replaced fn `Widget::size` (43 → 63 bytes)\nTee snapshot: `<tee>` preserves `src/widget.rs` before this write.\n[impact: 0 dependents]"
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/widget.rs:4`\nsrc/widget.rs — replaced fn `Widget::size` (43 → 63 bytes)\nSyntax check: passed\nTee snapshot: `<tee>` preserves `src/widget.rs` before this write.\n[impact: 0 dependents]"
     },
     {
       "name": "edit within through a qualified method selector preview",
@@ -220,7 +220,7 @@
         "new_text": "2",
         "dry_run": true
       },
-      "expected": "Edit safety: text-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/widget.rs:4`\n[DRY RUN] Would edit within `Widget::size` in src/widget.rs (1 replacement(s))"
+      "expected": "Edit safety: text-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/widget.rs:4`\n[DRY RUN] Would edit within `Widget::size` in src/widget.rs (1 replacement(s))\nSyntax check: passed"
     },
     {
       "name": "structural rewrite preview",

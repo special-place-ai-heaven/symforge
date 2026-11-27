@@ -61,6 +61,17 @@ impl CodeModeRunner {
 
 /// Executes one Python snippet inside a fresh, zero-egress `MontyRepl`.
 pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -> ExecuteOutcome {
+    let mut notices = Vec::new();
+    let mut outcome = execute_script_inner(request, backend, &mut notices);
+    outcome.notices = notices;
+    outcome
+}
+
+fn execute_script_inner(
+    request: &ExecuteRequest,
+    backend: &dyn CodeReadBackend,
+    notices: &mut Vec<super::CodeReadNotice>,
+) -> ExecuteOutcome {
     let started = Instant::now();
     let limits = request.limits.clamped();
     let max_wall_duration = limits
@@ -105,6 +116,7 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                 started.elapsed().as_millis() as u64,
                 &limits,
                 request.spill_dir.as_deref(),
+                &notices[..],
             );
         }
     };
@@ -122,6 +134,7 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                             duration_ms,
                             &limits,
                             request.spill_dir.as_deref(),
+                            &notices[..],
                         );
                     }
                     Err(conv_err) => {
@@ -132,6 +145,7 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                             duration_ms,
                             &limits,
                             request.spill_dir.as_deref(),
+                            &notices[..],
                         );
                     }
                 }
@@ -153,6 +167,7 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                                 started.elapsed().as_millis() as u64,
                                 &limits,
                                 request.spill_dir.as_deref(),
+                                &notices[..],
                             );
                         }
                     }
@@ -178,6 +193,7 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                                 started.elapsed().as_millis() as u64,
                                 &limits,
                                 request.spill_dir.as_deref(),
+                                &notices[..],
                             );
                         }
                     }
@@ -209,6 +225,7 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                             started.elapsed().as_millis() as u64,
                             &limits,
                             request.spill_dir.as_deref(),
+                            &notices[..],
                         );
                     }
                 };
@@ -230,6 +247,7 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                                 started.elapsed().as_millis() as u64,
                                 &limits,
                                 request.spill_dir.as_deref(),
+                                &notices[..],
                             );
                         }
                     }
@@ -256,6 +274,7 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                                 started.elapsed().as_millis() as u64,
                                 &limits,
                                 request.spill_dir.as_deref(),
+                                &notices[..],
                             );
                         }
                     }
@@ -277,6 +296,7 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                                 started.elapsed().as_millis() as u64,
                                 &limits,
                                 request.spill_dir.as_deref(),
+                                &notices[..],
                             );
                         }
                     };
@@ -290,8 +310,16 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                     }
                     Ok(kwargs) => {
                         host_calls += 1;
-                        match backend.execute_op(op, kwargs) {
-                            Ok(val) => {
+                        match backend.execute_op_with_completeness(op, kwargs) {
+                            Ok(result) => {
+                                if !result.completeness.is_empty() {
+                                    notices.push(super::CodeReadNotice {
+                                        call: host_calls,
+                                        op,
+                                        completeness: result.completeness,
+                                    });
+                                }
+                                let val = result.value;
                                 let converted = json_to_monty(&val);
                                 drop_json_iteratively(val);
                                 match converted {
@@ -324,6 +352,7 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                                 started.elapsed().as_millis() as u64,
                                 &limits,
                                 request.spill_dir.as_deref(),
+                                &notices[..],
                             );
                         }
                     };
@@ -341,6 +370,7 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                                 started.elapsed().as_millis() as u64,
                                 &limits,
                                 request.spill_dir.as_deref(),
+                                &notices[..],
                             );
                         }
                     };
@@ -363,6 +393,7 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                                 started.elapsed().as_millis() as u64,
                                 &limits,
                                 request.spill_dir.as_deref(),
+                                &notices[..],
                             );
                         }
                     }
@@ -388,6 +419,7 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                                 started.elapsed().as_millis() as u64,
                                 &limits,
                                 request.spill_dir.as_deref(),
+                                &notices[..],
                             );
                         }
                     }
@@ -410,6 +442,7 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                             started.elapsed().as_millis() as u64,
                             &limits,
                             request.spill_dir.as_deref(),
+                            &notices[..],
                         );
                     }
                 };
@@ -435,6 +468,7 @@ pub fn execute_script(request: &ExecuteRequest, backend: &dyn CodeReadBackend) -
                             started.elapsed().as_millis() as u64,
                             &limits,
                             request.spill_dir.as_deref(),
+                            &notices[..],
                         );
                     }
                 }
@@ -477,6 +511,7 @@ fn build_error_outcome(
     duration_ms: u64,
     limits: &CodeModeLimits,
     spill_dir: Option<&Path>,
+    notices: &[super::CodeReadNotice],
 ) -> ExecuteOutcome {
     let exc = err.error;
     let kind = classify_exception_kind(&exc).to_owned();
@@ -499,6 +534,7 @@ fn build_error_outcome(
         duration_ms,
         limits,
         spill_dir,
+        notices,
     )
 }
 
@@ -509,6 +545,7 @@ fn build_conversion_error_outcome(
     duration_ms: u64,
     limits: &CodeModeLimits,
     spill_dir: Option<&Path>,
+    notices: &[super::CodeReadNotice],
 ) -> ExecuteOutcome {
     finalize_error_with_stdout(
         ExecuteErrorInfo {
@@ -522,6 +559,7 @@ fn build_conversion_error_outcome(
         duration_ms,
         limits,
         spill_dir,
+        notices,
     )
 }
 
@@ -532,13 +570,17 @@ fn finalize_error_with_stdout(
     duration_ms: u64,
     limits: &CodeModeLimits,
     spill_dir: Option<&Path>,
+    notices: &[super::CodeReadNotice],
 ) -> ExecuteOutcome {
     let (capped_stdout, stdout_truncated) = cap_utf8_inline(&stdout_buf, limits.max_output_chars);
     let (spill_path, total_bytes) = if stdout_truncated {
-        let full = json!({
+        let mut full = json!({
             "stdout": &stdout_buf,
             "error": &error_info,
         });
+        if !notices.is_empty() {
+            full["notices"] = json!(notices);
+        }
         let bytes = serde_json::to_vec(&full).ok();
         drop_json_iteratively(full);
         match bytes {
@@ -563,6 +605,7 @@ fn finalize_error_with_stdout(
         stdout: capped_stdout,
         calls,
         duration_ms,
+        notices: Vec::new(),
         output_bytes: stdout_buf.len(),
         truncated: stdout_truncated.then_some(true),
         total_bytes,
@@ -579,6 +622,7 @@ fn finalize_ok_outcome(
     duration_ms: u64,
     limits: &CodeModeLimits,
     spill_dir: Option<&Path>,
+    notices: &[super::CodeReadNotice],
 ) -> ExecuteOutcome {
     // Serialize `value` once to compact JSON, then drop the tree iteratively so we
     // never serialize it a second time or risk stack overflow on Drop.
@@ -602,6 +646,7 @@ fn finalize_ok_outcome(
             stdout: stdout_buf,
             calls,
             duration_ms,
+            notices: Vec::new(),
             output_bytes: total_bytes,
             truncated: None,
             spill_path: None,
@@ -618,6 +663,8 @@ fn finalize_ok_outcome(
         value: &'a RawValue,
         stdout: &'a str,
         calls: usize,
+        #[serde(skip_serializing_if = "<[_]>::is_empty")]
+        notices: &'a [super::CodeReadNotice],
         duration_ms: u64,
         total_bytes: usize,
     }
@@ -630,6 +677,7 @@ fn finalize_ok_outcome(
                     value: &raw_val,
                     stdout: &stdout_buf,
                     calls,
+                    notices,
                     duration_ms,
                     total_bytes,
                 };
@@ -659,6 +707,7 @@ fn finalize_ok_outcome(
         stdout: stdout_preview,
         calls,
         duration_ms,
+        notices: Vec::new(),
         output_bytes: total_bytes,
         truncated: Some(true),
         spill_path,

@@ -51,7 +51,9 @@ use crate::domain::ParseDiagnostic;
 // dismissal digest, so treating it as stale is the honest outcome and a
 // one-time cold parse per user is acceptable.
 // Format 11 appends a SHA-256 checksum covering every serialized snapshot field.
-const CURRENT_VERSION: u32 = 11;
+// Format 12 requires a fresh parse: serialized JSX/callable xrefs and JS/TS
+// symbol item ranges changed even though the postcard field layout did not.
+const CURRENT_VERSION: u32 = 12;
 
 /// The on-disk snapshot format version this engine writes and restores
 /// (embed `engine_info` reporting; a mismatched snapshot fails soft to a
@@ -266,6 +268,7 @@ pub struct IndexSnapshot {
     /// Paths that store's records named. A team artifact restored under a
     /// different store re-reads exactly these plus the local store's paths.
     pub dismissal_paths: Vec<String>,
+    pub callable_values: Option<super::callable_values::PersistedCallableValues>,
 }
 
 /// Serializable provenance for the immutable code-signal slice of a published generation.
@@ -365,6 +368,7 @@ fn capture_snapshot_build_input(index: &LiveIndex) -> SnapshotBuildInput {
         manifest: None,
         code_signals: None,
         trigrams: index.trigram_index.to_persisted(),
+        callable_values: index.callable_values.clone(),
     }
 }
 
@@ -785,6 +789,7 @@ pub fn checkpoint_shared_index(
                 published.code_signals.as_ref(),
             )),
             trigrams: published.live.trigram_index.to_persisted(),
+            callable_values: published.live.callable_values.clone(),
         }
     };
     serialize_captured_snapshot(snapshot_input, project_root, state_placement)
@@ -2872,6 +2877,7 @@ fn hydrate_snapshot_with_proof(
         manifest,
         code_signals,
         trigrams,
+        callable_values,
         ..
     } = snapshot;
     let manifest_entries = manifest.entries;
@@ -2938,10 +2944,11 @@ fn hydrate_snapshot_with_proof(
         load_source: IndexLoadSource::SnapshotRestore,
         snapshot_verify_state: SnapshotVerifyState::Pending,
         reverse_index: HashMap::new(),
+        callable_values: Default::default(),
         files_by_basename: HashMap::new(),
         files_by_dir_component: HashMap::new(),
         trigram_index,
-        gitignore: None,
+        gitignore: crate::discovery::load_gitignore(project_root),
         manifest_entries,
         coupling_store: None,
         local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
@@ -2950,11 +2957,30 @@ fn hydrate_snapshot_with_proof(
         indexed_root: Some(normalize_root(project_root)),
     };
     let phase = Instant::now();
-    index.rebuild_reverse_index();
-    tracing::info!(
-        "warm restore: reverse index rebuilt in {:?}",
-        phase.elapsed()
-    );
+    match callable_values.map(|section| section.adopt(&index.files)) {
+        Some(Ok(table)) => {
+            index.reverse_index = super::store::build_reverse_index_from_files(&index.files);
+            let adopted = table.len();
+            index.callable_values = table;
+            tracing::info!(
+                "warm restore: reverse index rebuilt, callable values adopted from snapshot ({adopted} files) in {:?}",
+                phase.elapsed()
+            );
+        }
+        rejected => {
+            index.rebuild_reverse_index();
+            match rejected {
+                Some(Err(reason)) => tracing::warn!(
+                    "warm restore: {reason}; reverse index and callable values rebuilt from restored files in {:?}",
+                    phase.elapsed()
+                ),
+                _ => tracing::info!(
+                    "warm restore: snapshot carries no callable values; reverse index and callable values rebuilt from restored files in {:?}",
+                    phase.elapsed()
+                ),
+            }
+        }
+    }
 
     let phase = Instant::now();
     index.rebuild_path_indices();
@@ -3186,7 +3212,10 @@ fn discover_files_from_source_anchor_within(
     let mut files = Vec::new();
     let mut observed = HashMap::new();
     let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
-    let mut matcher = ignore::gitignore::Gitignore::empty();
+    crate::discovery::add_repository_excludes(&mut builder, root);
+    let mut matcher = builder
+        .build()
+        .map_err(|_| "admitted ignore rules could not be compiled".to_string())?;
     let mut visited = 0usize;
     while !level.is_empty() {
         let mut next_level = Vec::new();
@@ -3630,6 +3659,7 @@ pub(crate) struct SnapshotBuildInput {
     manifest: Option<RepositoryManifest>,
     code_signals: Option<PersistedCodeSignals>,
     trigrams: super::trigram::PersistedTrigramIndex,
+    callable_values: super::callable_values::CallableValueIndex,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3697,6 +3727,7 @@ fn build_snapshot(
         manifest,
         code_signals,
         trigrams,
+        callable_values,
     } = snapshot_input;
     let mut snap_files = HashMap::with_capacity(files.len());
 
@@ -3824,6 +3855,9 @@ fn build_snapshot(
         trigrams,
         dismissal_store_digest: held_dismissals.digest,
         dismissal_paths: held_dismissals.paths.into_iter().collect(),
+        callable_values: Some(super::callable_values::PersistedCallableValues::capture(
+            &callable_values,
+        )),
     })
 }
 
@@ -4995,6 +5029,7 @@ mod tests {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index,
@@ -7313,6 +7348,49 @@ mod tests {
 
     #[cfg(any(feature = "server", feature = "embed"))]
     #[test]
+    fn discovery_honours_the_repository_exclude_file_like_the_cold_walk() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        for relative in ["src/a.rs", "hidden/b.rs", "src/gen/g.rs", "src/keep/k.rs"] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "fn f() {}\n").unwrap();
+        }
+        let init = crate::process_util::hidden_command("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .output()
+            .expect("git init");
+        assert!(init.status.success(), "git init failed");
+        std::fs::write(root.join(".git/info/exclude"), "hidden/\n").unwrap();
+        std::fs::write(root.join("src/.gitignore"), "gen/\n").unwrap();
+        let index =
+            crate::live_index::SharedIndexHandle::shared(make_live_index_with_files(Vec::new()));
+        let authority = crate::index_lifecycle::activation::ProjectSourceAuthority::for_root(root);
+        let Ok(discovered) = discover_files_from_source_anchor(root, &index, &authority, &|| false)
+        else {
+            panic!("the walk must succeed");
+        };
+        let cold: Vec<String> = crate::discovery::discover_files(root)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.relative_path)
+            .filter(|path| path.ends_with(".rs"))
+            .collect();
+        let mut cold = cold;
+        cold.sort();
+        let anchored: Vec<String> = discovered
+            .files
+            .iter()
+            .filter(|path| path.ends_with(".rs"))
+            .cloned()
+            .collect();
+        assert_eq!(anchored, ["src/a.rs", "src/keep/k.rs"]);
+        assert_eq!(anchored, cold);
+    }
+
+    #[cfg(any(feature = "server", feature = "embed"))]
+    #[test]
     fn discovery_does_not_list_ignored_directories_and_honours_nested_reinclusion() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
@@ -8671,6 +8749,7 @@ mod tests {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index,
@@ -8720,7 +8799,7 @@ mod tests {
     #[test]
     fn test_persist_format_version_is_pinned() {
         assert_eq!(
-            CURRENT_VERSION, 11,
+            CURRENT_VERSION, 12,
             "persist format version changed — a format bump breaks every existing \
              user's .symforge/index.bin and requires orchestrator approval"
         );
@@ -8857,6 +8936,7 @@ mod tests {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index,
@@ -9859,6 +9939,7 @@ mod tests {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index,
@@ -9928,6 +10009,7 @@ mod tests {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index,
@@ -10191,6 +10273,7 @@ mod tests {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index,
@@ -10255,6 +10338,7 @@ mod tests {
             load_source: IndexLoadSource::FreshLoad,
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index,
@@ -11377,6 +11461,224 @@ mod tests {
         assert_eq!(
             metadata["reason"], "missing-sidecar",
             "quarantine metadata must record the missing-sidecar integrity failure"
+        );
+    }
+    const CALLABLE_PROBE_FIXTURE: &[(&str, &str)] = &[
+        (
+            "facts-probe/util.ts",
+            "export function makeId(p: string): string { return p; }\nexport const label = (v: string) => v.trim();\n",
+        ),
+        (
+            "facts-probe/handlers.ts",
+            "import { label, makeId } from \"./util\";\nexport function wire(r: (f: unknown) => void) { r(label); r(makeId); }\n",
+        ),
+        ("facts-probe/pkg/__init__.py", ""),
+        (
+            "facts-probe/pkg/a.py",
+            "def handler():\n    pass\n\n\nclass Thing:\n    pass\n",
+        ),
+        (
+            "facts-probe/pkg/b.py",
+            "from .a import handler, Thing\n\n\ndef run():\n    register(handler)\n    make(Thing)\n",
+        ),
+        (
+            "facts-probe/w.js",
+            "import { makeId } from \"./util\";\nexport function go() { install(makeId); }\n",
+        ),
+    ];
+
+    fn write_callable_probe_fixture(root: &Path) {
+        for (name, content) in CALLABLE_PROBE_FIXTURE {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+    }
+
+    fn restore_counting_facts(snapshot: IndexSnapshot, root: &Path) -> (LiveIndex, usize) {
+        let probe = &crate::live_index::callable_values::FACTS_PROBE_CALLS;
+        let before = probe.load(std::sync::atomic::Ordering::SeqCst);
+        let restored = snapshot_to_live_index(snapshot, root);
+        let calls = probe.load(std::sync::atomic::Ordering::SeqCst) - before;
+        (restored, calls)
+    }
+
+    #[test]
+    fn restore_adopts_persisted_callable_values_and_falls_back_when_absent_or_unfit() {
+        let tmp = TempDir::new().unwrap();
+        write_callable_probe_fixture(tmp.path());
+        let fresh = LiveIndex::load(tmp.path()).unwrap();
+        let expected = fresh.read().callable_values.clone();
+        assert!(expected.len() >= 4, "fixture yields facts: {expected:?}");
+        serialize_index(&fresh.read(), tmp.path()).unwrap();
+
+        let (adopted, calls) =
+            restore_counting_facts(load_snapshot(tmp.path()).unwrap(), tmp.path());
+        assert_eq!(adopted.callable_values, expected);
+        assert_eq!(calls, 0, "restore with the section parses nothing");
+
+        let mut absent = load_snapshot(tmp.path()).unwrap();
+        absent.callable_values = None;
+        let (rebuilt, calls) = restore_counting_facts(absent, tmp.path());
+        assert_eq!(rebuilt.callable_values, expected);
+        assert_eq!(
+            calls,
+            CALLABLE_PROBE_FIXTURE.len(),
+            "no section rebuilds by parsing"
+        );
+
+        let mut unfit = load_snapshot(tmp.path()).unwrap();
+        unfit
+            .files
+            .get_mut("facts-probe/util.ts")
+            .unwrap()
+            .parse_status = ParseStatus::PartialParse {
+            warning: "damaged".to_string(),
+        };
+        let (fallback, calls) = restore_counting_facts(unfit, tmp.path());
+        assert_eq!(
+            calls,
+            CALLABLE_PROBE_FIXTURE.len(),
+            "an unfit key rebuilds by parsing"
+        );
+        assert!(!fallback.callable_values.contains_key("facts-probe/util.ts"));
+        assert_eq!(
+            fallback.callable_values,
+            crate::live_index::callable_values::build_callable_values(&fallback.files, None),
+            "an unfit key yields the full rebuild, never a partial adopted table"
+        );
+    }
+
+    #[test]
+    fn persisted_callable_values_encode_identically_for_identical_content() {
+        let tmp = TempDir::new().unwrap();
+        write_callable_probe_fixture(tmp.path());
+        let encode = || {
+            let index = LiveIndex::load(tmp.path()).unwrap();
+            let section = crate::live_index::callable_values::PersistedCallableValues::capture(
+                &index.read().callable_values,
+            );
+            postcard::to_stdvec(&section).unwrap()
+        };
+        let first = encode();
+        assert!(first.len() > 64);
+        for _ in 0..4 {
+            assert_eq!(encode(), first);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verify_refreshes_adopted_callable_values_for_a_file_edited_after_the_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        write_callable_probe_fixture(tmp.path());
+        let fresh = LiveIndex::load(tmp.path()).unwrap();
+        serialize_index(&fresh.read(), tmp.path()).unwrap();
+        let snapshot = load_snapshot(tmp.path()).unwrap();
+        let mtimes = snapshot
+            .files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.mtime_secs))
+            .collect::<HashMap<_, _>>();
+        let (restored, calls) = restore_counting_facts(snapshot, tmp.path());
+        assert_eq!(calls, 0);
+        std::fs::write(
+            tmp.path().join("facts-probe/util.ts"),
+            "export function makeId(p: string): string { return p + \"-x\"; }\nexport function label(v: string) { return v; }\nexport function extra() {}\n",
+        )
+        .unwrap();
+        let shared = crate::live_index::SharedIndexHandle::shared(restored);
+        background_verify(
+            shared.clone(),
+            tmp.path().to_path_buf(),
+            mtimes,
+            verify_observer(tmp.path()),
+        )
+        .await;
+        let expected = LiveIndex::load(tmp.path())
+            .unwrap()
+            .read()
+            .callable_values
+            .clone();
+        let guard = shared.read();
+        assert_ne!(
+            guard.callable_values.get("facts-probe/util.ts"),
+            fresh.read().callable_values.get("facts-probe/util.ts"),
+            "the edit changed the exporter's facts"
+        );
+        assert_eq!(guard.callable_values, expected);
+    }
+    #[test]
+    fn restore_falls_back_when_the_facts_were_written_by_another_build() {
+        let tmp = TempDir::new().unwrap();
+        write_callable_probe_fixture(tmp.path());
+        let fresh = LiveIndex::load(tmp.path()).unwrap();
+        let expected = fresh.read().callable_values.clone();
+        serialize_index(&fresh.read(), tmp.path()).unwrap();
+
+        let mut foreign = load_snapshot(tmp.path()).unwrap();
+        let section = foreign.callable_values.take().unwrap();
+        foreign.callable_values = Some(section.with_writer("0.0.0+facts0"));
+        let (rebuilt, calls) = restore_counting_facts(foreign, tmp.path());
+        assert_eq!(
+            calls,
+            CALLABLE_PROBE_FIXTURE.len(),
+            "another writer's facts are parsed again"
+        );
+        assert_eq!(rebuilt.callable_values, expected);
+
+        let (adopted, calls) =
+            restore_counting_facts(load_snapshot(tmp.path()).unwrap(), tmp.path());
+        assert_eq!(calls, 0, "this build's own facts are adopted");
+        assert_eq!(adopted.callable_values, expected);
+    }
+
+    #[test]
+    fn persisted_callable_values_bytes_carry_the_writer_stamp() {
+        let tmp = TempDir::new().unwrap();
+        write_callable_probe_fixture(tmp.path());
+        let index = LiveIndex::load(tmp.path()).unwrap();
+        let section = crate::live_index::callable_values::PersistedCallableValues::capture(
+            &index.read().callable_values,
+        );
+        let own = postcard::to_stdvec(&section).unwrap();
+        let stamp = crate::live_index::callable_values::facts_writer_stamp();
+        assert!(stamp.starts_with(env!("CARGO_PKG_VERSION")));
+        assert!(
+            own.windows(stamp.len())
+                .any(|window| window == stamp.as_bytes())
+        );
+        let other = postcard::to_stdvec(&section.with_writer("0.0.0+facts0")).unwrap();
+        assert_ne!(own, other);
+    }
+
+    #[test]
+    fn a_format_12_snapshot_without_the_facts_field_is_refused_softly() {
+        let tmp = TempDir::new().unwrap();
+        write_callable_probe_fixture(tmp.path());
+        let fresh = LiveIndex::load(tmp.path()).unwrap();
+        serialize_index(&fresh.read(), tmp.path()).unwrap();
+        let mut snapshot = load_snapshot(tmp.path()).unwrap();
+        snapshot.callable_values = None;
+        let mut payload = postcard::to_stdvec(&snapshot).unwrap();
+        assert_eq!(
+            payload.pop(),
+            Some(0),
+            "the absent section is one trailing None tag"
+        );
+        let checksum = crate::hash::digest(&payload);
+        payload.extend_from_slice(&checksum);
+        let snapshot_path = tmp.path().join(".symforge").join("index.bin");
+        std::fs::write(&snapshot_path, &payload).unwrap();
+
+        assert!(
+            load_snapshot(tmp.path()).is_none(),
+            "the older layout never restores"
+        );
+        let reloaded = LiveIndex::load(tmp.path()).unwrap();
+        assert_eq!(
+            reloaded.read().callable_values,
+            fresh.read().callable_values,
+            "a fresh parse replaces it"
         );
     }
 }

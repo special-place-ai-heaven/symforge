@@ -169,8 +169,8 @@ pub fn compile_structural_pattern(
 }
 
 /// Search `source` using an already compiled ast-grep pattern. The parse is
-/// bounded by the indexer's deadline; a cancelled parse is an error, not an
-/// empty match list.
+/// bounded by the indexer's deadline. A cancelled or recovered parse is an
+/// error, not an empty or partial match list.
 pub fn structural_search_with_compiled(
     source: &str,
     compiled: &CompiledStructuralPattern,
@@ -178,44 +178,127 @@ pub fn structural_search_with_compiled(
     structural_search_within(source, compiled, super::PARSE_DEADLINE)
 }
 
+/// Bounded search that keeps matches outside syntax-error regions. The flag is
+/// true when the source tree had damage, so rows inside it may be missing.
+pub(crate) fn structural_search_bounded(
+    source: &str,
+    compiled: &CompiledStructuralPattern,
+    deadline: Duration,
+    match_limit: usize,
+) -> Result<(Vec<StructuralMatch>, bool), String> {
+    structural_search_impl(source, compiled, deadline, Some(match_limit))
+}
+
 fn structural_search_within(
     source: &str,
     compiled: &CompiledStructuralPattern,
     deadline: Duration,
 ) -> Result<Vec<StructuralMatch>, String> {
+    match structural_search_impl(source, compiled, deadline, None)? {
+        (_, true) => Err("structural search source contains syntax errors".to_owned()),
+        (matches, false) => Ok(matches),
+    }
+}
+
+fn damaged_byte_ranges(root: tree_sitter::Node<'_>) -> Vec<(usize, usize)> {
+    let mut damaged = Vec::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.is_error() || node.is_missing() {
+            damaged.push((node.start_byte(), node.end_byte()));
+        } else if node.has_error() {
+            let mut cursor = node.walk();
+            pending.extend(node.children(&mut cursor));
+        }
+    }
+    damaged
+}
+
+fn structural_search_impl(
+    source: &str,
+    compiled: &CompiledStructuralPattern,
+    deadline: Duration,
+    match_limit: Option<usize>,
+) -> Result<(Vec<StructuralMatch>, bool), String> {
+    let started = std::time::Instant::now();
     let mut parser = Parser::new();
     parser
         .set_language(&compiled.lang.get_ts_language())
         .map_err(|e| format!("failed to set tree-sitter language: {e}"))?;
     let tree = super::parse_within(&mut parser, source, deadline)?;
+    let damaged = if tree.root_node().has_error() {
+        damaged_byte_ranges(tree.root_node())
+    } else {
+        Vec::new()
+    };
     let root = AstGrep::doc(StrDoc {
         src: source.to_string(),
         lang: compiled.lang.clone(),
         tree,
     });
 
-    Ok(root
+    let clip = |text: &str, bytes: usize| -> String {
+        if text.len() <= bytes {
+            text.to_owned()
+        } else {
+            format!("{}...", &text[..text.floor_char_boundary(bytes)])
+        }
+    };
+    let matches = root
         .root()
         .find_all(&compiled.pattern)
-        .map(|node_match| {
+        .filter(|node_match| {
+            let range = node_match.range();
+            !damaged.iter().any(|&(start, end)| {
+                if start == end {
+                    range.start <= start && start <= range.end
+                } else {
+                    start < range.end && range.start < end
+                }
+            })
+        })
+        .enumerate()
+        .map(|(i, node_match)| {
+            if let Some(limit) = match_limit
+                && (i >= limit || started.elapsed() >= deadline)
+            {
+                // Discard this file, rather than publishing a partial per-file count.
+                return Err("structural search exceeded the file match budget".to_owned());
+            }
             let start = node_match.start_pos();
-            let text = node_match.text().to_string();
+            let text = node_match.text();
+            let text = if match_limit.is_some() {
+                clip(text.lines().next().unwrap_or(text.as_ref()), 1024)
+            } else {
+                text.to_string()
+            };
 
-            // Extract metavariable captures
+            let capture = |text: &str| {
+                if match_limit.is_some() {
+                    clip(text, 40)
+                } else {
+                    text.to_owned()
+                }
+            };
             let env = node_match.get_env();
             let captures: Vec<(String, String)> = env
                 .get_matched_variables()
                 .filter_map(|var| match var {
                     MetaVariable::Capture(name, _) => {
-                        env.get_match(&name).map(|n| (name, n.text().to_string()))
+                        env.get_match(&name).map(|n| (name, capture(&n.text())))
                     }
                     MetaVariable::MultiCapture(name) => {
                         let nodes = env.get_multiple_matches(&name);
-                        let combined: String = nodes
-                            .iter()
-                            .map(|n| n.text().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                        let mut combined = String::new();
+                        for (i, node) in nodes.iter().enumerate() {
+                            if i != 0 {
+                                combined.push_str(", ");
+                            }
+                            combined.push_str(&capture(&node.text()));
+                            if match_limit.is_some() && combined.len() > 40 {
+                                break;
+                            }
+                        }
                         if combined.is_empty() {
                             None
                         } else {
@@ -226,16 +309,26 @@ fn structural_search_within(
                 })
                 .collect();
 
-            StructuralMatch {
+            Ok(StructuralMatch {
                 start_byte: node_match.range().start,
                 end_byte: node_match.range().end,
                 start_line: start.line(),
                 start_col: start.byte_point().1,
                 text,
                 captures,
-            }
+            })
         })
-        .collect())
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|matches| {
+            // `find_all` can spend time before yielding its next (or final)
+            // match. Treat that file as incomplete if it exceeded the budget.
+            if match_limit.is_some() && started.elapsed() >= deadline {
+                Err("structural search exceeded the file match budget".to_owned())
+            } else {
+                Ok(matches)
+            }
+        });
+    matches.map(|matches| (matches, !damaged.is_empty()))
 }
 
 /// Rewrite every match of `compiled` in `source` with ast-grep's own template
@@ -315,7 +408,8 @@ pub fn structural_rewrite_with_compiled(
 
 /// Search `source` for occurrences of an ast-grep `pattern` in the given language.
 ///
-/// Returns an error string if the pattern cannot be compiled (e.g., syntax error).
+/// Returns an error if the pattern cannot be compiled or the source cannot be
+/// parsed completely.
 pub fn structural_search(
     source: &str,
     pattern_str: &str,
@@ -464,10 +558,9 @@ struct Bar {
 
     #[test]
     fn test_structural_search_tsx_jsx_component() {
-        // A JSX component body only parses under the TSX grammar. With the plain
-        // TypeScript grammar this yields a partial parse and the structural
-        // pattern matches nothing; with the TSX grammar (is_tsx=true) the
-        // function declaration is matched.
+        // A JSX component body only parses under the TSX grammar. With the
+        // plain TypeScript grammar this yields a partial parse and the file is
+        // skipped; with TSX the function declaration is matched.
         let source = r#"
 export function App() {
   return (

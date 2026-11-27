@@ -1,7 +1,7 @@
 use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolKind, SymbolRecord};
 
 use super::store::IndexedFile;
-pub(super) fn parse_reference_kind_filter(kind_filter: Option<&str>) -> Option<ReferenceKind> {
+pub(crate) fn parse_reference_kind_filter(kind_filter: Option<&str>) -> Option<ReferenceKind> {
     match kind_filter {
         Some("call") => Some(ReferenceKind::Call),
         Some("import") => Some(ReferenceKind::Import),

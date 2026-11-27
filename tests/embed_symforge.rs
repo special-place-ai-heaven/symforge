@@ -237,8 +237,12 @@ fn symforge_edit_answers_match_the_mcp_golden() {
             "plain_text",
             "file",
         ] {
+            let expected = match case[key].as_str() {
+                Some(text) => serde_json::Value::String(without_mcp_syntax_line(text)),
+                None => case[key].clone(),
+            };
             assert_eq!(
-                observed[key], case[key],
+                observed[key], expected,
                 "{} / {key}:\n{}",
                 case["name"], answer.rendered
             );
@@ -333,4 +337,11 @@ fn host_room_serves_the_facade_and_gates_symforge_edit_apply() {
         fs::read_to_string(root.path().join("src/lib.rs")).unwrap(),
         "pub fn target() -> u32 {\n    1\n}\n"
     );
+}
+
+fn without_mcp_syntax_line(text: &str) -> String {
+    text.split('\n')
+        .filter(|line| !line.trim_start().starts_with("Syntax check: "))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

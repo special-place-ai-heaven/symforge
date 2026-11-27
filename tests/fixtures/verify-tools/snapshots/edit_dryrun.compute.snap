@@ -1,4 +1,4 @@
-── stel · edit → replace_symbol_body (exact) · serve · ~168 tok served (est.) ──
+── stel · edit → replace_symbol_body (exact) · serve · ~174 tok served (est.) ──
 
 Mode: preview-only (dry_run); default when apply is omitted or false
 Route confidence: exact
@@ -13,3 +13,4 @@ Source authority: current index
 Write semantics: dry run (no writes)
 Evidence: symbol anchor `src/edit_target.rs:6`
 [DRY RUN] Would replace `compute` in src/edit_target.rs (old: 51 bytes -> new: 65 bytes)
+Syntax check: passed

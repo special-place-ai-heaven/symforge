@@ -1145,13 +1145,48 @@ impl SymForgeServer {
             Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
+        let source = crate::edit_safety::structural::SourceTree::new(
+            &file.content,
+            &file.language,
+            &params.0.path,
+        );
+        let prepared = match crate::edit_safety::structural::prepare_replace(
+            &file.content,
+            &sym,
+            &params.0.new_body,
+            crate::edit_safety::structural::list_member(&source, &sym),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return fail_and_return_bound_mutation_replay(
+                    &idempotency,
+                    format!("Error: {error}"),
+                );
+            }
+        };
+        let old_bytes = prepared.old_bytes;
+        let inserted_bytes = prepared.inserted_bytes;
+        let new_content = prepared.new_content;
+        let syntax = match crate::edit_safety::structural::syntax_check(
+            &source,
+            &new_content,
+            crate::edit_safety::structural::SyntaxEdit::Text,
+        ) {
+            crate::edit_safety::structural::SyntaxCheck::Regressed(message) => {
+                return fail_and_return_bound_mutation_replay(&idempotency, message);
+            }
+            verdict => verdict.reply_line(),
+        };
         if params.0.dry_run == Some(true) {
             let old_bytes = (sym.byte_range.1 - sym.byte_range.0) as usize;
-            let summary = edit_body::dry_run_replace_summary(
-                &params.0.name,
-                &params.0.path,
-                old_bytes,
-                params.0.new_body.len(),
+            let summary = format!(
+                "{}\n{syntax}",
+                edit_body::dry_run_replace_summary(
+                    &params.0.name,
+                    &params.0.path,
+                    old_bytes,
+                    params.0.new_body.len(),
+                )
             );
             return edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
                 safety: edit_format::EditSafetyMode::StructuralEditSafe,
@@ -1167,22 +1202,6 @@ impl SymForgeServer {
                 impact: None,
             });
         }
-        let prepared = match crate::edit_safety::structural::prepare_replace(
-            &file.content,
-            &sym,
-            &params.0.new_body,
-        ) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return fail_and_return_bound_mutation_replay(
-                    &idempotency,
-                    format!("Error: {error}"),
-                );
-            }
-        };
-        let old_bytes = prepared.old_bytes;
-        let inserted_bytes = prepared.inserted_bytes;
-        let new_content = prepared.new_content;
         // TR-06 / FR-009 (design D1): re-verify the `if_match` guard against the
         // bytes ACTUALLY on disk, in the same per-path-locked critical section
         // as the write. `file.content` is the exact base the splice in
@@ -1264,12 +1283,15 @@ impl SymForgeServer {
             authority: source_authority,
             semantics: edit_format::EditWriteSemantics::AtomicWriteAndReindex,
             anchor: &evidence_anchor,
-            summary: &edit_format::format_replace(
-                &params.0.path,
-                &params.0.name,
-                &sym.kind.to_string(),
-                old_bytes,
-                inserted_bytes,
+            summary: &format!(
+                "{}\n{syntax}",
+                edit_format::format_replace(
+                    &params.0.path,
+                    &params.0.name,
+                    &sym.kind.to_string(),
+                    old_bytes,
+                    inserted_bytes,
+                )
             ),
             stale_warnings: &edit_format::format_stale_warnings(
                 &params.0.path,
@@ -1434,28 +1456,19 @@ impl SymForgeServer {
             Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
-        if params.0.dry_run == Some(true) {
-            let summary = edit_body::dry_run_insert_summary(
-                position,
-                &params.0.name,
-                &params.0.path,
-                params.0.content.len(),
-            );
-            return edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
-                safety: edit_format::EditSafetyMode::StructuralEditSafe,
-                authority: source_authority,
-                semantics: edit_format::EditWriteSemantics::DryRunNoWrites,
-                anchor: &evidence_anchor,
-                summary: &summary,
-                stale_warnings: "",
-                tee: "",
-                reroute: "",
-                tee_before_reroute: false,
-                trust: project_config_trust_suffix.as_deref(),
-                impact: None,
-            });
-        }
+        let source = crate::edit_safety::structural::SourceTree::new(
+            &file.content,
+            &file.language,
+            &params.0.path,
+        );
         let line_ending = edit::detect_line_ending(&file.content);
+        let member = crate::edit_safety::structural::list_member(&source, &sym);
+        if let Err(message) = crate::edit_safety::structural::refuse_list_member(member, &sym) {
+            return fail_and_return_bound_mutation_replay(
+                &idempotency,
+                format!("Error: {message}"),
+            );
+        }
         let new_content = if position == "before" {
             match edit::build_insert_before(
                 &file.content,
@@ -1475,6 +1488,40 @@ impl SymForgeServer {
         } else {
             edit::build_insert_after(&file.content, &sym, &params.0.content, line_ending)
         };
+        let syntax = match crate::edit_safety::structural::syntax_check(
+            &source,
+            &new_content,
+            crate::edit_safety::structural::SyntaxEdit::Text,
+        ) {
+            crate::edit_safety::structural::SyntaxCheck::Regressed(message) => {
+                return fail_and_return_bound_mutation_replay(&idempotency, message);
+            }
+            verdict => verdict.reply_line(),
+        };
+        if params.0.dry_run == Some(true) {
+            let summary = format!(
+                "{}\n{syntax}",
+                edit_body::dry_run_insert_summary(
+                    position,
+                    &params.0.name,
+                    &params.0.path,
+                    params.0.content.len(),
+                )
+            );
+            return edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
+                safety: edit_format::EditSafetyMode::StructuralEditSafe,
+                authority: source_authority,
+                semantics: edit_format::EditWriteSemantics::DryRunNoWrites,
+                anchor: &evidence_anchor,
+                summary: &summary,
+                stale_warnings: "",
+                tee: "",
+                reroute: "",
+                tee_before_reroute: false,
+                trust: project_config_trust_suffix.as_deref(),
+                impact: None,
+            });
+        }
         let write_report = match edit::atomic_write_file(
             &repo_root,
             project_state.as_ref(),
@@ -1510,11 +1557,14 @@ impl SymForgeServer {
             authority: source_authority,
             semantics: edit_format::EditWriteSemantics::AtomicWriteAndReindex,
             anchor: &evidence_anchor,
-            summary: &edit_format::format_insert(
-                &params.0.path,
-                &params.0.name,
-                position,
-                params.0.content.len(),
+            summary: &format!(
+                "{}\n{syntax}",
+                edit_format::format_insert(
+                    &params.0.path,
+                    &params.0.name,
+                    position,
+                    params.0.content.len(),
+                )
             ),
             stale_warnings: "",
             tee: &edit::format_tee_snapshot_suffix(&write_report),
@@ -1670,10 +1720,30 @@ impl SymForgeServer {
             Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
+        let source = crate::edit_safety::structural::SourceTree::new(
+            &file.content,
+            &file.language,
+            &params.0.path,
+        );
+        let line_ending = edit::detect_line_ending(&file.content);
+        let member = crate::edit_safety::structural::list_member(&source, &sym);
+        let new_content = edit::build_delete(&file.content, &sym, line_ending, member);
+        let syntax = match crate::edit_safety::structural::syntax_check(
+            &source,
+            &new_content,
+            crate::edit_safety::structural::SyntaxEdit::Delete(&params.0.name),
+        ) {
+            crate::edit_safety::structural::SyntaxCheck::Regressed(message) => {
+                return fail_and_return_bound_mutation_replay(&idempotency, message);
+            }
+            verdict => verdict.reply_line(),
+        };
         if params.0.dry_run == Some(true) {
             let deleted_bytes = (sym.byte_range.1 - sym.byte_range.0) as usize;
-            let summary =
-                edit_body::dry_run_delete_summary(&params.0.name, &params.0.path, deleted_bytes);
+            let summary = format!(
+                "{}\n{syntax}",
+                edit_body::dry_run_delete_summary(&params.0.name, &params.0.path, deleted_bytes)
+            );
             return edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
                 safety: edit_format::EditSafetyMode::StructuralEditSafe,
                 authority: source_authority,
@@ -1689,8 +1759,6 @@ impl SymForgeServer {
             });
         }
         let deleted_bytes = (sym.byte_range.1 - sym.byte_range.0) as usize;
-        let line_ending = edit::detect_line_ending(&file.content);
-        let new_content = edit::build_delete(&file.content, &sym, line_ending);
         let write_report = match edit::atomic_write_file(
             &repo_root,
             project_state.as_ref(),
@@ -1726,11 +1794,14 @@ impl SymForgeServer {
             authority: source_authority,
             semantics: edit_format::EditWriteSemantics::AtomicWriteAndReindex,
             anchor: &evidence_anchor,
-            summary: &edit_format::format_delete(
-                &params.0.path,
-                &params.0.name,
-                &sym.kind.to_string(),
-                deleted_bytes,
+            summary: &format!(
+                "{}\n{syntax}",
+                edit_format::format_delete(
+                    &params.0.path,
+                    &params.0.name,
+                    &sym.kind.to_string(),
+                    deleted_bytes,
+                )
             ),
             stale_warnings: "",
             tee: &edit::format_tee_snapshot_suffix(&write_report),
@@ -1888,6 +1959,11 @@ impl SymForgeServer {
             Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
+        let source = crate::edit_safety::structural::SourceTree::new(
+            &file.content,
+            &file.language,
+            &params.0.path,
+        );
         let sym_start = sym.effective_start() as usize;
         let sym_end = sym.byte_range.1 as usize;
         let body_str = file
@@ -1918,15 +1994,30 @@ impl SymForgeServer {
         let new_body = selection.new_body;
         let count = selection.count;
         let untargeted_extra = selection.untargeted_extra;
+        let effective_range = (sym.effective_start(), sym.byte_range.1);
+        let new_content = edit::apply_splice(&file.content, effective_range, new_body.as_bytes());
+        let syntax = match crate::edit_safety::structural::syntax_check(
+            &source,
+            &new_content,
+            crate::edit_safety::structural::SyntaxEdit::Text,
+        ) {
+            crate::edit_safety::structural::SyntaxCheck::Regressed(message) => {
+                return fail_and_return_bound_mutation_replay(&idempotency, message);
+            }
+            verdict => verdict.reply_line(),
+        };
         if params.0.dry_run == Some(true) {
-            let summary = edit_body::edit_within_summary(
-                true,
-                &params.0.path,
-                &params.0.name,
-                count,
-                0,
-                0,
-                untargeted_extra,
+            let summary = format!(
+                "{}\n{syntax}",
+                edit_body::edit_within_summary(
+                    true,
+                    &params.0.path,
+                    &params.0.name,
+                    count,
+                    0,
+                    0,
+                    untargeted_extra,
+                )
             );
             return edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
                 safety: edit_format::EditSafetyMode::TextEditSafe,
@@ -1943,8 +2034,6 @@ impl SymForgeServer {
             });
         }
         let old_sym_bytes = sym_end - sym_start;
-        let effective_range = (sym.effective_start(), sym.byte_range.1);
-        let new_content = edit::apply_splice(&file.content, effective_range, new_body.as_bytes());
         let write_report = match edit::atomic_write_file(
             &repo_root,
             project_state.as_ref(),
@@ -1980,14 +2069,17 @@ impl SymForgeServer {
             authority: source_authority,
             semantics: edit_format::EditWriteSemantics::AtomicWriteAndReindex,
             anchor: &evidence_anchor,
-            summary: &edit_body::edit_within_summary(
-                false,
-                &params.0.path,
-                &params.0.name,
-                count,
-                old_sym_bytes,
-                new_body.len(),
-                untargeted_extra,
+            summary: &format!(
+                "{}\n{syntax}",
+                edit_body::edit_within_summary(
+                    false,
+                    &params.0.path,
+                    &params.0.name,
+                    count,
+                    old_sym_bytes,
+                    new_body.len(),
+                    untargeted_extra,
+                )
             ),
             stale_warnings: "",
             tee: &edit::format_tee_snapshot_suffix(&write_report),

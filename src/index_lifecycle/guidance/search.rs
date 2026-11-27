@@ -230,6 +230,7 @@ pub(crate) struct TextSearchExecution {
     pub options: search::TextSearchOptions,
     pub is_regex: bool,
     pub structural: bool,
+    pub incompatible_grammar_files: usize,
     pub auto_detected_regex: bool,
     pub auto_corrected_regex: bool,
     pub effective_query: Option<String>,
@@ -320,6 +321,26 @@ pub(crate) fn execute_text_search(
     generation: &crate::live_index::PublishedGeneration,
     input: &super::search_contract::SearchTextInput,
 ) -> Result<TextSearchExecution, String> {
+    execute_text_search_inner(generation, input, None)
+}
+
+pub(crate) fn execute_text_search_for_code_mode(
+    generation: &crate::live_index::PublishedGeneration,
+    input: &super::search_contract::SearchTextInput,
+    refuse: &dyn Fn(&str) -> bool,
+) -> Result<TextSearchExecution, String> {
+    let refuse = |path: &str| {
+        (!input.include_vendor.unwrap_or(false) && crate::live_index::query::is_vendor_path(path))
+            || refuse(path)
+    };
+    execute_text_search_inner(generation, input, Some(&refuse))
+}
+
+fn execute_text_search_inner(
+    generation: &crate::live_index::PublishedGeneration,
+    input: &super::search_contract::SearchTextInput,
+    refuse: Option<&dyn Fn(&str) -> bool>,
+) -> Result<TextSearchExecution, String> {
     use super::search_contract::search_text_options_from_input;
     let index = &generation.live;
     let mut options = search_text_options_from_input(input)?;
@@ -370,17 +391,42 @@ pub(crate) fn execute_text_search(
             .map(str::trim)
             .filter(|pattern| !pattern.is_empty())
             .ok_or_else(|| "Error: `query` is required for structural search.".to_owned())?;
-        let mut result = finish(search::search_structural(index, pattern, &options));
+        let structural_refuse = |path: &str| {
+            (!input.include_vendor.unwrap_or(false)
+                && crate::live_index::query::is_vendor_path(path))
+                || refuse.is_some_and(|refuse| refuse(path))
+        };
+        let mut incompatible_grammar_files = 0;
+        let mut result = finish(
+            search::search_structural_with_admission(
+                index,
+                pattern,
+                &options,
+                Some(&structural_refuse),
+            )
+            .map(|(result, incompatible)| {
+                incompatible_grammar_files = incompatible;
+                result
+            }),
+        );
         if !count_mode {
             maybe_compact_text_search_result(&mut result, pattern);
         }
         if include_body {
             attach_symbol_bodies(index, &mut result);
         }
-        let hidden_test_matches = count_mode
+        let hidden_test_matches = (count_mode && refuse.is_none())
             .then(|| {
                 hidden_test_match_count(&options, &result, |opts| {
-                    finish(search::search_structural(index, pattern, opts))
+                    finish(
+                        search::search_structural_with_admission(
+                            index,
+                            pattern,
+                            opts,
+                            Some(&structural_refuse),
+                        )
+                        .map(|(result, _)| result),
+                    )
                 })
             })
             .flatten();
@@ -389,6 +435,7 @@ pub(crate) fn execute_text_search(
             options,
             is_regex: false,
             structural: true,
+            incompatible_grammar_files,
             auto_detected_regex: false,
             auto_corrected_regex: false,
             effective_query: Some(pattern.to_owned()),
@@ -427,12 +474,13 @@ pub(crate) fn execute_text_search(
         }
     }
     let run = |query: Option<&str>, opts: &search::TextSearchOptions| {
-        finish(search::search_text_with_options(
+        finish(search::search_text_with_admission(
             index,
             query,
             input.terms.as_deref(),
             is_regex,
             opts,
+            refuse,
         ))
     };
     let mut result = run(input.query.as_deref(), &options);
@@ -477,6 +525,7 @@ pub(crate) fn execute_text_search(
         options,
         is_regex,
         structural: false,
+        incompatible_grammar_files: 0,
         auto_detected_regex,
         auto_corrected_regex,
         effective_query,
@@ -506,8 +555,14 @@ fn hidden_test_match_count(
     let matched = |result: &search::TextSearchResult| -> usize {
         result.files.iter().map(|file| file.matches.len()).sum()
     };
-    let visible = matched(visible.as_ref().ok()?);
-    let all = matched(&rerun(&with_tests).ok()?);
+    let visible = visible
+        .as_ref()
+        .ok()
+        .filter(|result| result.unparsed_files == 0)?;
+    let all = rerun(&with_tests)
+        .ok()
+        .filter(|result| result.unparsed_files == 0)?;
+    let (visible, all) = (matched(visible), matched(&all));
     Some(all.saturating_sub(visible))
 }
 
@@ -525,28 +580,61 @@ pub(crate) fn execute_symbol_search(
     index: &LiveIndex,
     input: &super::search_contract::SearchSymbolsInput,
 ) -> Result<SymbolSearchExecution, String> {
+    execute_symbol_search_inner(index, input, None)
+}
+
+pub(crate) fn execute_symbol_search_for_code_mode(
+    index: &LiveIndex,
+    input: &super::search_contract::SearchSymbolsInput,
+    refuse: &dyn Fn(&str) -> bool,
+) -> Result<SymbolSearchExecution, String> {
+    let refuse = |path: &str| {
+        (!input.include_vendor.unwrap_or(false) && crate::live_index::query::is_vendor_path(path))
+            || refuse(path)
+    };
+    execute_symbol_search_inner(index, input, Some(&refuse))
+}
+
+fn execute_symbol_search_inner(
+    index: &LiveIndex,
+    input: &super::search_contract::SearchSymbolsInput,
+    refuse: Option<&dyn Fn(&str) -> bool>,
+) -> Result<SymbolSearchExecution, String> {
     let query = input.query.as_deref().unwrap_or("").trim();
     let is_browse = query.is_empty();
     if is_browse && input.kind.is_none() && input.path_prefix.is_none() {
         return Err("search_symbols requires at least one of: query, kind, or path_prefix".into());
     }
     let options = super::search_contract::search_symbols_options_from_input(input)?;
-    let mut result =
-        search::search_symbols_with_options(index, query, input.kind.as_deref(), &options);
+    let mut result = search::search_symbols_with_admission(
+        index,
+        query,
+        input.kind.as_deref(),
+        &options,
+        refuse,
+    );
     // FR-030: a several-word query with no match returns the symbols whose names
     // contain all the words, and the rendering says so.
     let mut all_words_rule = None;
     if result.hits.is_empty() && !is_browse {
         let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-        if let Some(found) = all_words_symbol_matches(index, input, &options, &words) {
+        if let Some(found) = all_words_symbol_matches(index, input, &options, &words, refuse) {
             result = found;
             all_words_rule = Some(words);
         }
     }
-    let suppressed_by_noise =
-        hidden_search_symbols_noise_count(index, query, input.kind.as_deref(), &options, &result);
+    let suppressed_by_noise = if refuse.is_some() {
+        // Code Mode does not project legacy noise diagnostics or text fallbacks.
+        0
+    } else {
+        hidden_search_symbols_noise_count(index, query, input.kind.as_deref(), &options, &result)
+    };
     let mut text_fallback = Vec::new();
-    if !is_browse && query.len() >= 2 && result.hits.len() < options.result_limit.get() / 2 {
+    if refuse.is_none()
+        && !is_browse
+        && query.len() >= 2
+        && result.hits.len() < options.result_limit.get() / 2
+    {
         let mut text_options = search::TextSearchOptions::for_current_code_search();
         text_options.path_scope = options.path_scope.clone();
         text_options.noise_policy = options.noise_policy;
@@ -589,20 +677,28 @@ fn all_words_symbol_matches(
     input: &super::search_contract::SearchSymbolsInput,
     options: &search::SymbolSearchOptions,
     words: &[String],
+    refuse: Option<&dyn Fn(&str) -> bool>,
 ) -> Option<search::SymbolSearchResult> {
-    // ponytail: candidates come from one word's substring search capped at 2,000 rows;
-    // a full all-words index scan if a first word ever matches more symbols than that.
-    const CANDIDATE_LIMIT: usize = 2_000;
+    // Apply the display limit only after the all-words predicate so matches
+    // beyond the first word's ranked prefix contribute to the exact overflow.
     let strip = |text: &str| text.to_lowercase().replace('_', "");
     let (first, rest) = words.split_first()?;
     if rest.is_empty() {
         return None;
     }
     let mut widened = options.clone();
-    widened.result_limit =
-        search::ResultLimit::new(CANDIDATE_LIMIT.max(options.result_limit.get()));
-    let candidates =
-        search::search_symbols_with_options(index, first, input.kind.as_deref(), &widened);
+    widened.result_limit = search::ResultLimit::new(if refuse.is_some() {
+        usize::MAX
+    } else {
+        2_000.max(options.result_limit.get())
+    });
+    let candidates = search::search_symbols_with_admission(
+        index,
+        first,
+        input.kind.as_deref(),
+        &widened,
+        refuse,
+    );
     let words: Vec<String> = words.iter().map(|word| strip(word)).collect();
     let mut hits: Vec<_> = candidates
         .hits
@@ -982,7 +1078,7 @@ pub(crate) fn render_search_text_output(
 }
 
 /// An empty or untruncated text search claims its whole scope (FR-017),
-/// unless it skipped files whose parse was cancelled or failed.
+/// unless it skipped files during structural search.
 pub(crate) fn text_search_claim(
     result: &Result<search::TextSearchResult, search::TextSearchError>,
 ) -> super::freshen::Claim {

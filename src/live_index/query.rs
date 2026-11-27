@@ -186,11 +186,223 @@ fn is_pub_use_import(file: &IndexedFile, reference: &ReferenceRecord) -> bool {
     line_prefix.starts_with("pub ") || line_prefix.starts_with("pub(") || line_prefix == "pub"
 }
 
+#[cfg(test)]
+thread_local! {
+    static PER_FILE_DEPENDENTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DEPENDENT_FILES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DEPENDENT_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_per_file_dependents<R>(work: impl FnOnce() -> R) -> R {
+    PER_FILE_DEPENDENTS.with(|flag| flag.set(true));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+    PER_FILE_DEPENDENTS.with(|flag| flag.set(false));
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+#[cfg(test)]
+pub(crate) fn take_dependent_files_scanned() -> usize {
+    DEPENDENT_FILES_SCANNED.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+fn take_dependent_index_builds() -> usize {
+    DEPENDENT_INDEX_BUILDS.with(|count| count.replace(0))
+}
+
+const JS_EXPORT_FORMS: [&str; 8] = [
+    "{ ",
+    "",
+    "default ",
+    "function ",
+    "class ",
+    "const ",
+    "interface ",
+    "type ",
+];
+
+fn starts_with_whole_word(text: &[u8], word: &str) -> bool {
+    text.starts_with(word.as_bytes())
+        && text
+            .get(word.len())
+            .is_none_or(|next| !(next.is_ascii_alphanumeric() || *next == b'_'))
+}
+
+const MAX_IMPORT_TEXT_SEPARATORS: usize = 32;
+
+fn scan_files<'f, 's>(
+    files: &'f HashMap<String, Arc<IndexedFile>>,
+    among: Option<&'s [&'f str]>,
+) -> Box<dyn Iterator<Item = (&'f String, &'f Arc<IndexedFile>)> + 's>
+where
+    'f: 's,
+{
+    match among {
+        None => Box::new(files.iter()),
+        Some(paths) => Box::new(paths.iter().filter_map(|path| files.get_key_value(*path))),
+    }
+}
+
+fn bounded_import_segments(text: &str) -> Option<Vec<&str>> {
+    let separators: Vec<usize> = text
+        .bytes()
+        .enumerate()
+        .filter(|(_, byte)| matches!(byte, b'/' | b':' | b'.'))
+        .map(|(position, _)| position)
+        .collect();
+    if separators.len() > MAX_IMPORT_TEXT_SEPARATORS {
+        return None;
+    }
+    let ends: Vec<usize> = separators
+        .iter()
+        .copied()
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let segments = std::iter::once(0)
+        .chain(separators.iter().map(|position| position + 1))
+        .flat_map(|start| {
+            ends.iter()
+                .filter(move |end| **end >= start)
+                .map(move |end| &text[start..*end])
+        })
+        .collect();
+    Some(segments)
+}
+
+#[derive(Default)]
+struct DependentCandidates<'a> {
+    importers: HashMap<&'a str, HashSet<&'a str>>,
+    wildcard: HashSet<&'a str>,
+    qualified_calls: HashMap<&'a str, HashSet<&'a str>>,
+    type_usages: HashMap<&'a str, HashSet<&'a str>>,
+}
+
+impl<'a> DependentCandidates<'a> {
+    fn build(files: &'a HashMap<String, Arc<IndexedFile>>) -> Self {
+        let mut key_owners: HashMap<String, Vec<&'a str>> = HashMap::new();
+        for (path, file) in files {
+            let stem = std::path::Path::new(path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(path.as_str());
+            key_owners
+                .entry(stem.to_string())
+                .or_default()
+                .push(path.as_str());
+            if let Some(module_path) = resolve_module_path(path, &file.language) {
+                if let Some(tail) = module_path.strip_prefix("crate::") {
+                    key_owners.entry(tail.to_string()).or_default().push(path);
+                }
+                key_owners.entry(module_path).or_default().push(path);
+            }
+        }
+
+        let mut candidates = Self::default();
+        for (path, file) in files {
+            let path = path.as_str();
+            for reference in &file.references {
+                match reference.kind {
+                    ReferenceKind::Import => {
+                        candidates.add_importer(&key_owners, file, path, reference);
+                    }
+                    ReferenceKind::Call if reference.qualified_name.is_some() => {
+                        candidates
+                            .qualified_calls
+                            .entry(reference.name.as_str())
+                            .or_default()
+                            .insert(path);
+                    }
+                    ReferenceKind::TypeUsage => {
+                        candidates
+                            .type_usages
+                            .entry(reference.name.as_str())
+                            .or_default()
+                            .insert(path);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        candidates
+    }
+
+    fn add_importer(
+        &mut self,
+        key_owners: &HashMap<String, Vec<&'a str>>,
+        file: &'a IndexedFile,
+        path: &'a str,
+        reference: &'a ReferenceRecord,
+    ) {
+        let mut owners: Vec<&'a str> = Vec::new();
+        if file.language == LanguageId::Python
+            && let Some(qualified) = reference.qualified_name.as_deref()
+            && qualified.starts_with('.')
+            && let Some(resolved) = resolve_python_relative_import(path, qualified)
+            && let Some(found) = key_owners.get(resolved.as_str())
+        {
+            owners.extend(found);
+        }
+        let texts =
+            std::iter::once(reference.name.as_str()).chain(reference.qualified_name.as_deref());
+        for text in texts {
+            let Some(segments) = bounded_import_segments(text) else {
+                self.wildcard.insert(path);
+                continue;
+            };
+            for segment in segments {
+                if let Some(found) = key_owners.get(segment) {
+                    owners.extend(found);
+                }
+            }
+        }
+        for owner in owners {
+            self.importers.entry(owner).or_default().insert(path);
+        }
+    }
+
+    fn importers_of(&self, target_path: &str) -> Vec<&'a str> {
+        let mut paths: Vec<&'a str> = self
+            .importers
+            .get(target_path)
+            .into_iter()
+            .flatten()
+            .chain(&self.wildcard)
+            .copied()
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        paths
+    }
+
+    fn for_target(
+        &self,
+        target_path: &str,
+        target_language: &LanguageId,
+        exported_names: &HashSet<String>,
+    ) -> Vec<&'a str> {
+        let typed = matches!(target_language, LanguageId::CSharp | LanguageId::Java);
+        let mut paths = self.importers_of(target_path);
+        for name in exported_names {
+            if let Some(found) = self.qualified_calls.get(name.as_str()) {
+                paths.extend(found);
+            }
+            if typed && let Some(found) = self.type_usages.get(name.as_str()) {
+                paths.extend(found);
+            }
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        paths
+    }
+}
+
 /// Find files that re-export symbols from `target_module_path` via `pub use`.
 ///
 /// Returns the file paths of re-exporter files.
 fn find_reexporters<'a>(
     files: &'a std::collections::HashMap<String, Arc<IndexedFile>>,
+    among: Option<&[&'a str]>,
     target_path: &str,
     target_module_path: Option<&str>,
     target_language: &LanguageId,
@@ -201,7 +413,7 @@ fn find_reexporters<'a>(
     }
 
     let mut reexporters = Vec::new();
-    for (file_path, file) in files {
+    for (file_path, file) in scan_files(files, among) {
         if file_path.as_str() == target_path {
             continue;
         }
@@ -930,7 +1142,7 @@ fn matches_target_module(language: &LanguageId, text: &str, module_path: Option<
 /// The only genuine cross-language interop for bare-module imports is the
 /// JavaScript/TypeScript family, where a `.js` file may import a `.ts` module and
 /// vice versa; those are treated as mutually compatible.
-fn import_languages_compatible(
+pub(crate) fn import_languages_compatible(
     importer_language: &LanguageId,
     target_language: &LanguageId,
 ) -> bool {
@@ -1934,6 +2146,27 @@ impl LiveIndex {
             .map(|entry| &entry.disposition)
     }
 
+    /// Snapshot of the recorded security demotions for a bulk read of this
+    /// publication. A caller must still check the current path rule, hard
+    /// scope and restore state, and use the byte gate where required.
+    pub(crate) fn capture_sensitive_admission_paths(&self) -> HashSet<String> {
+        use crate::domain::{FileDisposition, MetadataOnlyReason};
+
+        self.manifest_entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.disposition,
+                    FileDisposition::MetadataOnly {
+                        reason: MetadataOnlyReason::SensitivePath { .. }
+                            | MetadataOnlyReason::SensitiveContent { .. },
+                    }
+                )
+            })
+            .map(|entry| normalize_path_query(super::store::scouted_catalog_path(&entry.path)))
+            .collect()
+    }
+
     /// Paths eligible for the Tier-2 textual sweep: ONLY oversized first-party
     /// files. Positive eligibility off the typed disposition — a security demotion
     /// can never appear here regardless of what the legacy `SkipReason` projection
@@ -2910,10 +3143,31 @@ impl LiveIndex {
             .position(|symbol| symbol.byte_range == target_symbol.byte_range)
             .map(|idx| idx as u32);
 
+        let uses_callable_bindings =
+            super::callable_values::uses_callable_value_bindings(file.language);
+        let python_class_value = file.language == LanguageId::Python
+            && target_symbol.kind == SymbolKind::Class
+            && !file.symbols.iter().any(|symbol| {
+                symbol.name == target_name && symbol.byte_range != target_symbol.byte_range
+            });
         let mut refs: Vec<(&str, &ReferenceRecord, &'static str)> = file
             .references
             .iter()
             .filter(|reference| {
+                if uses_callable_bindings && reference.kind == ReferenceKind::ValueUse {
+                    if let Some(declaration) = self.local_callable_declaration(path, reference) {
+                        // The outer same-named symbol may contain the declaration.
+                        return matches!(kind_filter, None | Some(ReferenceKind::ValueUse))
+                            && reference.name == target_name
+                            && declaration == target_symbol.byte_range;
+                    }
+                    // Python separately emits class-name value uses (e.g.
+                    // `isinstance(obj, Model)`). Keep that path for classes,
+                    // but never fall back to spelling for a callback target.
+                    if !python_class_value || reference.qualified_name.is_some() {
+                        return false;
+                    }
+                }
                 if reference.kind == ReferenceKind::Call
                     && target_symbol_index.is_some()
                     && reference.enclosing_symbol_index == target_symbol_index
@@ -2942,6 +3196,23 @@ impl LiveIndex {
             })
             .map(|reference| (path, reference, "exact"))
             .collect();
+        let mut seen: HashSet<_> = refs
+            .iter()
+            .map(|(ref_path, reference, _)| (*ref_path, reference.byte_range))
+            .collect();
+        if uses_callable_bindings && matches!(kind_filter, None | Some(ReferenceKind::ValueUse)) {
+            for value in self.imported_bound_values(
+                target_name,
+                Some(path),
+                file.language == LanguageId::Python && target_symbol.kind == SymbolKind::Class,
+            ) {
+                if target_symbol.byte_range == value.definition_range
+                    && seen.insert((value.path, value.reference.byte_range))
+                {
+                    refs.push((value.path, value.reference, "exact"));
+                }
+            }
+        }
 
         let dependent_refs = self.find_dependents_for_file(path);
         let dependent_paths: HashSet<&str> = dependent_refs.iter().map(|(fp, _)| *fp).collect();
@@ -2950,6 +3221,12 @@ impl LiveIndex {
             |ref_path: &'a str, ref_record: &'a ReferenceRecord| -> Option<&'static str> {
                 let ref_file = self.get_file(ref_path)?;
                 if !import_languages_compatible(&ref_file.language, &file.language) {
+                    return None;
+                }
+                if uses_callable_bindings && ref_record.kind == ReferenceKind::ValueUse {
+                    // Already joined to a specific import binding above. An
+                    // unrelated same-name local value in a dependent file is
+                    // not evidence of a use of this symbol.
                     return None;
                 }
                 if !matches_exact_symbol_reference(
@@ -3040,23 +3317,23 @@ impl LiveIndex {
             };
 
         for (file_path, reference) in dependent_refs {
-            if let Some(conf) = evaluate_cross_file(file_path, reference) {
+            if let Some(conf) = evaluate_cross_file(file_path, reference)
+                && seen.insert((file_path, reference.byte_range))
+            {
                 refs.push((file_path, reference, conf));
             }
         }
 
-        for (ref_path, ref_record) in self.find_references_for_name(target_name, kind_filter, false)
+        // The exact import join has already run with the selected declaration.
+        for (ref_path, ref_record) in
+            self.find_references_for_name_impl(target_name, kind_filter, false, false)
         {
-            if ref_path == path {
-                continue;
-            }
-            if refs
-                .iter()
-                .any(|(p, r, _)| *p == ref_path && r.byte_range == ref_record.byte_range)
-            {
+            let key = (ref_path, ref_record.byte_range);
+            if ref_path == path || seen.contains(&key) {
                 continue;
             }
             if let Some(conf) = evaluate_cross_file(ref_path, ref_record) {
+                seen.insert(key);
                 refs.push((ref_path, ref_record, conf));
             }
         }
@@ -3078,7 +3355,7 @@ impl LiveIndex {
 
     /// Interleave test and non-test file paths so compact `find_references` output
     /// is not starved of `tests/**` hits by pure lexicographic ordering under file caps.
-    fn order_find_references_file_paths_fair(&self, paths: Vec<String>) -> Vec<String> {
+    pub(crate) fn order_find_references_file_paths_fair(&self, paths: Vec<String>) -> Vec<String> {
         let mut tests = Vec::new();
         let mut non_tests = Vec::new();
         for path in paths {
@@ -3659,6 +3936,16 @@ impl LiveIndex {
         kind_filter: Option<ReferenceKind>,
         include_filtered: bool,
     ) -> Vec<(&str, &ReferenceRecord)> {
+        self.find_references_for_name_impl(name, kind_filter, include_filtered, true)
+    }
+
+    fn find_references_for_name_impl(
+        &self,
+        name: &str,
+        kind_filter: Option<ReferenceKind>,
+        include_filtered: bool,
+        include_imported_values: bool,
+    ) -> Vec<(&str, &ReferenceRecord)> {
         let is_qualified = name.contains("::") || name.contains('.');
 
         let mut results: Vec<(&str, &ReferenceRecord)> = Vec::new();
@@ -3692,20 +3979,35 @@ impl LiveIndex {
 
             // Alias resolution: find any alias that resolves to `name`.
             // e.g. alias_map["Map"] = "HashMap" means we also look up "Map".
-            // Collect aliases first to avoid re-borrowing self during mutation of results.
-            let aliases: Vec<String> = self
+            // Query each alias key once even when many importers use it.
+            let mut seen_aliases = HashSet::new();
+            let aliases = self
                 .files
                 .values()
                 .flat_map(|file| {
                     file.alias_map
                         .iter()
                         .filter(|(_alias, original)| original.as_str() == name)
-                        .map(|(alias, _)| alias.clone())
+                        .map(|(alias, _)| alias.as_str())
                 })
-                .collect();
+                .filter(|&alias| seen_aliases.insert(alias));
 
-            for alias in &aliases {
-                self.collect_refs_for_key(alias, kind_filter, include_filtered, &mut results);
+            for alias in aliases {
+                let mut alias_hits = Vec::new();
+                self.collect_refs_for_key(alias, kind_filter, include_filtered, &mut alias_hits);
+                // A proven value is associated with its lexical binding, not
+                // with an alias of the same spelling in some other file.
+                results.extend(alias_hits.into_iter().filter(|(path, reference)| {
+                    reference.kind != ReferenceKind::ValueUse
+                        || self.get_file(path).is_some_and(|file| {
+                            !matches!(
+                                file.language,
+                                LanguageId::Python
+                                    | LanguageId::JavaScript
+                                    | LanguageId::TypeScript
+                            )
+                        })
+                }));
             }
 
             // D13 recall: qualified-call construction sites (`Foo::new()`,
@@ -3793,6 +4095,27 @@ impl LiveIndex {
             }
         }
 
+        if include_imported_values
+            && !is_qualified
+            && matches!(kind_filter, None | Some(ReferenceKind::ValueUse))
+        {
+            let mut already: HashSet<_> = results
+                .iter()
+                .map(|(path, reference)| (*path, reference.byte_range))
+                .collect();
+            results.extend(
+                self.imported_callable_values(name, None)
+                    .into_iter()
+                    .filter(|value| {
+                        (include_filtered
+                            || self.get_file(value.path).is_some_and(|file| {
+                                !is_filtered_name(&value.reference.name, &file.language)
+                            }))
+                            && already.insert((value.path, value.reference.byte_range))
+                    })
+                    .map(|value| (value.path, value.reference)),
+            );
+        }
         results
     }
 
@@ -3832,6 +4155,7 @@ impl LiveIndex {
 
     /// Check whether a file exports a public symbol with the given name.
     /// Uses a text scan of file content since SymbolRecord has no visibility field.
+    #[cfg(test)]
     pub(crate) fn has_pub_symbol(file: &IndexedFile, name: &str) -> bool {
         let is_word_match = |content: &str, pattern: &str| -> bool {
             let mut start = 0;
@@ -3913,12 +4237,28 @@ impl LiveIndex {
                 }
                 exported
             }
-            LanguageId::JavaScript | LanguageId::TypeScript => target_symbol_names
-                .iter()
-                .copied()
-                .filter(|name| Self::has_pub_symbol(file, name))
-                .map(str::to_string)
-                .collect(),
+            LanguageId::JavaScript | LanguageId::TypeScript => {
+                let content = String::from_utf8_lossy(&file.content);
+                let export_tails: Vec<&[u8]> = content
+                    .match_indices("export ")
+                    .flat_map(|(position, keyword)| {
+                        let rest = &content.as_bytes()[position + keyword.len()..];
+                        JS_EXPORT_FORMS
+                            .iter()
+                            .filter_map(move |form| rest.strip_prefix(form.as_bytes()))
+                    })
+                    .collect();
+                target_symbol_names
+                    .iter()
+                    .copied()
+                    .filter(|name| {
+                        export_tails
+                            .iter()
+                            .any(|tail| starts_with_whole_word(tail, name))
+                    })
+                    .map(str::to_string)
+                    .collect()
+            }
             _ => target_symbol_names
                 .iter()
                 .copied()
@@ -3939,6 +4279,35 @@ impl LiveIndex {
     ///
     /// Returns a `Vec` of `(importing_file_path, &import_reference)` tuples.
     pub fn find_dependents_for_file(&self, target_path: &str) -> Vec<(&str, &ReferenceRecord)> {
+        self.dependents_among(target_path, None)
+    }
+
+    pub(crate) fn find_dependents_for_files<'a>(
+        &'a self,
+        target_paths: &[&str],
+    ) -> Vec<Vec<(&'a str, &'a ReferenceRecord)>> {
+        let per_file = target_paths.len() < 2;
+        #[cfg(test)]
+        let per_file = per_file || PER_FILE_DEPENDENTS.with(std::cell::Cell::get);
+        if per_file {
+            return target_paths
+                .iter()
+                .map(|path| self.find_dependents_for_file(path))
+                .collect();
+        }
+        #[cfg(test)]
+        DEPENDENT_INDEX_BUILDS.with(|count| count.set(count.get() + 1));
+        let candidates = DependentCandidates::build(&self.files);
+        super::store::ordered_parallel_map(target_paths, |path| {
+            self.dependents_among(path, Some(&candidates))
+        })
+    }
+
+    fn dependents_among<'a>(
+        &'a self,
+        target_path: &str,
+        among: Option<&DependentCandidates<'a>>,
+    ) -> Vec<(&'a str, &'a ReferenceRecord)> {
         let Some(target_file) = self.files.get(target_path) else {
             return vec![];
         };
@@ -3962,10 +4331,16 @@ impl LiveIndex {
             .collect();
         let exported_target_symbol_names =
             Self::exported_symbol_names(target_file, &target_symbol_names);
+        let scan = among.map(|candidates| {
+            candidates.for_target(target_path, &target_language, &exported_target_symbol_names)
+        });
+        let import_scan = |path: &str| among.map(|candidates| candidates.importers_of(path));
 
         let mut results = Vec::new();
 
-        for (file_path, file) in &self.files {
+        for (file_path, file) in scan_files(&self.files, scan.as_deref()) {
+            #[cfg(test)]
+            DEPENDENT_FILES_SCANNED.with(|count| count.set(count.get() + 1));
             // Don't report a file as depending on itself.
             if file_path.as_str() == target_path {
                 continue;
@@ -4040,7 +4415,7 @@ impl LiveIndex {
         if let Some(ref mp) = module_path {
             let already_found: HashSet<&str> = results.iter().map(|(p, _)| *p).collect();
 
-            for (file_path, file) in &self.files {
+            for (file_path, file) in scan_files(&self.files, scan.as_deref()) {
                 if file_path.as_str() == target_path || already_found.contains(file_path.as_str()) {
                     continue;
                 }
@@ -4097,8 +4472,10 @@ impl LiveIndex {
 
             // Seed: find files that pub-use-re-export from target
             let mut queue: VecDeque<(&str, u8)> = VecDeque::new();
+            let target_import_scan = import_scan(target_path);
             let reexporters = find_reexporters(
                 &self.files,
+                target_import_scan.as_deref(),
                 target_path,
                 module_path.as_deref(),
                 &target_language,
@@ -4121,8 +4498,8 @@ impl LiveIndex {
                     .unwrap_or(reexporter_path);
                 let re_module_path = resolve_module_path(reexporter_path, &re_file.language);
 
-                // Find files that import from the re-exporter
-                for (file_path, file) in &self.files {
+                let reexporter_scan = import_scan(reexporter_path);
+                for (file_path, file) in scan_files(&self.files, reexporter_scan.as_deref()) {
                     if file_path.as_str() == target_path
                         || file_path.as_str() == reexporter_path
                         || already_found.contains(file_path.as_str())
@@ -4181,6 +4558,7 @@ impl LiveIndex {
                 if depth < 2 {
                     let next_reexporters = find_reexporters(
                         &self.files,
+                        reexporter_scan.as_deref(),
                         reexporter_path,
                         re_module_path.as_deref(),
                         &target_language,
@@ -4302,6 +4680,7 @@ mod tests {
             load_source: crate::live_index::store::IndexLoadSource::FreshLoad,
             snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
             reverse_index: std::collections::HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: std::collections::HashMap::new(),
             files_by_dir_component: std::collections::HashMap::new(),
             trigram_index,
@@ -7169,6 +7548,7 @@ impl Actor for MyActor {
             load_source: crate::live_index::store::IndexLoadSource::FreshLoad,
             snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
             reverse_index: std::collections::HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: std::collections::HashMap::new(),
             files_by_dir_component: std::collections::HashMap::new(),
             trigram_index: crate::live_index::trigram::TrigramIndex::new(),
@@ -7208,6 +7588,7 @@ impl Actor for MyActor {
             load_source: crate::live_index::store::IndexLoadSource::FreshLoad,
             snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
             reverse_index: std::collections::HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: std::collections::HashMap::new(),
             files_by_dir_component: std::collections::HashMap::new(),
             trigram_index: crate::live_index::trigram::TrigramIndex::new(),
@@ -7824,6 +8205,54 @@ impl Actor for MyActor {
         assert!(error.contains("Ambiguous symbol selector"), "got: {error}");
         assert!(error.contains("1"), "got: {error}");
         assert!(error.contains("10"), "got: {error}");
+    }
+
+    #[test]
+    fn js_exported_names_match_per_name_export_check() {
+        use std::collections::HashSet;
+        let content = "export class Foo2 {}\nexport {Bar}\nexport { Baz, Qux }\nexport default Main\nexport const answer = 1;\nexport interface Shape {}\nexport type Alias = Shape;\nexport function run() {}\nexport function runner() {}\nconst hidden = 2;\nexport \u{e9}t\u{e9}\nexport enum Mode {}\nexport Tail";
+        let mut bytes = content.as_bytes().to_vec();
+        bytes.extend_from_slice(b"\nexport \xff\xfe broken\nexport last_");
+        let names: HashSet<&str> = [
+            "Foo",
+            "Foo2",
+            "Bar",
+            "Baz",
+            "Qux",
+            "Main",
+            "answer",
+            "Shape",
+            "Alias",
+            "run",
+            "runner",
+            "hidden",
+            "\u{e9}t",
+            "\u{e9}t\u{e9}",
+            "Mode",
+            "enum",
+            "Tail",
+            "last",
+            "last_",
+            "\u{fffd}",
+            "class Foo2",
+            "default",
+            "x y",
+        ]
+        .into_iter()
+        .collect();
+        for language in [LanguageId::TypeScript, LanguageId::JavaScript] {
+            let mut file =
+                make_file_with_refs_and_content("web/a.ts", language, "", vec![], vec![]);
+            file.content = bytes.clone();
+            let batch = LiveIndex::exported_symbol_names(&file, &names);
+            let per_name: HashSet<String> = names
+                .iter()
+                .filter(|name| LiveIndex::has_pub_symbol(&file, name))
+                .map(|name| name.to_string())
+                .collect();
+            assert_eq!(batch, per_name);
+            assert!(batch.contains("Foo2") && !batch.contains("Foo") && batch.contains("Tail"));
+        }
     }
 
     // --- find_dependents_for_file ---
@@ -9909,6 +10338,302 @@ public class PacketsController {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod batch_dependents_tests {
+    use super::{take_dependent_files_scanned, take_dependent_index_builds};
+    use crate::live_index::store::{LiveIndex, with_serial_oracle};
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    const FIXTURE: &[(&str, &str)] = &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub mod api;\npub mod db;\npub mod facade;\npub mod user;\npub use db::Pool;\n",
+        ),
+        (
+            "src/db.rs",
+            "pub struct Pool;\n\npub fn connect() -> Pool {\n    Pool\n}\n",
+        ),
+        (
+            "src/api/mod.rs",
+            "pub mod handlers;\nuse crate::db::connect;\n\npub fn serve() {\n    connect();\n}\n",
+        ),
+        (
+            "src/api/handlers.rs",
+            "use super::serve;\nuse crate::Pool;\n\npub fn handle(pool: &Pool) {\n    serve();\n    crate::db::connect();\n    self::helper();\n}\n\nfn helper() {}\n",
+        ),
+        ("src/facade.rs", "pub use crate::api::handlers::handle;\n"),
+        (
+            "src/user.rs",
+            "use crate::facade::handle;\nuse crate::db::Pool;\n\npub struct User;\n\npub fn run(pool: &Pool) {\n    handle(pool);\n}\n",
+        ),
+        ("launcher/src/gguf.rs", "pub struct Gguf;\n"),
+        ("py/gguf.py", "class Gguf:\n    pass\n"),
+        ("py/pkg/__init__.py", "from .core import Engine\n"),
+        (
+            "py/pkg/core.py",
+            "class Engine:\n    def run(self):\n        pass\n",
+        ),
+        ("py/pkg/sub/__init__.py", ""),
+        (
+            "py/pkg/sub/consumer.py",
+            "from ..core import Engine\nfrom ....outside import nothing\nimport pkg.core\nimport gguf\n\nengine = Engine()\npkg.core.Engine().run()\n",
+        ),
+        (
+            "web/src/user.service.ts",
+            "export class UserService {\n  find(): string {\n    return '';\n  }\n}\n\nexport interface UserRecord {\n  id: string;\n}\n",
+        ),
+        ("web/src/index.ts", "export * from './user.service';\n"),
+        (
+            "web/src/app.ts",
+            "import { UserService, UserRecord } from './user.service';\nimport * as all from '.';\n\nconst service = new UserService();\nconst record: UserRecord = { id: service.find() };\nexport const keep = [all, record];\n",
+        ),
+        (
+            "web/src/legacy.js",
+            "const { UserService } = require('./user.service');\nmodule.exports = new UserService();\n",
+        ),
+        (
+            "web/src/deep.ts",
+            "import { UserService } from '../../a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t/u/v/w/x/y/z/aa/bb/cc/dd/ee/ff/gg/user.service';\nexport const deep = new UserService();\n",
+        ),
+        (
+            "cs/Core/IStore.cs",
+            "namespace Acme.Core\n{\n    public interface IStore\n    {\n        void Put();\n    }\n}\n",
+        ),
+        (
+            "cs/Core/Store.cs",
+            "namespace Acme.Core\n{\n    public class Store : IStore\n    {\n        public void Put() {}\n    }\n}\n",
+        ),
+        (
+            "cs/App/Program.cs",
+            "using Acme.Core;\n\nnamespace Acme.App\n{\n    class Program\n    {\n        IStore store;\n        void Main() { store.Put(); }\n    }\n}\n",
+        ),
+        (
+            "java/com/acme/storage/MinioService.java",
+            "package com.acme.storage;\n\npublic class MinioService {\n    public void put() {}\n}\n",
+        ),
+        (
+            "java/com/acme/storage/Peer.java",
+            "package com.acme.storage;\n\nclass Peer {\n    MinioService service;\n}\n",
+        ),
+        (
+            "java/com/acme/app/App.java",
+            "package com.acme.app;\n\nimport com.acme.storage.MinioService;\n\npublic class App {\n    MinioService service;\n}\n",
+        ),
+        (
+            "java/com/acme/app/Star.java",
+            "package com.acme.app;\n\nimport com.acme.storage.*;\n\nclass Star {\n    MinioService service;\n}\n",
+        ),
+        (
+            "go/store/store.go",
+            "package store\n\ntype Store struct{}\n\nfunc Open() *Store {\n    return &Store{}\n}\n",
+        ),
+        (
+            "go/app/main.go",
+            "package main\n\nimport \"example.com/fixture/go/store\"\n\nfunc main() {\n    s := store.Open()\n    _ = s\n}\n",
+        ),
+        (
+            "php/Models/User.php",
+            "<?php\nnamespace App\\Models;\n\nclass User\n{\n}\n",
+        ),
+        (
+            "php/Http/Controller.php",
+            "<?php\nnamespace App\\Http;\n\nuse App\\Models\\User;\n\nclass Controller\n{\n    public function show(): User\n    {\n        return new User();\n    }\n}\n",
+        ),
+        ("docs/notes.md", "# Notes\n"),
+    ];
+
+    fn write_fixture(root: &Path, files: &[(&str, &str)]) {
+        for (relative, content) in files {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+    }
+
+    fn assert_batch_matches_per_file(index: &LiveIndex) -> usize {
+        let mut paths: Vec<&str> = index.files.keys().map(String::as_str).collect();
+        paths.sort_unstable();
+        let batch = index.find_dependents_for_files(&paths);
+        assert_eq!(batch.len(), paths.len());
+        let mut targets_with_dependents = 0;
+        for (path, batched) in paths.iter().zip(&batch) {
+            let per_file = index.find_dependents_for_file(path);
+            assert_eq!(batched, &per_file, "dependents of {path}");
+            if !per_file.is_empty() {
+                targets_with_dependents += 1;
+            }
+        }
+        targets_with_dependents
+    }
+
+    #[test]
+    fn batch_dependents_equal_per_file_dependents_on_mixed_fixture() {
+        let root = TempDir::new().unwrap();
+        write_fixture(root.path(), FIXTURE);
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let index = shared.read();
+
+        let parallel = assert_batch_matches_per_file(&index);
+        let serial = with_serial_oracle(|| assert_batch_matches_per_file(&index));
+
+        assert_eq!(parallel, serial);
+        assert!(parallel >= 8, "fixture exercised only {parallel} targets");
+        for (target, importer) in [
+            ("src/db.rs", "src/user.rs"),
+            ("src/api/handlers.rs", "src/user.rs"),
+            ("py/pkg/core.py", "py/pkg/sub/consumer.py"),
+            ("web/src/user.service.ts", "web/src/app.ts"),
+            ("cs/Core/IStore.cs", "cs/App/Program.cs"),
+            (
+                "java/com/acme/storage/MinioService.java",
+                "java/com/acme/app/App.java",
+            ),
+            ("go/store/store.go", "go/app/main.go"),
+        ] {
+            let dependents = index.find_dependents_for_file(target);
+            assert!(
+                dependents.iter().any(|(path, _)| *path == importer),
+                "{importer} should depend on {target}: {dependents:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_dependents_scan_fewer_files_than_per_file_dependents() {
+        let root = TempDir::new().unwrap();
+        write_fixture(root.path(), FIXTURE);
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let index = shared.read();
+        let mut paths: Vec<&str> = index.files.keys().map(String::as_str).collect();
+        paths.sort_unstable();
+
+        take_dependent_files_scanned();
+        let batch = with_serial_oracle(|| index.find_dependents_for_files(&paths));
+        let batch_scanned = take_dependent_files_scanned();
+        let per_file: Vec<_> = paths
+            .iter()
+            .map(|path| index.find_dependents_for_file(path))
+            .collect();
+        let per_file_scanned = take_dependent_files_scanned();
+
+        assert_eq!(batch, per_file);
+        assert_eq!(per_file_scanned, paths.len() * index.files.len());
+        assert!(
+            batch_scanned * 4 < per_file_scanned,
+            "batch scanned {batch_scanned} of {per_file_scanned}"
+        );
+    }
+
+    #[test]
+    fn batch_dependents_build_no_index_for_fewer_than_two_targets() {
+        let root = TempDir::new().unwrap();
+        write_fixture(root.path(), FIXTURE);
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let index = shared.read();
+        take_dependent_index_builds();
+        take_dependent_files_scanned();
+
+        let none = with_serial_oracle(|| index.find_dependents_for_files(&[]));
+        assert!(none.is_empty());
+        assert_eq!(take_dependent_index_builds(), 0);
+        assert_eq!(take_dependent_files_scanned(), 0);
+
+        let one = with_serial_oracle(|| index.find_dependents_for_files(&["src/db.rs"]));
+        assert_eq!(one, vec![index.find_dependents_for_file("src/db.rs")]);
+        assert!(!one[0].is_empty());
+        assert_eq!(take_dependent_index_builds(), 0);
+
+        let two = with_serial_oracle(|| {
+            index.find_dependents_for_files(&["src/db.rs", "web/src/user.service.ts"])
+        });
+        assert_eq!(two.len(), 2);
+        assert_eq!(take_dependent_index_builds(), 1);
+    }
+
+    #[test]
+    fn batch_dependents_scan_nothing_when_no_file_refers_to_another() {
+        let root = TempDir::new().unwrap();
+        let files: Vec<(String, String)> = (0..20)
+            .map(|index| {
+                (
+                    format!("src/module_{index}.rs"),
+                    format!("pub struct Item{index};\n"),
+                )
+            })
+            .collect();
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str()))
+            .collect();
+        write_fixture(root.path(), &borrowed);
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let index = shared.read();
+        let paths: Vec<&str> = index.files.keys().map(String::as_str).collect();
+
+        take_dependent_files_scanned();
+        let batch = with_serial_oracle(|| index.find_dependents_for_files(&paths));
+
+        assert_eq!(take_dependent_files_scanned(), 0);
+        assert!(batch.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    #[ignore]
+    fn batch_dependents_equal_per_file_dependents_on_this_repository_and_env_repos() {
+        let mut roots = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))];
+        if let Ok(raw) = std::env::var("SYMFORGE_DEPENDENTS_PARITY_REPOS") {
+            roots.extend(
+                raw.split(';')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(std::path::PathBuf::from),
+            );
+        }
+        for root in roots {
+            let shared = LiveIndex::load(&root).unwrap();
+            let index = shared.read();
+            for file in index.files.values() {
+                let names: std::collections::HashSet<&str> = file
+                    .symbols
+                    .iter()
+                    .map(|symbol| symbol.name.as_str())
+                    .collect();
+                let per_name: std::collections::HashSet<String> = names
+                    .iter()
+                    .filter(|name| LiveIndex::has_pub_symbol(file, name))
+                    .map(|name| name.to_string())
+                    .collect();
+                if matches!(
+                    file.language,
+                    crate::domain::LanguageId::JavaScript | crate::domain::LanguageId::TypeScript
+                ) {
+                    assert_eq!(
+                        LiveIndex::exported_symbol_names(file, &names),
+                        per_name,
+                        "{}",
+                        file.relative_path
+                    );
+                }
+            }
+            let started = std::time::Instant::now();
+            let with_dependents = assert_batch_matches_per_file(&index);
+            eprintln!(
+                "{}: {} files, {with_dependents} with dependents, parity checked in {:?}",
+                root.display(),
+                index.files.len(),
+                started.elapsed()
+            );
+            assert!(with_dependents > 0, "{}", root.display());
         }
     }
 }

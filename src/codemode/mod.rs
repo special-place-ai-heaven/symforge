@@ -16,8 +16,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 pub use backend::{
-    CodeBackendError, CodeReadBackend, DaemonCodeBackend, DaemonCodeQueryRequest,
-    DaemonCodeQueryResponse, LocalCodeBackend, execute_op_on_generation,
+    CodeBackendError, CodeReadBackend, CodeReadCompleteness, CodeReadResult, DaemonCodeBackend,
+    DaemonCodeQueryRequest, DaemonCodeQueryResponse, LocalCodeBackend, execute_op_on_generation,
 };
 pub use catalog::{CODE_READ_OPS, CodeReadOp, render_idioms, render_stubs};
 pub use runner::{CodeModeRunner, execute_script};
@@ -131,6 +131,15 @@ pub struct ExecuteErrorInfo {
     pub traceback: Option<String>,
 }
 
+/// One incomplete host call. The index is one-based in host-call order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeReadNotice {
+    pub call: usize,
+    pub op: CodeReadOp,
+    #[serde(flatten)]
+    pub completeness: CodeReadCompleteness,
+}
+
 /// Structured JSON outcome of one `CodeModeRunner` execution.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecuteOutcome {
@@ -139,6 +148,8 @@ pub struct ExecuteOutcome {
     pub value: Option<serde_json::Value>,
     pub stdout: String,
     pub calls: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<CodeReadNotice>,
     pub duration_ms: u64,
     pub output_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]

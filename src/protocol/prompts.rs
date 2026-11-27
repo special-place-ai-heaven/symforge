@@ -406,6 +406,7 @@ mod tests {
             load_source: crate::live_index::store::IndexLoadSource::FreshLoad,
             snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
             reverse_index: HashMap::new(),
+            callable_values: Default::default(),
             files_by_basename: HashMap::new(),
             files_by_dir_component: HashMap::new(),
             trigram_index: crate::live_index::trigram::TrigramIndex::new(),

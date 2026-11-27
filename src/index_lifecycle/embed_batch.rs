@@ -332,11 +332,19 @@ fn stage_batch(
             .get_file(&path)
             .ok_or(EditErrorKind::FileNotAdmitted)?;
         let line_ending = detect_line_ending(&file.content);
+        let source =
+            crate::edit_safety::structural::SourceTree::new(&file.content, &file.language, &path);
         let footprints = actions
             .iter()
             .map(|resolved| {
+                let member = crate::edit_safety::structural::list_member(&source, &resolved.symbol);
                 Ok(match resolved.action {
                     BatchEditAction::Insert(request) => {
+                        crate::edit_safety::structural::refuse_list_member(
+                            member,
+                            &resolved.symbol,
+                        )
+                        .map_err(|_| EditErrorKind::InvalidReplacement)?;
                         SpliceFootprint::Insert(match request.position {
                             crate::embed::parity::edit::InsertPosition::Before => {
                                 insert_before_position(
@@ -352,8 +360,12 @@ fn stage_batch(
                         })
                     }
                     BatchEditAction::Delete(_) => {
-                        let (start, end) =
-                            delete_source_range(&file.content, &resolved.symbol, line_ending);
+                        let (start, end) = delete_source_range(
+                            &file.content,
+                            &resolved.symbol,
+                            line_ending,
+                            member,
+                        );
                         SpliceFootprint::Bytes(start, end)
                     }
                     BatchEditAction::Replace(request) => {
@@ -361,6 +373,7 @@ fn stage_batch(
                             &file.content,
                             &resolved.symbol,
                             &request.new_body,
+                            member,
                         )
                         .map_err(|_| EditErrorKind::StaleContent)?;
                         SpliceFootprint::Bytes(start, end)
@@ -383,7 +396,9 @@ fn stage_batch(
             if !matches!(resolved.action, BatchEditAction::Delete(_)) {
                 continue;
             }
-            let cleanup = delete_cleanup_ranges(&file.content, &resolved.symbol, line_ending);
+            let member = crate::edit_safety::structural::list_member(&source, &resolved.symbol);
+            let cleanup =
+                delete_cleanup_ranges(&file.content, &resolved.symbol, line_ending, member);
             if footprints.iter().enumerate().any(|(other, footprint)| {
                 other != index && cleanup_invalidates_splice(&cleanup, *footprint)
             }) {
@@ -392,9 +407,10 @@ fn stage_batch(
         }
         let mut content = file.content.clone();
         for (action_index, resolved) in actions.iter().enumerate() {
+            let member = crate::edit_safety::structural::list_member(&source, &resolved.symbol);
             content = match resolved.action {
                 BatchEditAction::Replace(request) => {
-                    prepare_replace(&content, &resolved.symbol, &request.new_body)
+                    prepare_replace(&content, &resolved.symbol, &request.new_body, member)
                         .map_err(|_| EditErrorKind::StaleContent)?
                         .new_content
                 }
@@ -425,9 +441,12 @@ fn stage_batch(
                         ),
                     }
                 }
-                BatchEditAction::Delete(_) => {
-                    build_delete(&content, &resolved.symbol, detect_line_ending(&content))
-                }
+                BatchEditAction::Delete(_) => build_delete(
+                    &content,
+                    &resolved.symbol,
+                    detect_line_ending(&content),
+                    member,
+                ),
                 BatchEditAction::EditWithin(request) => {
                     let selection = select_edit_within_body(
                         &content,

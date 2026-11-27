@@ -100,7 +100,7 @@ async fn code_execute_renders_search_references_and_symbol_reads_as_lean_text() 
             r#"get_symbol(path="src/math.rs", name="add_pair")"#
         )
         .await,
-        "@ end_line=3\tkind=fn\tname=add_pair\tpath=src/math.rs\tstart_line=1\nsource:\npub fn add_pair(a: i32, b: i32) -> i32 {\n    a + b\n}"
+        "@ end_line=3\tkind=fn\tname=add_pair\tpath=src/math.rs\tstart_line=1\tsymbol_line=1\nsource:\npub fn add_pair(a: i32, b: i32) -> i32 {\n    a + b\n}"
     );
     assert_eq!(
         code_execute_text(&server, r#"find_references(name="add_pair", context=1)"#).await,
@@ -110,6 +110,97 @@ async fn code_execute_renders_search_references_and_symbol_reads_as_lean_text() 
         code_execute_text(&server, "print(\"hi\")\n\"done\"").await,
         "done\nstdout:\nhi\n"
     );
+}
+
+const BARE_COUNT_SCRIPT: &str = r#"len(find_references(name="add_pair", max_per_file=1))"#;
+
+fn assert_bare_count_keeps_notice(text: &str) {
+    let (value, notices) = text
+        .split_once("\n\nHost-call completeness: ")
+        .unwrap_or_else(|| panic!("missing completeness suffix: {text}"));
+    assert_eq!(value, "1");
+    let notices: Value = serde_json::from_str(notices).expect("notices json");
+    assert_eq!(notices["notices"][0]["op"], "find_references");
+    assert_eq!(notices["notices"][0]["omitted_rows"], 1);
+    assert!(notices.get("withheld_files_meaning").is_none(), "{text}");
+}
+
+#[tokio::test]
+async fn code_execute_lean_text_explains_withheld_files_when_it_reports_them() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+    std::fs::write(
+        root.join("src/math.rs"),
+        "pub fn add_pair(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .expect("write math");
+    std::fs::write(
+        root.join("src/held.rs"),
+        format!("// -----BEGIN {} KEY-----\n", "PRIVATE"),
+    )
+    .expect("write held");
+    let canonical = root.canonicalize().expect("canon");
+    let server = SymForgeServer::new(
+        LiveIndex::load(&canonical).expect("load index"),
+        "code-surface-withheld-test".to_string(),
+        Arc::new(Mutex::new(WatcherInfo::default())),
+        Some(canonical),
+        None,
+    );
+    let text = code_execute_text(&server, r#"len(find_references(name="add_pair"))"#).await;
+    let (_, notices) = text
+        .split_once("\n\nHost-call completeness: ")
+        .unwrap_or_else(|| panic!("missing completeness suffix: {text}"));
+    let notices: Value = serde_json::from_str(notices).expect("notices json");
+    assert_eq!(notices["notices"][0]["withheld_files"], 1, "{text}");
+    assert!(
+        notices["withheld_files_meaning"].as_str().is_some_and(
+            |m| m.contains("not searched") && m.contains("not a count of files with more hits")
+        ),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn code_execute_lean_text_keeps_completeness_notices_for_a_bare_count() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let (_dir, server) = build_server_fixture();
+    assert_bare_count_keeps_notice(&code_execute_text(&server, BARE_COUNT_SCRIPT).await);
+}
+
+#[tokio::test]
+async fn daemon_proxied_code_execute_keeps_completeness_notices_for_a_bare_count() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let (dir, _local) = build_server_fixture();
+    let daemon_home = TempDir::new().expect("daemon home");
+    let control_state = ControlStateDir::new(daemon_home.path().to_path_buf());
+    let loopback = std::net::Ipv4Addr::LOCALHOST.to_string();
+    let daemon = spawn_daemon_at(&loopback, &control_state)
+        .await
+        .expect("spawn isolated daemon");
+    let session = connect_existing_session_at(
+        dir.path(),
+        "mcp-code-notice-test",
+        Some(std::process::id()),
+        &control_state,
+    )
+    .await
+    .expect("connect daemon session")
+    .expect("daemon session available");
+    let server = SymForgeServer::new_daemon_proxy(session.clone());
+    let res = symforge::protocol::result_status::with_project_evidence_scope(
+        None,
+        server.dispatch_tool_result_for_tests("code_execute", json!({"code": BARE_COUNT_SCRIPT})),
+    )
+    .await
+    .expect("code_execute over daemon");
+    let text = first_text_block(&res).to_owned();
+    let _ = session.close().await;
+    let _ = daemon.shutdown_tx.send(());
+    assert_ne!(res.is_error, Some(true), "{text}");
+    assert_bare_count_keeps_notice(&text);
 }
 
 #[tokio::test]

@@ -54,6 +54,1022 @@ fn build_index(files: &[(&str, &str)]) -> (TempDir, symforge::live_index::Shared
     (dir, shared)
 }
 
+#[test]
+fn jsx_component_xrefs_are_opening_uses_in_both_grammars() {
+    let jsx = "function render() { return <Panel><UI.Forms.Input /><ui.button></ui.button><div /><custom-tag /></Panel>; }";
+    let ts = "function convert(value: unknown) { return use(<number>value); }";
+    let (_dir, shared) = build_index(&[("view.jsx", jsx), ("view.tsx", jsx), ("plain.ts", ts)]);
+    let index = shared.read();
+    for (name, qualifier) in [
+        ("Panel", None),
+        ("Input", Some("UI.Forms.Input")),
+        ("button", Some("ui.button")),
+    ] {
+        let hits = index.find_references_for_name(name, Some(ReferenceKind::Call), false);
+        assert_eq!(hits.len(), 2, "{name}: {hits:?}");
+        for (_, hit) in hits {
+            assert_eq!(hit.qualified_name.as_deref(), qualifier);
+            assert!(hit.enclosing_symbol_index.is_some());
+            assert_eq!(
+                &jsx[hit.byte_range.0 as usize..hit.byte_range.1 as usize],
+                name
+            );
+        }
+    }
+    for name in ["div", "custom-tag", "number"] {
+        assert!(
+            index
+                .find_references_for_name(name, Some(ReferenceKind::Call), false)
+                .is_empty()
+        );
+    }
+    assert_eq!(
+        index
+            .find_references_for_name("use", Some(ReferenceKind::Call), false)
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn callback_xrefs_are_value_uses_not_calls() {
+    let py = r#"def process():
+    pass
+
+class Worker:
+    def handle(self):
+        pass
+
+    @property
+    def caption(self):
+        return "label"
+
+    def register(self, registry, data):
+        registry.add((self.handle))
+        registry.add(callback=process, metadata=data)
+        alias = process
+        handlers = {"process": process, "handle": self.handle, "other": data}
+        registry.add(other.handle)
+        registry.add(self.caption)
+        process()
+
+def shadowed(process):
+    register(process)
+"#;
+    let js = "const process = () => {}; function register(data) { install(process); const alias = process; const handlers = { run: process, data }; process(); } function shadowed(process) { install(process); }";
+    let ts = r#"class Worker {
+    handle() {}
+    get caption() { return "label"; }
+    static configure() {}
+    bind(data: string) {
+        install(this.handle, this.caption, this.configure);
+        const handlers = { run: this.handle, data };
+    }
+}"#;
+    let (_dir, shared) = build_index(&[("worker.py", py), ("worker.js", js), ("worker.ts", ts)]);
+    let index = shared.read();
+    for (name, values, calls) in [
+        ("process", 6, 2),
+        ("handle", 4, 0),
+        ("data", 0, 0),
+        ("alias", 0, 0),
+        ("caption", 0, 0),
+        ("configure", 0, 0),
+    ] {
+        let hits = index.find_references_for_name(name, Some(ReferenceKind::ValueUse), false);
+        assert_eq!(hits.len(), values, "{name}: {hits:?}");
+        if name == "handle" {
+            assert!(hits.iter().all(|(_, hit)| {
+                hit.qualified_name.as_deref() == Some("Worker.handle")
+                    && hit.enclosing_symbol_index.is_some()
+            }));
+        }
+        let actual_calls = index.find_references_for_name(name, Some(ReferenceKind::Call), false);
+        assert_eq!(actual_calls.len(), calls, "{name}: {actual_calls:?}");
+    }
+}
+
+#[test]
+fn exact_same_file_callbacks_follow_the_selected_declaration() {
+    let path = "local.js";
+    let source = "function callback() {\n    function callback() {}\n    install(callback);\n}\ninstall(callback);\nconst alias = function callback() { install(callback); };\n";
+    let (_dir, shared) = build_index(&[(path, source)]);
+    let index = shared.read();
+    let kind = Some(ReferenceKind::ValueUse);
+    // The unindexed name of the function expression is discoverable by name,
+    // but must not count as a use of either indexed function.
+    assert_eq!(
+        index
+            .find_references_for_name("callback", kind, false)
+            .len(),
+        3
+    );
+    assert!(
+        index
+            .find_exact_references_for_symbol(path, "callback", None, None, kind)
+            .is_err()
+    );
+    let sites: Vec<_> = source
+        .match_indices("install(callback)")
+        .map(|(start, _)| (start + "install(".len()) as u32)
+        .collect();
+    for (declaration_line, site) in [(1, sites[1]), (2, sites[0])] {
+        let exact = index
+            .find_exact_references_for_symbol(path, "callback", None, Some(declaration_line), kind)
+            .unwrap();
+        let actual: Vec<_> = exact
+            .iter()
+            .map(|(path, reference)| (*path, reference.byte_range))
+            .collect();
+        assert_eq!(actual, [(path, (site, site + "callback".len() as u32))]);
+    }
+}
+
+#[test]
+fn exact_method_callbacks_survive_only_writes_to_other_decoded_keys() {
+    let decoded = "class Worker {\n    handle() {}\n    stable() {}\n    bind(fn) {\n        this[\"h\\u0061ndle\"] = fn;\n        install(this.handle);\n        install(this.stable);\n    }\n}\n";
+    let opaque = "class Worker {\n    handle() {}\n    stable() {}\n    bind(key, fn) {\n        this[key] = fn;\n        install(this.handle);\n        install(this.stable);\n    }\n}\n";
+    let (_dir, shared) = build_index(&[
+        ("decoded.js", decoded),
+        ("decoded.ts", decoded),
+        ("opaque.js", opaque),
+        ("opaque.ts", opaque),
+    ]);
+    let index = shared.read();
+    let kind = Some(ReferenceKind::ValueUse);
+    for (path, source, stable_hits) in [
+        ("decoded.js", decoded, 1),
+        ("decoded.ts", decoded, 1),
+        ("opaque.js", opaque, 0),
+        ("opaque.ts", opaque, 0),
+    ] {
+        let handle = index
+            .find_exact_references_for_symbol(path, "handle", None, None, kind)
+            .unwrap();
+        assert!(handle.is_empty(), "{path}: {handle:?}");
+        let stable = index
+            .find_exact_references_for_symbol(path, "stable", None, None, kind)
+            .unwrap();
+        let site = source.find("this.stable)").unwrap() as u32 + "this.".len() as u32;
+        let expected: Vec<_> = (0..stable_hits)
+            .map(|_| (path, (site, site + "stable".len() as u32)))
+            .collect();
+        let actual: Vec<_> = stable
+            .iter()
+            .map(|(path, reference)| (*path, reference.byte_range))
+            .collect();
+        assert_eq!(actual, expected, "{path}");
+    }
+}
+
+#[test]
+fn class_fields_and_escaped_names_never_leave_a_false_exact_method_callback() {
+    let cases: &[(&str, &str, &str, usize, usize)] = &[
+        (
+            "FieldArrow.js",
+            "class FieldArrow {\n    handle() { return 0; }\n    stable() { return 0; }\n    swap = (fn) => { this.handle = fn; };\n    bind() {\n        installFieldArrow(this.handle);\n        installFieldArrowStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "FieldArrow.ts",
+            "class FieldArrow {\n    handle() { return 0; }\n    stable() { return 0; }\n    swap = (fn) => { this.handle = fn; };\n    bind() {\n        installFieldArrow(this.handle);\n        installFieldArrowStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "FieldBracket.js",
+            "class FieldBracket {\n    handle() { return 1; }\n    stable() { return 1; }\n    swap = (fn) => { this[\"handle\"] = fn; };\n    bind() {\n        installFieldBracket(this.handle);\n        installFieldBracketStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "FieldBracket.ts",
+            "class FieldBracket {\n    handle() { return 1; }\n    stable() { return 1; }\n    swap = (fn) => { this[\"handle\"] = fn; };\n    bind() {\n        installFieldBracket(this.handle);\n        installFieldBracketStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "FieldOpaque.js",
+            "class FieldOpaque {\n    handle() { return 2; }\n    stable() { return 2; }\n    swap = (key, fn) => { this[key] = fn; };\n    bind() {\n        installFieldOpaque(this.handle);\n        installFieldOpaqueStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            0,
+        ),
+        (
+            "FieldOpaque.ts",
+            "class FieldOpaque {\n    handle() { return 2; }\n    stable() { return 2; }\n    swap = (key, fn) => { this[key] = fn; };\n    bind() {\n        installFieldOpaque(this.handle);\n        installFieldOpaqueStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            0,
+        ),
+        (
+            "FieldValue.js",
+            "class FieldValue {\n    handle() { return 3; }\n    stable() { return 3; }\n    swap = this.handle = null;\n    bind() {\n        installFieldValue(this.handle);\n        installFieldValueStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "FieldValue.ts",
+            "class FieldValue {\n    handle() { return 3; }\n    stable() { return 3; }\n    swap = this.handle = null;\n    bind() {\n        installFieldValue(this.handle);\n        installFieldValueStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "StaticField.js",
+            "class StaticField {\n    handle() { return 4; }\n    stable() { return 4; }\n    static swap = (fn) => { this.handle = fn; };\n    bind() {\n        installStaticField(this.handle);\n        installStaticFieldStable(this.stable);\n    }\n}\n",
+            "handle",
+            1,
+            1,
+        ),
+        (
+            "StaticField.ts",
+            "class StaticField {\n    handle() { return 4; }\n    stable() { return 4; }\n    static swap = (fn) => { this.handle = fn; };\n    bind() {\n        installStaticField(this.handle);\n        installStaticFieldStable(this.stable);\n    }\n}\n",
+            "handle",
+            1,
+            1,
+        ),
+        (
+            "Shadow.js",
+            "class Shadow {\n    handle() { return 5; }\n    stable() { return 5; }\n    handle = () => 0;\n    bind() {\n        installShadow(this.handle);\n        installShadowStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "Shadow.ts",
+            "class Shadow {\n    handle() { return 5; }\n    stable() { return 5; }\n    handle = () => 0;\n    bind() {\n        installShadow(this.handle);\n        installShadowStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "ShadowBracket.js",
+            "class ShadowBracket {\n    handle() { return 6; }\n    stable() { return 6; }\n    [\"h\\u0061ndle\"] = () => 0;\n    bind() {\n        installShadowBracket(this.handle);\n        installShadowBracketStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "ShadowBracket.ts",
+            "class ShadowBracket {\n    handle() { return 6; }\n    stable() { return 6; }\n    [\"h\\u0061ndle\"] = () => 0;\n    bind() {\n        installShadowBracket(this.handle);\n        installShadowBracketStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "EscapedWrite.js",
+            "class EscapedWrite {\n    handle() { return 7; }\n    stable() { return 7; }\n    swap(fn) { this.h\\u0061ndle = fn; }\n    bind() {\n        installEscapedWrite(this.handle);\n        installEscapedWriteStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "EscapedWrite.ts",
+            "class EscapedWrite {\n    handle() { return 7; }\n    stable() { return 7; }\n    swap(fn) { this.h\\u0061ndle = fn; }\n    bind() {\n        installEscapedWrite(this.handle);\n        installEscapedWriteStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "EscapedMethod.js",
+            "class EscapedMethod {\n    h\\u0061ndle() { return 8; }\n    stable() { return 8; }\n    swap(fn) { this[\"handle\"] = fn; }\n    bind() {\n        installEscapedMethod(this.h\\u0061ndle);\n        installEscapedMethodStable(this.stable);\n    }\n}\n",
+            "h\\u0061ndle",
+            0,
+            1,
+        ),
+        (
+            "EscapedMethod.ts",
+            "class EscapedMethod {\n    h\\u0061ndle() { return 8; }\n    stable() { return 8; }\n    swap(fn) { this[\"handle\"] = fn; }\n    bind() {\n        installEscapedMethod(this.h\\u0061ndle);\n        installEscapedMethodStable(this.stable);\n    }\n}\n",
+            "h\\u0061ndle",
+            0,
+            1,
+        ),
+        (
+            "Declared.ts",
+            "class Declared {\n    handle() { return 9; }\n    stable() { return 9; }\n    declare handle: () => void;\n    bind() {\n        installDeclared(this.handle);\n        installDeclaredStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "Definite.ts",
+            "class Definite {\n    handle() { return 10; }\n    stable() { return 10; }\n    handle!: () => void;\n    bind() {\n        installDefinite(this.handle);\n        installDefiniteStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+    ];
+    let files: Vec<_> = cases
+        .iter()
+        .map(|(path, source, ..)| (*path, *source))
+        .collect();
+    let (_dir, shared) = build_index(&files);
+    let index = shared.read();
+    let kind = Some(ReferenceKind::ValueUse);
+    let mut wrong = Vec::new();
+    for &(path, _, handle, handle_hits, stable_hits) in cases {
+        for (name, expected) in [(handle, handle_hits), ("stable", stable_hits)] {
+            let hits = index
+                .find_exact_references_for_symbol(path, name, None, None, kind)
+                .unwrap_or_else(|error| panic!("{path} {name}: {error}"));
+            if hits.len() != expected {
+                wrong.push(format!("{path} {name}: expected {expected}, got {hits:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn jsx_attribute_callbacks_are_exact_value_uses_in_tsx_and_jsx() {
+    let view = "import { gamma } from \"./handlers\";\nfunction handleClick() {}\nexport function View() {\n    return <Button onClick={handleClick} cb={gamma} />;\n}\n";
+    for (view_path, handlers_path) in [("view.tsx", "handlers.ts"), ("view.jsx", "handlers.js")] {
+        let (_dir, shared) = build_index(&[
+            (view_path, view),
+            (handlers_path, "export function gamma() {}\n"),
+        ]);
+        let index = shared.read();
+        let kind = Some(ReferenceKind::ValueUse);
+        for (path, name) in [(view_path, "handleClick"), (handlers_path, "gamma")] {
+            let site = view.find(&format!("={{{name}}}")).unwrap() as u32 + 2;
+            let hits: Vec<_> = index
+                .find_exact_references_for_symbol(path, name, None, None, kind)
+                .unwrap_or_else(|error| panic!("{path} {name}: {error}"))
+                .into_iter()
+                .map(|(path, reference)| (path, reference.byte_range))
+                .collect();
+            assert_eq!(
+                hits,
+                [(view_path, (site, site + name.len() as u32))],
+                "{view_path} {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn later_method_names_and_outer_this_never_give_an_exact_method_callback_in_js_and_ts() {
+    let cases: &[(&str, &str, usize)] = &[
+        (
+            "StringName.js",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass StringName {\n    handle() { return 1; }\n    stable() { return 1; }\n    \"handle\"() { return 0; }\n    bind() {\n        installStringName(this.handle);\n        installStringNameStable(this.stable);\n    }\n}\n",
+            1,
+        ),
+        (
+            "StringName.ts",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass StringName {\n    handle() { return 1; }\n    stable() { return 1; }\n    \"handle\"() { return 0; }\n    bind() {\n        installStringName(this.handle);\n        installStringNameStable(this.stable);\n    }\n}\n",
+            1,
+        ),
+        (
+            "EscapedName.js",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass EscapedName {\n    handle() { return 2; }\n    stable() { return 2; }\n    h\\u0061ndle() { return 0; }\n    bind() {\n        installEscapedName(this.handle);\n        installEscapedNameStable(this.stable);\n    }\n}\n",
+            1,
+        ),
+        (
+            "EscapedName.ts",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass EscapedName {\n    handle() { return 2; }\n    stable() { return 2; }\n    h\\u0061ndle() { return 0; }\n    bind() {\n        installEscapedName(this.handle);\n        installEscapedNameStable(this.stable);\n    }\n}\n",
+            1,
+        ),
+        (
+            "ComputedLiteral.js",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass ComputedLiteral {\n    handle() { return 3; }\n    stable() { return 3; }\n    [\"handle\"]() { return 0; }\n    bind() {\n        installComputedLiteral(this.handle);\n        installComputedLiteralStable(this.stable);\n    }\n}\n",
+            1,
+        ),
+        (
+            "ComputedLiteral.ts",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass ComputedLiteral {\n    handle() { return 3; }\n    stable() { return 3; }\n    [\"handle\"]() { return 0; }\n    bind() {\n        installComputedLiteral(this.handle);\n        installComputedLiteralStable(this.stable);\n    }\n}\n",
+            1,
+        ),
+        (
+            "ComputedName.js",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass ComputedName {\n    handle() { return 4; }\n    stable() { return 4; }\n    [key]() { return 0; }\n    bind() {\n        installComputedName(this.handle);\n        installComputedNameStable(this.stable);\n    }\n}\n",
+            0,
+        ),
+        (
+            "ComputedName.ts",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass ComputedName {\n    handle() { return 4; }\n    stable() { return 4; }\n    [key]() { return 0; }\n    bind() {\n        installComputedName(this.handle);\n        installComputedNameStable(this.stable);\n    }\n}\n",
+            0,
+        ),
+        (
+            "Decorated.js",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass Decorated {\n    handle() { return 5; }\n    stable() { return 5; }\n    @register(this.handle) other() { return 0; }\n    bind() {\n        installDecoratedStable(this.stable);\n    }\n}\n",
+            1,
+        ),
+        (
+            "Decorated.ts",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass Decorated {\n    handle() { return 5; }\n    stable() { return 5; }\n    @register(this.handle) other() { return 0; }\n    bind() {\n        installDecoratedStable(this.stable);\n    }\n}\n",
+            1,
+        ),
+    ];
+    let files: Vec<_> = cases
+        .iter()
+        .map(|(path, source, _)| (*path, *source))
+        .collect();
+    let (_dir, shared) = build_index(&files);
+    let index = shared.read();
+    let kind = Some(ReferenceKind::ValueUse);
+    let mut wrong = Vec::new();
+    for &(path, _, stable_hits) in cases {
+        for (name, line, expected) in [("handle", 4, 0), ("stable", 5, stable_hits)] {
+            let hits = index
+                .find_exact_references_for_symbol(path, name, None, Some(line), kind)
+                .unwrap_or_else(|error| panic!("{path} {name}: {error}"));
+            if hits.len() != expected {
+                wrong.push(format!("{path} {name}: expected {expected}, got {hits:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn exact_python_class_value_uses_do_not_require_callback_evidence() {
+    let path = "model.py";
+    let source = "class Model:\n    pass\n\nisinstance(obj, Model)\n";
+    let (_dir, shared) = build_index(&[(path, source)]);
+    let index = shared.read();
+    let hits = index
+        .find_exact_references_for_symbol(
+            path,
+            "Model",
+            None,
+            Some(1),
+            Some(ReferenceKind::ValueUse),
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].1.line_range, (3, 3));
+}
+
+#[test]
+fn exact_cross_file_python_class_values_require_unique_import_evidence() {
+    let model = "class Model:\n    pass\n";
+    let direct = "from model import Model\nisinstance(obj, Model)\n";
+    let qualified = "import model\nisinstance(obj, model.Model)\n";
+    let module_alias = "import model as actual\nisinstance(obj, actual.Model)\n";
+    let alias = "from model import Model as Imported\ndef check(obj):\n    return isinstance(obj, Imported)\n";
+    let wrong = "from other import Model\nisinstance(obj, Model)\n";
+    let (_dir, shared) = build_index(&[
+        ("model.py", model),
+        ("other.py", model),
+        ("direct.py", direct),
+        ("qualified.py", qualified),
+        ("module_alias.py", module_alias),
+        (
+            "shadowed_module.py",
+            "import model\ndef check(obj, model):\n    return isinstance(obj, model.Model)\n",
+        ),
+        (
+            "mutated_module.py",
+            "import model\nmodel.Model = object\nisinstance(obj, model.Model)\n",
+        ),
+        (
+            "conditional_module.py",
+            "if flag:\n    import model\nisinstance(obj, model.Model)\n",
+        ),
+        ("aliased.py", alias),
+        ("wrong.py", wrong),
+        ("unimported.py", "isinstance(obj, Model)\n"),
+        (
+            "rebound.py",
+            "from model import Model\nModel = object\nisinstance(obj, Model)\n",
+        ),
+        (
+            "parameter.py",
+            "from model import Model\ndef check(obj, Model):\n    return isinstance(obj, Model)\n",
+        ),
+        (
+            "conflict.py",
+            "from model import Model\nfrom other import Model\nisinstance(obj, Model)\n",
+        ),
+        (
+            "star.py",
+            "from model import Model\nfrom other import *\nisinstance(obj, Model)\n",
+        ),
+    ]);
+    let index = shared.read();
+    for (provider, sites) in [
+        (
+            "model.py",
+            &[
+                ("aliased.py", alias, "Imported", 2),
+                ("direct.py", direct, "Model", 1),
+                ("module_alias.py", module_alias, "Model", 1),
+                ("qualified.py", qualified, "Model", 1),
+            ][..],
+        ),
+        ("other.py", &[("wrong.py", wrong, "Model", 1)][..]),
+    ] {
+        let hits = index
+            .find_exact_references_for_symbol(
+                provider,
+                "Model",
+                None,
+                Some(1),
+                Some(ReferenceKind::ValueUse),
+            )
+            .unwrap();
+        let mut actual: Vec<_> = hits
+            .into_iter()
+            .map(|(path, hit)| {
+                assert_eq!(hit.kind, ReferenceKind::ValueUse);
+                (path, hit.name.as_str(), hit.byte_range, hit.line_range)
+            })
+            .collect();
+        actual.sort_unstable();
+        let expected: Vec<_> = sites
+            .iter()
+            .map(|&(path, src, token, line)| {
+                let start = src.rfind(token).unwrap() as u32;
+                (
+                    path,
+                    token,
+                    (start, start + token.len() as u32),
+                    (line, line),
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected, "{provider}");
+    }
+}
+
+#[test]
+fn exact_cross_file_python_class_values_reject_ambiguous_or_rebound_exports() {
+    let model = "class Model:\n    pass\n";
+    for (provider, files) in [
+        (
+            "model.py",
+            &[
+                ("model.py", model),
+                ("model/__init__.py", "Model = object\n"),
+            ][..],
+        ),
+        (
+            "model.py",
+            &[("model.py", "class Model:\n    pass\nModel = object\n")][..],
+        ),
+    ] {
+        let mut files = files.to_vec();
+        files.push((
+            "consumer.py",
+            "from model import Model\nisinstance(obj, Model)\n",
+        ));
+        let (_dir, shared) = build_index(&files);
+        let index = shared.read();
+        let hits = index
+            .find_exact_references_for_symbol(
+                provider,
+                "Model",
+                None,
+                Some(1),
+                Some(ReferenceKind::ValueUse),
+            )
+            .unwrap();
+        assert!(hits.is_empty(), "{files:?}: {hits:?}");
+    }
+}
+
+#[test]
+fn uppercase_tsx_keeps_exact_imported_callback_and_jsx_uses() {
+    let source = "import { callback } from './provider';\nexport function View() { return <Panel onClick={install(callback)} />; }\n";
+    let path = "View.TSX";
+    let (_dir, shared) = build_index(&[
+        ("provider.ts", "export function callback() {}\n"),
+        (path, source),
+    ]);
+    let index = shared.read();
+    let callback = index
+        .find_exact_references_for_symbol(
+            "provider.ts",
+            "callback",
+            None,
+            Some(1),
+            Some(ReferenceKind::ValueUse),
+        )
+        .unwrap();
+    let jsx = index.find_references_for_name("Panel", Some(ReferenceKind::Call), false);
+    for (hits, token, kind) in [
+        (callback, "callback", ReferenceKind::ValueUse),
+        (jsx, "Panel", ReferenceKind::Call),
+    ] {
+        let start = source.rfind(token).unwrap() as u32;
+        assert_eq!(hits.len(), 1, "{token}: {hits:?}");
+        assert_eq!(hits[0].0, path);
+        assert_eq!(hits[0].1.kind, kind);
+        assert_eq!(hits[0].1.byte_range, (start, start + token.len() as u32));
+    }
+}
+
+#[test]
+fn exact_callback_high_fanout_has_one_hit_per_source_site() {
+    const IMPORTERS: usize = 8;
+    const SITES_PER_IMPORTER: usize = 128;
+    let provider = "web/provider.js";
+    let consumer = format!(
+        "import {{ callback }} from './provider';\n{}",
+        "install(callback);\ncallback();\n".repeat(SITES_PER_IMPORTER)
+    );
+    let paths: Vec<_> = (0..IMPORTERS)
+        .map(|i| format!("web/consumer{i}.js"))
+        .collect();
+    let mut files = vec![(provider, "export function callback() {}\n")];
+    files.extend(paths.iter().map(|path| (path.as_str(), consumer.as_str())));
+    let (_dir, shared) = build_index(&files);
+    let index = shared.read();
+    let hits = index
+        .find_exact_references_for_symbol(provider, "callback", None, Some(1), None)
+        .unwrap();
+    for (kind, prefix) in [
+        (ReferenceKind::ValueUse, "install(callback)"),
+        (ReferenceKind::Call, "callback();"),
+    ] {
+        let prefix_len = if kind == ReferenceKind::ValueUse {
+            "install(".len()
+        } else {
+            0
+        };
+        let expected: Vec<_> = paths
+            .iter()
+            .flat_map(|path| {
+                consumer.match_indices(prefix).map(move |(start, _)| {
+                    let start = (start + prefix_len) as u32;
+                    (path.as_str(), (start, start + "callback".len() as u32))
+                })
+            })
+            .collect();
+        let actual: Vec<_> = hits
+            .iter()
+            .filter(|(_, hit)| hit.kind == kind)
+            .map(|(path, hit)| (*path, hit.byte_range))
+            .collect();
+        assert_eq!(expected.len(), IMPORTERS * SITES_PER_IMPORTER);
+        assert_eq!(actual, expected, "{kind:?}");
+    }
+}
+
+#[test]
+fn imported_callback_xrefs_require_callable_exports() {
+    let provider = "def _default(value):\n    return value\n\nmetadata = 42\n";
+    let consumer = r#"from .provider import _default as fallback, metadata
+from .missing import _default as unresolved
+
+def dump(kwargs):
+    kwargs.setdefault("default", fallback)
+    kwargs.setdefault("metadata", metadata)
+    kwargs.setdefault("missing", unresolved)
+
+def shadowed(fallback):
+    register(fallback)
+"#;
+    let js = r#"export const callback = () => {};
+export const payload = 42;
+function hidden() {}
+export default function defaultCallback() {}
+"#;
+    let ts = r#"import defaultHandler, { callback as run, payload, hidden } from './callbacks.js';
+import type { callback as TypeOnly } from './callbacks.js';
+install(run, defaultHandler, payload, hidden, TypeOnly);
+function shadowed(run: string) { install(run); }
+"#;
+    let (_dir, shared) = build_index(&[
+        ("src/flask/json/provider.py", provider),
+        ("src/flask/json/__init__.py", consumer),
+        ("web/callbacks.js", js),
+        ("web/view.ts", ts),
+        ("other/provider.py", "def metadata(): pass\n"),
+    ]);
+    let index = shared.read();
+    for (name, token, path, definition) in [
+        (
+            "_default",
+            "fallback",
+            "src/flask/json/provider.py",
+            "_default",
+        ),
+        ("callback", "run", "web/callbacks.js", "callback"),
+        (
+            "defaultCallback",
+            "defaultHandler",
+            "web/callbacks.js",
+            "defaultCallback",
+        ),
+    ] {
+        let hits = index.find_references_for_name(name, Some(ReferenceKind::ValueUse), false);
+        assert_eq!(hits.len(), 1, "{name}: {hits:?}");
+        let (hit_path, hit) = hits[0];
+        let source = &index.get_file(hit_path).unwrap().content;
+        assert_eq!(
+            &source[hit.byte_range.0 as usize..hit.byte_range.1 as usize],
+            token.as_bytes()
+        );
+        assert!(
+            index
+                .find_references_for_name(name, Some(ReferenceKind::Call), false)
+                .is_empty()
+        );
+        let selected = index
+            .find_exact_references_for_symbol(
+                path,
+                definition,
+                None,
+                None,
+                Some(ReferenceKind::ValueUse),
+            )
+            .unwrap();
+        assert_eq!(selected.len(), 1, "{name}: {selected:?}");
+    }
+    for name in ["metadata", "unresolved", "payload", "hidden", "TypeOnly"] {
+        assert!(
+            index
+                .find_references_for_name(name, Some(ReferenceKind::ValueUse), false)
+                .is_empty(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn f5_imported_callbacks_respect_js_and_ts_block_bindings() {
+    let provider = r#"export function callback() {}
+export function type() {}
+export function rebound() {}
+const slot = {};
+{ ({ replacement: rebound, callback: slot.value } = { replacement: 42, callback: 0 }); }
+"#;
+    let js = r#"import { callback as run } from './provider.js';
+install(run); // hit
+function nested({ key: [run = fallback], ...rest }) { install(run); }
+function hoisted(value) {
+    install(run);
+    if (value) { var { value: run } = value; }
+    install(run);
+}
+function hoistedLoop(values) {
+    for (var { value: run } of values) install(run);
+    install(run);
+}
+{
+    install(run);
+    const { value: run = fallback } = object;
+    install(run);
+}
+{ const { run: other } = object; install(run); } // hit
+try {} catch ({ value: run }) { install(run); }
+const Local = class run { static { install(run); } };
+for (const { value: run } of values) install(run);
+switch (value) {
+    case 0: const run = value; break;
+    default: install(run);
+}
+install(run); // hit
+"#;
+    let ts = r#"import { callback as run, rebound as reboundAlias, type callback as TypeOnly, type as runtimeType } from './provider.js';
+install(run); // hit
+install(TypeOnly);
+install(runtimeType); // hit
+install(reboundAlias);
+function typed({ key: [run = fallback] }: Input) { install(run); }
+function typedKey({ run: other }: Input) { install(run); } // hit
+function hoisted(value: Input) {
+    if (value) { var { run } = value; }
+    install(run);
+}
+namespace Shadowed { import run = Foreign.value; install(run); }
+function enumShadow() { enum run { First } install(run); }
+install(run); // hit
+"#;
+    let consumers = [("web/view.js", js), ("web/view.ts", ts)];
+    let (_dir, shared) = build_index(&[("web/provider.js", provider), consumers[0], consumers[1]]);
+    let index = shared.read();
+    assert_callback_value_sites(&index, "web/provider.js", "callback", "run", &consumers);
+    assert_callback_value_sites(&index, "web/provider.js", "type", "runtimeType", &consumers);
+    for name in ["TypeOnly", "rebound", "reboundAlias"] {
+        assert!(
+            index
+                .find_references_for_name(name, Some(ReferenceKind::ValueUse), false)
+                .is_empty(),
+            "{name}"
+        );
+    }
+    assert!(
+        index
+            .find_exact_references_for_symbol(
+                "web/provider.js",
+                "rebound",
+                None,
+                None,
+                Some(ReferenceKind::ValueUse)
+            )
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn f5_imported_callbacks_respect_python_bindings_and_package_identity() {
+    let provider = "def callback():\n    pass\n";
+    let consumer = r#"from . import callback as run
+install(run)  # hit
+def unpacked(values):
+    first, *run = values
+    install(run)
+def target(manager):
+    with manager as (run, other):
+        install(run)
+def caught():
+    try: pass
+    except Exception as run: install(run)
+def named(value):
+    if (run := value): install(run)
+def pattern(value):
+    match value:
+        case {"value": run}: install(run)
+def comp(values):
+    return [install(run) for run in values]
+def type_alias():
+    type run[T] = list[T]
+    install(run)
+def inert_import():
+    import json as run
+    install(run)
+def conditional(flag):
+    if flag:
+        from . import callback as run
+    install(run)
+def local_import():
+    install(run)
+    from . import callback as run
+    install(run)  # hit
+def rebound_local():
+    from . import callback as run
+    def rebind():
+        nonlocal run
+        run = None
+    rebind()
+    install(run)
+class Scope:
+    run = None
+    install(run)
+    def method(self):
+        install(run)  # hit
+install(run)  # hit
+"#;
+    let wildcard = "from . import callback as run\nfrom .opaque import *\ninstall(run)\n";
+    let rebound = r#"from . import callback as run
+def rebind():
+    global run
+    run = None
+rebind()
+install(run)
+"#;
+    let consumers = [
+        ("pkg/consumer.py", consumer),
+        ("pkg/wildcard.py", wildcard),
+        ("pkg/rebound.py", rebound),
+    ];
+    let (_dir, shared) = build_index(&[
+        ("pkg/__init__.py", provider),
+        ("pkg.py", provider),
+        ("pkg/opaque.py", "run = 0\n"),
+        consumers[0],
+        consumers[1],
+        consumers[2],
+    ]);
+    let index = shared.read();
+    assert_callback_value_sites(&index, "pkg/__init__.py", "callback", "run", &consumers);
+    let sibling = index
+        .find_exact_references_for_symbol(
+            "pkg.py",
+            "callback",
+            None,
+            None,
+            Some(ReferenceKind::ValueUse),
+        )
+        .unwrap();
+    assert!(sibling.is_empty(), "same-named sibling module: {sibling:?}");
+}
+
+#[test]
+fn f5_imported_callbacks_do_not_guess_between_modules() {
+    let js = "import { callback as run } from './provider';\ninstall(run);\n";
+    let ts = "import { callback as run } from './provider.js';\ninstall(run); // hit\n";
+    let consumers = [("web/ambiguous.js", js), ("web/explicit.ts", ts)];
+    let (_dir, shared) = build_index(&[
+        ("web/provider.js", "export function callback() {}\n"),
+        ("web/provider.ts", "export const callback = 42;\n"),
+        consumers[0],
+        consumers[1],
+    ]);
+    assert_callback_value_sites(
+        &shared.read(),
+        "web/provider.js",
+        "callback",
+        "run",
+        &consumers,
+    );
+}
+
+fn assert_callback_value_sites(
+    index: &LiveIndex,
+    provider: &str,
+    name: &str,
+    token: &str,
+    consumers: &[(&str, &str)],
+) {
+    let mut expected = Vec::new();
+    let invocation = format!("install({token})");
+    for &(path, source) in consumers {
+        let mut offset = 0;
+        for (line, text) in source.split_inclusive('\n').enumerate() {
+            if (text.contains("// hit") || text.contains("# hit"))
+                && let Some(start) = text.find(invocation.as_str())
+            {
+                let start = (offset + start + "install(".len()) as u32;
+                let line = line as u32;
+                expected.push((path, (start, start + token.len() as u32), (line, line)));
+            }
+            offset += text.len();
+        }
+    }
+    assert!(!expected.is_empty(), "missing fixture controls for {name}");
+    expected.sort_unstable();
+    for (query, hits) in [
+        (
+            "canonical",
+            index.find_references_for_name(name, Some(ReferenceKind::ValueUse), false),
+        ),
+        (
+            "alias",
+            index.find_references_for_name(token, Some(ReferenceKind::ValueUse), false),
+        ),
+        (
+            "exact",
+            index
+                .find_exact_references_for_symbol(
+                    provider,
+                    name,
+                    None,
+                    None,
+                    Some(ReferenceKind::ValueUse),
+                )
+                .unwrap(),
+        ),
+    ] {
+        let mut actual: Vec<_> = hits
+            .into_iter()
+            .map(|(path, hit)| {
+                assert_eq!(hit.kind, ReferenceKind::ValueUse);
+                assert_eq!(hit.name, token);
+                (path, hit.byte_range, hit.line_range)
+            })
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(actual, expected, "{query} query for {name}");
+    }
+}
+
+#[test]
+fn python_subclass_hook_tuple_reads_methods_without_calling_them() {
+    let source = r#"class Flask:
+    def __init_subclass__(cls, **kwargs):
+        for method in (cls.do_teardown_appcontext, cls.caption, other.do_teardown_appcontext):
+            inspect.signature(method)
+
+    def do_teardown_appcontext(self):
+        pass
+
+    @property
+    def caption(self):
+        return "label"
+"#;
+    let (_dir, shared) = build_index(&[("src/flask/app.py", source)]);
+    let index = shared.read();
+    let name = "do_teardown_appcontext";
+    let hits = index.find_references_for_name(name, Some(ReferenceKind::ValueUse), false);
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(
+        hits[0].1.qualified_name.as_deref(),
+        Some("Flask.do_teardown_appcontext")
+    );
+    assert!(
+        index
+            .find_references_for_name(name, Some(ReferenceKind::Call), false)
+            .is_empty()
+    );
+    assert!(
+        index
+            .find_references_for_name("caption", Some(ReferenceKind::ValueUse), false)
+            .is_empty()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // XREF-01, XREF-02: Rust call site extraction
 // ---------------------------------------------------------------------------

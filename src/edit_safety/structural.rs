@@ -11,14 +11,19 @@ pub(crate) fn prepare_replace(
     file_content: &[u8],
     symbol: &SymbolRecord,
     new_body: &str,
+    member: Option<ListMember>,
 ) -> Result<PreparedReplace, &'static str> {
     let (start, end) = symbol.byte_range;
-    let (splice_start, _) = replacement_splice_range(file_content, symbol, new_body)?;
+    let (splice_start, _) = replacement_splice_range(file_content, symbol, new_body, member)?;
     let indent = detect_indentation(file_content, start);
     let line_ending = detect_line_ending(file_content);
     let normalized = normalize_line_endings(new_body.as_bytes(), line_ending);
     let normalized_str = std::str::from_utf8(&normalized).unwrap_or(new_body);
-    let indented = apply_indentation(normalized_str, &indent, line_ending);
+    let indented = if member.is_some() {
+        normalized
+    } else {
+        indent_replacement(file_content, symbol, normalized_str, &indent, line_ending)
+    };
     let new_content = apply_splice(file_content, (splice_start, end), &indented);
     Ok(PreparedReplace {
         new_content,
@@ -33,10 +38,19 @@ pub(crate) fn replacement_splice_range(
     file_content: &[u8],
     symbol: &SymbolRecord,
     new_body: &str,
+    member: Option<ListMember>,
 ) -> Result<(u32, u32), &'static str> {
     let (start, end) = symbol.byte_range;
     if start > end || end as usize > file_content.len() || symbol.effective_start() > start {
         return Err("symbol span is outside the captured file");
+    }
+    if member.is_some() {
+        let start = if body_starts_with_doc_comment(new_body) {
+            symbol.effective_start()
+        } else {
+            start
+        };
+        return Ok((start, end));
     }
     let new_body_supplies_docs = body_starts_with_doc_comment(new_body);
     let effective = if new_body_supplies_docs {
@@ -57,6 +71,264 @@ pub(crate) fn replacement_splice_range(
     Ok((splice_start as u32, end))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SyntaxCheck {
+    Passed,
+    Regressed(String),
+    NotRun(&'static str),
+}
+
+impl SyntaxCheck {
+    pub(crate) fn reply_line(&self) -> String {
+        match self {
+            Self::Passed => "Syntax check: passed".to_string(),
+            Self::NotRun(reason) => format!("Syntax check: not run ({reason})"),
+            Self::Regressed(_) => "Syntax check: failed".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyntaxEdit<'a> {
+    Text,
+    Delete(&'a str),
+}
+
+pub(crate) struct SourceTree<'a> {
+    content: &'a [u8],
+    language: &'a crate::domain::LanguageId,
+    path: &'a str,
+    tree: std::sync::OnceLock<Result<tree_sitter::Tree, &'static str>>,
+}
+
+impl<'a> SourceTree<'a> {
+    pub(crate) fn new(
+        content: &'a [u8],
+        language: &'a crate::domain::LanguageId,
+        path: &'a str,
+    ) -> Self {
+        Self {
+            content,
+            language,
+            path,
+            tree: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn tsx(&self) -> bool {
+        crate::domain::LanguageId::is_tsx_path(self.path)
+    }
+
+    fn tree(&self) -> Result<&tree_sitter::Tree, &'static str> {
+        self.tree
+            .get_or_init(|| {
+                if !crate::parsing::has_source_grammar(self.language, self.tsx()) {
+                    return Err("no bundled parser for this language");
+                }
+                let source =
+                    std::str::from_utf8(self.content).map_err(|_| "the file is not UTF-8")?;
+                crate::parsing::parse_source_tree(source, self.language, self.tsx())
+                    .map_err(|_| "the parser did not finish")
+            })
+            .as_ref()
+            .map_err(|reason| *reason)
+    }
+}
+
+fn byte_point(bytes: &[u8], at: usize) -> tree_sitter::Point {
+    let head = &bytes[..at];
+    let row = head.iter().filter(|&&byte| byte == b'\n').count();
+    let column = at
+        - head
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |line| line + 1);
+    tree_sitter::Point::new(row, column)
+}
+
+fn splice_edit(before: &[u8], after: &[u8]) -> tree_sitter::InputEdit {
+    let prefix = before.iter().zip(after).take_while(|(a, b)| a == b).count();
+    let room = before.len().min(after.len()) - prefix;
+    let suffix = before
+        .iter()
+        .rev()
+        .zip(after.iter().rev())
+        .take(room)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let (old_end, new_end) = (before.len() - suffix, after.len() - suffix);
+    tree_sitter::InputEdit {
+        start_byte: prefix,
+        old_end_byte: old_end,
+        new_end_byte: new_end,
+        start_position: byte_point(before, prefix),
+        old_end_position: byte_point(before, old_end),
+        new_end_position: byte_point(after, new_end),
+    }
+}
+
+pub(crate) fn syntax_check(
+    before: &SourceTree<'_>,
+    after: &[u8],
+    edit: SyntaxEdit<'_>,
+) -> SyntaxCheck {
+    let tree = match before.tree() {
+        Ok(tree) => tree,
+        Err(reason) => return SyntaxCheck::NotRun(reason),
+    };
+    if tree.root_node().has_error() {
+        return SyntaxCheck::NotRun("the file already had syntax errors");
+    }
+    let Ok(source) = std::str::from_utf8(after) else {
+        return SyntaxCheck::NotRun("the file is not UTF-8");
+    };
+    let mut edited = tree.clone();
+    edited.edit(&splice_edit(before.content, after));
+    let tree =
+        match crate::parsing::reparse_source_tree(source, before.language, before.tsx(), &edited) {
+            Ok(tree) => tree,
+            Err(_) => return SyntaxCheck::NotRun("the parser did not finish"),
+        };
+    if !tree.root_node().has_error() {
+        return SyntaxCheck::Passed;
+    }
+    let (language, path) = (before.language, before.path);
+    let line = first_syntax_error(tree.root_node()).map_or(0, |node| node.start_position().row);
+    let snippet = after
+        .split(|&byte| byte == b'\n')
+        .nth(line)
+        .map(|text| {
+            String::from_utf8_lossy(text)
+                .trim()
+                .chars()
+                .take(60)
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    let observed = format!(
+        "the bundled {} parser reports a syntax error at line {} (`{snippet}`)",
+        language.name(),
+        line + 1
+    );
+    SyntaxCheck::Regressed(match edit {
+        SyntaxEdit::Text => format!(
+            "Error: {observed} after this edit and none before; nothing was written. Fix the new text and retry; if the text is valid syntax this parser does not know yet, apply it with a plain text edit, after which SymForge re-indexes the file."
+        ),
+        SyntaxEdit::Delete(name) => format!(
+            "Error: {observed} after deleting `{name}` and none before: the span SymForge computed for this deletion would break `{path}`; nothing was written. Delete it with a plain text edit instead, after which SymForge re-indexes the file."
+        ),
+    })
+}
+
+fn first_syntax_error(root: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        if node.is_error() || node.is_missing() {
+            return Some(node);
+        }
+        if node.has_error() && cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return None;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ListMember {
+    delete: (u32, u32),
+}
+
+pub(crate) fn list_member(source: &SourceTree<'_>, symbol: &SymbolRecord) -> Option<ListMember> {
+    if matches!(
+        source.language,
+        crate::domain::LanguageId::JavaScript | crate::domain::LanguageId::TypeScript
+    ) {
+        return declarator_member(source.tree().ok()?, source.content, symbol);
+    }
+    inline_list_member(source.content, symbol).then(|| ListMember {
+        delete: inline_member_delete_range(source.content, symbol),
+    })
+}
+
+fn declarator_member(
+    tree: &tree_sitter::Tree,
+    file_content: &[u8],
+    symbol: &SymbolRecord,
+) -> Option<ListMember> {
+    let (start, end) = (symbol.byte_range.0 as usize, symbol.byte_range.1 as usize);
+    let declarator = std::iter::successors(
+        tree.root_node().descendant_for_byte_range(start, end),
+        |node| node.parent(),
+    )
+    .take_while(|node| node.start_byte() == start && node.end_byte() == end)
+    .find(|node| node.kind() == "variable_declarator")?;
+    let declaration = declarator.parent()?;
+    let children: Vec<_> = declaration.children(&mut declaration.walk()).collect();
+    if children
+        .iter()
+        .filter(|n| n.kind() == "variable_declarator")
+        .count()
+        < 2
+    {
+        return None;
+    }
+    let at = children.iter().position(|n| *n == declarator)?;
+    let next_comma = children[at..].iter().find(|n| n.kind() == ",");
+    let delete = match next_comma {
+        Some(comma) => {
+            let tail = &file_content[comma.end_byte()..];
+            let skip = tail.iter().take_while(|b| b.is_ascii_whitespace()).count();
+            (symbol.effective_start(), (comma.end_byte() + skip) as u32)
+        }
+        None => {
+            let comma = children[..at].iter().rev().find(|n| n.kind() == ",")?;
+            let head = &file_content[..comma.start_byte()];
+            let skip = head
+                .iter()
+                .rev()
+                .take_while(|b| b.is_ascii_whitespace())
+                .count();
+            ((comma.start_byte() - skip) as u32, end as u32)
+        }
+    };
+    Some(ListMember { delete })
+}
+pub(crate) fn inline_list_member(file_content: &[u8], symbol: &SymbolRecord) -> bool {
+    let (start, end) = (
+        symbol.effective_start() as usize,
+        symbol.byte_range.1 as usize,
+    );
+    if start > end || end > file_content.len() {
+        return false;
+    }
+    let line_start = file_content[..start]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |position| position + 1);
+    let before = file_content[line_start..start].trim_ascii_end();
+    let after = file_content[end..]
+        .iter()
+        .find(|byte| !matches!(byte, b' ' | b'\t'));
+    !before.is_empty() && (before.ends_with(b",") || after == Some(&b','))
+}
+
+pub(crate) fn refuse_list_member(
+    member: Option<ListMember>,
+    symbol: &SymbolRecord,
+) -> Result<(), String> {
+    if member.is_some() {
+        return Err(format!(
+            "Cannot insert next to `{}`: it shares one declaration with its siblings; insert relative to a whole statement instead",
+            symbol.name
+        ));
+    }
+    Ok(())
+}
 // ---------------------------------------------------------------------------
 // Core splice
 // ---------------------------------------------------------------------------
@@ -200,6 +472,100 @@ fn common_leading_whitespace<'a>(lines: &[&'a str]) -> &'a str {
         }
     }
     common.unwrap_or("")
+}
+
+pub(crate) fn indent_replacement(
+    file_content: &[u8],
+    symbol: &SymbolRecord,
+    body: &str,
+    indent: &[u8],
+    line_ending: LineEnding,
+) -> Vec<u8> {
+    if !carries_file_indentation(file_content, symbol, body, indent) {
+        return apply_indentation(body, indent, line_ending);
+    }
+    let mut indented = indent.to_vec();
+    indented.extend_from_slice(&normalize_line_endings(body.as_bytes(), line_ending));
+    indented
+}
+
+fn leads_with_marker(line: &[u8]) -> bool {
+    let line = line.trim_ascii_start();
+    [&b"@"[..], b"///", b"//!", b"/*", b"*", b"#["]
+        .iter()
+        .any(|marker| line.starts_with(marker))
+}
+
+fn nonblank_lines(text: &[u8]) -> impl Iterator<Item = &[u8]> {
+    text.split(|&byte| byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter(|line| !line.trim_ascii().is_empty())
+}
+
+fn leading_width(line: &[u8]) -> usize {
+    line.len() - line.trim_ascii_start().len()
+}
+
+fn carries_file_indentation(
+    file_content: &[u8],
+    symbol: &SymbolRecord,
+    body: &str,
+    indent: &[u8],
+) -> bool {
+    let mut body_lines = nonblank_lines(body.as_bytes());
+    let Some(first) = body_lines.next() else {
+        return false;
+    };
+    let rest: Vec<&[u8]> = body_lines.collect();
+    let Some(second) = rest.first() else {
+        return false;
+    };
+    if indent.is_empty()
+        || leading_width(first) != 0
+        || !rest.iter().all(|line| line.starts_with(indent))
+    {
+        return false;
+    }
+    let brings_marker = leads_with_marker(first);
+    let start = if brings_marker {
+        symbol.effective_start()
+    } else {
+        symbol.byte_range.0
+    } as usize;
+    let end = symbol.byte_range.1 as usize;
+    let Some(current) = file_content.get(start..end) else {
+        return false;
+    };
+    let line_start = file_content[..start]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |position| position + 1);
+    let lead = &file_content[line_start..start];
+    if !lead.trim_ascii().is_empty() {
+        return false;
+    }
+    let mut current_lines: Vec<(usize, &[u8])> = Vec::new();
+    for (index, line) in nonblank_lines(current).enumerate() {
+        let width = if index == 0 {
+            lead.len()
+        } else {
+            leading_width(line)
+        };
+        current_lines.push((width, line));
+    }
+    if !brings_marker {
+        let skip = current_lines
+            .iter()
+            .take_while(|(_, line)| leads_with_marker(line))
+            .count();
+        current_lines.drain(..skip);
+    }
+    match current_lines.as_slice() {
+        [(first_width, _), (second_width, _), ..] => {
+            *first_width > 0 && leading_width(second) == *second_width
+        }
+        _ => false,
+    }
 }
 
 /// Re-column `text` to `indent`: strip the body's uniform base indent, then
@@ -537,8 +903,9 @@ pub(crate) fn build_delete(
     file_content: &[u8],
     sym: &SymbolRecord,
     line_ending: LineEnding,
+    member: Option<ListMember>,
 ) -> Vec<u8> {
-    let (start, end) = delete_source_range(file_content, sym, line_ending);
+    let (start, end) = delete_source_range(file_content, sym, line_ending, member);
     let spliced = apply_splice(file_content, (start, end), b"");
     collapse_blank_lines(&spliced, line_ending)
 }
@@ -547,7 +914,11 @@ pub(crate) fn delete_source_range(
     file_content: &[u8],
     sym: &SymbolRecord,
     line_ending: LineEnding,
+    member: Option<ListMember>,
 ) -> (u32, u32) {
+    if let Some(member) = member {
+        return member.delete;
+    }
     // Extend to start of line (include leading whitespace, attached attributes,
     // and orphaned doc comments).
     let start = {
@@ -597,6 +968,29 @@ pub(crate) fn delete_source_range(
     (start, end)
 }
 
+fn inline_member_delete_range(file_content: &[u8], sym: &SymbolRecord) -> (u32, u32) {
+    let (start, end) = (sym.byte_range.0 as usize, sym.byte_range.1 as usize);
+    let blank = |byte: &u8| matches!(byte, b' ' | b'\t');
+    let after = end + file_content[end..].iter().take_while(|b| blank(b)).count();
+    if file_content.get(after) == Some(&b',') {
+        let next = after
+            + 1
+            + file_content[after + 1..]
+                .iter()
+                .take_while(|b| blank(b))
+                .count();
+        return (start as u32, next as u32);
+    }
+    let before = start
+        - file_content[..start]
+            .iter()
+            .rev()
+            .take_while(|b| blank(b))
+            .count();
+    let comma = before.saturating_sub(1);
+    (comma as u32, end as u32)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum SpliceFootprint {
     Bytes(u32, u32),
@@ -621,8 +1015,9 @@ pub(crate) fn delete_cleanup_ranges(
     file_content: &[u8],
     sym: &SymbolRecord,
     line_ending: LineEnding,
+    member: Option<ListMember>,
 ) -> Vec<(u32, u32)> {
-    let (start, end) = delete_source_range(file_content, sym, line_ending);
+    let (start, end) = delete_source_range(file_content, sym, line_ending, member);
     let spliced = apply_splice(file_content, (start, end), b"");
     let mut removed = Vec::new();
     match line_ending {
@@ -1064,6 +1459,56 @@ pub(crate) fn select_edit_within_body(
 mod rust_insert_boundary_tests {
     use super::*;
     use crate::domain::LanguageId;
+
+    fn list_symbol(source: &str, text: &str) -> SymbolRecord {
+        let start = source.find(text).unwrap() as u32;
+        SymbolRecord {
+            name: text.to_string(),
+            kind: crate::domain::SymbolKind::Variable,
+            depth: 1,
+            sort_order: 0,
+            byte_range: (start, start + text.len() as u32),
+            line_range: (0, 0),
+            doc_byte_range: None,
+            item_byte_range: None,
+        }
+    }
+
+    #[test]
+    fn one_line_list_members_of_other_languages_splice_only_their_own_bytes() {
+        for (path, language, source, member, replacement, replaced, deleted) in [
+            (
+                "a.rs",
+                LanguageId::Rust,
+                "enum Color { Red, Green, Blue }\n",
+                "Green",
+                "Teal",
+                "enum Color { Red, Teal, Blue }\n",
+                "enum Color { Red, Blue }\n",
+            ),
+            (
+                "a.json",
+                LanguageId::Json,
+                "{\"a\": 1, \"b\": 2}\n",
+                "\"a\": 1",
+                "\"a\": 3",
+                "{\"a\": 3, \"b\": 2}\n",
+                "{\"b\": 2}\n",
+            ),
+        ] {
+            let symbol = list_symbol(source, member);
+            let member_of = list_member(
+                &SourceTree::new(source.as_bytes(), &language, path),
+                &symbol,
+            );
+            assert!(member_of.is_some(), "{path}");
+            let prepared =
+                prepare_replace(source.as_bytes(), &symbol, replacement, member_of).unwrap();
+            assert_eq!(String::from_utf8(prepared.new_content).unwrap(), replaced);
+            let removed = build_delete(source.as_bytes(), &symbol, LineEnding::Lf, member_of);
+            assert_eq!(String::from_utf8(removed).unwrap(), deleted);
+        }
+    }
 
     fn target(source: &str) -> SymbolRecord {
         let (symbols, _, _, _, _) =

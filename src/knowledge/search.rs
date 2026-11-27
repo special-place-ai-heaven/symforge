@@ -725,6 +725,7 @@ mod tests {
             health: Arc::clone(&generation.health),
             outline: Arc::clone(&generation.outline),
             memory_counts: std::sync::OnceLock::new(),
+            code_mode_withheld: std::sync::OnceLock::new(),
         }
     }
 
@@ -1108,6 +1109,7 @@ mod tests {
             health: Arc::new(health),
             outline: Arc::clone(&generation.outline),
             memory_counts: std::sync::OnceLock::new(),
+            code_mode_withheld: std::sync::OnceLock::new(),
         }
     }
 
@@ -1351,6 +1353,7 @@ mod tests {
             health: Arc::clone(&current.health),
             outline: Arc::clone(&current.outline),
             memory_counts: std::sync::OnceLock::new(),
+            code_mode_withheld: std::sync::OnceLock::new(),
         };
 
         let output = search_current(&unsafe_generation, &input("checkpoint evidence"));

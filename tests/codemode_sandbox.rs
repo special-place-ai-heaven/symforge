@@ -96,6 +96,36 @@ print("checked", len(refs), "refs")
 }
 
 #[test]
+fn rendered_idioms_example_runs_in_monty() {
+    let guide = render_idioms();
+    let (_, fence) = guide.split_once("```python\n").expect("worked example");
+    let (script, _) = fence.split_once("\n```").expect("closing fence");
+    let backend = |op: CodeReadOp, kwargs: Map<String, Value>| {
+        if op == CodeReadOp::FindReferences {
+            let row = |line| json!({"path":"src/a.ts", "enclosing_symbol":"render", "caller_kind":"method", "enclosing_line":line});
+            return Ok(json!([row(4), row(4), row(19)]));
+        }
+        if op == CodeReadOp::GetSymbol {
+            let targets = kwargs["targets"].as_array().unwrap();
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[0]["symbol_line"], 4);
+            assert_eq!(targets[1]["symbol_line"], 19);
+            assert_eq!(targets[1]["kind"], "method");
+        }
+        mock_backend(op, kwargs)
+    };
+    let out = CodeModeRunner::default().execute(script, &backend);
+    assert_eq!(out.status, ExecuteStatus::Ok, "{:?}", out.error);
+    assert_eq!(out.calls, 3);
+    let result = out.value.expect("example output");
+    assert_eq!(result["visible_caller_count"], 2);
+    assert_eq!(
+        result["caller_bodies"][0]["source"],
+        "fn call_tool() { /* batch=2 */ }"
+    );
+}
+
+#[test]
 fn positional_arguments_raise_type_error_with_signature_hint() {
     let runner = CodeModeRunner::default();
     let out = runner.execute(r#"search_symbols("foo")"#, &mock_backend);
@@ -260,6 +290,58 @@ fn oversized_output_spills_losslessly_to_disk_and_caps_inline_preview() {
         saved["value"]["big"].as_str().map(|s| s.chars().count()),
         Some(4000)
     );
+}
+
+struct CappedBackend;
+
+impl symforge::codemode::CodeReadBackend for CappedBackend {
+    fn execute_op(
+        &self,
+        op: CodeReadOp,
+        kwargs: Map<String, Value>,
+    ) -> Result<Value, CodeBackendError> {
+        mock_backend(op, kwargs)
+    }
+
+    fn execute_op_with_completeness(
+        &self,
+        op: CodeReadOp,
+        kwargs: Map<String, Value>,
+    ) -> Result<symforge::codemode::CodeReadResult, CodeBackendError> {
+        Ok(symforge::codemode::CodeReadResult {
+            value: mock_backend(op, kwargs)?,
+            completeness: symforge::codemode::CodeReadCompleteness {
+                omitted_rows: 7,
+                ..Default::default()
+            },
+        })
+    }
+}
+
+#[test]
+fn spill_files_carry_the_host_call_notices() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    for code in [
+        "find_references(name='x')\n{'big': 'é' * 4000}",
+        "find_references(name='x')\nprint('é' * 4000)\n1/0",
+    ] {
+        let req = ExecuteRequest {
+            code: code.to_owned(),
+            limits: CodeModeLimits {
+                max_output_chars: 512,
+                ..CodeModeLimits::default()
+            },
+            spill_dir: Some(temp.path().to_path_buf()),
+        };
+        let out = execute_script(&req, &CappedBackend);
+        assert_eq!(out.notices.len(), 1, "{code}");
+        let spill = out.spill_path.expect("spill_path present");
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(&spill).expect("read spill"))
+                .expect("parse spill");
+        assert_eq!(saved["notices"][0]["op"], "find_references", "{code}");
+        assert_eq!(saved["notices"][0]["omitted_rows"], 7, "{code}");
+    }
 }
 
 #[test]

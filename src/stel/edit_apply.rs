@@ -56,6 +56,7 @@ pub struct ResolvedEditSymbol {
     pub line_start: u32,
     pub line_end: u32,
     pub current_body: String,
+    pub shown_body: String,
 }
 
 /// Outcome of guarded pre-apply validation.
@@ -153,7 +154,7 @@ pub fn run_pre_apply_gates_on_ready(
             && request
                 .body
                 .as_deref()
-                .is_some_and(|body| body == resolved.current_body)
+                .is_some_and(|body| body == resolved.current_body || body == resolved.shown_body)
         {
             return Ok(PreApplyOutcome::AlreadyApplied(resolved));
         }
@@ -239,6 +240,13 @@ fn resolve_symbol_in_file(
             let current_body = std::str::from_utf8(body_bytes)
                 .map_err(|_| EditValidationError::new("symbol body is not valid UTF-8"))?
                 .to_string();
+            let (shown_start, shown_end) = sym.display_span(Some(file.language));
+            let shown_body = file
+                .content
+                .get(shown_start..shown_end)
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .unwrap_or_default()
+                .to_string();
             Ok(ResolvedEditSymbol {
                 path: path.to_string(),
                 name: name.to_string(),
@@ -247,6 +255,7 @@ fn resolve_symbol_in_file(
                 line_start: sym.line_range.0 + 1,
                 line_end: sym.line_range.1 + 1,
                 current_body,
+                shown_body,
             })
         }
     }

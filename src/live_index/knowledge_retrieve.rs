@@ -1134,6 +1134,7 @@ mod tests {
             health: Arc::clone(&generation.health),
             outline: Arc::clone(&generation.outline),
             memory_counts: std::sync::OnceLock::new(),
+            code_mode_withheld: std::sync::OnceLock::new(),
         };
         let result = retrieve_one(&unsafe_generation, &request("checkpoint evidence"));
         assert!(

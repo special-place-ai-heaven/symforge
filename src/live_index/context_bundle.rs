@@ -159,8 +159,7 @@ impl LiveIndex {
             }
         };
 
-        let start = sym_rec.effective_start() as usize;
-        let end = sym_rec.item_end() as usize;
+        let (start, end) = sym_rec.context_span(file.language);
         let clamped_end = end.min(file.content.len());
         let clamped_start = start.min(clamped_end);
         let body = String::from_utf8_lossy(&file.content[clamped_start..clamped_end]).into_owned();

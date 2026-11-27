@@ -6,6 +6,8 @@ use tree_sitter::{Language, Node, Query, QueryCursor};
 
 use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord};
 
+pub(crate) mod callable_values;
+
 // ---------------------------------------------------------------------------
 // Per-language query strings
 // ---------------------------------------------------------------------------
@@ -1899,6 +1901,13 @@ pub fn extract_references(
         references.extend(value_refs);
         let string_refs = extract_python_string_type_refs(root, source, &ts_language, &references);
         references.extend(string_refs);
+    }
+
+    if matches!(
+        language,
+        LanguageId::Python | LanguageId::JavaScript | LanguageId::TypeScript
+    ) {
+        callable_values::extract(*root, source, *language, is_tsx, &mut references);
     }
 
     (references, alias_map)

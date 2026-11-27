@@ -66,12 +66,60 @@ pub struct DaemonCodeQueryRequest {
     pub project: Option<String>,
 }
 
+/// Observed omissions from one row-producing call, separate from its script value.
+/// `omitted_rows` counts observed eligible rows clipped by limits, not withheld
+/// files. It is only a lower bound when `omitted_rows_inexact` is true.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeReadCompleteness {
+    pub omitted_rows: usize,
+    pub withheld_files: usize,
+    pub unparsed_files: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub omitted_rows_inexact: bool,
+    /// Files whose grammar cannot express the query. Informational: they cannot
+    /// hold a match, so they never count as unparsed and never raise a notice alone.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub incompatible_grammar_files: usize,
+    /// Returned rows whose source was cut by a token budget.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub truncated_rows: usize,
+}
+
+fn is_false(flag: &bool) -> bool {
+    !*flag
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
+}
+
+impl CodeReadCompleteness {
+    pub fn is_empty(&self) -> bool {
+        Self {
+            incompatible_grammar_files: 0,
+            ..*self
+        } == Self::default()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CodeReadResult {
+    pub value: Value,
+    pub completeness: CodeReadCompleteness,
+}
+
 /// Wire reply returned by `POST /v1/sessions/{session_id}/code-query`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DaemonCodeQueryResponse {
-    Ok { value: Value },
-    Error { error: CodeBackendError },
+    Ok {
+        value: Value,
+        #[serde(default, skip_serializing_if = "CodeReadCompleteness::is_empty")]
+        completeness: CodeReadCompleteness,
+    },
+    Error {
+        error: CodeBackendError,
+    },
 }
 
 /// Transport-neutral read-only query backend for `CodeModeRunner` and `symforge q`.
@@ -81,6 +129,17 @@ pub trait CodeReadBackend: Send + Sync {
         op: CodeReadOp,
         kwargs: Map<String, Value>,
     ) -> Result<Value, CodeBackendError>;
+
+    fn execute_op_with_completeness(
+        &self,
+        op: CodeReadOp,
+        kwargs: Map<String, Value>,
+    ) -> Result<CodeReadResult, CodeBackendError> {
+        self.execute_op(op, kwargs).map(|value| CodeReadResult {
+            value,
+            completeness: CodeReadCompleteness::default(),
+        })
+    }
 }
 
 impl<F> CodeReadBackend for F
@@ -239,6 +298,15 @@ impl CodeReadBackend for LocalCodeBackend {
         op: CodeReadOp,
         kwargs: Map<String, Value>,
     ) -> Result<Value, CodeBackendError> {
+        self.execute_op_with_completeness(op, kwargs)
+            .map(|result| result.value)
+    }
+
+    fn execute_op_with_completeness(
+        &self,
+        op: CodeReadOp,
+        kwargs: Map<String, Value>,
+    ) -> Result<CodeReadResult, CodeBackendError> {
         let (generation, source_set) = self.snapshot_pair();
         execute_op_on_generation(
             op,
@@ -259,12 +327,40 @@ impl CodeReadBackend for LocalCodeBackend {
 /// byte-identical structured JSON.
 pub fn execute_op_on_generation(
     op: CodeReadOp,
+    kwargs: Map<String, Value>,
+    generation: &Arc<PublishedGeneration>,
+    source_set: &Arc<PublishedSourceSet>,
+    repo_root: Option<&Path>,
+    project_name: &str,
+    on_commitment_read: &dyn Fn(&str),
+) -> Result<CodeReadResult, CodeBackendError> {
+    let mut completeness = CodeReadCompleteness::default();
+    let value = execute_value_on_generation(
+        op,
+        kwargs,
+        generation,
+        source_set,
+        repo_root,
+        project_name,
+        on_commitment_read,
+        &mut completeness,
+    )?;
+    Ok(CodeReadResult {
+        value,
+        completeness,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_value_on_generation(
+    op: CodeReadOp,
     mut kwargs: Map<String, Value>,
     generation: &Arc<PublishedGeneration>,
     source_set: &Arc<PublishedSourceSet>,
     repo_root: Option<&Path>,
     project_name: &str,
     on_commitment_read: &dyn Fn(&str),
+    completeness: &mut CodeReadCompleteness,
 ) -> Result<Value, CodeBackendError> {
     // Strip optional caller `project` if present after routing.
     kwargs.remove("project");
@@ -304,12 +400,30 @@ pub fn execute_op_on_generation(
                     "sensitive query rejected by repository safety policy",
                 ));
             }
-            let exec = crate::index_lifecycle::guidance::search::execute_symbol_search(
-                &generation.live,
-                &input,
-            )
-            .map_err(CodeBackendError::invalid_args)?;
+            let refused = search_refusal_predicate(generation);
+            let exec =
+                crate::index_lifecycle::guidance::search::execute_symbol_search_for_code_mode(
+                    &generation.live,
+                    &input,
+                    &refused,
+                )
+                .map_err(CodeBackendError::invalid_args)?;
 
+            completeness.omitted_rows = exec.result.overflow_count;
+            completeness.withheld_files = crate::live_index::search::count_code_mode_withheld(
+                &generation.live,
+                &crate::live_index::search::TextSearchOptions {
+                    path_scope: exec.options.path_scope,
+                    search_scope: exec.options.search_scope,
+                    noise_policy: exec.options.noise_policy,
+                    include_personal_tooling: exec.options.include_personal_tooling,
+                    language_filter: exec.options.language_filter,
+                    ..Default::default()
+                },
+                code_mode_withheld(generation),
+                false,
+            )
+            .map_err(|err| CodeBackendError::invalid_args(format!("{err:?}")))?;
             let mut out = Vec::with_capacity(exec.result.hits.len());
             for hit in &exec.result.hits {
                 let tier = match hit.tier {
@@ -407,6 +521,51 @@ pub fn execute_op_on_generation(
                     }]
                 };
 
+            let max_bytes = input
+                .max_tokens
+                .filter(|t| *t > 0)
+                .map(|t| (t as usize).saturating_mul(4));
+            let source_row = |path: &str,
+                              name: &str,
+                              kind: &str,
+                              symbol_line: Option<u32>,
+                              content: &[u8],
+                              (start, end): (usize, usize)| {
+                let start = start.min(content.len());
+                let end = end.clamp(start, content.len());
+                let mut source = String::from_utf8_lossy(&content[start..end]).into_owned();
+                let truncated = if let Some(max_bytes) = max_bytes.filter(|&n| n < source.len()) {
+                    source.truncate(source.floor_char_boundary(max_bytes));
+                    true
+                } else {
+                    false
+                };
+                let (start_line, end_line) =
+                    crate::index_lifecycle::guidance::symbol_read::displayed_line_range(
+                        content,
+                        start,
+                        source.as_bytes(),
+                    );
+                let mut row = json!({
+                    "path": path,
+                    "name": name,
+                    "kind": kind,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "source": source,
+                    "refusal": Value::Null,
+                    "withheld_reason": Value::Null,
+                });
+                if let Some(symbol_line) = symbol_line {
+                    row["symbol_line"] = json!(symbol_line);
+                }
+                if truncated {
+                    row["truncated"] = json!(true);
+                }
+                on_commitment_read(path);
+                row
+            };
+
             let mut results = Vec::with_capacity(targets.len());
             for target in targets {
                 let norm_path =
@@ -462,29 +621,15 @@ pub fn execute_op_on_generation(
                         target.symbol_line,
                     ) {
                         SymbolSelectorMatch::Selected(_idx, sym) => {
-                            let start = (sym.effective_start() as usize).min(file.content.len());
-                            let end = (sym.byte_range.1 as usize)
-                                .min(file.content.len())
-                                .max(start);
-                            let mut src =
-                                String::from_utf8_lossy(&file.content[start..end]).into_owned();
-                            if let Some(max_tok) = input.max_tokens.filter(|t| *t > 0) {
-                                let max_bytes = (max_tok as usize).saturating_mul(4);
-                                if src.len() > max_bytes {
-                                    src.truncate(src.floor_char_boundary(max_bytes));
-                                }
-                            }
-                            on_commitment_read(&norm_path);
-                            results.push(json!({
-                                "path": norm_path,
-                                "name": sym.name,
-                                "kind": sym.kind.to_string(),
-                                "start_line": sym.line_range.0.saturating_add(1),
-                                "end_line": sym.line_range.1.saturating_add(1),
-                                "source": src,
-                                "refusal": Value::Null,
-                                "withheld_reason": Value::Null,
-                            }));
+                            let span = sym.display_span(Some(file.language));
+                            results.push(source_row(
+                                &norm_path,
+                                &sym.name,
+                                &sym.kind.to_string(),
+                                Some(sym.line_range.0 + 1),
+                                &file.content,
+                                span,
+                            ));
                         }
                         SymbolSelectorMatch::NotFound => {
                             results.push(json!({
@@ -512,44 +657,25 @@ pub fn execute_op_on_generation(
                         }
                     }
                 } else if let Some(sb) = target.start_byte {
-                    let start = (sb as usize).min(file.content.len());
-                    let end = target
-                        .end_byte
-                        .map_or(file.content.len(), |eb| {
-                            (eb as usize).min(file.content.len())
-                        })
-                        .max(start);
-                    let start_line = 1 + file.content[..start]
-                        .iter()
-                        .filter(|b| **b == b'\n')
-                        .count();
-                    let mut src = String::from_utf8_lossy(&file.content[start..end]).into_owned();
-                    if let Some(max_tok) = input.max_tokens.filter(|t| *t > 0) {
-                        let max_bytes = (max_tok as usize).saturating_mul(4);
-                        if src.len() > max_bytes {
-                            src.truncate(src.floor_char_boundary(max_bytes));
-                        }
-                    }
-                    let end_line = start_line
-                        + src.as_bytes().iter().filter(|b| **b == b'\n').count()
-                        - usize::from(src.ends_with('\n') && src.len() > 1);
-                    on_commitment_read(&norm_path);
-                    results.push(json!({
-                        "path": norm_path,
-                        "name": "",
-                        "kind": "slice",
-                        "start_line": start_line,
-                        "end_line": end_line.max(start_line),
-                        "source": src,
-                        "refusal": Value::Null,
-                        "withheld_reason": Value::Null,
-                    }));
+                    let end = target.end_byte.map_or(file.content.len(), |eb| eb as usize);
+                    results.push(source_row(
+                        &norm_path,
+                        "",
+                        "slice",
+                        None,
+                        &file.content,
+                        (sb as usize, end),
+                    ));
                 } else {
                     return Err(CodeBackendError::invalid_args(
                         "each target requires `name` or `start_byte`",
                     ));
                 }
             }
+            completeness.truncated_rows = results
+                .iter()
+                .filter(|row| row.get("truncated") == Some(&Value::Bool(true)))
+                .count();
             Ok(Value::Array(results))
         }
 
@@ -565,6 +691,8 @@ pub fn execute_op_on_generation(
                     "sensitive query rejected by repository safety policy",
                 ));
             }
+            let live = &generation.live;
+            let refuse = search_refusal_predicate(generation);
             if input.mode.as_deref() == Some("implementations") {
                 if context > 0 {
                     return Err(CodeBackendError::invalid_args(
@@ -575,8 +703,19 @@ pub fn execute_op_on_generation(
                 let impls = generation
                     .live
                     .capture_implementations_view(&input.name, input.direction.as_deref());
-                let rows: Vec<Value> = impls
-                    .entries
+                let mut refused =
+                    withheld_reference_corpus(live, code_mode_withheld(generation), None, None);
+                let mut entries = impls.entries;
+                entries.retain(|entry| {
+                    let admitted = !refuse(&entry.file_path);
+                    if !admitted {
+                        refused.insert(entry.file_path.clone());
+                    }
+                    admitted
+                });
+                completeness.withheld_files = refused.len();
+                completeness.omitted_rows = entries.len().saturating_sub(cap);
+                let rows: Vec<Value> = entries
                     .into_iter()
                     .take(cap)
                     .map(|entry| {
@@ -603,37 +742,75 @@ pub fn execute_op_on_generation(
                 input.limit.unwrap_or(20),
                 input.max_per_file.unwrap_or(10),
             );
-            let view = if let Some(path) = input.path.as_deref() {
-                let norm =
-                    crate::index_lifecycle::guidance::read_gate::normalize_requested_path(path);
-                generation
-                    .live
-                    .capture_find_references_view_for_symbol_with_context(
-                        &norm,
-                        &input.name,
-                        input.symbol_kind.as_deref(),
-                        input.symbol_line,
-                        input.kind.as_deref(),
-                        limits.total_hits,
-                        context.max(crate::live_index::query::REFERENCE_CONTEXT_LINES),
-                    )
-                    .map_err(CodeBackendError::invalid_args)?
-            } else {
-                generation.live.capture_find_references_view_with_context(
+            let kind = crate::live_index::disambiguation::parse_reference_kind_filter(
+                input.kind.as_deref(),
+            );
+            let target = input
+                .path
+                .as_deref()
+                .map(crate::index_lifecycle::guidance::read_gate::normalize_requested_path);
+            let refs = if let Some(path) = target.as_deref() {
+                if refuse(path) {
+                    return Err(CodeBackendError::refusal(
+                        "policy_withheld",
+                        "target excluded by repository safety policy",
+                    ));
+                }
+                live.find_exact_references_for_symbol(
+                    path,
                     &input.name,
-                    input.kind.as_deref(),
-                    limits.total_hits,
-                    context.max(crate::live_index::query::REFERENCE_CONTEXT_LINES),
+                    input.symbol_kind.as_deref(),
+                    input.symbol_line,
+                    kind,
                 )
+                .map_err(CodeBackendError::invalid_args)?
+            } else {
+                live.find_references_for_name(&input.name, kind, false)
             };
-
-            let mut out = Vec::new();
-            for file in view.files.into_iter().take(limits.max_files) {
-                if check_secret_or_scope_refusal(&generation.live, &file.file_path).is_some() {
+            let mut by_file = std::collections::HashMap::<String, Vec<_>>::new();
+            for reference in refs {
+                by_file
+                    .entry(reference.0.to_owned())
+                    .or_default()
+                    .push(reference);
+            }
+            let target_lang = target
+                .as_deref()
+                .and_then(|p| live.get_file(p))
+                .map(|f| f.language);
+            let mut withheld =
+                withheld_reference_corpus(live, code_mode_withheld(generation), target_lang, None);
+            let mut selected = Vec::new();
+            let mut shown_files = 0;
+            for path in
+                live.order_find_references_file_paths_fair(by_file.keys().cloned().collect())
+            {
+                let mut refs = by_file.remove(&path).expect("ordered reference path");
+                if refuse(&path) {
+                    withheld.insert(path);
                     continue;
                 }
+                let keep = if shown_files < limits.max_files {
+                    shown_files += 1;
+                    refs.len().min(limits.max_per_file)
+                } else {
+                    0
+                };
+                completeness.omitted_rows += refs.len() - keep;
+                refs.sort_by_key(|(_, r)| (r.line_range.0, r.byte_range.0));
+                selected.extend(refs.into_iter().take(keep));
+            }
+            completeness.withheld_files = withheld.len();
+            let view = live.build_find_references_view(
+                &selected,
+                limits.total_hits,
+                &input.name,
+                context.max(crate::live_index::query::REFERENCE_CONTEXT_LINES),
+            );
+            let mut out = Vec::new();
+            for file in view.files {
                 let idx_file = generation.live.get_file(&file.file_path);
-                for hit in file.hits.into_iter().take(limits.max_per_file) {
+                for hit in file.hits {
                     if let Some(ref_line) = hit.context_lines.iter().find(|l| l.is_reference_line) {
                         let (enc_name, enc_kind, enc_line) = idx_file
                             .and_then(|f| {
@@ -686,26 +863,58 @@ pub fn execute_op_on_generation(
             }
             let max_files = input.limit.unwrap_or(20).clamp(1, 100) as usize;
             let max_per_file = input.max_per_file.unwrap_or(10).clamp(1, 50) as usize;
-            let view = generation.live.capture_find_dependents_view(&norm_path);
+            let live = &generation.live;
+            let Some(target_file) = live.get_file(&norm_path) else {
+                if live.capture_file_disposition(&norm_path).is_some() {
+                    completeness.withheld_files = 1;
+                    return Ok(Value::Array(Vec::new()));
+                }
+                return Err(CodeBackendError::refusal(
+                    "not_found",
+                    format!("File not in the index: {norm_path}"),
+                ));
+            };
+            let refuse = search_refusal_predicate(generation);
+            let mut withheld = withheld_reference_corpus(
+                live,
+                code_mode_withheld(generation),
+                Some(target_file.language),
+                Some(&norm_path),
+            );
+            let view = live.capture_find_dependents_view(&norm_path);
             let mut out = Vec::new();
-            for file in view.files.into_iter().take(max_files) {
-                if check_secret_or_scope_refusal(&generation.live, &file.file_path).is_some() {
+            let mut shown_files = 0;
+            let name = input.name.as_deref().filter(|name| !name.is_empty());
+            for file in view.files {
+                let mut lines = file.lines;
+                lines.retain(|line| name.is_none_or(|name| line.name == name));
+                if lines.is_empty() {
                     continue;
                 }
-                if let Some(dep_file) = generation.live.get_file(&file.file_path)
-                    && check_bytes_admission(&generation.live, &file.file_path, &dep_file.content)
-                        .is_some()
+                if refuse(&file.file_path)
+                    || generation
+                        .live
+                        .get_file(&file.file_path)
+                        .is_some_and(|dep_file| {
+                            check_bytes_admission(
+                                &generation.live,
+                                &file.file_path,
+                                &dep_file.content,
+                            )
+                            .is_some()
+                        })
                 {
+                    withheld.insert(file.file_path);
                     continue;
                 }
-                let filtered_lines = file.lines.into_iter().filter(|line| {
-                    input
-                        .name
-                        .as_deref()
-                        .filter(|n| !n.is_empty())
-                        .is_none_or(|filter_name| line.name == filter_name)
-                });
-                for line in filtered_lines.take(max_per_file) {
+                let keep = if shown_files < max_files {
+                    shown_files += 1;
+                    lines.len().min(max_per_file)
+                } else {
+                    0
+                };
+                completeness.omitted_rows += lines.len() - keep;
+                for line in lines.into_iter().take(keep) {
                     out.push(json!({
                         "path": file.file_path,
                         "line": line.line_number,
@@ -715,6 +924,7 @@ pub fn execute_op_on_generation(
                     }));
                 }
             }
+            completeness.withheld_files = withheld.len();
             Ok(Value::Array(out))
         }
 
@@ -894,40 +1104,52 @@ pub fn execute_op_on_generation(
                     "sensitive query rejected by repository safety policy",
                 ));
             }
-            let exec =
-                crate::index_lifecycle::guidance::search::execute_text_search(generation, &input)
-                    .map_err(CodeBackendError::invalid_args)?;
+            let refused = search_refusal_predicate(generation);
+            let exec = crate::index_lifecycle::guidance::search::execute_text_search_for_code_mode(
+                generation, &input, &refused,
+            )
+            .map_err(CodeBackendError::invalid_args)?;
             let res = exec
                 .result
                 .map_err(|e| CodeBackendError::invalid_args(format!("{e:?}")))?;
+            completeness.withheld_files = crate::live_index::search::count_code_mode_withheld(
+                &generation.live,
+                &exec.options,
+                code_mode_withheld(generation),
+                exec.structural,
+            )
+            .map_err(|e| CodeBackendError::invalid_args(format!("{e:?}")))?;
+            completeness.unparsed_files = res.unparsed_files;
+            completeness.omitted_rows_inexact = res.unparsed_files != 0;
+            completeness.incompatible_grammar_files = exec.incompatible_grammar_files;
 
             if input.group_by.as_deref() == Some("count") {
                 let cap = input.limit.unwrap_or(200).clamp(1, 1000) as usize;
                 let mut counts: Vec<Value> = Vec::new();
-                for file in res.files {
-                    if check_secret_or_scope_refusal(&generation.live, &file.path).is_some() {
-                        continue;
-                    }
-                    if file.matches.is_empty() {
-                        continue;
-                    }
+                completeness.omitted_rows = res
+                    .files
+                    .iter()
+                    .filter(|file| !file.matches.is_empty())
+                    .count()
+                    .saturating_sub(cap);
+                let files = res
+                    .files
+                    .into_iter()
+                    .filter(|file| !file.matches.is_empty());
+                for file in files.take(cap) {
                     counts.push(json!({
                         "path": file.path,
                         "count": file.matches.len(),
                     }));
-                    if counts.len() >= cap {
-                        break;
-                    }
                 }
                 return Ok(Value::Array(counts));
             }
 
             let cap = input.limit.unwrap_or(50).clamp(1, 500) as usize;
+            let available: usize = res.files.iter().map(|file| file.matches.len()).sum();
+            completeness.omitted_rows = res.overflow_count + available.saturating_sub(cap);
             let mut out = Vec::new();
             for file in res.files {
-                if check_secret_or_scope_refusal(&generation.live, &file.path).is_some() {
-                    continue;
-                }
                 for m in file.matches {
                     if out.len() >= cap {
                         break;
@@ -1015,25 +1237,35 @@ pub fn execute_op_on_generation(
                 &scope,
             );
             let out = match view {
-                SearchFilesView::Found { hits, .. } => hits
-                    .into_iter()
-                    .map(|h| {
-                        let tier = match h.tier {
-                            crate::live_index::query::SearchFilesTier::CoChange => "co_change",
-                            crate::live_index::query::SearchFilesTier::StrongPath => "strong_path",
-                            crate::live_index::query::SearchFilesTier::Basename => "basename",
-                            crate::live_index::query::SearchFilesTier::LoosePath => "loose_path",
-                            crate::live_index::query::SearchFilesTier::MetadataOnly => {
-                                "metadata_only"
-                            }
-                        };
-                        json!({
-                            "path": h.path,
-                            "tier": tier,
-                            "coupling_score": h.coupling_score,
+                SearchFilesView::Found {
+                    hits,
+                    overflow_count,
+                    ..
+                } => {
+                    completeness.omitted_rows = overflow_count;
+                    hits.into_iter()
+                        .map(|h| {
+                            let tier = match h.tier {
+                                crate::live_index::query::SearchFilesTier::CoChange => "co_change",
+                                crate::live_index::query::SearchFilesTier::StrongPath => {
+                                    "strong_path"
+                                }
+                                crate::live_index::query::SearchFilesTier::Basename => "basename",
+                                crate::live_index::query::SearchFilesTier::LoosePath => {
+                                    "loose_path"
+                                }
+                                crate::live_index::query::SearchFilesTier::MetadataOnly => {
+                                    "metadata_only"
+                                }
+                            };
+                            json!({
+                                "path": h.path,
+                                "tier": tier,
+                                "coupling_score": h.coupling_score,
+                            })
                         })
-                    })
-                    .collect(),
+                        .collect()
+                }
                 _ => Vec::new(),
             };
             Ok(Value::Array(out))
@@ -1201,6 +1433,19 @@ pub fn execute_op_on_generation(
                             .filter(|e| include_tests_flag || !is_test_entry(&e.file_path))
                             .collect();
                     let total_callers = filtered_callers.len();
+                    let section_omitted =
+                        |sec: &crate::live_index::ContextBundleSectionView| -> usize {
+                            sec.overflow_count
+                                + sec
+                                    .entries
+                                    .iter()
+                                    .filter(|e| include_tests_flag || !is_test_entry(&e.file_path))
+                                    .count()
+                                    .saturating_sub(CODE_MODE_SECTION_CAP)
+                        };
+                    completeness.omitted_rows = total_callers.saturating_sub(CODE_MODE_CALLERS_CAP)
+                        + section_omitted(&found.callees)
+                        + section_omitted(&found.type_usages);
                     let callers_json: Vec<Value> = filtered_callers
                         .into_iter()
                         .take(CODE_MODE_CALLERS_CAP)
@@ -1850,6 +2095,128 @@ fn symbol_diff_view_to_json(
     })
 }
 
+// A target path disambiguates the relationship, not the caller's directory.
+// Exact targets restrict caller languages; name-based lookups do not.
+fn withheld_reference_corpus(
+    live: &LiveIndex,
+    catalog: &crate::live_index::search::CodeModeWithheld,
+    target_language: Option<crate::domain::LanguageId>,
+    exclude_path: Option<&str>,
+) -> std::collections::HashSet<String> {
+    catalog
+        .manifest
+        .iter()
+        .filter_map(|&i| {
+            let entry = live.manifest_entries.get(i)?;
+            let path = entry.path.normalized_utf8.as_deref()?;
+            let language = entry.language.as_ref()?;
+            (exclude_path != Some(path)
+                && language.is_code_language()
+                && target_language.as_ref().is_none_or(|target| {
+                    crate::live_index::query::import_languages_compatible(language, target)
+                }))
+            .then(|| path.to_owned())
+        })
+        .collect()
+}
+
+fn path_refused_without_catalog(live: &LiveIndex, path: &str) -> bool {
+    live.unverified_since_restore(path).is_some()
+        || crate::knowledge::sensitive_path_rule(path).is_some()
+        || crate::discovery::path_is_hard_scope_excluded(Path::new(path))
+}
+
+// Bulk equivalent of the read gate's path, manifest and restore checks.
+// Index the sensitive dispositions once: the single-file lookup scans the manifest.
+fn build_code_mode_withheld(live: &LiveIndex) -> crate::live_index::search::CodeModeWithheld {
+    let sensitive = live.capture_sensitive_admission_paths();
+    let rule = |path: &str| sensitive.contains(path) || path_refused_without_catalog(live, path);
+    let refused_entries =
+        crate::live_index::store::ordered_parallel_map(&live.manifest_entries, |entry| {
+            entry
+                .path
+                .normalized_utf8
+                .as_deref()
+                .is_some_and(|path| rule(&normalized_path(path)))
+        });
+    let mut catalog = crate::live_index::search::CodeModeWithheld::default();
+    let mut refused_targets = std::collections::HashMap::new();
+    for ((i, entry), refused) in live
+        .manifest_entries
+        .iter()
+        .enumerate()
+        .zip(refused_entries)
+    {
+        let Some(path) = entry.path.normalized_utf8.as_deref() else {
+            continue;
+        };
+        let path = normalized_path(path).into_owned();
+        if refused || crate::live_index::search::catalog_content_is_withheld(&entry.disposition) {
+            catalog.manifest.push(i);
+        }
+        if refused {
+            if let crate::domain::FileDisposition::Indexed { targets, .. } = &entry.disposition {
+                refused_targets.insert(path.clone(), *targets);
+            }
+            catalog.refused.insert(path.clone());
+        }
+        catalog.known.insert(path);
+    }
+    for (key, _) in live.all_files() {
+        let path = normalized_path(key);
+        let refused = if catalog.known.contains(path.as_ref()) {
+            catalog.refused.contains(path.as_ref())
+        } else {
+            let refused = rule(&path);
+            if refused {
+                catalog.refused.insert(path.to_string());
+            }
+            catalog.known.insert(path.to_string());
+            refused
+        };
+        if refused {
+            catalog
+                .refused_files
+                .push((key.clone(), refused_targets.get(path.as_ref()).copied()));
+        }
+    }
+    catalog
+}
+
+fn normalized_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if path.contains('\\')
+        || path.starts_with("./")
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path.trim().len() != path.len()
+    {
+        std::borrow::Cow::Owned(crate::live_index::query::normalize_path_query(path))
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
+}
+
+fn code_mode_withheld(
+    generation: &PublishedGeneration,
+) -> &crate::live_index::search::CodeModeWithheld {
+    generation
+        .code_mode_withheld
+        .get_or_init(|| build_code_mode_withheld(&generation.live))
+}
+
+fn search_refusal_predicate(generation: &PublishedGeneration) -> impl Fn(&str) -> bool + '_ {
+    let catalog = code_mode_withheld(generation);
+    let live = &*generation.live;
+    move |path| {
+        catalog.known_refusal(path).unwrap_or_else(|| {
+            path_refused_without_catalog(
+                live,
+                &crate::live_index::query::normalize_path_query(path),
+            )
+        })
+    }
+}
+
 fn check_secret_or_scope_refusal(live: &LiveIndex, norm_path: &str) -> Option<String> {
     if let Some(scope_err) =
         crate::index_lifecycle::guidance::read_gate::hard_scope_refusal(norm_path)
@@ -1960,6 +2327,15 @@ impl CodeReadBackend for DaemonCodeBackend {
         op: CodeReadOp,
         kwargs: Map<String, Value>,
     ) -> Result<Value, CodeBackendError> {
+        self.execute_op_with_completeness(op, kwargs)
+            .map(|result| result.value)
+    }
+
+    fn execute_op_with_completeness(
+        &self,
+        op: CodeReadOp,
+        kwargs: Map<String, Value>,
+    ) -> Result<CodeReadResult, CodeBackendError> {
         let req = DaemonCodeQueryRequest {
             op,
             kwargs,
@@ -1968,7 +2344,7 @@ impl CodeReadBackend for DaemonCodeBackend {
         let session = self.session.clone();
         let (result, evidence) = self.handle.block_on(async move {
             session
-                .call_code_query(&req)
+                .call_code_query_with_completeness(&req)
                 .await
                 .map_err(|e| CodeBackendError::refusal("daemon_transport", e.to_string()))
         })?;
@@ -1976,5 +2352,179 @@ impl CodeReadBackend for DaemonCodeBackend {
             *self.last_evidence.lock() = Some(ev);
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod refusal_predicate_tests {
+    use super::*;
+    use crate::domain::{FileDisposition, MetadataOnlyReason};
+    use crate::live_index::store::{SnapshotVerifyReport, SnapshotVerifyState};
+
+    #[test]
+    fn bulk_search_refusal_agrees_with_the_read_gate_for_every_refusal_reason() {
+        let repo = tempfile::tempdir().unwrap();
+        let key_marker = format!("// -----BEGIN {} KEY-----\n", "PRIVATE");
+        let files = [
+            ("src/lib.rs", "pub fn ok() {}\n"),
+            ("src/held.rs", "pub fn held() {}\n"),
+            ("src/indeterminate.rs", "pub fn unsure() {}\n"),
+            ("src/key.rs", key_marker.as_str()),
+            (".env", "NAME=placeholder\n"),
+            ("config/id_rsa", "placeholder\n"),
+            ("docs/plain.md", "# plain\n"),
+        ];
+        for (path, body) in files {
+            let path = repo.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let shared = LiveIndex::load(repo.path()).unwrap();
+        let mut live = shared.write();
+        live.snapshot_verify_state = SnapshotVerifyState::Completed(
+            SnapshotVerifyReport::from_mismatched_paths(vec!["src/held.rs".to_string()])
+                .with_unverified(std::collections::BTreeMap::from([(
+                    "src/held.rs".to_string(),
+                    "it could not be read".to_string(),
+                )])),
+        );
+        for entry in live.manifest_entries.iter_mut() {
+            if entry.path.normalized_utf8.as_deref() == Some("src/indeterminate.rs") {
+                entry.disposition = FileDisposition::MetadataOnly {
+                    reason: MetadataOnlyReason::SensitiveContent {
+                        rule_ids: vec![crate::knowledge::INDETERMINATE_RULE_ID.to_string()],
+                        finding_count: 0,
+                    },
+                };
+            }
+        }
+        drop(live);
+        let generation = shared.published_generation();
+        let live: &LiveIndex = &generation.live;
+        let mut probes: std::collections::BTreeSet<String> = live
+            .manifest_entries
+            .iter()
+            .filter_map(|entry| entry.path.normalized_utf8.clone())
+            .chain(live.all_files().map(|(path, _)| path.clone()))
+            .collect();
+        probes.extend(
+            [
+                ".git/config",
+                ".symforge/state.json",
+                "src/.env",
+                "src/missing.rs",
+                "./src/key.rs",
+                "src\\key.rs",
+            ]
+            .map(str::to_string),
+        );
+        let refuse = search_refusal_predicate(&generation);
+        for probe in &probes {
+            let gate_path =
+                crate::index_lifecycle::guidance::read_gate::normalize_requested_path(probe);
+            assert_eq!(
+                refuse(probe),
+                check_secret_or_scope_refusal(live, &gate_path).is_some(),
+                "bulk predicate and read gate disagree on {probe}"
+            );
+        }
+        for refused in [
+            "src/held.rs",
+            "src/indeterminate.rs",
+            "src/key.rs",
+            ".env",
+            "config/id_rsa",
+            ".git/config",
+        ] {
+            assert!(refuse(refused), "{refused} must be refused");
+        }
+        assert!(!refuse("src/lib.rs"));
+    }
+
+    #[test]
+    fn find_dependents_reports_a_size_skipped_target_as_withheld_and_a_missing_one_as_not_found() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+        let shared = LiveIndex::load(repo.path()).unwrap();
+        {
+            let mut live = shared.write();
+            let mut entry = live.manifest_entries[0].clone();
+            entry.path.normalized_utf8 = Some("src/huge.rs".to_string());
+            entry.path.public_id = "src/huge.rs".to_string();
+            entry.disposition = FileDisposition::HardSkip {
+                reason: crate::domain::HardSkipReason::PerFileCeiling,
+            };
+            live.manifest_entries.push(entry);
+        }
+        let generation = shared.published_generation();
+        let source_set = shared.published_source_set();
+        let run = |path: &str| {
+            let mut kwargs = Map::new();
+            kwargs.insert("path".to_string(), json!(path));
+            execute_op_on_generation(
+                CodeReadOp::FindDependents,
+                kwargs,
+                &generation,
+                &source_set,
+                None,
+                "fixture",
+                &|_| {},
+            )
+        };
+        let huge = run("src/huge.rs").unwrap();
+        assert_eq!(huge.value, json!([]));
+        assert_eq!(huge.completeness.withheld_files, 1);
+        let missing = run("src/none.rs").unwrap_err();
+        assert_eq!(missing.kind, "not_found");
+    }
+
+    #[test]
+    fn withheld_paths_are_recomputed_for_each_published_generation() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+        std::fs::write(repo.path().join("src/later.rs"), "pub fn later() {}\n").unwrap();
+        let shared = LiveIndex::load(repo.path()).unwrap();
+        let first = shared.published_generation();
+        assert!(!search_refusal_predicate(&first)("src/later.rs"));
+        assert!(code_mode_withheld(&first).manifest.is_empty());
+        {
+            let mut live = shared.write();
+            live.snapshot_verify_state = SnapshotVerifyState::Completed(
+                SnapshotVerifyReport::from_mismatched_paths(vec!["src/later.rs".to_string()])
+                    .with_unverified(std::collections::BTreeMap::from([(
+                        "src/later.rs".to_string(),
+                        "it could not be read".to_string(),
+                    )])),
+            );
+        }
+        let second = shared.published_generation();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(search_refusal_predicate(&second)("src/later.rs"));
+        assert!(!search_refusal_predicate(&first)("src/later.rs"));
+        {
+            let mut live = shared.write();
+            for entry in live.manifest_entries.iter_mut() {
+                if entry.path.normalized_utf8.as_deref() == Some("src/lib.rs") {
+                    entry.disposition = FileDisposition::MetadataOnly {
+                        reason: MetadataOnlyReason::SensitiveContent {
+                            rule_ids: vec!["fixture.rule".to_string()],
+                            finding_count: 1,
+                        },
+                    };
+                }
+            }
+        }
+        let third = shared.published_generation();
+        assert!(search_refusal_predicate(&third)("src/lib.rs"));
+        assert!(!search_refusal_predicate(&second)("src/lib.rs"));
+        assert!(code_mode_withheld(&third).manifest.iter().any(|&i| {
+            third.live.manifest_entries[i]
+                .path
+                .normalized_utf8
+                .as_deref()
+                == Some("src/lib.rs")
+        }));
     }
 }

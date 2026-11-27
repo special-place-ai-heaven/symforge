@@ -192,8 +192,7 @@ pub(crate) fn search_scope_summary(
 pub(crate) fn search_completeness_label(
     overflow_count: usize,
     suppressed_by_noise: usize,
-    // Files a structural search skipped because their parse was cancelled or
-    // failed: never searched, so the scope is not claimed as full.
+    // Files structural search could not cover: never claim the scope as full.
     unparsed_files: usize,
 ) -> String {
     // Honesty (trust): the index is built by a discovery walk with the `ignore`
@@ -203,7 +202,11 @@ pub(crate) fn search_completeness_label(
     // exhaustive (the dogfood report: `search_text` silently omitted
     // `.github/workflows/release-please.yml` that ripgrep found). Qualify the
     // claim so the agent knows to use a raw grep for hidden paths.
-    let mut parts = vec![if overflow_count > 0 {
+    let mut parts = vec![if unparsed_files > 0 && overflow_count > 0 {
+        format!(
+            "incomplete for indexed scope (at least {overflow_count} more omitted by result cap)"
+        )
+    } else if overflow_count > 0 {
         format!("truncated by result cap ({overflow_count} more omitted)")
     } else if unparsed_files > 0 {
         "incomplete for indexed scope".to_string()
@@ -212,7 +215,7 @@ pub(crate) fn search_completeness_label(
     }];
     if unparsed_files > 0 {
         parts.push(format!(
-            "{unparsed_files} file(s) not searched (parse cancelled or failed)"
+            "{unparsed_files} file(s) not fully searched (syntax errors, work budget or result limit)"
         ));
     }
     if suppressed_by_noise > 0 {
@@ -595,7 +598,7 @@ mod tests {
         );
         assert!(
             envelope.contains(
-                "\nCompleteness: incomplete for indexed scope; 1 file(s) not searched (parse cancelled or failed)"
+                "\nCompleteness: incomplete for indexed scope; 1 file(s) not fully searched (syntax errors, work budget or result limit)"
             ),
             "{envelope}"
         );
