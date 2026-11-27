@@ -970,3 +970,96 @@ async fn a_snapshot_written_before_the_enclosing_rules_loses_the_files_they_excl
     ));
     assert_eq!(file_set(&restored), cold);
 }
+
+const DIFFERENTIAL_RULES: &[&[&str]] = &[
+    &["gen/"],
+    &["*.gen.ts"],
+    &["/project/a/"],
+    &["project/b/"],
+    &["/project/*.tmp.ts"],
+    &["project/**/deep.ts"],
+    &["**/any.ts"],
+    &["/**/x/"],
+    &["pro*/c/"],
+    &["/other/d/"],
+    &["/project/"],
+    &["/*"],
+    &["/*/src/"],
+    &["project/**"],
+    &["project/k*/", "!project/keep/"],
+    &["/project/e.ts"],
+    &["/project/e"],
+    &["a?c/"],
+    &["[ab]/"],
+    &["\\#hash.ts"],
+    &["\\!bang.ts"],
+    &["sp.ts   "],
+    &["sp2.ts\\ "],
+    &["**/"],
+    &["project/*/"],
+    &["/project/**/z.ts"],
+    &["deep/nested/"],
+    &["PROJECT/case/"],
+];
+
+const DIFFERENTIAL_NAMES: &[&str] = &[
+    "gen/f.ts",
+    "a/f.ts",
+    "b/f.ts",
+    "c/f.ts",
+    "d/f.ts",
+    "e/f.ts",
+    "x/f.ts",
+    "abc/f.ts",
+    "keep/f.ts",
+    "kx/f.ts",
+    "case/f.ts",
+    "deep/nested/f.ts",
+    "one.gen.ts",
+    "one.tmp.ts",
+    "any.ts",
+    "deep.ts",
+    "z.ts",
+    "e.ts",
+    "#hash.ts",
+    "!bang.ts",
+    "sp.ts",
+    "sp2.ts",
+    "plain.ts",
+];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parent_rules_restore_exactly_the_cold_file_set() {
+    let mut failures = Vec::new();
+    for rule in DIFFERENTIAL_RULES {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let root = repo.join("project");
+        fs::create_dir_all(&root).unwrap();
+        git(&repo, &["init", "-q"]);
+        fs::write(repo.join(".gitignore"), format!("{}\n", rule.join("\n"))).unwrap();
+        for name in DIFFERENTIAL_NAMES {
+            for base in ["", "m/n/"] {
+                let path = root.join(format!("{base}{name}"));
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, "export function f() {}\n").unwrap();
+            }
+        }
+        let cold = file_set(&LiveIndex::load(&root).unwrap());
+        let restored = file_set(&checkpoint_and_restore(&root, &placement_for(&root)).await);
+        if restored != cold {
+            let missing: Vec<_> = cold
+                .iter()
+                .filter(|path| !restored.contains(path))
+                .collect();
+            let extra: Vec<_> = restored
+                .iter()
+                .filter(|path| !cold.contains(path))
+                .collect();
+            failures.push(format!(
+                "{rule:?}: restored misses {missing:?}, restored adds {extra:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
