@@ -112,6 +112,58 @@ async fn code_execute_renders_search_references_and_symbol_reads_as_lean_text() 
     );
 }
 
+const BARE_COUNT_SCRIPT: &str = r#"len(find_references(name="add_pair", max_per_file=1))"#;
+
+fn assert_bare_count_keeps_notice(text: &str) {
+    let (value, notices) = text
+        .split_once("\n\nHost-call completeness: ")
+        .unwrap_or_else(|| panic!("missing completeness suffix: {text}"));
+    assert_eq!(value, "1");
+    let notices: Value = serde_json::from_str(notices).expect("notices json");
+    assert_eq!(notices["notices"][0]["op"], "find_references");
+    assert_eq!(notices["notices"][0]["omitted_rows"], 1);
+}
+
+#[tokio::test]
+async fn code_execute_lean_text_keeps_completeness_notices_for_a_bare_count() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let (_dir, server) = build_server_fixture();
+    assert_bare_count_keeps_notice(&code_execute_text(&server, BARE_COUNT_SCRIPT).await);
+}
+
+#[tokio::test]
+async fn daemon_proxied_code_execute_keeps_completeness_notices_for_a_bare_count() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let (dir, _local) = build_server_fixture();
+    let daemon_home = TempDir::new().expect("daemon home");
+    let control_state = ControlStateDir::new(daemon_home.path().to_path_buf());
+    let loopback = std::net::Ipv4Addr::LOCALHOST.to_string();
+    let daemon = spawn_daemon_at(&loopback, &control_state)
+        .await
+        .expect("spawn isolated daemon");
+    let session = connect_existing_session_at(
+        dir.path(),
+        "mcp-code-notice-test",
+        Some(std::process::id()),
+        &control_state,
+    )
+    .await
+    .expect("connect daemon session")
+    .expect("daemon session available");
+    let server = SymForgeServer::new_daemon_proxy(session.clone());
+    let res = symforge::protocol::result_status::with_project_evidence_scope(
+        None,
+        server.dispatch_tool_result_for_tests("code_execute", json!({"code": BARE_COUNT_SCRIPT})),
+    )
+    .await
+    .expect("code_execute over daemon");
+    let text = first_text_block(&res).to_owned();
+    let _ = session.close().await;
+    let _ = daemon.shutdown_tx.send(());
+    assert_ne!(res.is_error, Some(true), "{text}");
+    assert_bare_count_keeps_notice(&text);
+}
+
 #[tokio::test]
 async fn code_execute_json_opt_out_restores_the_full_outcome_text() {
     let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
