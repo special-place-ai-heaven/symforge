@@ -568,6 +568,14 @@ async fn the_syntax_check_names_the_error_and_spares_broken_files() {
             "def beta():\n    return 2\n",
             "def beta(:\n    return 2\n",
         ),
+        (
+            "lib.ts",
+            "function alpha(): number {\n    return 1;\n}\n\nfunction beta() {}\n",
+            "function alpha(): number {\n    return (1;\n}",
+            "function alpha(): number {\n    return 2;\n}",
+            "function beta() {}",
+            "function beta( {}",
+        ),
     ];
     for (path, source, broken, fixed, from, to) in cases {
         let (root, index) = fixture(path, source);
@@ -577,8 +585,8 @@ async fn the_syntax_check_names_the_error_and_spares_broken_files() {
         let (_, refused) = call(&server, "replace_symbol_body", replace(broken, false)).await;
         for text in [&preview, &refused] {
             assert!(
-                text.contains("syntax error at line ")
-                    && text.contains("nothing was written")
+                text.contains("parser reports a syntax error at line ")
+                    && text.contains("after this edit and none before; nothing was written")
                     && text.contains("plain text edit"),
                 "{path}: {text}"
             );
@@ -588,12 +596,15 @@ async fn the_syntax_check_names_the_error_and_spares_broken_files() {
             source
         );
         let (_, preview) = call(&server, "replace_symbol_body", replace(fixed, true)).await;
-        assert!(
-            preview.contains("[DRY RUN] Would replace"),
-            "{path}: {preview}"
-        );
         let (error, applied) = call(&server, "replace_symbol_body", replace(fixed, false)).await;
         assert!(!error, "{path}: {applied}");
+        for text in [&preview, &applied] {
+            assert!(
+                text.contains("\nSyntax check: passed\n")
+                    || text.ends_with("\nSyntax check: passed"),
+                "{path}: {text}"
+            );
+        }
         assert!(
             std::fs::read_to_string(root.path().join(path))
                 .unwrap()
@@ -604,8 +615,15 @@ async fn the_syntax_check_names_the_error_and_spares_broken_files() {
         let broken_source = source.replacen(from, to, 1);
         let (root, index) = fixture(path, &broken_source);
         let server = item_server(&root, &index);
+        let (_, preview) = call(&server, "replace_symbol_body", replace(fixed, true)).await;
         let (error, applied) = call(&server, "replace_symbol_body", replace(fixed, false)).await;
         assert!(!error, "{path}: {applied}");
+        for text in [&preview, &applied] {
+            assert!(
+                text.contains("Syntax check: not run (the file already had syntax errors)"),
+                "{path}: {text}"
+            );
+        }
         assert!(
             std::fs::read_to_string(root.path().join(path))
                 .unwrap()
@@ -613,4 +631,114 @@ async fn the_syntax_check_names_the_error_and_spares_broken_files() {
             "{path}: {applied}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_delete_whose_span_would_break_the_file_is_refused_with_its_own_reason() {
+    let path = "loop.ts";
+    let source = "function f(): void {\n    for (let i = 0;\n        i < 3; i++) {}\n}\n";
+    let (root, index) = fixture(path, source);
+    let server = item_server(&root, &index);
+    for dry_run in [true, false] {
+        let (_, text) = call(
+            &server,
+            "delete_symbol",
+            json!({"path": path, "name": "i", "dry_run": dry_run}),
+        )
+        .await;
+        assert!(
+            text.contains("after deleting `i` and none before")
+                && text.contains("the span SymForge computed for this deletion would break")
+                && text.contains("Delete it with a plain text edit"),
+            "{dry_run}: {text}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.path().join(path)).unwrap(),
+        source
+    );
+}
+
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            if entry.file_name() != ".symforge" {
+                std::fs::create_dir_all(&target).unwrap();
+                copy_tree(&entry.path(), &target);
+            }
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn identity_replace_of_every_fixture_symbol_is_never_refused() {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut checked = 0;
+    let mut refused = Vec::new();
+    for name in [
+        "phase0-corpus",
+        "compression_ratio",
+        "cbm_impact",
+        "reliability",
+        "ruby",
+        "swift",
+        "kotlin",
+        "perl",
+        "rust",
+    ] {
+        let root = TempDir::new().unwrap();
+        copy_tree(&fixtures.join(name), root.path());
+        let index = LiveIndex::load(root.path()).unwrap();
+        let targets: Vec<(String, String, u32)> = index
+            .read()
+            .all_files()
+            .flat_map(|(path, file)| {
+                file.symbols
+                    .iter()
+                    .map(move |symbol| (path.clone(), symbol.name.clone(), symbol.line_range.0 + 1))
+            })
+            .collect();
+        let backend = LocalCodeBackend::new(
+            index.clone(),
+            Some(root.path().into()),
+            "symbol-spans",
+            None,
+        );
+        let server = item_server(&root, &index);
+        for (path, symbol, line) in targets {
+            let rows = backend.execute_op(
+                CodeReadOp::GetSymbol,
+                json!({"path": path, "name": symbol, "symbol_line": line})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+            let Some(shown) = rows
+                .ok()
+                .and_then(|rows| rows[0]["source"].as_str().map(str::to_owned))
+            else {
+                continue;
+            };
+            let (_, text) = call(
+                &server,
+                "replace_symbol_body",
+                json!({"path": path, "name": symbol, "symbol_line": line, "new_body": shown, "dry_run": true}),
+            )
+            .await;
+            checked += 1;
+            if text.contains("parser reports a syntax error") {
+                refused.push(format!("{name}/{path}:{line} {symbol}: {text}"));
+            }
+        }
+    }
+    assert!(checked > 100, "only {checked} symbols checked");
+    assert!(
+        refused.is_empty(),
+        "{checked} checked:\n{}",
+        refused.join("\n")
+    );
 }

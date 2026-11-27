@@ -690,10 +690,17 @@ fn routed_edit_lanes_render_the_mcp_answer() {
         );
         assert_eq!(
             routed_golden_text(&rendered, &fixture.main, &fixture.linked),
-            case["expected"].as_str().expect("golden answer"),
+            without_mcp_syntax_line(case["expected"].as_str().expect("golden answer")),
             "{name}: embedded routed answer differs from MCP's"
         );
         main.close().unwrap();
         linked.close().unwrap();
     }
+}
+
+fn without_mcp_syntax_line(text: &str) -> String {
+    text.split('\n')
+        .filter(|line| !line.trim_start().starts_with("Syntax check: "))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

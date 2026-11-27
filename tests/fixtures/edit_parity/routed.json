@@ -14,7 +14,7 @@
         "new_body": "pub fn number() -> u32 {\n    2\n}",
         "working_directory": "{worktree}"
       },
-      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:1`\nsrc/lib.rs — replaced fn `number` (32 → 32 bytes)\nTee snapshot: `<tee>` preserves `{worktree}/src/lib.rs` before this write.\nworking_directory: {worktree}\nrerouted: true\nwrote_to: {worktree}/src/lib.rs\nindexed_path: {main}/src/lib.rs\n[impact: 0 dependents]"
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:1`\nsrc/lib.rs — replaced fn `number` (32 → 32 bytes)\nSyntax check: passed\nTee snapshot: `<tee>` preserves `{worktree}/src/lib.rs` before this write.\nworking_directory: {worktree}\nrerouted: true\nwrote_to: {worktree}/src/lib.rs\nindexed_path: {main}/src/lib.rs\n[impact: 0 dependents]"
     },
     {
       "name": "replace preview routed into the worktree",
@@ -27,7 +27,7 @@
         "working_directory": "{worktree}",
         "dry_run": true
       },
-      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:1`\n[DRY RUN] Would replace `number` in src/lib.rs (old: 32 bytes -> new: 32 bytes)"
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: dry run (no writes)\nEvidence: symbol anchor `src/lib.rs:1`\n[DRY RUN] Would replace `number` in src/lib.rs (old: 32 bytes -> new: 32 bytes)\nSyntax check: passed"
     },
     {
       "name": "edit within through the bound root",
@@ -40,7 +40,7 @@
         "new_text": "number() + 1",
         "working_directory": "{main}"
       },
-      "expected": "Edit safety: text-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:5`\nsrc/lib.rs — edited within `helper` (1 replacement(s), 39 → 43 bytes)\nworking_directory: {main}\nrerouted: false\nwrote_to: {main}/src/lib.rs\nindexed_path: {main}/src/lib.rs\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 0 dependents]"
+      "expected": "Edit safety: text-edit-safe\nPath authority: repository-bound\nSource authority: current index\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/lib.rs:5`\nsrc/lib.rs — edited within `helper` (1 replacement(s), 39 → 43 bytes)\nSyntax check: passed\nworking_directory: {main}\nrerouted: false\nwrote_to: {main}/src/lib.rs\nindexed_path: {main}/src/lib.rs\nTee snapshot: `<tee>` preserves `src/lib.rs` before this write.\n[impact: 0 dependents]"
     },
     {
       "name": "insert rebased onto a diverged worktree copy",
@@ -55,7 +55,7 @@
         "position": "after",
         "working_directory": "{worktree}"
       },
-      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: worktree target (rebased)\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/other.rs:1`\nsrc/other.rs — inserted after `other` (16 bytes)\nworking_directory: {worktree}\nrerouted: true\nwrote_to: {worktree}/src/other.rs\nindexed_path: {main}/src/other.rs\nTee snapshot: `<tee>` preserves `{worktree}/src/other.rs` before this write.\n[impact: 0 dependents]"
+      "expected": "Edit safety: structural-edit-safe\nPath authority: repository-bound\nSource authority: worktree target (rebased)\nWrite semantics: atomic write + reindex\nEvidence: symbol anchor `src/other.rs:1`\nsrc/other.rs — inserted after `other` (16 bytes)\nSyntax check: passed\nworking_directory: {worktree}\nrerouted: true\nwrote_to: {worktree}/src/other.rs\nindexed_path: {main}/src/other.rs\nTee snapshot: `<tee>` preserves `{worktree}/src/other.rs` before this write.\n[impact: 0 dependents]"
     },
     {
       "name": "batch edit across two worktrees",

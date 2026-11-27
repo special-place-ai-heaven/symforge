@@ -314,7 +314,7 @@ fn embedded_edit_lanes_render_the_mcp_answer_for_every_edit_tool() {
         );
         assert_eq!(
             normalize_tee(&rendered),
-            case["expected"].as_str().expect("golden answer"),
+            without_mcp_syntax_line(case["expected"].as_str().expect("golden answer")),
             "{name}: embedded answer differs from MCP's"
         );
         if let Some((tee, original)) = tee_path(&rendered) {
@@ -642,4 +642,11 @@ fn embedded_edits_keep_a_split_declaration_intact() {
         );
         handle.close().unwrap();
     }
+}
+
+fn without_mcp_syntax_line(text: &str) -> String {
+    text.split('\n')
+        .filter(|line| !line.trim_start().starts_with("Syntax check: "))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

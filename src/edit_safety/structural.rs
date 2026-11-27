@@ -66,23 +66,60 @@ pub(crate) fn replacement_splice_range(
     Ok((splice_start as u32, end))
 }
 
-pub(crate) fn syntax_regression(
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SyntaxCheck {
+    Passed,
+    Regressed(String),
+    NotRun(&'static str),
+}
+
+impl SyntaxCheck {
+    pub(crate) fn reply_line(&self) -> String {
+        match self {
+            Self::Passed => "Syntax check: passed".to_string(),
+            Self::NotRun(reason) => format!("Syntax check: not run ({reason})"),
+            Self::Regressed(_) => "Syntax check: failed".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyntaxEdit<'a> {
+    Text,
+    Delete(&'a str),
+}
+
+pub(crate) fn syntax_check(
     language: &crate::domain::LanguageId,
     path: &str,
     before: &[u8],
     after: &[u8],
-) -> Option<String> {
+    edit: SyntaxEdit<'_>,
+) -> SyntaxCheck {
     let tsx = crate::domain::LanguageId::is_tsx_path(path);
-    let parse = |bytes: &[u8]| {
-        let source = std::str::from_utf8(bytes).ok()?;
-        crate::parsing::parse_source_tree(source, language, tsx).ok()
-    };
-    if parse(before)?.root_node().has_error() {
-        return None;
+    if !crate::parsing::has_source_grammar(language, tsx) {
+        return SyntaxCheck::NotRun("no bundled parser for this language");
     }
-    let tree = parse(after)?;
-    let error = first_syntax_error(tree.root_node())?;
-    let line = error.start_position().row;
+    let parse = |bytes: &[u8]| {
+        let source = std::str::from_utf8(bytes).map_err(|_| "the file is not UTF-8")?;
+        crate::parsing::parse_source_tree(source, language, tsx)
+            .map_err(|_| "the parser did not finish")
+    };
+    let before = match parse(before) {
+        Ok(tree) => tree,
+        Err(reason) => return SyntaxCheck::NotRun(reason),
+    };
+    if before.root_node().has_error() {
+        return SyntaxCheck::NotRun("the file already had syntax errors");
+    }
+    let tree = match parse(after) {
+        Ok(tree) => tree,
+        Err(reason) => return SyntaxCheck::NotRun(reason),
+    };
+    if !tree.root_node().has_error() {
+        return SyntaxCheck::Passed;
+    }
+    let line = first_syntax_error(tree.root_node()).map_or(0, |node| node.start_position().row);
     let snippet = after
         .split(|&byte| byte == b'\n')
         .nth(line)
@@ -94,10 +131,19 @@ pub(crate) fn syntax_regression(
                 .collect::<String>()
         })
         .unwrap_or_default();
-    Some(format!(
-        "Error: this edit would leave `{path}` with a syntax error at line {} (`{snippet}`); nothing was written. Fix the new text and retry. If the text is valid syntax that this parser does not know yet, apply it with a plain text edit; SymForge re-indexes the file afterwards.",
+    let observed = format!(
+        "the bundled {} parser reports a syntax error at line {} (`{snippet}`)",
+        language.name(),
         line + 1
-    ))
+    );
+    SyntaxCheck::Regressed(match edit {
+        SyntaxEdit::Text => format!(
+            "Error: {observed} after this edit and none before; nothing was written. Fix the new text and retry; if the text is valid syntax this parser does not know yet, apply it with a plain text edit, after which SymForge re-indexes the file."
+        ),
+        SyntaxEdit::Delete(name) => format!(
+            "Error: {observed} after deleting `{name}` and none before: the span SymForge computed for this deletion would break `{path}`; nothing was written. Delete it with a plain text edit instead, after which SymForge re-indexes the file."
+        ),
+    })
 }
 
 fn first_syntax_error(root: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {

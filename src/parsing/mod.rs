@@ -316,6 +316,10 @@ fn error_candidate_is_better(
     candidate.is_missing() && !current.is_missing()
 }
 
+pub(crate) fn has_source_grammar(language: &LanguageId, is_tsx: bool) -> bool {
+    tree_sitter_language(language, is_tsx).is_some()
+}
+
 fn tree_sitter_language(language: &LanguageId, is_tsx: bool) -> Option<tree_sitter::Language> {
     Some(match language {
         LanguageId::Rust => tree_sitter_rust::LANGUAGE.into(),

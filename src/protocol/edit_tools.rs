@@ -1167,21 +1167,28 @@ impl SymForgeServer {
         let old_bytes = prepared.old_bytes;
         let inserted_bytes = prepared.inserted_bytes;
         let new_content = prepared.new_content;
-        if let Some(message) = crate::edit_safety::structural::syntax_regression(
+        let syntax = match crate::edit_safety::structural::syntax_check(
             &file.language,
             &params.0.path,
             &file.content,
             &new_content,
+            crate::edit_safety::structural::SyntaxEdit::Text,
         ) {
-            return fail_and_return_bound_mutation_replay(&idempotency, message);
-        }
+            crate::edit_safety::structural::SyntaxCheck::Regressed(message) => {
+                return fail_and_return_bound_mutation_replay(&idempotency, message);
+            }
+            verdict => verdict.reply_line(),
+        };
         if params.0.dry_run == Some(true) {
             let old_bytes = (sym.byte_range.1 - sym.byte_range.0) as usize;
-            let summary = edit_body::dry_run_replace_summary(
-                &params.0.name,
-                &params.0.path,
-                old_bytes,
-                params.0.new_body.len(),
+            let summary = format!(
+                "{}\n{syntax}",
+                edit_body::dry_run_replace_summary(
+                    &params.0.name,
+                    &params.0.path,
+                    old_bytes,
+                    params.0.new_body.len(),
+                )
             );
             return edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
                 safety: edit_format::EditSafetyMode::StructuralEditSafe,
@@ -1278,12 +1285,15 @@ impl SymForgeServer {
             authority: source_authority,
             semantics: edit_format::EditWriteSemantics::AtomicWriteAndReindex,
             anchor: &evidence_anchor,
-            summary: &edit_format::format_replace(
-                &params.0.path,
-                &params.0.name,
-                &sym.kind.to_string(),
-                old_bytes,
-                inserted_bytes,
+            summary: &format!(
+                "{}\n{syntax}",
+                edit_format::format_replace(
+                    &params.0.path,
+                    &params.0.name,
+                    &sym.kind.to_string(),
+                    old_bytes,
+                    inserted_bytes,
+                )
             ),
             stale_warnings: &edit_format::format_stale_warnings(
                 &params.0.path,
@@ -1480,20 +1490,27 @@ impl SymForgeServer {
         } else {
             edit::build_insert_after(&file.content, &sym, &params.0.content, line_ending)
         };
-        if let Some(message) = crate::edit_safety::structural::syntax_regression(
+        let syntax = match crate::edit_safety::structural::syntax_check(
             &file.language,
             &params.0.path,
             &file.content,
             &new_content,
+            crate::edit_safety::structural::SyntaxEdit::Text,
         ) {
-            return fail_and_return_bound_mutation_replay(&idempotency, message);
-        }
+            crate::edit_safety::structural::SyntaxCheck::Regressed(message) => {
+                return fail_and_return_bound_mutation_replay(&idempotency, message);
+            }
+            verdict => verdict.reply_line(),
+        };
         if params.0.dry_run == Some(true) {
-            let summary = edit_body::dry_run_insert_summary(
-                position,
-                &params.0.name,
-                &params.0.path,
-                params.0.content.len(),
+            let summary = format!(
+                "{}\n{syntax}",
+                edit_body::dry_run_insert_summary(
+                    position,
+                    &params.0.name,
+                    &params.0.path,
+                    params.0.content.len(),
+                )
             );
             return edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
                 safety: edit_format::EditSafetyMode::StructuralEditSafe,
@@ -1544,11 +1561,14 @@ impl SymForgeServer {
             authority: source_authority,
             semantics: edit_format::EditWriteSemantics::AtomicWriteAndReindex,
             anchor: &evidence_anchor,
-            summary: &edit_format::format_insert(
-                &params.0.path,
-                &params.0.name,
-                position,
-                params.0.content.len(),
+            summary: &format!(
+                "{}\n{syntax}",
+                edit_format::format_insert(
+                    &params.0.path,
+                    &params.0.name,
+                    position,
+                    params.0.content.len(),
+                )
             ),
             stale_warnings: "",
             tee: &edit::format_tee_snapshot_suffix(&write_report),
@@ -1712,18 +1732,24 @@ impl SymForgeServer {
             &sym,
         );
         let new_content = edit::build_delete(&file.content, &sym, line_ending, member);
-        if let Some(message) = crate::edit_safety::structural::syntax_regression(
+        let syntax = match crate::edit_safety::structural::syntax_check(
             &file.language,
             &params.0.path,
             &file.content,
             &new_content,
+            crate::edit_safety::structural::SyntaxEdit::Delete(&params.0.name),
         ) {
-            return fail_and_return_bound_mutation_replay(&idempotency, message);
-        }
+            crate::edit_safety::structural::SyntaxCheck::Regressed(message) => {
+                return fail_and_return_bound_mutation_replay(&idempotency, message);
+            }
+            verdict => verdict.reply_line(),
+        };
         if params.0.dry_run == Some(true) {
             let deleted_bytes = (sym.byte_range.1 - sym.byte_range.0) as usize;
-            let summary =
-                edit_body::dry_run_delete_summary(&params.0.name, &params.0.path, deleted_bytes);
+            let summary = format!(
+                "{}\n{syntax}",
+                edit_body::dry_run_delete_summary(&params.0.name, &params.0.path, deleted_bytes)
+            );
             return edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
                 safety: edit_format::EditSafetyMode::StructuralEditSafe,
                 authority: source_authority,
@@ -1774,11 +1800,14 @@ impl SymForgeServer {
             authority: source_authority,
             semantics: edit_format::EditWriteSemantics::AtomicWriteAndReindex,
             anchor: &evidence_anchor,
-            summary: &edit_format::format_delete(
-                &params.0.path,
-                &params.0.name,
-                &sym.kind.to_string(),
-                deleted_bytes,
+            summary: &format!(
+                "{}\n{syntax}",
+                edit_format::format_delete(
+                    &params.0.path,
+                    &params.0.name,
+                    &sym.kind.to_string(),
+                    deleted_bytes,
+                )
             ),
             stale_warnings: "",
             tee: &edit::format_tee_snapshot_suffix(&write_report),
@@ -1968,23 +1997,30 @@ impl SymForgeServer {
         let untargeted_extra = selection.untargeted_extra;
         let effective_range = (sym.effective_start(), sym.byte_range.1);
         let new_content = edit::apply_splice(&file.content, effective_range, new_body.as_bytes());
-        if let Some(message) = crate::edit_safety::structural::syntax_regression(
+        let syntax = match crate::edit_safety::structural::syntax_check(
             &file.language,
             &params.0.path,
             &file.content,
             &new_content,
+            crate::edit_safety::structural::SyntaxEdit::Text,
         ) {
-            return fail_and_return_bound_mutation_replay(&idempotency, message);
-        }
+            crate::edit_safety::structural::SyntaxCheck::Regressed(message) => {
+                return fail_and_return_bound_mutation_replay(&idempotency, message);
+            }
+            verdict => verdict.reply_line(),
+        };
         if params.0.dry_run == Some(true) {
-            let summary = edit_body::edit_within_summary(
-                true,
-                &params.0.path,
-                &params.0.name,
-                count,
-                0,
-                0,
-                untargeted_extra,
+            let summary = format!(
+                "{}\n{syntax}",
+                edit_body::edit_within_summary(
+                    true,
+                    &params.0.path,
+                    &params.0.name,
+                    count,
+                    0,
+                    0,
+                    untargeted_extra,
+                )
             );
             return edit_body::render_single_edit_answer(&edit_body::SingleEditAnswer {
                 safety: edit_format::EditSafetyMode::TextEditSafe,
@@ -2036,14 +2072,17 @@ impl SymForgeServer {
             authority: source_authority,
             semantics: edit_format::EditWriteSemantics::AtomicWriteAndReindex,
             anchor: &evidence_anchor,
-            summary: &edit_body::edit_within_summary(
-                false,
-                &params.0.path,
-                &params.0.name,
-                count,
-                old_sym_bytes,
-                new_body.len(),
-                untargeted_extra,
+            summary: &format!(
+                "{}\n{syntax}",
+                edit_body::edit_within_summary(
+                    false,
+                    &params.0.path,
+                    &params.0.name,
+                    count,
+                    old_sym_bytes,
+                    new_body.len(),
+                    untargeted_extra,
+                )
             ),
             stale_warnings: "",
             tee: &edit::format_tee_snapshot_suffix(&write_report),
