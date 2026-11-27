@@ -1645,7 +1645,7 @@ pub(crate) fn search_structural_with_admission(
 const STRUCTURAL_SEARCH_ROUND: usize = 64;
 const STRUCTURAL_SEARCH_MAX_PATTERN_BYTES: usize = 4 * 1024;
 const STRUCTURAL_SEARCH_MAX_FILE_MATCHES: usize = 1024;
-const STRUCTURAL_SEARCH_FILE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
+const STRUCTURAL_SEARCH_FILE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 const STRUCTURAL_SEARCH_ROUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(test)]
