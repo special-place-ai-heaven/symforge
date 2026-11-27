@@ -62,7 +62,7 @@ b7b9b4ea16da0fdd49b62e73b38bb6f2e0e01249884ab6d4a34349a9d1b62820  codemode/value
 
 c21ffa0e7745eae3dbd8369929faec2ed4c3376b0f090530da328e4d6b02ac4e  daemon.rs
 
-2479240bd48c304980236b85759e47663912a042d8867a38fe4f04d4b7ec34bb  discovery/mod.rs
+b78bfb2acb35d25b8023ea0ec194ef3e0a24c935ace3abbd77b5d0eabd73acb5  discovery/mod.rs
 
 20281b9543c2297f9b22ab4a1440d9ac264321cf08c3a9bf4fd8965344d3a133  discovery/os_response.rs
 
@@ -82,7 +82,7 @@ b35166da9cd79786ab20c2ee9fdf489c20a1b04f722ecd308aedf76635de5c45  edit_safety/re
 
 07c6783a51d7f75468e0c58703c70cfa597f7b77760a2ad7eac833d3e4ddd2c8  edit_safety/secret_remediation.rs
 
-3895f57da6b20dd363759526d6995670355d576d8d4101e3de70426fd8f4c22a  edit_safety/structural.rs
+97c11dfe7897fd43dda844df97fd3f2abb9c8dff4cb2c52ebecf34692a222b08  edit_safety/structural.rs
 
 a0edcdeb1e33ef3390e552a0bbec82237978dc45e1a32cf95ce431ca8fd63ad9  edit_safety/structural_rewrite.rs
 
