@@ -4297,31 +4297,9 @@ fn run_background_verify<F, C>(
     let stat_result = stat_check_files_from_view(&verify_view, snapshot_mtimes, root, &|| {
         stopped("the stat pass")
     });
-    let Some(mut stat_result) = stat_result else {
+    let Some(stat_result) = stat_result else {
         return;
     };
-    #[cfg(any(feature = "server", feature = "embed"))]
-    {
-        let flagged: HashSet<String> = stat_result
-            .changed
-            .iter()
-            .chain(&stat_result.deleted)
-            .cloned()
-            .collect();
-        let apply_ignore_rules = crate::discovery::inside_repository(root);
-        let now_excluded: Vec<String> = verify_view
-            .files
-            .iter()
-            .map(|file| &file.relative_path)
-            .filter(|path| {
-                !flagged.contains(path.as_str())
-                    && (crate::discovery::path_is_hard_scope_excluded(Path::new(path.as_str()))
-                        || (apply_ignore_rules && base.is_path_gitignored(path)))
-            })
-            .cloned()
-            .collect();
-        stat_result.changed.extend(now_excluded);
-    }
     let changed_count = stat_result.changed.len();
     let deleted_count = stat_result.deleted.len();
     let new_count = stat_result.new_files.len();

@@ -1946,10 +1946,6 @@ pub(crate) fn ignored_below_root(
     false
 }
 
-pub(crate) fn inside_repository(root: &Path) -> bool {
-    root.join(".git").exists() || repository_top_above(root).is_some()
-}
-
 fn repository_top_above(root: &Path) -> Option<&Path> {
     if root.join(".git").exists() {
         return None;
