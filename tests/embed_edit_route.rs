@@ -386,10 +386,14 @@ fn routed_batch_conflict_in_one_worktree_writes_nothing_in_either() {
     // Same length and mtime: the worker's scout cannot see it, so only the
     // commit's pre-image check can.
     let lib = fixture.main.join("src/lib.rs");
-    let mtime = filetime::FileTime::from_last_modification_time(&fs::metadata(&lib).unwrap());
+    let mtime = fs::metadata(&lib).unwrap().modified().unwrap();
     let tampered = fs::read_to_string(&lib).unwrap().replace("{ 1 }", "{ 9 }");
     fs::write(&lib, &tampered).unwrap();
-    filetime::set_file_mtime(&lib, mtime).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&lib)
+        .and_then(|f| f.set_modified(mtime))
+        .unwrap();
 
     let parts = [
         RoutedBatchPart {

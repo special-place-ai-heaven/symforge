@@ -1368,13 +1368,13 @@ async fn file_context_repeat_cache_invalidates_after_targeted_publication() {
 
     let path = fixture._dir.path().join("src/lib.rs");
     fs::write(&path, "pub fn replacement_anchor() {}\n").expect("rewrite code fixture");
-    filetime::set_file_mtime(
-        &path,
-        filetime::FileTime::from_system_time(
-            std::time::SystemTime::now() + std::time::Duration::from_secs(2),
-        ),
-    )
-    .expect("advance code fixture mtime");
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|f| {
+            f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+        })
+        .expect("advance code fixture mtime");
 
     let second = fixture
         .server
@@ -1444,13 +1444,13 @@ async fn deep_read_after_publication_serves_current_bytes() {
         "# Recovery\n## Persistence boundaries\nCheckpoint completion is the persistence boundary.\n",
     )
     .expect("rewrite knowledge fixture");
-    filetime::set_file_mtime(
-        &path,
-        filetime::FileTime::from_system_time(
-            std::time::SystemTime::now() + std::time::Duration::from_secs(2),
-        ),
-    )
-    .expect("advance fixture mtime so targeted freshness publishes the rewrite");
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|f| {
+            f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+        })
+        .expect("advance fixture mtime so targeted freshness publishes the rewrite");
 
     let second = fixture
         .server

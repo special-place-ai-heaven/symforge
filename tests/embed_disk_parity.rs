@@ -47,7 +47,11 @@ fn open(runtime: &ProcessIndexRuntime, root: &Path) -> EmbeddedSourceHandle {
 fn rewrite_later(path: &Path, contents: &str, seconds: u64) {
     fs::write(path, contents).unwrap();
     let later = SystemTime::now() + Duration::from_secs(seconds);
-    filetime::set_file_mtime(path, filetime::FileTime::from_system_time(later)).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_modified(later))
+        .unwrap();
 }
 
 /// Query, retrying only while the background worker holds the source out of

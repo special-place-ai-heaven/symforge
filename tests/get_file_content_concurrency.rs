@@ -97,13 +97,13 @@ async fn concurrent_range_reads_under_staleness_do_not_hang() {
         ));
     }
     fs::write(&path, &body).expect("rewrite fixture");
-    filetime::set_file_mtime(
-        &path,
-        filetime::FileTime::from_system_time(
-            std::time::SystemTime::now() + std::time::Duration::from_secs(3),
-        ),
-    )
-    .expect("advance mtime");
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|f| {
+            f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3))
+        })
+        .expect("advance mtime");
 
     let n = 32u32;
     let mut handles = Vec::with_capacity(n as usize);
