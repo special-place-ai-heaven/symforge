@@ -2059,7 +2059,8 @@ fn descend_gitignore_line(prefix: &[String], line: &str) -> Option<Vec<String>> 
                 pending.push((segment, depth + 1));
             }
             Some(glob) => {
-                if glob_segment_matches(glob, &prefix[depth])? {
+                let matched = glob_segment_matches(glob, &prefix[depth])?;
+                if matched {
                     pending.push((segment + 1, depth + 1));
                 }
             }
