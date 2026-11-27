@@ -2578,6 +2578,7 @@ mod tests {
                 health: Arc::new(health),
                 outline: Arc::clone(&base.outline),
                 memory_counts: std::sync::OnceLock::new(),
+                code_mode_withheld: std::sync::OnceLock::new(),
             }
         };
 

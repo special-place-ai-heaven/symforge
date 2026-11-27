@@ -1731,6 +1731,9 @@ pub struct PublishedGeneration {
     /// generation. Every construction starts it empty (`OnceLock::new()`); a
     /// generation is immutable once built, so the count can never go stale.
     pub memory_counts: std::sync::OnceLock<IndexMemoryCounts>,
+    /// Code Mode's refused and withheld paths for `live`, built at most once
+    /// per generation for the same reason as `memory_counts`.
+    pub code_mode_withheld: std::sync::OnceLock<super::search::CodeModeWithheld>,
 }
 
 /// What one published index holds, counted from its file map and trigram index.
@@ -2824,6 +2827,7 @@ impl SharedIndexHandle {
             health: Arc::clone(&published_state),
             outline: Arc::clone(&published_repo_outline),
             memory_counts: std::sync::OnceLock::new(),
+            code_mode_withheld: std::sync::OnceLock::new(),
         });
         let current_source_id = source
             .as_ref()
@@ -3035,6 +3039,7 @@ impl SharedIndexHandle {
             health: published_state,
             outline,
             memory_counts: std::sync::OnceLock::new(),
+            code_mode_withheld: std::sync::OnceLock::new(),
         })
     }
 
@@ -3897,6 +3902,7 @@ impl SharedIndexHandle {
             health: Arc::clone(&previous.health),
             outline: Arc::clone(&previous.outline),
             memory_counts: std::sync::OnceLock::new(),
+            code_mode_withheld: std::sync::OnceLock::new(),
         });
         self.published_source_set
             .store(Arc::new(previous_source_set.next_after_current_publish(
@@ -3964,6 +3970,7 @@ impl SharedIndexHandle {
             health: Arc::clone(&previous.health),
             outline: Arc::clone(&previous.outline),
             memory_counts: std::sync::OnceLock::new(),
+            code_mode_withheld: std::sync::OnceLock::new(),
         });
         self.published_source_set
             .store(Arc::new(previous_source_set.next_after_current_publish(
@@ -4010,6 +4017,7 @@ impl SharedIndexHandle {
             health: Arc::clone(&previous.health),
             outline: Arc::clone(&previous.outline),
             memory_counts: std::sync::OnceLock::new(),
+            code_mode_withheld: std::sync::OnceLock::new(),
         });
         self.published_source_set
             .store(Arc::new(previous_source_set.next_after_current_publish(
@@ -4078,6 +4086,7 @@ impl SharedIndexHandle {
             health: Arc::clone(&previous.health),
             outline: Arc::clone(&previous.outline),
             memory_counts: std::sync::OnceLock::new(),
+            code_mode_withheld: std::sync::OnceLock::new(),
         });
         self.published_source_set
             .store(Arc::new(previous_source_set.next_after_current_publish(
@@ -4108,6 +4117,7 @@ impl SharedIndexHandle {
             health: Arc::clone(&previous.health),
             outline: Arc::clone(&previous.outline),
             memory_counts: std::sync::OnceLock::new(),
+            code_mode_withheld: std::sync::OnceLock::new(),
         });
         self.published_source_set
             .store(Arc::new(previous_source_set.next_after_current_publish(
@@ -5807,6 +5817,7 @@ impl SharedIndexHandle {
             health: Arc::clone(&published_state),
             outline: Arc::clone(&published_repo_outline),
             memory_counts: std::sync::OnceLock::new(),
+            code_mode_withheld: std::sync::OnceLock::new(),
         });
         let current_source_id = source
             .as_ref()

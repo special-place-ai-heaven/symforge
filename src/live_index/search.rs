@@ -219,16 +219,39 @@ pub(crate) fn catalog_content_is_withheld(disposition: &FileDisposition) -> bool
     )
 }
 
+/// Paths Code Mode search refuses, computed once per published generation.
+/// `known` holds every catalog and indexed path (normalized); `manifest` the
+/// catalog entries whose content is withheld or refused; `refused_files` the
+/// indexed files the predicate refuses, with their catalog targets.
+#[derive(Debug, Default)]
+pub struct CodeModeWithheld {
+    pub(crate) known: HashSet<String>,
+    pub(crate) refused: HashSet<String>,
+    pub(crate) manifest: Vec<usize>,
+    pub(crate) refused_files: Vec<(String, Option<IndexTargets>)>,
+}
+
+impl CodeModeWithheld {
+    pub(crate) fn known_refusal(&self, path: &str) -> Option<bool> {
+        if self.known.contains(path) {
+            return Some(self.refused.contains(path));
+        }
+        let path = crate::live_index::query::normalize_path_query(path);
+        self.known
+            .contains(&path)
+            .then(|| self.refused.contains(&path))
+    }
+}
+
 /// Count refused files in the actual code-search scope, independently of hits.
 /// Manifest-only entries have no searchable bytes; this is not a match count.
 pub(crate) fn count_code_mode_withheld(
     index: &LiveIndex,
     options: &TextSearchOptions,
-    refused: impl Fn(&str) -> bool,
+    catalog: &CodeModeWithheld,
     structural: bool,
 ) -> Result<usize, TextSearchError> {
     let globs = compile_text_glob_filters(options)?;
-    let targets = indexed_targets_by_path(index);
     let path_in_scope = |path: &str| {
         options.path_scope.matches(path)
             && globs.matches(path)
@@ -246,7 +269,11 @@ pub(crate) fn count_code_mode_withheld(
             })
     };
     let mut withheld = HashSet::new();
-    for entry in &index.manifest_entries {
+    for entry in catalog
+        .manifest
+        .iter()
+        .filter_map(|&i| index.manifest_entries.get(i))
+    {
         let Some(path) = entry.path.normalized_utf8.as_deref() else {
             continue;
         };
@@ -263,16 +290,20 @@ pub(crate) fn count_code_mode_withheld(
                 &entry.classification,
                 Some(IndexTargets::for_path(path, entry.language.as_ref())),
             )
-            && (catalog_content_is_withheld(&entry.disposition) || refused(path))
         {
             withheld.insert(path);
         }
     }
-    for (path, file) in index.all_files() {
-        if path_in_scope(path)
+    let targets: HashMap<&str, IndexTargets> = catalog
+        .refused_files
+        .iter()
+        .filter_map(|(path, targets)| targets.map(|targets| (path.as_str(), targets)))
+        .collect();
+    for (path, _) in &catalog.refused_files {
+        if let Some(file) = index.get_file(path)
+            && path_in_scope(path)
             && supports_structural(path, Some(&file.language))
             && file_matches_text_options(path, file, options, &globs, &targets)
-            && refused(path)
         {
             withheld.insert(path.as_str());
         }
@@ -1611,7 +1642,7 @@ pub(crate) fn search_structural_with_admission(
     )
 }
 
-const STRUCTURAL_SEARCH_ROUND: usize = 16;
+const STRUCTURAL_SEARCH_ROUND: usize = 64;
 const STRUCTURAL_SEARCH_MAX_PATTERN_BYTES: usize = 4 * 1024;
 const STRUCTURAL_SEARCH_MAX_BYTES: usize = 16 * 1024 * 1024;
 const STRUCTURAL_SEARCH_MAX_FILE_BYTES: usize = 1024 * 1024;
@@ -1771,7 +1802,6 @@ fn search_structural_impl(
                 unparsed_files += 1;
                 continue;
             };
-            let content_str = String::from_utf8_lossy(&file.content);
 
             // Pre-compute Rust test module line ranges for noise filtering.
             let test_ranges: Vec<(u32, u32)> =
@@ -1825,9 +1855,13 @@ fn search_structural_impl(
             }
 
             if !matches.is_empty() {
-                let rendered_lines = options
-                    .context
-                    .map(|ctx| build_context_rendered_lines(&content_str, &matches, ctx));
+                let rendered_lines = options.context.map(|ctx| {
+                    build_context_rendered_lines(
+                        &String::from_utf8_lossy(&file.content),
+                        &matches,
+                        ctx,
+                    )
+                });
                 total_matches += matches.len();
                 files.push(TextFileMatches {
                     path: path.to_owned(),

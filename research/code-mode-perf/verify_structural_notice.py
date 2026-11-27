@@ -22,7 +22,7 @@ def envelope(text):
 CASES = {
     'ordinary-exact': ([('a', 2), ('b', 1)], 0, 2),
     'dense-lower-bound': ([('a', 2), ('b', 1), ('dense', 1025)], 1, 2),
-    'early-exit-lower-bound': ([(f'f{i:02}', 1) for i in range(20)], 4, 15),
+    'early-exit-lower-bound': ([(f'f{i:02}', 1) for i in range(70)], 6, 63),
 }
 
 

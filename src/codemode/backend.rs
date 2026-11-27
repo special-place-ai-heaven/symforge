@@ -400,7 +400,7 @@ fn execute_value_on_generation(
                     "sensitive query rejected by repository safety policy",
                 ));
             }
-            let refused = search_refusal_predicate(&generation.live);
+            let refused = search_refusal_predicate(generation);
             let exec =
                 crate::index_lifecycle::guidance::search::execute_symbol_search_for_code_mode(
                     &generation.live,
@@ -420,7 +420,7 @@ fn execute_value_on_generation(
                     language_filter: exec.options.language_filter,
                     ..Default::default()
                 },
-                refused,
+                code_mode_withheld(generation),
                 false,
             )
             .map_err(|err| CodeBackendError::invalid_args(format!("{err:?}")))?;
@@ -692,7 +692,7 @@ fn execute_value_on_generation(
                 ));
             }
             let live = &generation.live;
-            let refuse = search_refusal_predicate(live);
+            let refuse = search_refusal_predicate(generation);
             if input.mode.as_deref() == Some("implementations") {
                 if context > 0 {
                     return Err(CodeBackendError::invalid_args(
@@ -703,7 +703,8 @@ fn execute_value_on_generation(
                 let impls = generation
                     .live
                     .capture_implementations_view(&input.name, input.direction.as_deref());
-                let mut refused = withheld_reference_corpus(live, None, None, &refuse);
+                let mut refused =
+                    withheld_reference_corpus(live, code_mode_withheld(generation), None, None);
                 let mut entries = impls.entries;
                 entries.retain(|entry| {
                     let admitted = !refuse(&entry.file_path);
@@ -777,7 +778,8 @@ fn execute_value_on_generation(
                 .as_deref()
                 .and_then(|p| live.get_file(p))
                 .map(|f| f.language);
-            let mut withheld = withheld_reference_corpus(live, target_lang, None, &refuse);
+            let mut withheld =
+                withheld_reference_corpus(live, code_mode_withheld(generation), target_lang, None);
             let mut selected = Vec::new();
             let mut shown_files = 0;
             for path in
@@ -875,12 +877,12 @@ fn execute_value_on_generation(
                     format!("File not in the index: {norm_path}"),
                 ));
             };
-            let refuse = search_refusal_predicate(live);
+            let refuse = search_refusal_predicate(generation);
             let mut withheld = withheld_reference_corpus(
                 live,
+                code_mode_withheld(generation),
                 Some(target_file.language),
                 Some(&norm_path),
-                &refuse,
             );
             let view = live.capture_find_dependents_view(&norm_path);
             let mut out = Vec::new();
@@ -1105,7 +1107,7 @@ fn execute_value_on_generation(
                     "sensitive query rejected by repository safety policy",
                 ));
             }
-            let refused = search_refusal_predicate(&generation.live);
+            let refused = search_refusal_predicate(generation);
             let exec = crate::index_lifecycle::guidance::search::execute_text_search_for_code_mode(
                 generation, &input, &refused,
             )
@@ -1116,7 +1118,7 @@ fn execute_value_on_generation(
             completeness.withheld_files = crate::live_index::search::count_code_mode_withheld(
                 &generation.live,
                 &exec.options,
-                refused,
+                code_mode_withheld(generation),
                 exec.structural,
             )
             .map_err(|e| CodeBackendError::invalid_args(format!("{e:?}")))?;
@@ -2100,37 +2102,96 @@ fn symbol_diff_view_to_json(
 // Exact targets restrict caller languages; name-based lookups do not.
 fn withheld_reference_corpus(
     live: &LiveIndex,
+    catalog: &crate::live_index::search::CodeModeWithheld,
     target_language: Option<crate::domain::LanguageId>,
     exclude_path: Option<&str>,
-    refuse: &dyn Fn(&str) -> bool,
 ) -> std::collections::HashSet<String> {
-    live.manifest_entries
+    catalog
+        .manifest
         .iter()
-        .filter_map(|entry| {
+        .filter_map(|&i| {
+            let entry = live.manifest_entries.get(i)?;
             let path = entry.path.normalized_utf8.as_deref()?;
             let language = entry.language.as_ref()?;
             (exclude_path != Some(path)
                 && language.is_code_language()
                 && target_language.as_ref().is_none_or(|target| {
                     crate::live_index::query::import_languages_compatible(language, target)
-                })
-                && (crate::live_index::search::catalog_content_is_withheld(&entry.disposition)
-                    || refuse(path)))
+                }))
             .then(|| path.to_owned())
         })
         .collect()
 }
 
+fn path_refused_without_catalog(live: &LiveIndex, path: &str) -> bool {
+    live.unverified_since_restore(path).is_some()
+        || crate::knowledge::sensitive_path_rule(path).is_some()
+        || crate::discovery::path_is_hard_scope_excluded(Path::new(path))
+}
+
 // Bulk equivalent of the read gate's path, manifest and restore checks.
 // Index the sensitive dispositions once: the single-file lookup scans the manifest.
-fn search_refusal_predicate(live: &LiveIndex) -> impl Fn(&str) -> bool + '_ {
+fn build_code_mode_withheld(live: &LiveIndex) -> crate::live_index::search::CodeModeWithheld {
     let sensitive = live.capture_sensitive_admission_paths();
-    move |path| {
+    let rule = |path: &str| sensitive.contains(path) || path_refused_without_catalog(live, path);
+    let mut catalog = crate::live_index::search::CodeModeWithheld::default();
+    let mut refused_targets = std::collections::HashMap::new();
+    for (i, entry) in live.manifest_entries.iter().enumerate() {
+        let Some(path) = entry.path.normalized_utf8.as_deref() else {
+            continue;
+        };
         let path = crate::live_index::query::normalize_path_query(path);
-        sensitive.contains(&path)
-            || live.unverified_since_restore(&path).is_some()
-            || crate::knowledge::sensitive_path_rule(&path).is_some()
-            || crate::discovery::path_is_hard_scope_excluded(Path::new(&path))
+        let refused = rule(&path);
+        if refused || crate::live_index::search::catalog_content_is_withheld(&entry.disposition) {
+            catalog.manifest.push(i);
+        }
+        if refused {
+            if let crate::domain::FileDisposition::Indexed { targets, .. } = &entry.disposition {
+                refused_targets.insert(path.clone(), *targets);
+            }
+            catalog.refused.insert(path.clone());
+        }
+        catalog.known.insert(path);
+    }
+    for (key, _) in live.all_files() {
+        let path = crate::live_index::query::normalize_path_query(key);
+        let refused = if catalog.known.contains(&path) {
+            catalog.refused.contains(&path)
+        } else {
+            let refused = rule(&path);
+            if refused {
+                catalog.refused.insert(path.clone());
+            }
+            catalog.known.insert(path.clone());
+            refused
+        };
+        if refused {
+            catalog
+                .refused_files
+                .push((key.clone(), refused_targets.get(&path).copied()));
+        }
+    }
+    catalog
+}
+
+fn code_mode_withheld(
+    generation: &PublishedGeneration,
+) -> &crate::live_index::search::CodeModeWithheld {
+    generation
+        .code_mode_withheld
+        .get_or_init(|| build_code_mode_withheld(&generation.live))
+}
+
+fn search_refusal_predicate(generation: &PublishedGeneration) -> impl Fn(&str) -> bool + '_ {
+    let catalog = code_mode_withheld(generation);
+    let live = &*generation.live;
+    move |path| {
+        catalog.known_refusal(path).unwrap_or_else(|| {
+            path_refused_without_catalog(
+                live,
+                &crate::live_index::query::normalize_path_query(path),
+            )
+        })
     }
 }
 
@@ -2315,7 +2376,9 @@ mod refusal_predicate_tests {
                 };
             }
         }
-        let live: &LiveIndex = &live;
+        drop(live);
+        let generation = shared.published_generation();
+        let live: &LiveIndex = &generation.live;
         let mut probes: std::collections::BTreeSet<String> = live
             .manifest_entries
             .iter()
@@ -2333,7 +2396,7 @@ mod refusal_predicate_tests {
             ]
             .map(str::to_string),
         );
-        let refuse = search_refusal_predicate(live);
+        let refuse = search_refusal_predicate(&generation);
         for probe in &probes {
             let gate_path =
                 crate::index_lifecycle::guidance::read_gate::normalize_requested_path(probe);
@@ -2354,5 +2417,54 @@ mod refusal_predicate_tests {
             assert!(refuse(refused), "{refused} must be refused");
         }
         assert!(!refuse("src/lib.rs"));
+    }
+
+    #[test]
+    fn withheld_paths_are_recomputed_for_each_published_generation() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+        std::fs::write(repo.path().join("src/later.rs"), "pub fn later() {}\n").unwrap();
+        let shared = LiveIndex::load(repo.path()).unwrap();
+        let first = shared.published_generation();
+        assert!(!search_refusal_predicate(&first)("src/later.rs"));
+        assert!(code_mode_withheld(&first).manifest.is_empty());
+        {
+            let mut live = shared.write();
+            live.snapshot_verify_state = SnapshotVerifyState::Completed(
+                SnapshotVerifyReport::from_mismatched_paths(vec!["src/later.rs".to_string()])
+                    .with_unverified(std::collections::BTreeMap::from([(
+                        "src/later.rs".to_string(),
+                        "it could not be read".to_string(),
+                    )])),
+            );
+        }
+        let second = shared.published_generation();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(search_refusal_predicate(&second)("src/later.rs"));
+        assert!(!search_refusal_predicate(&first)("src/later.rs"));
+        {
+            let mut live = shared.write();
+            for entry in live.manifest_entries.iter_mut() {
+                if entry.path.normalized_utf8.as_deref() == Some("src/lib.rs") {
+                    entry.disposition = FileDisposition::MetadataOnly {
+                        reason: MetadataOnlyReason::SensitiveContent {
+                            rule_ids: vec!["fixture.rule".to_string()],
+                            finding_count: 1,
+                        },
+                    };
+                }
+            }
+        }
+        let third = shared.published_generation();
+        assert!(search_refusal_predicate(&third)("src/lib.rs"));
+        assert!(!search_refusal_predicate(&second)("src/lib.rs"));
+        assert!(code_mode_withheld(&third).manifest.iter().any(|&i| {
+            third.live.manifest_entries[i]
+                .path
+                .normalized_utf8
+                .as_deref()
+                == Some("src/lib.rs")
+        }));
     }
 }
