@@ -645,7 +645,6 @@ async fn a_linked_worktree_restore_honours_the_common_info_exclude() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "documents a gap: restore does not apply parent-directory .gitignore rules or the enclosing repository's info/exclude to a root below the repository top"]
 async fn a_root_below_the_repository_top_restores_the_cold_file_set() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
@@ -664,6 +663,98 @@ async fn a_root_below_the_repository_top_restores_the_cold_file_set() {
     let cold = file_set(&LiveIndex::load(&root).unwrap());
     let restored = checkpoint_and_restore(&root, &placement_for(&root)).await;
     assert_eq!(file_set(&restored), cold);
+}
+
+fn root_below_the_repository_top() -> (TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let root = repo.join("project");
+    fs::create_dir_all(&root).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(
+        repo.join(".gitignore"),
+        "parentrule/\n/project/anchored/\n/elsewhere/\n",
+    )
+    .unwrap();
+    fs::write(repo.join(".git/info/exclude"), "excluded/\n").unwrap();
+    write_fixture(
+        &root,
+        &[
+            ("parentrule/b.ts", "export function parent() {}\n"),
+            ("excluded/c.ts", "export function excluded() {}\n"),
+            ("anchored/d.ts", "export function anchored() {}\n"),
+            ("elsewhere/e.ts", "export function elsewhere() {}\n"),
+        ],
+    );
+    (tmp, root)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_root_below_the_repository_top_applies_the_enclosing_rules_cold_and_restored() {
+    let (_tmp, root) = root_below_the_repository_top();
+    let cold = file_set(&LiveIndex::load(&root).unwrap());
+    for ignored in ["parentrule/", "excluded/", "anchored/"] {
+        assert!(
+            !cold.iter().any(|path| path.starts_with(ignored)),
+            "{ignored} {cold:?}"
+        );
+    }
+    assert!(cold.iter().any(|path| path == "elsewhere/e.ts"), "{cold:?}");
+    let restored = checkpoint_and_restore(&root, &placement_for(&root)).await;
+    assert_eq!(file_set(&restored), cold);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_watcher_on_a_restored_root_below_the_repository_top_skips_enclosing_rules() {
+    let (_tmp, root) = root_below_the_repository_top();
+    let shared = checkpoint_and_restore(&root, &placement_for(&root)).await;
+    let info = Arc::new(Mutex::new(WatcherInfo::default()));
+    let watcher = tokio::spawn(run_watcher(
+        root.clone(),
+        Arc::clone(&shared),
+        Arc::clone(&info),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while info.lock().state != WatcherState::Active {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("watcher becomes active");
+    for dir in ["parentrule", "excluded", "anchored"] {
+        fs::write(
+            root.join(dir).join("late.ts"),
+            "export function late() {}\n",
+        )
+        .unwrap();
+    }
+    fs::write(root.join("src/late.ts"), "export function visible() {}\n").unwrap();
+    let indexed = tokio::time::timeout(Duration::from_secs(10), async {
+        while shared
+            .read()
+            .all_files()
+            .all(|(path, _)| path != "src/late.ts")
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        indexed.is_ok(),
+        "the tracked control file was never indexed"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let leaked: Vec<String> = shared
+        .read()
+        .all_files()
+        .map(|(path, _)| path.clone())
+        .filter(|path| path.ends_with("/late.ts") && !path.starts_with("src/"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "ignored files were indexed after a restore: {leaked:?}"
+    );
+    watcher.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

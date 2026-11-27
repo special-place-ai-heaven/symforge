@@ -1867,6 +1867,10 @@ pub(crate) fn add_repository_excludes(
     builder: &mut ignore::gitignore::GitignoreBuilder,
     root: &Path,
 ) {
+    if let Some(top) = repository_top_above(root) {
+        add_enclosing_repository_rules(builder, root, top);
+        return;
+    }
     let info_exclude = read_repository_exclude(root);
     add_git_excludes(
         builder,
@@ -1923,6 +1927,127 @@ fn repository_common_dir(root: &Path) -> Option<(PathBuf, bool)> {
         PathBuf::from(commondir)
     };
     Some((common, true))
+}
+
+fn repository_top_above(root: &Path) -> Option<&Path> {
+    if root.join(".git").exists() {
+        return None;
+    }
+    root.ancestors()
+        .skip(1)
+        .find(|dir| dir.join(".git").exists())
+}
+
+fn add_enclosing_repository_rules(
+    builder: &mut ignore::gitignore::GitignoreBuilder,
+    root: &Path,
+    top: &Path,
+) {
+    if let Some(global) = global_excludes_path().filter(|path| path.is_file())
+        && let Some(err) = builder.add(&global)
+    {
+        tracing::debug!("failed to load {:?}: {}", global, err);
+    }
+    let mut sources = Vec::new();
+    if let Some(contents) = read_repository_exclude(top) {
+        sources.push((top.join(".git").join("info").join("exclude"), contents, top));
+    }
+    let mut dirs: Vec<&Path> = root
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| *dir != top)
+        .collect();
+    dirs.push(top);
+    for dir in dirs.into_iter().rev() {
+        let file = dir.join(".gitignore");
+        if let Some(contents) = read_git_metadata(&file, REPOSITORY_EXCLUDE_MAX_BYTES) {
+            sources.push((file, contents, dir));
+        }
+    }
+    for (file, contents, base) in sources {
+        let Ok(relative) = root.strip_prefix(base) else {
+            continue;
+        };
+        let prefix: Vec<String> = relative
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        let contents = contents.strip_prefix('\u{feff}').unwrap_or(&contents);
+        for line in contents.lines() {
+            for pattern in descend_gitignore_line(&prefix, line) {
+                if let Err(err) = builder.add_line(Some(file.clone()), &pattern) {
+                    tracing::debug!("failed to load {:?}: {}", file, err);
+                }
+            }
+        }
+    }
+}
+
+fn descend_gitignore_line(prefix: &[String], line: &str) -> Vec<String> {
+    if line.starts_with('#') {
+        return Vec::new();
+    }
+    let line = if line.ends_with("\\ ") {
+        line
+    } else {
+        line.trim_end()
+    };
+    if line.is_empty() {
+        return Vec::new();
+    }
+    let (negation, pattern) = match line.strip_prefix('!') {
+        Some(rest) => ("!", rest),
+        None => ("", line),
+    };
+    let (body, dir_only) = match pattern.strip_suffix('/') {
+        Some(body) => (body, "/"),
+        None => (pattern, ""),
+    };
+    if !body.contains('/') {
+        return vec![line.to_string()];
+    }
+    let segments: Vec<&str> = body.strip_prefix('/').unwrap_or(body).split('/').collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut pending = vec![(0usize, 0usize)];
+    let mut descended = Vec::new();
+    while let Some((segment, depth)) = pending.pop() {
+        if !seen.insert((segment, depth)) {
+            continue;
+        }
+        if depth == prefix.len() {
+            if segment < segments.len() {
+                descended.push(format!(
+                    "{negation}/{}{dir_only}",
+                    segments[segment..].join("/")
+                ));
+            }
+            continue;
+        }
+        match segments.get(segment) {
+            None => {}
+            Some(&"**") => {
+                pending.push((segment + 1, depth));
+                pending.push((segment, depth + 1));
+            }
+            Some(glob) => {
+                if glob_segment_matches(glob, &prefix[depth]) {
+                    pending.push((segment + 1, depth + 1));
+                }
+            }
+        }
+    }
+    descended
+}
+
+fn glob_segment_matches(glob: &str, name: &str) -> bool {
+    globset::GlobBuilder::new(glob)
+        .literal_separator(true)
+        .backslash_escape(true)
+        .build()
+        .is_ok_and(|glob| glob.compile_matcher().is_match(name))
 }
 
 fn read_repository_exclude(root: &Path) -> Option<String> {
@@ -3766,6 +3891,35 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             ),
         }
+    }
+
+    #[test]
+    fn enclosing_rules_descend_to_a_root_below_their_directory() {
+        let prefix = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(|part| part.to_string())
+                .collect::<Vec<_>>()
+        };
+        let project = prefix(&["project"]);
+        assert_eq!(descend_gitignore_line(&project, "built/"), ["built/"]);
+        assert_eq!(descend_gitignore_line(&project, "/project/a/"), ["/a/"]);
+        assert_eq!(
+            descend_gitignore_line(&project, "!/project/keep.ts"),
+            ["!/keep.ts"]
+        );
+        assert_eq!(descend_gitignore_line(&project, "p*/x"), ["/x"]);
+        assert_eq!(descend_gitignore_line(&project, "**/foo"), ["/**/foo"]);
+        assert!(descend_gitignore_line(&project, "/other/x").is_empty());
+        assert!(descend_gitignore_line(&project, "/project/").is_empty());
+        assert!(descend_gitignore_line(&project, "# /project/a").is_empty());
+        let mut deep = descend_gitignore_line(&prefix(&["a", "b"]), "a/**/b/c");
+        deep.sort();
+        assert_eq!(deep, ["/**/b/c", "/c"]);
+        assert_eq!(
+            descend_gitignore_line(&prefix(&["a", "c"]), "a/**/b"),
+            ["/**/b"]
+        );
     }
 
     #[test]
