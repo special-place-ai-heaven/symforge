@@ -1638,6 +1638,7 @@ pub(crate) fn search_structural_with_admission(
         pattern,
         options,
         refuse,
+        STRUCTURAL_SEARCH_ROUND_DEADLINE,
         crate::parsing::ast_grep::compile_structural_pattern,
     )
 }
@@ -1660,7 +1661,15 @@ fn search_structural_with_compiler(
     )
         -> Result<crate::parsing::ast_grep::CompiledStructuralPattern, String>,
 ) -> Result<TextSearchResult, TextSearchError> {
-    search_structural_impl(index, pattern, options, None, compile_pattern).map(|(result, _)| result)
+    search_structural_impl(
+        index,
+        pattern,
+        options,
+        None,
+        STRUCTURAL_SEARCH_ROUND_DEADLINE,
+        compile_pattern,
+    )
+    .map(|(result, _)| result)
 }
 
 fn search_structural_impl(
@@ -1668,6 +1677,7 @@ fn search_structural_impl(
     pattern: &str,
     options: &TextSearchOptions,
     refuse: Option<&dyn Fn(&str) -> bool>,
+    round_deadline: std::time::Duration,
     mut compile_pattern: impl FnMut(
         &str,
         &LanguageId,
@@ -1747,17 +1757,18 @@ fn search_structural_impl(
         }
     }
 
-    // Per-file parse and match budgets are hard; the wall-time budget only
-    // controls starting new rounds. Matcher traversal already in flight can finish.
+    // Per-file parse and match budgets are hard; the wall-time budget controls
+    // starting new rounds and new files. Matcher traversal in flight can finish.
     let started = std::time::Instant::now();
     for (round_idx, round) in candidates.chunks(STRUCTURAL_SEARCH_ROUND).enumerate() {
-        if total_matches >= options.total_limit
-            || started.elapsed() >= STRUCTURAL_SEARCH_ROUND_DEADLINE
-        {
+        if total_matches >= options.total_limit || started.elapsed() >= round_deadline {
             unparsed_files += candidates.len() - round_idx * STRUCTURAL_SEARCH_ROUND;
             break;
         }
         let scans = crate::live_index::store::ordered_parallel_map(round, |&(path, lang, _)| {
+            if started.elapsed() >= round_deadline {
+                return None;
+            }
             let file = index.get_file(path)?;
             let key = (lang, LanguageId::is_tsx_path(path));
             let compiled_pattern = compiled_patterns.get(&key)?.as_ref().ok()?;
@@ -4701,6 +4712,49 @@ mod tests {
     }
 
     #[test]
+    fn structural_round_deadline_stops_files_inside_a_round() {
+        let body: String = (0..4000)
+            .map(|i| format!("fn g{i}() {{ let a = b{i} + c; }}\n"))
+            .collect();
+        let files = (0..STRUCTURAL_SEARCH_ROUND)
+            .map(|i| {
+                make_file(
+                    &format!("src/{i:03}.rs"),
+                    &format!("fn f() {{ slow_witness(); }}\n{body}"),
+                    vec![],
+                )
+            })
+            .collect::<Vec<_>>();
+        let index = make_index(files);
+        let options = TextSearchOptions {
+            total_limit: usize::MAX,
+            max_per_file: usize::MAX,
+            ..Default::default()
+        };
+        let deadline = std::time::Duration::from_millis(30);
+        let started = std::time::Instant::now();
+        let (result, _) = search_structural_impl(
+            &index,
+            "slow_witness()",
+            &options,
+            None,
+            deadline,
+            crate::parsing::ast_grep::compile_structural_pattern,
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert!(result.unparsed_files > 0, "every file ran in {elapsed:?}");
+        assert_eq!(
+            result.total_matches + result.unparsed_files,
+            STRUCTURAL_SEARCH_ROUND
+        );
+        assert!(
+            elapsed < deadline + STRUCTURAL_SEARCH_FILE_DEADLINE * 2,
+            "took {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn structural_search_finds_the_only_match_past_the_first_256_files() {
         let mut files = (0..300)
             .map(|i| make_file(&format!("src/{i:04}.rs"), "fn f() { other(); }", vec![]))
@@ -4810,15 +4864,21 @@ mod tests {
             total_limit: 1,
             ..Default::default()
         };
-        let (result, incompatible) =
-            search_structural_impl(&index, "witness()", &options, None, |pattern, lang, tsx| {
+        let (result, incompatible) = search_structural_impl(
+            &index,
+            "witness()",
+            &options,
+            None,
+            STRUCTURAL_SEARCH_ROUND_DEADLINE,
+            |pattern, lang, tsx| {
                 if *lang == LanguageId::Python {
                     Err("invalid structural pattern: fixture grammar rejected it".to_string())
                 } else {
                     crate::parsing::ast_grep::compile_structural_pattern(pattern, lang, tsx)
                 }
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(result.total_matches, 1);
         assert_eq!(incompatible, 1);
         assert_eq!(result.overflow_count, STRUCTURAL_SEARCH_ROUND - 1);
