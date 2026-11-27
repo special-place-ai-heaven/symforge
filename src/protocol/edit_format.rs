@@ -204,7 +204,7 @@ mod tests {
         ));
 
         // `Write mode: failed` only counts as a failure on an apply, never a preview.
-        let failed_apply = "Write mode: failed\nChanged file: src/a.rs";
+        let failed_apply = "Write mode: failed\nTarget file: src/a.rs";
         assert!(symforge_edit_internal_failure("ok", true, failed_apply));
         assert!(!symforge_edit_internal_failure("ok", false, failed_apply));
 

@@ -164,9 +164,14 @@ pub fn run_pre_apply_gates_on_ready(
 }
 
 pub fn format_apply_metadata(resolved: &ResolvedEditSymbol, write_mode: &str) -> String {
+    let file_label = if write_mode == "committed" {
+        "Changed file"
+    } else {
+        "Target file"
+    };
     format!(
         "Write mode: {write_mode}\n\
-         Changed file: {}\n\
+         {file_label}: {}\n\
          Symbol: {}\n\
          Byte range: {}-{}\n\
          Line range: {}-{}",
@@ -266,6 +271,35 @@ fn resolve_symbol_in_file(
 mod tests {
     use super::*;
     use crate::live_index::LiveIndex;
+
+    #[test]
+    fn apply_metadata_names_a_changed_file_only_for_a_committed_write() {
+        let resolved = ResolvedEditSymbol {
+            path: "src/a.rs".to_string(),
+            name: "foo".to_string(),
+            byte_start: 0,
+            byte_end: 8,
+            line_start: 1,
+            line_end: 1,
+            current_body: String::new(),
+            shown_body: String::new(),
+        };
+        assert_eq!(
+            format_apply_metadata(&resolved, "committed"),
+            "Write mode: committed\nChanged file: src/a.rs\nSymbol: foo\nByte range: 0-8\nLine range: 1-1"
+        );
+        for mode in ["failed", "dry_run"] {
+            assert!(
+                format_apply_metadata(&resolved, mode)
+                    .starts_with(&format!("Write mode: {mode}\nTarget file: src/a.rs\n")),
+                "{mode}"
+            );
+        }
+        let already = format_already_applied_body(&resolved);
+        assert!(already.contains("Write mode: already_applied\nTarget file: src/a.rs\n"));
+        assert!(!already.contains("Changed file:"));
+    }
+
     #[test]
     fn apply_requested_requires_explicit_true() {
         assert!(!apply_requested(&StelEditRequest::default()));
