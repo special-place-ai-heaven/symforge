@@ -442,6 +442,14 @@ pub(crate) fn repo_map_text_scoped(
     path_scope: Option<&str>,
     depth: Option<u32>,
 ) -> String {
+    repo_map_text_scoped_counted(generation, path_scope, depth).0
+}
+
+pub(crate) fn repo_map_text_scoped_counted(
+    generation: &crate::live_index::PublishedGeneration,
+    path_scope: Option<&str>,
+    depth: Option<u32>,
+) -> (String, usize) {
     let scope = path_scope
         .map(|p| p.replace('\\', "/"))
         .map(|p| {
@@ -496,8 +504,11 @@ pub(crate) fn repo_map_text_scoped(
     if let Some(scope) = scope
         && dir_file_counts.is_empty()
     {
-        return format!(
-            "No entries under {scope} (paths are relative to the project root and case-sensitive); get_repo_map(detail=\"tree\", depth=1) lists the top-level directories."
+        return (
+            format!(
+                "No entries under {scope} (paths are relative to the project root and case-sensitive); get_repo_map(detail=\"tree\", depth=1) lists the top-level directories."
+            ),
+            0,
         );
     }
     let (total_files, total_symbols) = match scope {
@@ -539,6 +550,7 @@ pub(crate) fn repo_map_text_scoped(
     }
     // Rows from here on belong to the key-types section.
     let dir_rows_end = lines.len();
+    let mut omitted_key_types = 0;
 
     // Key entry points: top-level structs/traits/interfaces/enums in src/ (depth 0, limit 10).
     {
@@ -668,6 +680,7 @@ pub(crate) fn repo_map_text_scoped(
                     // but keeps the order total either way).
                     .then_with(|| a_kind.cmp(b_kind))
             });
+            omitted_key_types = entry_points.len().saturating_sub(15);
             entry_points.truncate(15);
             lines.push(String::new());
             lines.push("Key types:".to_string());
@@ -715,7 +728,7 @@ pub(crate) fn repo_map_text_scoped(
         }
     }
 
-    text
+    (text, remaining + omitted_key_types)
 }
 
 #[derive(Clone, Copy)]

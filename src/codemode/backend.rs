@@ -977,6 +977,7 @@ fn execute_value_on_generation(
                 let mut lines = vec![format!("## {norm_path} ({})", file.language.name())];
                 for sym in &file.symbols {
                     if !include_tests_flag && sym.name == "tests" && sym.kind.to_string() == "mod" {
+                        completeness.omitted_rows += 1;
                         continue;
                     }
                     let indent = "  ".repeat(sym.depth as usize);
@@ -1002,14 +1003,23 @@ fn execute_value_on_generation(
                             r.qualified_name.as_deref().unwrap_or(&r.name)
                         )
                     })
-                    .take(50)
                     .collect();
+                completeness.omitted_rows += imports.len().saturating_sub(50);
+                let imports = &imports[..imports.len().min(50)];
                 if !imports.is_empty() {
                     rendered_parts.push(format!("### Imports\n{}", imports.join("\n")));
                 }
             }
             if selected.iter().any(|s| s == "consumers") {
                 let deps = generation.live.capture_find_dependents_view(&norm_path);
+                completeness.omitted_rows += deps.files.len().saturating_sub(30);
+                completeness.withheld_files = withheld_reference_corpus(
+                    &generation.live,
+                    code_mode_withheld(generation),
+                    Some(file.language),
+                    Some(&norm_path),
+                )
+                .len();
                 if !deps.files.is_empty() {
                     let consumer_paths: Vec<String> = deps
                         .files
@@ -1216,12 +1226,19 @@ fn execute_value_on_generation(
                         "tier": "metadata_only",
                         "coupling_score": Value::Null,
                     }]),
-                    SearchFilesResolveView::Ambiguous { matches, .. } => Value::Array(
-                        matches
-                            .into_iter()
-                            .map(|p| json!({"path": p, "tier": "ambiguous", "coupling_score": Value::Null}))
-                            .collect(),
-                    ),
+                    SearchFilesResolveView::Ambiguous {
+                        matches,
+                        overflow_count,
+                        ..
+                    } => {
+                        completeness.omitted_rows = overflow_count;
+                        Value::Array(
+                            matches
+                                .into_iter()
+                                .map(|p| json!({"path": p, "tier": "ambiguous", "coupling_score": Value::Null}))
+                                .collect(),
+                        )
+                    }
                     _ => json!([]),
                 });
             }
@@ -1314,6 +1331,7 @@ fn execute_value_on_generation(
                     let total = files.len() as u64;
                     files.truncate(max_files);
                     let shown = files.len() as u64;
+                    completeness.omitted_rows = (total - shown) as usize;
                     let total_symbols: usize = files.iter().map(|f| f.symbol_count).sum();
                     let view = crate::live_index::query::RepoOutlineView {
                         total_files: total as usize,
@@ -1340,11 +1358,13 @@ fn execute_value_on_generation(
                     (text, total, total)
                 }
                 _ => {
-                    let text = crate::index_lifecycle::guidance::read_context::repo_map_text_scoped(
-                        generation,
-                        input.path.as_deref(),
-                        input.depth,
-                    );
+                    let (text, omitted) =
+                        crate::index_lifecycle::guidance::read_context::repo_map_text_scoped_counted(
+                            generation,
+                            input.path.as_deref(),
+                            input.depth,
+                        );
+                    completeness.omitted_rows = omitted;
                     let total = scoped_count as u64;
                     (text, total, total)
                 }
@@ -1435,17 +1455,25 @@ fn execute_value_on_generation(
                     let total_callers = filtered_callers.len();
                     let section_omitted =
                         |sec: &crate::live_index::ContextBundleSectionView| -> usize {
-                            sec.overflow_count
-                                + sec
-                                    .entries
-                                    .iter()
-                                    .filter(|e| include_tests_flag || !is_test_entry(&e.file_path))
-                                    .count()
-                                    .saturating_sub(CODE_MODE_SECTION_CAP)
+                            let shown = sec
+                                .entries
+                                .iter()
+                                .filter(|e| include_tests_flag || !is_test_entry(&e.file_path))
+                                .count()
+                                .min(CODE_MODE_SECTION_CAP);
+                            sec.overflow_count + sec.entries.len() - shown
                         };
-                    completeness.omitted_rows = total_callers.saturating_sub(CODE_MODE_CALLERS_CAP)
+                    completeness.omitted_rows = found.callers.entries.len()
+                        - total_callers.min(CODE_MODE_CALLERS_CAP)
                         + section_omitted(&found.callees)
-                        + section_omitted(&found.type_usages);
+                        + section_omitted(&found.type_usages)
+                        + found.unresolved_same_name_member_calls.len();
+                    let mut withheld = withheld_reference_corpus(
+                        &generation.live,
+                        code_mode_withheld(generation),
+                        generation.live.get_file(&target_path).map(|f| f.language),
+                        None,
+                    );
                     let callers_json: Vec<Value> = filtered_callers
                         .into_iter()
                         .take(CODE_MODE_CALLERS_CAP)
@@ -1480,10 +1508,10 @@ fn execute_value_on_generation(
                                 .collect()
                         };
                     let deps: Vec<Value> = if input.bundle.unwrap_or(false) {
-                        found
-                            .dependencies
-                            .iter()
-                            .filter(|d| {
+                        completeness.omitted_rows_inexact |=
+                            found.dependencies.len() >= crate::live_index::MAX_TYPE_DEPENDENCIES;
+                        let (admitted, refused): (Vec<_>, Vec<_>) =
+                            found.dependencies.iter().partition(|d| {
                                 if check_secret_or_scope_refusal(&generation.live, &d.file_path)
                                     .is_some()
                                 {
@@ -1500,7 +1528,10 @@ fn execute_value_on_generation(
                                     return false;
                                 }
                                 true
-                            })
+                            });
+                        withheld.extend(refused.into_iter().map(|d| d.file_path.clone()));
+                        admitted
+                            .into_iter()
                             .map(|d| {
                                 json!({
                                     "name": d.name,
@@ -1515,6 +1546,7 @@ fn execute_value_on_generation(
                     } else {
                         Vec::new()
                     };
+                    completeness.withheld_files = withheld.len();
                     Ok(json!({
                         "path": found.file_path,
                         "name": input.name,
@@ -1568,6 +1600,7 @@ fn execute_value_on_generation(
             ) {
                 InspectMatchView::Found(found) => {
                     on_commitment_read(&norm_path);
+                    completeness.omitted_rows = found.siblings_overflow;
                     Ok(json!({
                         "path": found.path,
                         "line": found.line,
@@ -1692,6 +1725,7 @@ fn execute_value_on_generation(
                                     }
                                 },
                             );
+                        completeness.omitted_rows_inexact |= diff_view.name_collision_files > 0;
                         Some(symbol_diff_view_to_json(&diff_view))
                     } else {
                         None
@@ -1749,6 +1783,7 @@ fn execute_value_on_generation(
                                     }
                                 },
                             );
+                        completeness.omitted_rows_inexact |= diff_view.name_collision_files > 0;
                         Some(symbol_diff_view_to_json(&diff_view))
                     } else {
                         None
@@ -1857,6 +1892,7 @@ fn execute_value_on_generation(
                     },
                 )
             };
+            completeness.omitted_rows_inexact |= view.name_collision_files > 0;
             Ok(symbol_diff_view_to_json(&view))
         }
 
@@ -1897,6 +1933,8 @@ fn execute_value_on_generation(
                 include_data: input.include_data.unwrap_or(false),
                 paths: input.paths.as_deref(),
             };
+            let mut refused_git = std::collections::HashSet::new();
+            let mut refused_worktree = std::collections::HashSet::new();
             let report = crate::index_lifecycle::guidance::impact::compute_detect_impact(
                 &generation.live,
                 &repo,
@@ -1908,14 +1946,31 @@ fn execute_value_on_generation(
                         git_ref,
                         path,
                     )
+                    .inspect_err(|_| {
+                        refused_git.insert(path.to_owned());
+                    })
                 },
                 &mut |path| {
                     crate::protocol::read_gate::admit_worktree_text(&generation.live, &repo, path)
+                        .inspect_err(|_| {
+                            refused_worktree.insert(path.to_owned());
+                        })
                 },
             )
             .map_err(CodeBackendError::invalid_args)?;
 
             let cap = crate::index_lifecycle::guidance::impact::DETECT_IMPACT_MAX_RETURNED;
+            refused_git.extend(refused_worktree);
+            completeness.withheld_files = refused_git.len();
+            completeness.omitted_rows_inexact = report.effective_depth < report.requested_depth;
+            completeness.omitted_rows = [
+                report.changed_files.len(),
+                report.changed_symbols.len(),
+                report.blast_entries.len(),
+            ]
+            .into_iter()
+            .map(|len| len.saturating_sub(cap))
+            .sum();
             let changed_symbols: Vec<Value> = report
                 .changed_symbols
                 .iter()

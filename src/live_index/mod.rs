@@ -2,6 +2,8 @@ mod callable_values;
 mod context_bundle;
 pub mod coupling;
 pub(crate) mod disambiguation;
+#[cfg(feature = "server")]
+pub(crate) use context_bundle::MAX_TYPE_DEPENDENCIES;
 pub(crate) use disambiguation::enclosing_impl_owner;
 pub mod frecency;
 pub mod git_temporal;
