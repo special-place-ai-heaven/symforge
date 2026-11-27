@@ -162,7 +162,7 @@ counts = search_text(query="target::witness_target()", structural=True, group_by
 }
 
 #[test]
-fn structural_recovery_skips_whole_file_and_notices_survive_empty_and_count_results() {
+fn structural_recovery_keeps_intact_matches_and_notices_survive_empty_and_count_results() {
     let repo = tempfile::tempdir().unwrap();
     fs::write(
         repo.path().join("partial.rs"),
@@ -187,8 +187,8 @@ empty_counts = search_text(query="absent_target()", structural=True, language="r
     assert_eq!(
         output["value"],
         json!({
-            "paths": ["valid.rs"],
-            "counts": [{"path": "valid.rs", "count": 1}],
+            "paths": ["partial.rs", "valid.rs"],
+            "counts": [{"path": "partial.rs", "count": 1}, {"path": "valid.rs", "count": 1}],
             "empty": [],
             "empty_counts": [],
         })
@@ -202,9 +202,7 @@ empty_counts = search_text(query="absent_target()", structural=True, language="r
         })
         .collect();
     assert_eq!(output["notices"], json!(notices));
-    let serialized = output.to_string();
-    assert!(!serialized.contains("partial.rs"));
-    assert!(!serialized.contains("unfinished"));
+    assert!(!output.to_string().contains("unfinished"));
 }
 
 #[test]

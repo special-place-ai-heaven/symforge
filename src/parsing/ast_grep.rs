@@ -178,12 +178,14 @@ pub fn structural_search_with_compiled(
     structural_search_within(source, compiled, super::PARSE_DEADLINE)
 }
 
+/// Bounded search that keeps matches outside syntax-error regions. The flag is
+/// true when the source tree had damage, so rows inside it may be missing.
 pub(crate) fn structural_search_bounded(
     source: &str,
     compiled: &CompiledStructuralPattern,
     deadline: Duration,
     match_limit: usize,
-) -> Result<Vec<StructuralMatch>, String> {
+) -> Result<(Vec<StructuralMatch>, bool), String> {
     structural_search_impl(source, compiled, deadline, Some(match_limit))
 }
 
@@ -192,7 +194,27 @@ fn structural_search_within(
     compiled: &CompiledStructuralPattern,
     deadline: Duration,
 ) -> Result<Vec<StructuralMatch>, String> {
-    structural_search_impl(source, compiled, deadline, None)
+    match structural_search_impl(source, compiled, deadline, None)? {
+        (_, true) => Err("structural search source contains syntax errors".to_owned()),
+        (matches, false) => Ok(matches),
+    }
+}
+
+fn damaged_byte_ranges(root: tree_sitter::Node<'_>) -> Vec<(usize, usize)> {
+    let mut damaged = Vec::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.is_error() || node.is_missing() {
+            damaged.push((
+                node.start_byte(),
+                node.end_byte().max(node.start_byte() + 1),
+            ));
+        } else if node.has_error() {
+            let mut cursor = node.walk();
+            pending.extend(node.children(&mut cursor));
+        }
+    }
+    damaged
 }
 
 fn structural_search_impl(
@@ -200,18 +222,18 @@ fn structural_search_impl(
     compiled: &CompiledStructuralPattern,
     deadline: Duration,
     match_limit: Option<usize>,
-) -> Result<Vec<StructuralMatch>, String> {
+) -> Result<(Vec<StructuralMatch>, bool), String> {
     let started = std::time::Instant::now();
     let mut parser = Parser::new();
     parser
         .set_language(&compiled.lang.get_ts_language())
         .map_err(|e| format!("failed to set tree-sitter language: {e}"))?;
     let tree = super::parse_within(&mut parser, source, deadline)?;
-    // Recovery can keep some matching nodes while losing others. Do not
-    // publish hits or counts from an incomplete source tree.
-    if tree.root_node().has_error() {
-        return Err("structural search source contains syntax errors".to_owned());
-    }
+    let damaged = if tree.root_node().has_error() {
+        damaged_byte_ranges(tree.root_node())
+    } else {
+        Vec::new()
+    };
     let root = AstGrep::doc(StrDoc {
         src: source.to_string(),
         lang: compiled.lang.clone(),
@@ -225,8 +247,15 @@ fn structural_search_impl(
             format!("{}...", &text[..text.floor_char_boundary(bytes)])
         }
     };
-    root.root()
+    let matches = root
+        .root()
         .find_all(&compiled.pattern)
+        .filter(|node_match| {
+            let range = node_match.range();
+            !damaged
+                .iter()
+                .any(|&(start, end)| start < range.end && range.start < end)
+        })
         .enumerate()
         .map(|(i, node_match)| {
             if let Some(limit) = match_limit
@@ -297,7 +326,8 @@ fn structural_search_impl(
             } else {
                 Ok(matches)
             }
-        })
+        });
+    matches.map(|matches| (matches, !damaged.is_empty()))
 }
 
 /// Rewrite every match of `compiled` in `source` with ast-grep's own template

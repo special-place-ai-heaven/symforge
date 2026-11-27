@@ -892,8 +892,10 @@ pub struct TextSearchResult {
     pub withheld_policy_paths: Vec<String>,
     /// In-scope files withheld for size (oversized data or per-file ceiling).
     pub withheld_size_files: usize,
-    /// Structural search only: in-scope files not searched because of grammar
-    /// incompatibility, work budgets, or parse failure/cancellation.
+    /// Structural search only: in-scope files not fully searched because of work
+    /// budgets, the result limit ending the scan early, parse cancellation, or
+    /// syntax errors (rows outside the damaged region are still returned). Files
+    /// whose grammar cannot express the pattern are not counted.
     pub unparsed_files: usize,
 }
 
@@ -1593,7 +1595,7 @@ pub fn search_structural(
     search_structural_with_admission(index, pattern, options, None).map(|(result, _)| result)
 }
 
-/// Result and in-scope files with incompatible grammars (a subset of `unparsed_files`).
+/// Result and in-scope files whose grammar cannot express the pattern (never in `unparsed_files`).
 pub(crate) fn search_structural_with_admission(
     index: &LiveIndex,
     pattern: &str,
@@ -1611,7 +1613,6 @@ pub(crate) fn search_structural_with_admission(
 
 const STRUCTURAL_SEARCH_ROUND: usize = 16;
 const STRUCTURAL_SEARCH_MAX_PATTERN_BYTES: usize = 4 * 1024;
-const STRUCTURAL_SEARCH_MAX_FILES: usize = 256;
 const STRUCTURAL_SEARCH_MAX_BYTES: usize = 16 * 1024 * 1024;
 const STRUCTURAL_SEARCH_MAX_FILE_BYTES: usize = 1024 * 1024;
 const STRUCTURAL_SEARCH_MAX_FILE_MATCHES: usize = 1024;
@@ -1716,19 +1717,15 @@ fn search_structural_impl(
             });
         }
     }
-    unparsed_files += incompatible_grammar_files;
 
-    let mut scheduled_files = 0;
     let mut scheduled_bytes = 0;
     candidates.retain(|&(_, _, bytes)| {
-        if scheduled_files >= STRUCTURAL_SEARCH_MAX_FILES
-            || bytes > STRUCTURAL_SEARCH_MAX_FILE_BYTES
+        if bytes > STRUCTURAL_SEARCH_MAX_FILE_BYTES
             || bytes > STRUCTURAL_SEARCH_MAX_BYTES - scheduled_bytes
         {
             unparsed_files += 1;
             false
         } else {
-            scheduled_files += 1;
             scheduled_bytes += bytes;
             true
         }
@@ -1738,7 +1735,9 @@ fn search_structural_impl(
     // starting new rounds. Matcher traversal already in flight can finish.
     let started = std::time::Instant::now();
     for (round_idx, round) in candidates.chunks(STRUCTURAL_SEARCH_ROUND).enumerate() {
-        if started.elapsed() >= STRUCTURAL_SEARCH_ROUND_DEADLINE {
+        if total_matches >= options.total_limit
+            || started.elapsed() >= STRUCTURAL_SEARCH_ROUND_DEADLINE
+        {
             unparsed_files += candidates.len() - round_idx * STRUCTURAL_SEARCH_ROUND;
             break;
         }
@@ -1756,11 +1755,14 @@ fn search_structural_impl(
         });
 
         for (&(path, lang, _), scan) in round.iter().zip(scans) {
-            let Some(structural_matches) = scan else {
+            let Some((structural_matches, partially_parsed)) = scan else {
                 // Source parse and budget failures are not query/grammar incompatibilities.
                 unparsed_files += 1;
                 continue;
             };
+            if partially_parsed {
+                unparsed_files += 1;
+            }
 
             if structural_matches.is_empty() {
                 continue;
@@ -4393,6 +4395,21 @@ mod tests {
             .map(|(path, file)| (path.clone(), file.language))
             .collect();
         candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        for (path, lang) in &candidates {
+            let is_tsx = LanguageId::is_tsx_path(path);
+            compiled_patterns
+                .entry((*lang, is_tsx, pattern.to_string()))
+                .or_insert_with(|| compile_pattern(pattern, lang, is_tsx));
+        }
+        let compatible_files = candidates
+            .iter()
+            .filter(|(path, lang)| {
+                compiled_patterns
+                    .get(&(*lang, LanguageId::is_tsx_path(path), pattern.to_string()))
+                    .is_some_and(Result::is_ok)
+            })
+            .count();
+        let mut scheduled_files = 0usize;
 
         for (path, lang) in &candidates {
             let file = match index.get_file(path) {
@@ -4409,20 +4426,30 @@ mod tests {
             let structural_matches = match compiled {
                 Ok(compiled_pattern) => {
                     any_grammar_compiled = true;
-                    match crate::parsing::ast_grep::structural_search_with_compiled(
+                    if scheduled_files.is_multiple_of(STRUCTURAL_SEARCH_ROUND)
+                        && total_matches >= options.total_limit
+                    {
+                        unparsed_files += compatible_files - scheduled_files;
+                        break;
+                    }
+                    scheduled_files += 1;
+                    match crate::parsing::ast_grep::structural_search_bounded(
                         &content_str,
                         compiled_pattern,
+                        STRUCTURAL_SEARCH_FILE_DEADLINE,
+                        STRUCTURAL_SEARCH_MAX_FILE_MATCHES,
                     ) {
-                        Ok(found) => found,
+                        Ok((found, partially_parsed)) => {
+                            unparsed_files += usize::from(partially_parsed);
+                            found
+                        }
                         Err(_) => {
-                            // An incomplete source parse yields no rows.
                             unparsed_files += 1;
                             continue;
                         }
                     }
                 }
                 Err(e) => {
-                    unparsed_files += 1;
                     // compile_structural_pattern returns two distinguishable error
                     // shapes: "structural search not supported for …" for
                     // config languages, and "invalid structural pattern: …"
@@ -4638,7 +4665,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_hit_structural_search_still_counts_incompatible_grammar_files() {
+    fn incompatible_grammar_files_are_reported_apart_from_unsearched_files() {
         let rust = make_file("src/a.rs", "fn other() {}", vec![]);
         let mut toml = make_file("src/config.toml", "name = \"test\"", vec![]);
         toml.1.language = LanguageId::Toml;
@@ -4650,13 +4677,44 @@ mod tests {
         let (result, incompatible) =
             search_structural_with_admission(&index, "witness()", &options, None).unwrap();
         assert!(result.files.is_empty());
-        assert_eq!(result.unparsed_files, 1);
+        assert_eq!(result.unparsed_files, 0);
         assert_eq!(incompatible, 1);
     }
 
     #[test]
+    fn structural_search_finds_the_only_match_past_the_first_256_files() {
+        let mut files = (0..300)
+            .map(|i| make_file(&format!("src/{i:04}.rs"), "fn f() { other(); }", vec![]))
+            .collect::<Vec<_>>();
+        files.push(make_file("src/zz.rs", "fn g() { only_witness(); }", vec![]));
+        let index = make_index(files);
+        let result =
+            search_structural(&index, "only_witness()", &TextSearchOptions::default()).unwrap();
+        assert_eq!(result.total_matches, 1);
+        assert_eq!(result.files[0].path, "src/zz.rs");
+        assert_eq!(result.unparsed_files, 0);
+    }
+
+    #[test]
+    fn structural_search_keeps_matches_outside_a_contained_syntax_error() {
+        let index = make_index(vec![
+            make_file(
+                "src/partial.rs",
+                "fn intact() { g().unwrap(); }\nfn unfinished() {\n",
+                vec![],
+            ),
+            make_file("src/valid.rs", "fn valid() { h().unwrap(); }\n", vec![]),
+        ]);
+        let result =
+            search_structural(&index, "$X.unwrap()", &TextSearchOptions::default()).unwrap();
+        let paths: Vec<&str> = result.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["src/partial.rs", "src/valid.rs"]);
+        assert_eq!(result.unparsed_files, 1);
+    }
+
+    #[test]
     fn structural_budget_counts_late_grammars_even_after_the_result_limit() {
-        let mut files = (0..STRUCTURAL_SEARCH_MAX_FILES + 2)
+        let mut files = (0..258)
             .map(|i| make_file(&format!("src/{i:04}.rs"), "fn f() { witness(); }", vec![]))
             .collect::<Vec<_>>();
         let mut incompatible = make_file("src/zzz.py", "def other(): pass", vec![]);
@@ -4678,11 +4736,8 @@ mod tests {
             .unwrap();
         assert_eq!(result.total_matches, 1);
         assert_eq!(incompatible, 1);
-        assert!(result.unparsed_files >= 3);
-        assert_eq!(
-            result.total_matches + result.overflow_count + result.unparsed_files,
-            STRUCTURAL_SEARCH_MAX_FILES + 3,
-        );
+        assert_eq!(result.overflow_count, STRUCTURAL_SEARCH_ROUND - 1);
+        assert_eq!(result.unparsed_files, 258 - STRUCTURAL_SEARCH_ROUND);
     }
 
     #[test]

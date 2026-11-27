@@ -215,7 +215,7 @@ pub(crate) fn search_completeness_label(
     }];
     if unparsed_files > 0 {
         parts.push(format!(
-            "{unparsed_files} file(s) not searched (grammar, parse or work budget)"
+            "{unparsed_files} file(s) not fully searched (syntax errors, work budget or result limit)"
         ));
     }
     if suppressed_by_noise > 0 {
@@ -598,7 +598,7 @@ mod tests {
         );
         assert!(
             envelope.contains(
-                "\nCompleteness: incomplete for indexed scope; 1 file(s) not searched (grammar, parse or work budget)"
+                "\nCompleteness: incomplete for indexed scope; 1 file(s) not fully searched (syntax errors, work budget or result limit)"
             ),
             "{envelope}"
         );

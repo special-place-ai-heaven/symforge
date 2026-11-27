@@ -19,7 +19,15 @@ def envelope(text):
     return value if isinstance(value, dict) else {'value': value}
 
 
-def check(text, dense):
+CASES = {
+    'ordinary-exact': ([('a', 2), ('b', 1)], 0, 2),
+    'dense-lower-bound': ([('a', 2), ('b', 1), ('dense', 1025)], 1, 2),
+    'early-exit-lower-bound': ([(f'f{i:02}', 1) for i in range(20)], 4, 15),
+}
+
+
+def check(text, unparsed, omitted):
+    inexact = unparsed > 0
     result = envelope(text)
     require(result.get('value') == 1, 'expected one visible structural hit')
     notices = result.get('notices', [])
@@ -27,9 +35,9 @@ def check(text, dense):
     n = notices[0]
     require(n.get('op') == 'search_text' and n.get('call') == 1, 'unexpected call attribution')
     require(n.get('withheld_files') == 0, 'synthetic Rust files should be admitted')
-    require(n.get('unparsed_files') == int(dense), f'unexpected unparsed count: {n}')
-    require(n.get('omitted_rows') == 2, f'unexpected omission count: {n}')
-    require(n.get('omitted_rows_inexact', False) is dense, f'wrong exact/lower-bound flag: {n}')
+    require(n.get('unparsed_files') == unparsed, f'unexpected unparsed count: {n}')
+    require(n.get('omitted_rows') == omitted, f'unexpected omission count: {n}')
+    require(n.get('omitted_rows_inexact', False) is inexact, f'wrong exact/lower-bound flag: {n}')
     require(n.get('incompatible_grammar_files', 0) == 0, 'all fixtures use Rust')
     require('dense.rs' not in text, 'notice disclosed skipped path')
 
@@ -40,11 +48,10 @@ def main():
     binary = parser.parse_args().binary.resolve(strict=True)
     failures = []
     with tempfile.TemporaryDirectory(prefix='sf-notice-') as tmp:
-        for dense in [False, True]:
-            case = 'dense-lower-bound' if dense else 'ordinary-exact'
+        for case, (files, unparsed, omitted) in CASES.items():
             root = Path(tmp) / case
             root.mkdir()
-            for name, hits in [('a', 2), ('b', 1)] + ([('dense', 1025)] if dense else []):
+            for name, hits in files:
                 (root / f'{name}.rs').write_text(f'fn {name}() {{\n' + '    notice_target();\n' * hits + '}\n', encoding='utf8')
             for surface in ['cli', 'stdio']:
                 home = Path(tmp) / f'home-{case}-{surface}'
@@ -59,7 +66,7 @@ def main():
                             text = reply.text
                     else:
                         text = subprocess.run([str(binary), 'code', 'run', '-c', QUERY, '--root', str(root)], cwd=root, env=env, check=True, capture_output=True, text=True, timeout=45).stdout
-                    check(text, dense)
+                    check(text, unparsed, omitted)
                 except (RuntimeError, ValueError, subprocess.SubprocessError) as exc:
                     failures.append(f'{surface}/{case}: {exc}')
                 else:

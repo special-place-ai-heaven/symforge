@@ -42,7 +42,7 @@ The harness checks all 24 hit locations and all 24 three-line windows against th
 python -B research/code-mode-perf/verify_structural_notice.py --binary target/debug/symforge
 ```
 
-This separate gate runs one ordinary and one dense structural query through both `code run` and MCP `code_execute` with the daemon disabled. It checks the result the model sees after the script returns just a count. An ordinary cap must report exact omissions. When the matcher skips a dense file, the notice must identify the known omissions as a lower bound and count the unparsed file. All four cases must pass. This is a response-contract check, not a latency benchmark or a daemon interoperability test.
+This separate gate runs one ordinary and one dense structural query through both `code run` and MCP `code_execute` with the daemon disabled. It checks the result the model sees after the script returns just a count. An ordinary cap must report exact omissions. When the matcher skips a dense file, or the scan stops early once the result limit is filled, the notice must identify the known omissions as a lower bound and count every file left unsearched. All six cases must pass. This is a response-contract check, not a latency benchmark or a daemon interoperability test.
 
 ## Reading the receipt
 
