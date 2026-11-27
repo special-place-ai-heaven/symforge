@@ -16,6 +16,23 @@ pub(super) fn literal_key(index: Node<'_>, src: &[u8]) -> Option<String> {
     Some(key)
 }
 
+pub(super) fn identifier_name(text: &str) -> Option<String> {
+    let mut parts = text.split('\\');
+    let mut name = parts.next()?.to_owned();
+    for part in parts {
+        let body = part.strip_prefix('u')?;
+        let len = if body.starts_with('{') {
+            body.find('}')? + 1
+        } else {
+            4
+        };
+        let escape = body.get(..len)?;
+        name.push(decode_escape(&format!("\\u{escape}"))??);
+        name.push_str(&body[len..]);
+    }
+    Some(name)
+}
+
 fn decode_escape(sequence: &str) -> Option<Option<char>> {
     let mut chars = sequence.strip_prefix('\\')?.chars();
     let first = chars.next()?;
@@ -52,7 +69,22 @@ fn decode_escape(sequence: &str) -> Option<Option<char>> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_escape;
+    use super::{decode_escape, identifier_name};
+
+    #[test]
+    fn decodes_identifier_escapes_or_refuses_them() {
+        for (text, expected) in [
+            ("h\\u0061ndle", Some("handle")),
+            ("h\\u{61}ndle", Some("handle")),
+            ("\\u0068\\u0061ndle", Some("handle")),
+            ("handle", Some("handle")),
+            ("h\\x61ndle", None),
+            ("h\\u06", None),
+            ("h\\u{61ndle", None),
+        ] {
+            assert_eq!(identifier_name(text).as_deref(), expected, "{text:?}");
+        }
+    }
 
     #[test]
     fn decodes_each_javascript_escape_spelling() {

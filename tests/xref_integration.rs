@@ -223,6 +223,171 @@ fn exact_method_callbacks_survive_only_writes_to_other_decoded_keys() {
 }
 
 #[test]
+fn class_fields_and_escaped_names_never_leave_a_false_exact_method_callback() {
+    let cases: &[(&str, &str, &str, usize, usize)] = &[
+        (
+            "FieldArrow.js",
+            "class FieldArrow {\n    handle() { return 0; }\n    stable() { return 0; }\n    swap = (fn) => { this.handle = fn; };\n    bind() {\n        installFieldArrow(this.handle);\n        installFieldArrowStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "FieldArrow.ts",
+            "class FieldArrow {\n    handle() { return 0; }\n    stable() { return 0; }\n    swap = (fn) => { this.handle = fn; };\n    bind() {\n        installFieldArrow(this.handle);\n        installFieldArrowStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "FieldBracket.js",
+            "class FieldBracket {\n    handle() { return 1; }\n    stable() { return 1; }\n    swap = (fn) => { this[\"handle\"] = fn; };\n    bind() {\n        installFieldBracket(this.handle);\n        installFieldBracketStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "FieldBracket.ts",
+            "class FieldBracket {\n    handle() { return 1; }\n    stable() { return 1; }\n    swap = (fn) => { this[\"handle\"] = fn; };\n    bind() {\n        installFieldBracket(this.handle);\n        installFieldBracketStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "FieldOpaque.js",
+            "class FieldOpaque {\n    handle() { return 2; }\n    stable() { return 2; }\n    swap = (key, fn) => { this[key] = fn; };\n    bind() {\n        installFieldOpaque(this.handle);\n        installFieldOpaqueStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            0,
+        ),
+        (
+            "FieldOpaque.ts",
+            "class FieldOpaque {\n    handle() { return 2; }\n    stable() { return 2; }\n    swap = (key, fn) => { this[key] = fn; };\n    bind() {\n        installFieldOpaque(this.handle);\n        installFieldOpaqueStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            0,
+        ),
+        (
+            "FieldValue.js",
+            "class FieldValue {\n    handle() { return 3; }\n    stable() { return 3; }\n    swap = this.handle = null;\n    bind() {\n        installFieldValue(this.handle);\n        installFieldValueStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "FieldValue.ts",
+            "class FieldValue {\n    handle() { return 3; }\n    stable() { return 3; }\n    swap = this.handle = null;\n    bind() {\n        installFieldValue(this.handle);\n        installFieldValueStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "StaticField.js",
+            "class StaticField {\n    handle() { return 4; }\n    stable() { return 4; }\n    static swap = (fn) => { this.handle = fn; };\n    bind() {\n        installStaticField(this.handle);\n        installStaticFieldStable(this.stable);\n    }\n}\n",
+            "handle",
+            1,
+            1,
+        ),
+        (
+            "StaticField.ts",
+            "class StaticField {\n    handle() { return 4; }\n    stable() { return 4; }\n    static swap = (fn) => { this.handle = fn; };\n    bind() {\n        installStaticField(this.handle);\n        installStaticFieldStable(this.stable);\n    }\n}\n",
+            "handle",
+            1,
+            1,
+        ),
+        (
+            "Shadow.js",
+            "class Shadow {\n    handle() { return 5; }\n    stable() { return 5; }\n    handle = () => 0;\n    bind() {\n        installShadow(this.handle);\n        installShadowStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "Shadow.ts",
+            "class Shadow {\n    handle() { return 5; }\n    stable() { return 5; }\n    handle = () => 0;\n    bind() {\n        installShadow(this.handle);\n        installShadowStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "ShadowBracket.js",
+            "class ShadowBracket {\n    handle() { return 6; }\n    stable() { return 6; }\n    [\"h\\u0061ndle\"] = () => 0;\n    bind() {\n        installShadowBracket(this.handle);\n        installShadowBracketStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "ShadowBracket.ts",
+            "class ShadowBracket {\n    handle() { return 6; }\n    stable() { return 6; }\n    [\"h\\u0061ndle\"] = () => 0;\n    bind() {\n        installShadowBracket(this.handle);\n        installShadowBracketStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "EscapedWrite.js",
+            "class EscapedWrite {\n    handle() { return 7; }\n    stable() { return 7; }\n    swap(fn) { this.h\\u0061ndle = fn; }\n    bind() {\n        installEscapedWrite(this.handle);\n        installEscapedWriteStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "EscapedWrite.ts",
+            "class EscapedWrite {\n    handle() { return 7; }\n    stable() { return 7; }\n    swap(fn) { this.h\\u0061ndle = fn; }\n    bind() {\n        installEscapedWrite(this.handle);\n        installEscapedWriteStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "EscapedMethod.js",
+            "class EscapedMethod {\n    h\\u0061ndle() { return 8; }\n    stable() { return 8; }\n    swap(fn) { this[\"handle\"] = fn; }\n    bind() {\n        installEscapedMethod(this.h\\u0061ndle);\n        installEscapedMethodStable(this.stable);\n    }\n}\n",
+            "h\\u0061ndle",
+            0,
+            1,
+        ),
+        (
+            "EscapedMethod.ts",
+            "class EscapedMethod {\n    h\\u0061ndle() { return 8; }\n    stable() { return 8; }\n    swap(fn) { this[\"handle\"] = fn; }\n    bind() {\n        installEscapedMethod(this.h\\u0061ndle);\n        installEscapedMethodStable(this.stable);\n    }\n}\n",
+            "h\\u0061ndle",
+            0,
+            1,
+        ),
+        (
+            "Declared.ts",
+            "class Declared {\n    handle() { return 9; }\n    stable() { return 9; }\n    declare handle: () => void;\n    bind() {\n        installDeclared(this.handle);\n        installDeclaredStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+        (
+            "Definite.ts",
+            "class Definite {\n    handle() { return 10; }\n    stable() { return 10; }\n    handle!: () => void;\n    bind() {\n        installDefinite(this.handle);\n        installDefiniteStable(this.stable);\n    }\n}\n",
+            "handle",
+            0,
+            1,
+        ),
+    ];
+    let files: Vec<_> = cases
+        .iter()
+        .map(|(path, source, ..)| (*path, *source))
+        .collect();
+    let (_dir, shared) = build_index(&files);
+    let index = shared.read();
+    let kind = Some(ReferenceKind::ValueUse);
+    let mut wrong = Vec::new();
+    for &(path, _, handle, handle_hits, stable_hits) in cases {
+        for (name, expected) in [(handle, handle_hits), ("stable", stable_hits)] {
+            let hits = index
+                .find_exact_references_for_symbol(path, name, None, None, kind)
+                .unwrap_or_else(|error| panic!("{path} {name}: {error}"));
+            if hits.len() != expected {
+                wrong.push(format!("{path} {name}: expected {expected}, got {hits:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
 fn exact_python_class_value_uses_do_not_require_callback_evidence() {
     let path = "model.py";
     let source = "class Model:\n    pass\n\nisinstance(obj, Model)\n";

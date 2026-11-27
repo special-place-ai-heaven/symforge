@@ -258,3 +258,291 @@ class Interpolated {
         );
     }
 }
+
+#[test]
+fn class_fields_and_escaped_names_block_exact_method_callbacks() {
+    check(
+        r#"class FieldArrow {
+    handle() { return 0; }
+    stable() { return 0; }
+    swap = (fn) => { this.handle = fn; };
+    bind() {
+        installFieldArrow(this.handle);
+        installFieldArrowStable(this.stable);
+    }
+}
+class FieldBracket {
+    handle() { return 1; }
+    stable() { return 1; }
+    swap = (fn) => { this["handle"] = fn; };
+    bind() {
+        installFieldBracket(this.handle);
+        installFieldBracketStable(this.stable);
+    }
+}
+class FieldOpaque {
+    handle() { return 2; }
+    stable() { return 2; }
+    swap = (key, fn) => { this[key] = fn; };
+    bind() {
+        installFieldOpaque(this.handle);
+        installFieldOpaqueStable(this.stable);
+    }
+}
+class FieldValue {
+    handle() { return 3; }
+    stable() { return 3; }
+    swap = this.handle = null;
+    bind() {
+        installFieldValue(this.handle);
+        installFieldValueStable(this.stable);
+    }
+}
+class StaticField {
+    handle() { return 4; }
+    stable() { return 4; }
+    static swap = (fn) => { this.handle = fn; };
+    bind() {
+        installStaticField(this.handle);
+        installStaticFieldStable(this.stable);
+    }
+}
+class Shadow {
+    handle() { return 5; }
+    stable() { return 5; }
+    handle = () => 0;
+    bind() {
+        installShadow(this.handle);
+        installShadowStable(this.stable);
+    }
+}
+class ShadowBracket {
+    handle() { return 6; }
+    stable() { return 6; }
+    ["h\u0061ndle"] = () => 0;
+    bind() {
+        installShadowBracket(this.handle);
+        installShadowBracketStable(this.stable);
+    }
+}
+class EscapedWrite {
+    handle() { return 7; }
+    stable() { return 7; }
+    swap(fn) { this.h\u0061ndle = fn; }
+    bind() {
+        installEscapedWrite(this.handle);
+        installEscapedWriteStable(this.stable);
+    }
+}
+class EscapedMethod {
+    h\u0061ndle() { return 8; }
+    stable() { return 8; }
+    swap(fn) { this["handle"] = fn; }
+    bind() {
+        installEscapedMethod(this.h\u0061ndle);
+        installEscapedMethodStable(this.stable);
+    }
+}
+"#,
+        LanguageId::JavaScript,
+        &[
+            "installFieldArrow(this.handle)",
+            "installFieldBracket(this.handle)",
+            "installFieldOpaque(this.handle)",
+            "installFieldOpaqueStable(this.stable)",
+            "installFieldValue(this.handle)",
+            "installShadow(this.handle)",
+            "installShadowBracket(this.handle)",
+            "installEscapedWrite(this.handle)",
+            "installEscapedMethod(this.h\\u0061ndle)",
+        ],
+        &[
+            (
+                "installFieldArrowStable(this.stable)",
+                "stable() { return 0; }",
+            ),
+            (
+                "installFieldBracketStable(this.stable)",
+                "stable() { return 1; }",
+            ),
+            (
+                "installFieldValueStable(this.stable)",
+                "stable() { return 3; }",
+            ),
+            ("installStaticField(this.handle)", "handle() { return 4; }"),
+            (
+                "installStaticFieldStable(this.stable)",
+                "stable() { return 4; }",
+            ),
+            ("installShadowStable(this.stable)", "stable() { return 5; }"),
+            (
+                "installShadowBracketStable(this.stable)",
+                "stable() { return 6; }",
+            ),
+            (
+                "installEscapedWriteStable(this.stable)",
+                "stable() { return 7; }",
+            ),
+            (
+                "installEscapedMethodStable(this.stable)",
+                "stable() { return 8; }",
+            ),
+        ],
+    );
+    check(
+        r#"class FieldArrow {
+    handle() { return 0; }
+    stable() { return 0; }
+    swap = (fn) => { this.handle = fn; };
+    bind() {
+        installFieldArrow(this.handle);
+        installFieldArrowStable(this.stable);
+    }
+}
+class FieldBracket {
+    handle() { return 1; }
+    stable() { return 1; }
+    swap = (fn) => { this["handle"] = fn; };
+    bind() {
+        installFieldBracket(this.handle);
+        installFieldBracketStable(this.stable);
+    }
+}
+class FieldOpaque {
+    handle() { return 2; }
+    stable() { return 2; }
+    swap = (key, fn) => { this[key] = fn; };
+    bind() {
+        installFieldOpaque(this.handle);
+        installFieldOpaqueStable(this.stable);
+    }
+}
+class FieldValue {
+    handle() { return 3; }
+    stable() { return 3; }
+    swap = this.handle = null;
+    bind() {
+        installFieldValue(this.handle);
+        installFieldValueStable(this.stable);
+    }
+}
+class StaticField {
+    handle() { return 4; }
+    stable() { return 4; }
+    static swap = (fn) => { this.handle = fn; };
+    bind() {
+        installStaticField(this.handle);
+        installStaticFieldStable(this.stable);
+    }
+}
+class Shadow {
+    handle() { return 5; }
+    stable() { return 5; }
+    handle = () => 0;
+    bind() {
+        installShadow(this.handle);
+        installShadowStable(this.stable);
+    }
+}
+class ShadowBracket {
+    handle() { return 6; }
+    stable() { return 6; }
+    ["h\u0061ndle"] = () => 0;
+    bind() {
+        installShadowBracket(this.handle);
+        installShadowBracketStable(this.stable);
+    }
+}
+class EscapedWrite {
+    handle() { return 7; }
+    stable() { return 7; }
+    swap(fn) { this.h\u0061ndle = fn; }
+    bind() {
+        installEscapedWrite(this.handle);
+        installEscapedWriteStable(this.stable);
+    }
+}
+class EscapedMethod {
+    h\u0061ndle() { return 8; }
+    stable() { return 8; }
+    swap(fn) { this["handle"] = fn; }
+    bind() {
+        installEscapedMethod(this.h\u0061ndle);
+        installEscapedMethodStable(this.stable);
+    }
+}
+class Declared {
+    handle() { return 9; }
+    stable() { return 9; }
+    declare handle: () => void;
+    bind() {
+        installDeclared(this.handle);
+        installDeclaredStable(this.stable);
+    }
+}
+class Definite {
+    handle() { return 10; }
+    stable() { return 10; }
+    handle!: () => void;
+    bind() {
+        installDefinite(this.handle);
+        installDefiniteStable(this.stable);
+    }
+}
+"#,
+        LanguageId::TypeScript,
+        &[
+            "installFieldArrow(this.handle)",
+            "installFieldBracket(this.handle)",
+            "installFieldOpaque(this.handle)",
+            "installFieldOpaqueStable(this.stable)",
+            "installFieldValue(this.handle)",
+            "installShadow(this.handle)",
+            "installShadowBracket(this.handle)",
+            "installEscapedWrite(this.handle)",
+            "installEscapedMethod(this.h\\u0061ndle)",
+            "installDeclared(this.handle)",
+            "installDefinite(this.handle)",
+        ],
+        &[
+            (
+                "installFieldArrowStable(this.stable)",
+                "stable() { return 0; }",
+            ),
+            (
+                "installFieldBracketStable(this.stable)",
+                "stable() { return 1; }",
+            ),
+            (
+                "installFieldValueStable(this.stable)",
+                "stable() { return 3; }",
+            ),
+            ("installStaticField(this.handle)", "handle() { return 4; }"),
+            (
+                "installStaticFieldStable(this.stable)",
+                "stable() { return 4; }",
+            ),
+            ("installShadowStable(this.stable)", "stable() { return 5; }"),
+            (
+                "installShadowBracketStable(this.stable)",
+                "stable() { return 6; }",
+            ),
+            (
+                "installEscapedWriteStable(this.stable)",
+                "stable() { return 7; }",
+            ),
+            (
+                "installEscapedMethodStable(this.stable)",
+                "stable() { return 8; }",
+            ),
+            (
+                "installDeclaredStable(this.stable)",
+                "stable() { return 9; }",
+            ),
+            (
+                "installDefiniteStable(this.stable)",
+                "stable() { return 10; }",
+            ),
+        ],
+    );
+}

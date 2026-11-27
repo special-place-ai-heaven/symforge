@@ -123,7 +123,9 @@ fn walk(
                                 } else {
                                     !has_child_kind(node, "get")
                                         && !has_child_kind(node, "set")
-                                        && name.utf8_text(src) != Ok("constructor")
+                                        && name.utf8_text(src).is_ok_and(|text| {
+                                            text != "constructor" && !text.contains('\\')
+                                        })
                                 };
                                 let definition = if python {
                                     node.parent()
@@ -157,6 +159,16 @@ fn walk(
                         }
                     }
                     bind_parameters(&mut bindings, node, src);
+                }
+                "field_definition" | "public_field_definition" if !python => {
+                    let name = node
+                        .child_by_field_name("property")
+                        .or_else(|| node.child_by_field_name("name"));
+                    if let (Some(name), Some(class)) = (name, enclosing_method_class(node, false))
+                        && !has_child_kind(node, "static")
+                    {
+                        block_member_name(&mut methods, class, name, src);
+                    }
                 }
                 "arrow_function" | "function_expression" | "generator_function" | "lambda" => {
                     bind_parameters(&mut bindings, node, src);
@@ -606,26 +618,65 @@ fn block_method_writes<'tree, 'src>(
         // A constructor or sibling method can change what this receiver sees.
         // Don't infer execution order or a replacement callable; block this
         // member throughout the class without touching lexical namesakes.
-        if member.kind() != "subscript_expression" {
+        if python {
             bind(methods, class, name, None, src);
-            return;
-        }
-        let key = member_key::literal_key(name, src);
-        let Some(body) = class.child_by_field_name("body") else {
-            return;
-        };
-        for method in body
-            .named_children(&mut body.walk())
-            .filter(|n| n.kind() == "method_definition")
-            .filter_map(|n| n.child_by_field_name("name"))
-        {
-            if key.as_deref().is_none_or(|key| {
-                method.kind() == "property_identifier" && method.utf8_text(src) == Ok(key)
-            }) {
-                bind(methods, class, method, None, src);
-            }
+        } else {
+            block_member_name(methods, class, name, src);
         }
     });
+}
+
+fn block_member_name<'tree, 'src>(
+    methods: &mut Bindings<'tree, 'src>,
+    class: Node<'tree>,
+    name: Node<'tree>,
+    src: &'src [u8],
+) {
+    match name.kind() {
+        "property_identifier" | "private_property_identifier" => match name.utf8_text(src) {
+            Ok(text) if text.contains('\\') => {
+                let key = member_key::identifier_name(text);
+                block_class_methods(methods, class, key.as_deref(), src);
+            }
+            _ => bind(methods, class, name, None, src),
+        },
+        "number" => {}
+        "computed_property_name" => match name.named_child(0) {
+            Some(key) => block_member_name(methods, class, unparen(key), src),
+            None => block_class_methods(methods, class, None, src),
+        },
+        _ => {
+            let key = member_key::literal_key(name, src);
+            block_class_methods(methods, class, key.as_deref(), src);
+        }
+    }
+}
+
+fn block_class_methods<'tree, 'src>(
+    methods: &mut Bindings<'tree, 'src>,
+    class: Node<'tree>,
+    key: Option<&str>,
+    src: &'src [u8],
+) {
+    let Some(body) = class.child_by_field_name("body") else {
+        return;
+    };
+    for method in body
+        .named_children(&mut body.walk())
+        .filter(|n| n.kind() == "method_definition")
+        .filter_map(|n| n.child_by_field_name("name"))
+    {
+        if key.is_none_or(|key| {
+            method.kind() == "property_identifier" && method.utf8_text(src) == Ok(key)
+        }) {
+            bind(methods, class, method, None, src);
+        }
+    }
+}
+
+fn is_class_field(node: Node<'_>) -> bool {
+    matches!(node.kind(), "field_definition" | "public_field_definition")
+        && node.parent().is_some_and(|n| n.kind() == "class_body")
 }
 
 fn visit_pattern<'tree>(
@@ -850,7 +901,10 @@ fn enclosing_method_class(node: Node<'_>, python: bool) -> Option<Node<'_>> {
     }
     if python && node.kind() == "function_definition" && parent.kind() == "block" {
         parent.parent().filter(|n| n.kind() == "class_definition")
-    } else if !python && node.kind() == "method_definition" && parent.kind() == "class_body" {
+    } else if !python
+        && (node.kind() == "method_definition" || is_class_field(node))
+        && parent.kind() == "class_body"
+    {
         parent.parent()
     } else {
         None
@@ -934,7 +988,15 @@ fn receiver_member<'tree>(
     let enclosing = std::iter::successors(value.parent(), |n| n.parent()).find(|n| {
         (is_function(n.kind()) && (python || n.kind() != "arrow_function"))
             || matches!(n.kind(), "class_definition" | "class_body")
+            || (!python && is_class_field(*n))
     })?;
+    if is_class_field(enclosing)
+        && enclosing.child_by_field_name("value").is_none_or(|init| {
+            init.start_byte() > value.start_byte() || init.end_byte() < value.end_byte()
+        })
+    {
+        return None;
+    }
     let class = enclosing_method_class(enclosing, python)?;
     if python {
         let receiver = receiver.utf8_text(src).ok()?;
