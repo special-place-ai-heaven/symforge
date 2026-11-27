@@ -977,7 +977,6 @@ fn execute_value_on_generation(
                 let mut lines = vec![format!("## {norm_path} ({})", file.language.name())];
                 for sym in &file.symbols {
                     if !include_tests_flag && sym.name == "tests" && sym.kind.to_string() == "mod" {
-                        completeness.omitted_rows += 1;
                         continue;
                     }
                     let indent = "  ".repeat(sym.depth as usize);
@@ -1467,7 +1466,7 @@ fn execute_value_on_generation(
                         - total_callers.min(CODE_MODE_CALLERS_CAP)
                         + section_omitted(&found.callees)
                         + section_omitted(&found.type_usages)
-                        + found.unresolved_same_name_member_calls.len();
+                        + usize::from(!found.unresolved_same_name_member_calls.is_empty());
                     let mut withheld = withheld_reference_corpus(
                         &generation.live,
                         code_mode_withheld(generation),
@@ -1933,6 +1932,7 @@ fn execute_value_on_generation(
                 include_data: input.include_data.unwrap_or(false),
                 paths: input.paths.as_deref(),
             };
+            let refuse = search_refusal_predicate(generation);
             let mut refused_git = std::collections::HashSet::new();
             let mut refused_worktree = std::collections::HashSet::new();
             let report = crate::index_lifecycle::guidance::impact::compute_detect_impact(
@@ -1961,8 +1961,11 @@ fn execute_value_on_generation(
 
             let cap = crate::index_lifecycle::guidance::impact::DETECT_IMPACT_MAX_RETURNED;
             refused_git.extend(refused_worktree);
+            let unread = refused_git.len();
+            refused_git.retain(|path: &String| refuse(path));
             completeness.withheld_files = refused_git.len();
-            completeness.omitted_rows_inexact = report.effective_depth < report.requested_depth;
+            completeness.omitted_rows_inexact =
+                report.effective_depth < report.requested_depth || refused_git.len() < unread;
             completeness.omitted_rows = [
                 report.changed_files.len(),
                 report.changed_symbols.len(),

@@ -94,7 +94,7 @@ shown = symbol_context(path="src/lib.rs", name="only_tested", include_tests=True
 }
 
 #[test]
-fn file_context_reports_consumers_imports_and_test_module_past_their_caps() {
+fn file_context_reports_consumers_and_imports_past_their_caps() {
     let mut files = vec![
         (
             "src/target.rs".to_owned(),
@@ -103,10 +103,6 @@ fn file_context_reports_consumers_imports_and_test_module_past_their_caps() {
         (
             "src/many_imports.rs".to_owned(),
             lines(51, |i| format!("use crate::m{i}::Item;\n")),
-        ),
-        (
-            "src/with_tests.rs".to_owned(),
-            "pub fn real() {}\nmod tests {\n    fn t() {}\n}\n".to_owned(),
         ),
     ];
     for i in 0..31 {
@@ -125,8 +121,7 @@ fn file_context_reports_consumers_imports_and_test_module_past_their_caps() {
         r#"
 consumers = file_context(path="src/target.rs", sections=["consumers"])
 imports = file_context(path="src/many_imports.rs", sections=["imports"])
-outline = file_context(path="src/with_tests.rs", sections=["outline"])
-[consumers["rendered"].count("\n"), imports["rendered"].count("\n"), outline["rendered"]]
+[consumers["rendered"].count("\n"), imports["rendered"].count("\n")]
 "#,
     );
     assert_eq!(output["value"][0], 30, "{output}");
@@ -137,11 +132,7 @@ outline = file_context(path="src/with_tests.rs", sections=["outline"])
         .iter()
         .map(|n| json!([n["call"], n["omitted_rows"]]))
         .collect();
-    assert_eq!(
-        rows,
-        vec![json!([1, 1]), json!([2, 1]), json!([3, 1])],
-        "{output}"
-    );
+    assert_eq!(rows, vec![json!([1, 1]), json!([2, 1])], "{output}");
 }
 
 #[test]
@@ -163,7 +154,7 @@ fn inspect_match_reports_siblings_past_the_limit() {
 #[test]
 fn repo_map_reports_a_budget_cut_compact_map_and_a_capped_full_map() {
     let files: Vec<(String, String)> = (0..200)
-        .map(|i| (format!("d{i:03}/x{i:03}/f.rs"), "fn f() {}\n".to_owned()))
+        .map(|i| (format!("d{i:03}/f.rs"), format!("pub struct S{i};\n")))
         .collect();
     let borrowed: Vec<(&str, String)> = files
         .iter()
@@ -175,13 +166,23 @@ fn repo_map_reports_a_budget_cut_compact_map_and_a_capped_full_map() {
         r#"
 compact = repo_map()
 full = repo_map(detail="full", max_files=3)
-[compact["total_files"], compact["shown_files"], full["total_files"], full["shown_files"]]
+rows = compact["rendered"].split("\n")
+dirs = len([r for r in rows if r.startswith("  d")])
+types = len([r for r in rows if r.startswith("  struct ")])
+[compact["total_files"], compact["shown_files"], full["total_files"], full["shown_files"], dirs, types]
 "#,
     );
-    assert_eq!(output["value"], json!([200, 200, 200, 3]), "{output}");
+    let value = &output["value"];
+    assert_eq!(
+        json!([value[0], value[1], value[2], value[3]]),
+        json!([200, 200, 200, 3]),
+        "{output}"
+    );
+    let shown_rows = value[4].as_u64().unwrap() + value[5].as_u64().unwrap();
+    assert!(value[4].as_u64().unwrap() < 200, "{output}");
     let notices = output["notices"].as_array().unwrap();
     assert_eq!(notices.len(), 2, "{output}");
-    assert!(notices[0]["omitted_rows"].as_u64().unwrap() > 0, "{output}");
+    assert_eq!(notices[0]["omitted_rows"], 400 - shown_rows, "{output}");
     assert_eq!(notices[1]["omitted_rows"], 197, "{output}");
 }
 
@@ -195,7 +196,7 @@ fn symbol_context_bundle_marks_dependency_cap_and_keeps_recursive_receiver_calls
     let repo = repo_with(&[(
         "src/lib.rs",
         format!(
-            "{types}pub fn wide({params}) {{}}\npub struct Walker;\nimpl Walker {{\n    pub fn walk(&self) {{\n        self.walk();\n    }}\n}}\n"
+            "{types}pub fn wide({params}) {{}}\npub struct Walker;\nimpl Walker {{\n    pub fn walk(&self) {{\n        self.walk();\n        self.walk();\n    }}\n}}\n"
         ),
     )]);
     let output = run(
@@ -215,7 +216,7 @@ walk = symbol_context(path="src/lib.rs", name="walk")
 
 #[test]
 fn detect_impact_reports_capped_lists_refused_reads_and_clamped_depth() {
-    let repo = committed(&[("src/lib.rs", "pub fn seed() {}\n".to_owned())]);
+    let repo = committed(&[("src/lib.rs", "// base\n".to_owned())]);
     fs::write(
         repo.path().join("src/lib.rs"),
         lines(201, |i| format!("pub fn changed{i}() {{}}\n")),
@@ -237,11 +238,11 @@ deep = detect_impact(depth=9)
     assert_eq!(output["value"], json!([200, 200]), "{output}");
     let notices = output["notices"].as_array().unwrap();
     assert_eq!(notices.len(), 2, "{output}");
-    assert!(
-        notices[0]["omitted_rows"].as_u64().unwrap() >= 1,
-        "{output}"
-    );
-    assert_eq!(notices[0]["withheld_files"], 1, "{output}");
+    for notice in notices {
+        assert_eq!(notice["omitted_rows"], 1, "{output}");
+        assert_eq!(notice["withheld_files"], 1, "{output}");
+    }
+    assert!(notices[0].get("omitted_rows_inexact").is_none(), "{output}");
     assert_eq!(notices[1]["omitted_rows_inexact"], true, "{output}");
 }
 
@@ -287,4 +288,41 @@ changed = what_changed(include_symbol_diff=True)
     for notice in notices {
         assert_eq!(notice["omitted_rows_inexact"], true, "{output}");
     }
+}
+
+#[test]
+fn calls_that_drop_nothing_raise_no_notice() {
+    let repo = committed(&[
+        (
+            "src/lib.rs",
+            "pub struct T0;\npub fn small(a: T0) {}\npub fn other() {}\n".to_owned(),
+        ),
+        ("d0/same.rs", "fn f() {}\n".to_owned()),
+        (
+            "src/with_tests.rs",
+            "pub fn real() {}\nmod tests {\n    fn t() {}\n}\n".to_owned(),
+        ),
+        ("d1/same.rs", "fn f() {}\n".to_owned()),
+    ]);
+    fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub struct T0;\npub fn small(a: T0) {}\npub fn other() { small(T0); }\npub fn added() {}\n",
+    )
+    .unwrap();
+    let output = run(
+        &repo,
+        r#"
+ctx = file_context(path="src/lib.rs")
+outline = file_context(path="src/with_tests.rs")
+found = inspect_match(path="src/lib.rs", line=2)
+full = repo_map(detail="full")
+resolved = search_files(query="same.rs", resolve=True)
+impact = detect_impact()
+diff = diff_symbols()
+bundle = symbol_context(path="src/lib.rs", name="small", bundle=True)
+[len(found["siblings"]), full["shown_files"], len(resolved), len(impact["changed_symbols"]), len(bundle["dependencies"])]
+"#,
+    );
+    assert_eq!(output["value"], json!([4, 4, 2, 2, 1]), "{output}");
+    assert_eq!(output.get("notices"), None, "{output}");
 }
