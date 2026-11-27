@@ -551,6 +551,7 @@ pub(crate) fn repo_map_text_scoped_counted(
     // Rows from here on belong to the key-types section.
     let dir_rows_end = lines.len();
     let mut omitted_key_types = 0;
+    let mut key_type_rows = dir_rows_end..dir_rows_end;
 
     // Key entry points: top-level structs/traits/interfaces/enums in src/ (depth 0, limit 10).
     {
@@ -684,6 +685,7 @@ pub(crate) fn repo_map_text_scoped_counted(
             entry_points.truncate(15);
             lines.push(String::new());
             lines.push("Key types:".to_string());
+            let first_key_type_row = lines.len();
             for (kind, name, path) in &entry_points {
                 // Annotate high-fan-in files: `(→N)` iff distinct dependents N>=2.
                 let dep_count = dep_counts.get(path.as_str()).copied().unwrap_or(0);
@@ -693,6 +695,7 @@ pub(crate) fn repo_map_text_scoped_counted(
                     lines.push(format!("  {kind} {name}  ({path})"));
                 }
             }
+            key_type_rows = first_key_type_row..lines.len();
             if entry_points.len() == 15 {
                 lines.push("  ...".to_string());
             }
@@ -728,7 +731,12 @@ pub(crate) fn repo_map_text_scoped_counted(
         }
     }
 
-    (text, remaining + omitted_key_types)
+    let kept = lines.len() - remaining;
+    let cut_rows = dir_rows_end.saturating_sub(kept)
+        + key_type_rows
+            .end
+            .saturating_sub(kept.max(key_type_rows.start));
+    (text, cut_rows + omitted_key_types)
 }
 
 #[derive(Clone, Copy)]
