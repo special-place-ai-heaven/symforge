@@ -316,6 +316,21 @@ fn error_candidate_is_better(
     candidate.is_missing() && !current.is_missing()
 }
 
+pub(crate) fn reparse_source_tree(
+    source: &str,
+    language: &LanguageId,
+    is_tsx: bool,
+    edited: &tree_sitter::Tree,
+) -> Result<tree_sitter::Tree, String> {
+    let mut parser = Parser::new();
+    let ts_language = tree_sitter_language(language, is_tsx)
+        .ok_or_else(|| format!("no tree-sitter source grammar for {}", language.name()))?;
+    parser
+        .set_language(&ts_language)
+        .map_err(|e| format!("failed to set language: {e}"))?;
+    parse_within_from(&mut parser, source, PARSE_DEADLINE, Some(edited))
+}
+
 pub(crate) fn has_source_grammar(language: &LanguageId, is_tsx: bool) -> bool {
     tree_sitter_language(language, is_tsx).is_some()
 }
@@ -382,6 +397,15 @@ pub(crate) fn parse_within(
     source: &str,
     deadline: Duration,
 ) -> Result<tree_sitter::Tree, String> {
+    parse_within_from(parser, source, deadline, None)
+}
+
+fn parse_within_from(
+    parser: &mut Parser,
+    source: &str,
+    deadline: Duration,
+    old_tree: Option<&tree_sitter::Tree>,
+) -> Result<tree_sitter::Tree, String> {
     let started = Instant::now();
     let mut cancelled = false;
     let mut check_deadline = |_: &tree_sitter::ParseState| {
@@ -395,7 +419,7 @@ pub(crate) fn parse_within(
     let bytes = source.as_bytes();
     let tree = parser.parse_with_options(
         &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
-        None,
+        old_tree,
         Some(tree_sitter::ParseOptions::new().progress_callback(&mut check_deadline)),
     );
     match tree {

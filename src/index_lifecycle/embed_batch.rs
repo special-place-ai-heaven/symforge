@@ -332,15 +332,12 @@ fn stage_batch(
             .get_file(&path)
             .ok_or(EditErrorKind::FileNotAdmitted)?;
         let line_ending = detect_line_ending(&file.content);
+        let source =
+            crate::edit_safety::structural::SourceTree::new(&file.content, &file.language, &path);
         let footprints = actions
             .iter()
             .map(|resolved| {
-                let member = crate::edit_safety::structural::list_member(
-                    &file.content,
-                    &file.language,
-                    &path,
-                    &resolved.symbol,
-                );
+                let member = crate::edit_safety::structural::list_member(&source, &resolved.symbol);
                 Ok(match resolved.action {
                     BatchEditAction::Insert(request) => {
                         crate::edit_safety::structural::refuse_list_member(
@@ -399,12 +396,7 @@ fn stage_batch(
             if !matches!(resolved.action, BatchEditAction::Delete(_)) {
                 continue;
             }
-            let member = crate::edit_safety::structural::list_member(
-                &file.content,
-                &file.language,
-                &path,
-                &resolved.symbol,
-            );
+            let member = crate::edit_safety::structural::list_member(&source, &resolved.symbol);
             let cleanup =
                 delete_cleanup_ranges(&file.content, &resolved.symbol, line_ending, member);
             if footprints.iter().enumerate().any(|(other, footprint)| {
@@ -415,12 +407,7 @@ fn stage_batch(
         }
         let mut content = file.content.clone();
         for (action_index, resolved) in actions.iter().enumerate() {
-            let member = crate::edit_safety::structural::list_member(
-                &content,
-                &file.language,
-                &path,
-                &resolved.symbol,
-            );
+            let member = crate::edit_safety::structural::list_member(&source, &resolved.symbol);
             content = match resolved.action {
                 BatchEditAction::Replace(request) => {
                     prepare_replace(&content, &resolved.symbol, &request.new_body, member)

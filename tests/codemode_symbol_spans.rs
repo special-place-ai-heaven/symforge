@@ -486,6 +486,18 @@ async fn declarator_siblings_come_from_the_parse_in_every_mcp_path() {
             "const a = 1, /** d */ b = 3;\n".into(),
         ),
         (
+            doc_second,
+            "symforge_edit",
+            replace("b", "b = 4"),
+            "const a = 1, /** d */ b = 4;\n".into(),
+        ),
+        (
+            doc_second,
+            "batch_edit",
+            json!({"edits": [{"name": "b", "operation": {"type": "replace", "new_body": "b = 4"}}]}),
+            "const a = 1, /** d */ b = 4;\n".into(),
+        ),
+        (
             split,
             "delete_symbol",
             json!({"name": "b"}),
@@ -679,6 +691,7 @@ async fn identity_replace_of_every_fixture_symbol_is_never_refused() {
     let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let mut checked = 0;
     let mut refused = Vec::new();
+    let mut verdicts: std::collections::BTreeMap<String, [usize; 3]> = Default::default();
     for name in [
         "phase0-corpus",
         "compression_ratio",
@@ -730,15 +743,36 @@ async fn identity_replace_of_every_fixture_symbol_is_never_refused() {
             )
             .await;
             checked += 1;
+            let extension = std::path::Path::new(&path)
+                .extension()
+                .map_or("(none)".to_string(), |ext| {
+                    ext.to_string_lossy().into_owned()
+                });
+            let slot = if text.contains("Syntax check: passed") {
+                0
+            } else if text.contains("Syntax check: not run (") {
+                1
+            } else {
+                2
+            };
+            verdicts.entry(extension).or_default()[slot] += 1;
             if text.contains("parser reports a syntax error") {
                 refused.push(format!("{name}/{path}:{line} {symbol}: {text}"));
             }
         }
     }
-    assert!(checked > 100, "only {checked} symbols checked");
+    let table = verdicts
+        .iter()
+        .map(|(ext, [passed, not_run, other])| {
+            format!(".{ext}: passed {passed}, not run {not_run}, no verdict line {other}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    eprintln!("identity sweep, {checked} dry runs:\n{table}");
+    assert!(checked > 100, "only {checked} symbols checked\n{table}");
     assert!(
         refused.is_empty(),
-        "{checked} checked:\n{}",
+        "{checked} checked:\n{table}\n{}",
         refused.join("\n")
     );
 }

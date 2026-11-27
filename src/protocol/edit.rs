@@ -873,16 +873,13 @@ pub(crate) fn execute_batch_edit(
             continue; // The existing Phase 3 stale-span refusal reports the exact target.
         }
         let line_ending = detect_line_ending(&file.content);
+        let source =
+            crate::edit_safety::structural::SourceTree::new(&file.content, &file.language, path);
         let footprints = indices
             .iter()
             .map(|&index| {
                 let symbol = &resolved[index].sym;
-                let member = crate::edit_safety::structural::list_member(
-                    &file.content,
-                    &file.language,
-                    path,
-                    symbol,
-                );
+                let member = crate::edit_safety::structural::list_member(&source, symbol);
                 Ok(match &edits[resolved[index].operation].operation {
                     EditOperation::InsertBefore { .. } => {
                         crate::edit_safety::structural::refuse_list_member(member, symbol)?;
@@ -962,12 +959,7 @@ pub(crate) fn execute_batch_edit(
                 &file.content,
                 &resolved[index].sym,
                 line_ending,
-                crate::edit_safety::structural::list_member(
-                    &file.content,
-                    &file.language,
-                    path,
-                    &resolved[index].sym,
-                ),
+                crate::edit_safety::structural::list_member(&source, &resolved[index].sym),
             );
             if footprints.iter().enumerate().any(|(other, footprint)| {
                 other != position
@@ -1042,12 +1034,13 @@ pub(crate) fn execute_batch_edit(
         let language = resolved[indices[0]].language;
         let line_ending = detect_line_ending(&content);
         let mut file_summaries: Vec<String> = Vec::new();
+        let source =
+            crate::edit_safety::structural::SourceTree::new(&file.content, &file.language, path);
 
         for &ri in indices {
             let r = &resolved[ri];
             let edit = &edits[r.operation];
-            let member =
-                crate::edit_safety::structural::list_member(&content, &language, path, &r.sym);
+            let member = crate::edit_safety::structural::list_member(&source, &r.sym);
             match &edit.operation {
                 EditOperation::Replace { new_body } => {
                     let old_bytes = (r.sym.byte_range.1 - r.sym.byte_range.0) as usize;
@@ -1059,11 +1052,11 @@ pub(crate) fn execute_batch_edit(
                         .unwrap_or(0);
                     let normalized = normalize_line_endings(new_body.as_bytes(), line_ending);
                     if member.is_some() {
-                        content = apply_splice(
-                            &content,
-                            (r.sym.effective_start(), r.sym.byte_range.1),
-                            &normalized,
-                        );
+                        let span = crate::edit_safety::structural::replacement_splice_range(
+                            &content, &r.sym, new_body, member,
+                        )
+                        .map_err(|error| format!("Edit in {path}:{}: {error}", r.sym.name))?;
+                        content = apply_splice(&content, span, &normalized);
                     } else {
                         let line_start =
                             extend_past_orphaned_docs(&content, raw_line_start, &r.sym) as u32;
@@ -1870,17 +1863,14 @@ pub(crate) fn execute_batch_insert(
             }
         }
 
+        let source =
+            crate::edit_safety::structural::SourceTree::new(&file.content, &file.language, &path);
         let positions = indices
             .iter()
             .map(|&ri| {
                 let symbol = &resolved[ri].sym;
                 crate::edit_safety::structural::refuse_list_member(
-                    crate::edit_safety::structural::list_member(
-                        &file.content,
-                        &file.language,
-                        &path,
-                        symbol,
-                    ),
+                    crate::edit_safety::structural::list_member(&source, symbol),
                     symbol,
                 )?;
                 match input.position {

@@ -45,7 +45,12 @@ pub(crate) fn replacement_splice_range(
         return Err("symbol span is outside the captured file");
     }
     if member.is_some() {
-        return Ok((symbol.effective_start(), end));
+        let start = if body_starts_with_doc_comment(new_body) {
+            symbol.effective_start()
+        } else {
+            start
+        };
+        return Ok((start, end));
     }
     let new_body_supplies_docs = body_starts_with_doc_comment(new_body);
     let effective = if new_body_supplies_docs {
@@ -89,36 +94,105 @@ pub(crate) enum SyntaxEdit<'a> {
     Delete(&'a str),
 }
 
+pub(crate) struct SourceTree<'a> {
+    content: &'a [u8],
+    language: &'a crate::domain::LanguageId,
+    path: &'a str,
+    tree: std::sync::OnceLock<Result<tree_sitter::Tree, &'static str>>,
+}
+
+impl<'a> SourceTree<'a> {
+    pub(crate) fn new(
+        content: &'a [u8],
+        language: &'a crate::domain::LanguageId,
+        path: &'a str,
+    ) -> Self {
+        Self {
+            content,
+            language,
+            path,
+            tree: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn tsx(&self) -> bool {
+        crate::domain::LanguageId::is_tsx_path(self.path)
+    }
+
+    fn tree(&self) -> Result<&tree_sitter::Tree, &'static str> {
+        self.tree
+            .get_or_init(|| {
+                if !crate::parsing::has_source_grammar(self.language, self.tsx()) {
+                    return Err("no bundled parser for this language");
+                }
+                let source =
+                    std::str::from_utf8(self.content).map_err(|_| "the file is not UTF-8")?;
+                crate::parsing::parse_source_tree(source, self.language, self.tsx())
+                    .map_err(|_| "the parser did not finish")
+            })
+            .as_ref()
+            .map_err(|reason| *reason)
+    }
+}
+
+fn byte_point(bytes: &[u8], at: usize) -> tree_sitter::Point {
+    let head = &bytes[..at];
+    let row = head.iter().filter(|&&byte| byte == b'\n').count();
+    let column = at
+        - head
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |line| line + 1);
+    tree_sitter::Point::new(row, column)
+}
+
+fn splice_edit(before: &[u8], after: &[u8]) -> tree_sitter::InputEdit {
+    let prefix = before.iter().zip(after).take_while(|(a, b)| a == b).count();
+    let room = before.len().min(after.len()) - prefix;
+    let suffix = before
+        .iter()
+        .rev()
+        .zip(after.iter().rev())
+        .take(room)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let (old_end, new_end) = (before.len() - suffix, after.len() - suffix);
+    tree_sitter::InputEdit {
+        start_byte: prefix,
+        old_end_byte: old_end,
+        new_end_byte: new_end,
+        start_position: byte_point(before, prefix),
+        old_end_position: byte_point(before, old_end),
+        new_end_position: byte_point(after, new_end),
+    }
+}
+
 pub(crate) fn syntax_check(
-    language: &crate::domain::LanguageId,
-    path: &str,
-    before: &[u8],
+    before: &SourceTree<'_>,
     after: &[u8],
     edit: SyntaxEdit<'_>,
 ) -> SyntaxCheck {
-    let tsx = crate::domain::LanguageId::is_tsx_path(path);
-    if !crate::parsing::has_source_grammar(language, tsx) {
-        return SyntaxCheck::NotRun("no bundled parser for this language");
-    }
-    let parse = |bytes: &[u8]| {
-        let source = std::str::from_utf8(bytes).map_err(|_| "the file is not UTF-8")?;
-        crate::parsing::parse_source_tree(source, language, tsx)
-            .map_err(|_| "the parser did not finish")
-    };
-    let before = match parse(before) {
+    let tree = match before.tree() {
         Ok(tree) => tree,
         Err(reason) => return SyntaxCheck::NotRun(reason),
     };
-    if before.root_node().has_error() {
+    if tree.root_node().has_error() {
         return SyntaxCheck::NotRun("the file already had syntax errors");
     }
-    let tree = match parse(after) {
-        Ok(tree) => tree,
-        Err(reason) => return SyntaxCheck::NotRun(reason),
+    let Ok(source) = std::str::from_utf8(after) else {
+        return SyntaxCheck::NotRun("the file is not UTF-8");
     };
+    let mut edited = tree.clone();
+    edited.edit(&splice_edit(before.content, after));
+    let tree =
+        match crate::parsing::reparse_source_tree(source, before.language, before.tsx(), &edited) {
+            Ok(tree) => tree,
+            Err(_) => return SyntaxCheck::NotRun("the parser did not finish"),
+        };
     if !tree.root_node().has_error() {
         return SyntaxCheck::Passed;
     }
+    let (language, path) = (before.language, before.path);
     let line = first_syntax_error(tree.root_node()).map_or(0, |node| node.start_position().row);
     let snippet = after
         .split(|&byte| byte == b'\n')
@@ -169,32 +243,23 @@ pub(crate) struct ListMember {
     delete: (u32, u32),
 }
 
-pub(crate) fn list_member(
-    file_content: &[u8],
-    language: &crate::domain::LanguageId,
-    path: &str,
-    symbol: &SymbolRecord,
-) -> Option<ListMember> {
+pub(crate) fn list_member(source: &SourceTree<'_>, symbol: &SymbolRecord) -> Option<ListMember> {
     if matches!(
-        language,
+        source.language,
         crate::domain::LanguageId::JavaScript | crate::domain::LanguageId::TypeScript
     ) {
-        return declarator_member(file_content, language, path, symbol);
+        return declarator_member(source.tree().ok()?, source.content, symbol);
     }
-    inline_list_member(file_content, symbol).then(|| ListMember {
-        delete: inline_member_delete_range(file_content, symbol),
+    inline_list_member(source.content, symbol).then(|| ListMember {
+        delete: inline_member_delete_range(source.content, symbol),
     })
 }
 
 fn declarator_member(
+    tree: &tree_sitter::Tree,
     file_content: &[u8],
-    language: &crate::domain::LanguageId,
-    path: &str,
     symbol: &SymbolRecord,
 ) -> Option<ListMember> {
-    let source = std::str::from_utf8(file_content).ok()?;
-    let tsx = crate::domain::LanguageId::is_tsx_path(path);
-    let tree = crate::parsing::parse_source_tree(source, language, tsx).ok()?;
     let (start, end) = (symbol.byte_range.0 as usize, symbol.byte_range.1 as usize);
     let declarator = std::iter::successors(
         tree.root_node().descendant_for_byte_range(start, end),
@@ -1338,7 +1403,10 @@ mod rust_insert_boundary_tests {
             ),
         ] {
             let symbol = list_symbol(source, member);
-            let member_of = list_member(source.as_bytes(), &language, path, &symbol);
+            let member_of = list_member(
+                &SourceTree::new(source.as_bytes(), &language, path),
+                &symbol,
+            );
             assert!(member_of.is_some(), "{path}");
             let prepared =
                 prepare_replace(source.as_bytes(), &symbol, replacement, member_of).unwrap();

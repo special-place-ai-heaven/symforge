@@ -1145,16 +1145,16 @@ impl SymForgeServer {
             Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
+        let source = crate::edit_safety::structural::SourceTree::new(
+            &file.content,
+            &file.language,
+            &params.0.path,
+        );
         let prepared = match crate::edit_safety::structural::prepare_replace(
             &file.content,
             &sym,
             &params.0.new_body,
-            crate::edit_safety::structural::list_member(
-                &file.content,
-                &file.language,
-                &params.0.path,
-                &sym,
-            ),
+            crate::edit_safety::structural::list_member(&source, &sym),
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -1168,9 +1168,7 @@ impl SymForgeServer {
         let inserted_bytes = prepared.inserted_bytes;
         let new_content = prepared.new_content;
         let syntax = match crate::edit_safety::structural::syntax_check(
-            &file.language,
-            &params.0.path,
-            &file.content,
+            &source,
             &new_content,
             crate::edit_safety::structural::SyntaxEdit::Text,
         ) {
@@ -1458,13 +1456,13 @@ impl SymForgeServer {
             Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
-        let line_ending = edit::detect_line_ending(&file.content);
-        let member = crate::edit_safety::structural::list_member(
+        let source = crate::edit_safety::structural::SourceTree::new(
             &file.content,
             &file.language,
             &params.0.path,
-            &sym,
         );
+        let line_ending = edit::detect_line_ending(&file.content);
+        let member = crate::edit_safety::structural::list_member(&source, &sym);
         if let Err(message) = crate::edit_safety::structural::refuse_list_member(member, &sym) {
             return fail_and_return_bound_mutation_replay(
                 &idempotency,
@@ -1491,9 +1489,7 @@ impl SymForgeServer {
             edit::build_insert_after(&file.content, &sym, &params.0.content, line_ending)
         };
         let syntax = match crate::edit_safety::structural::syntax_check(
-            &file.language,
-            &params.0.path,
-            &file.content,
+            &source,
             &new_content,
             crate::edit_safety::structural::SyntaxEdit::Text,
         ) {
@@ -1724,18 +1720,16 @@ impl SymForgeServer {
             Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
-        let line_ending = edit::detect_line_ending(&file.content);
-        let member = crate::edit_safety::structural::list_member(
+        let source = crate::edit_safety::structural::SourceTree::new(
             &file.content,
             &file.language,
             &params.0.path,
-            &sym,
         );
+        let line_ending = edit::detect_line_ending(&file.content);
+        let member = crate::edit_safety::structural::list_member(&source, &sym);
         let new_content = edit::build_delete(&file.content, &sym, line_ending, member);
         let syntax = match crate::edit_safety::structural::syntax_check(
-            &file.language,
-            &params.0.path,
-            &file.content,
+            &source,
             &new_content,
             crate::edit_safety::structural::SyntaxEdit::Delete(&params.0.name),
         ) {
@@ -1965,6 +1959,11 @@ impl SymForgeServer {
             Err(e) => return fail_and_return_bound_mutation_replay(&idempotency, e),
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
+        let source = crate::edit_safety::structural::SourceTree::new(
+            &file.content,
+            &file.language,
+            &params.0.path,
+        );
         let sym_start = sym.effective_start() as usize;
         let sym_end = sym.byte_range.1 as usize;
         let body_str = file
@@ -1998,9 +1997,7 @@ impl SymForgeServer {
         let effective_range = (sym.effective_start(), sym.byte_range.1);
         let new_content = edit::apply_splice(&file.content, effective_range, new_body.as_bytes());
         let syntax = match crate::edit_safety::structural::syntax_check(
-            &file.language,
-            &params.0.path,
-            &file.content,
+            &source,
             &new_content,
             crate::edit_safety::structural::SyntaxEdit::Text,
         ) {

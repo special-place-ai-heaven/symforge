@@ -207,9 +207,11 @@ fn prepare(
         return Err(EditErrorKind::InvalidReplacement);
     }
     let member = crate::edit_safety::structural::list_member(
-        &file.content,
-        &file.language,
-        &file.relative_path,
+        &crate::edit_safety::structural::SourceTree::new(
+            &file.content,
+            &file.language,
+            &file.relative_path,
+        ),
         symbol,
     );
     let prepared = prepare_replace(&file.content, symbol, &request.new_body, member)
@@ -260,9 +262,11 @@ fn prepare_structural(
         return Err(EditErrorKind::InvalidReplacement);
     }
     let member = crate::edit_safety::structural::list_member(
-        &file.content,
-        &file.language,
-        &file.relative_path,
+        &crate::edit_safety::structural::SourceTree::new(
+            &file.content,
+            &file.language,
+            &file.relative_path,
+        ),
         symbol,
     );
     if matches!(operation, StructuralOperation::Insert(_, _)) {
