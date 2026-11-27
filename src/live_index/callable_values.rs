@@ -89,6 +89,22 @@ pub(super) fn file_facts(file: &IndexedFile) -> Option<Arc<CallableFacts>> {
     Some(Arc::new(facts))
 }
 
+pub(super) fn build_callable_values(
+    files: &HashMap<String, Arc<IndexedFile>>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> CallableValueIndex {
+    let entries: Vec<_> = files.iter().collect();
+    super::store::ordered_parallel_map(&entries, |(path, file)| {
+        if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+            return None;
+        }
+        Some(((*path).clone(), file_facts(file)?))
+    })
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 impl LiveIndex {
     pub(super) fn local_callable_declaration(
         &self,
@@ -233,4 +249,58 @@ fn js_paths(importer: &str, module: &str) -> Option<Vec<String>> {
             .flat_map(|ext| [format!("{base}.{ext}"), format!("{base}/index.{ext}")])
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parallel_callable_values_equal_the_serial_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sources = Vec::new();
+        for index in 0..40 {
+            sources.push((
+                format!("pkg/mod{index}.py"),
+                format!(
+                    "from pkg.mod{next} import handler{next}\n\n\ndef handler{index}():\n    pass\n\n\nregister(handler{next})\n",
+                    next = (index + 1) % 40
+                ),
+            ));
+            sources.push((
+                format!("web/view{index}.ts"),
+                format!(
+                    "import {{ cb{next} }} from \"./view{next}\";\nexport function cb{index}(): void {{}}\nexport const run{index} = () => install(cb{next});\n",
+                    next = (index + 1) % 40
+                ),
+            ));
+            sources.push((
+                format!("app/part{index}.js"),
+                format!(
+                    "import {{ part{next} }} from \"./part{next}\";\nexport function part{index}() {{}}\ninstall(part{next});\n",
+                    next = (index + 1) % 40
+                ),
+            ));
+        }
+        for (path, source) in &sources {
+            let full = dir.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, source).unwrap();
+        }
+        std::fs::write(dir.path().join("pkg/__init__.py"), "").unwrap();
+        let shared = super::LiveIndex::load(dir.path()).unwrap();
+        let index = shared.read();
+        let serial: super::CallableValueIndex = index
+            .files
+            .iter()
+            .filter_map(|(path, file)| Some((path.clone(), super::file_facts(file)?)))
+            .collect();
+        let parallel = super::build_callable_values(&index.files, None);
+        assert_eq!(serial.len(), 120, "every fixture file has facts");
+        assert_eq!(parallel, serial);
+        assert_eq!(
+            index.callable_values, serial,
+            "the load path uses the same build"
+        );
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        assert!(super::build_callable_values(&index.files, Some(&cancelled)).is_empty());
+    }
 }

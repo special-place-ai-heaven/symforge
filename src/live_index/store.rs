@@ -6387,13 +6387,7 @@ impl DerivedIndices {
         pause_between_derived_stages(cancel)?;
         let rest_phase = Instant::now();
         let reverse_index = build_reverse_index_from_files(files);
-        let mut callable_values = super::callable_values::CallableValueIndex::new();
-        for (path, file) in files {
-            check_reload_cancelled(cancel)?;
-            if let Some(facts) = super::callable_values::file_facts(file) {
-                callable_values.insert(path.clone(), facts);
-            }
-        }
+        let callable_values = super::callable_values::build_callable_values(files, cancel);
         check_reload_cancelled(cancel)?;
         let (files_by_basename, files_by_dir_component) = build_path_indices_from_files(files);
         info!(
@@ -8205,13 +8199,7 @@ impl LiveIndex {
     /// For bulk reload, prefer `DerivedIndices::build_from_files` outside the lock.
     pub(crate) fn rebuild_reverse_index(&mut self) {
         self.reverse_index = build_reverse_index_from_files(&self.files);
-        self.callable_values = self
-            .files
-            .iter()
-            .filter_map(|(path, file)| {
-                Some((path.clone(), super::callable_values::file_facts(file)?))
-            })
-            .collect();
+        self.callable_values = super::callable_values::build_callable_values(&self.files, None);
     }
 
     /// Rebuild path indices (basename + dir component) from current `self.files`.

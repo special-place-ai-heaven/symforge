@@ -21,7 +21,7 @@ pub(super) fn extract(
     walk(root, source, language, is_tsx, refs, None);
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ImportedValue {
     pub(crate) module: String,
     pub(crate) exported: String,
@@ -30,7 +30,7 @@ pub(crate) struct ImportedValue {
 
 type ByteRange = (u32, u32);
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CallableFacts {
     pub(crate) uses: Vec<ImportedValue>,
     // Use token range -> lexical declaration's core range in the same file.
