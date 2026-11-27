@@ -48,9 +48,9 @@ bdea61b7cb74d36733690b39bf7779a65ea9693241cfae8e8aab903578628744  cli/mod.rs
 
 6b5ebddfb76c15316c1ca393ba63fbf138c66556dbc04e5f2319d50fb6729e54  cli/version.rs
 
-1922c3e7bd7ae5f4b452c024eec7891afcac2875d34cc472b9bfc92b98d30579  codemode/backend.rs
+4d1de2a2f300d03f4d5cc54ee61b4c0d9095ae67a1828f3ed0a6ec1aad8c9fc1  codemode/backend.rs
 
-a06f1e2f7ee9b04854506ace3ef445cf2f4fe8f5995a69bb0d33d756b54a020c  codemode/catalog.rs
+5a292b36746d0132fe6e516d001ff75469aaf3ff25e459f4f74cd5f034de13e4  codemode/catalog.rs
 
 4deca75e1d4fb5e32b1fabd05056048e17b5e163fb56cbe61cf77858e3dd5d0e  codemode/lean.rs
 
@@ -60,7 +60,7 @@ a06f1e2f7ee9b04854506ace3ef445cf2f4fe8f5995a69bb0d33d756b54a020c  codemode/catal
 
 b7b9b4ea16da0fdd49b62e73b38bb6f2e0e01249884ab6d4a34349a9d1b62820  codemode/value.rs
 
-c21ffa0e7745eae3dbd8369929faec2ed4c3376b0f090530da328e4d6b02ac4e  daemon.rs
+6f0f254f67fc38f20991e167844faf41a21f8ea2a3a4d1d749959380dfb4c5cf  daemon.rs
 
 8e0831a82e16641c4874536370e28cd9fed6f8a8ad5fcd7853ca66d945078de7  discovery/mod.rs
 
@@ -230,7 +230,7 @@ d4e47bb0ddddf4b9aaf9860976b6ef54fbf237188151fbe2e99046d953e3e61d  index_lifecycl
 
 7fac4dae39b6a0122d23002b7f09fb80c080201ac6fbf2eac5f7e53ec427fc5e  index_lifecycle/guidance/argument_values.rs
 
-16d23ae703c07cf9523980a807cbbc340dfaa7bd78452def9af1ba41f689d87a  index_lifecycle/guidance/changes.rs
+69c2779a3c272c092ec213af5b17ea49f7427d66edd9de7bff3d8db080456633  index_lifecycle/guidance/changes.rs
 
 6032cb680e134064d2a9ad23dc84535eea5f03ebd97fd3324c9be92c7f977812  index_lifecycle/guidance/compression.rs
 
@@ -362,7 +362,7 @@ abc492b3381b96c401b2f42d1c9d7ea52255051d12bce42f6ebfb637fafefa9b  lib.rs
 
 cf6b43e949bda9e6a28d37a54666a72ca0687b7932e8cad26e1d5f510988057e  live_index/callable_values.rs
 
-cd297eb7bb2a6e4ba3a036b1d5d45ff9e12b51cfccd99add334a1f1db643f4c7  live_index/context_bundle.rs
+193b0202fef9058ffcfaa270755acbc7359ead46e6d532b9e1e5d3197f98785e  live_index/context_bundle.rs
 
 c3107afd66124b961a382ebcc4fa7286d7399f06b64eb4d2952a13dac5f36198  live_index/coupling/lifecycle.rs
 
@@ -394,7 +394,7 @@ f273b4114c254d900814a55d00beb2003a2621e70e56df3ae98d824dc0045ba6  live_index/kno
 
 3512707f1288ef058d043c714c887adb44e304bd6de169d7aca3f8ae555acf96  live_index/local_ref_scout.rs
 
-5638fac33f3b2742bb4418d2dcca6b692272e98fdc2f43e55b16c5ce20e34e41  live_index/mod.rs
+31c8bdec782769fd3ac350aff34a56a62f015c05abcdda9da4ba40eca26622b1  live_index/mod.rs
 
 ade7f504f0c56acfa592b3cc0cca0c6ab8a1aae27acaa68b07ccfffc70ea88f2  live_index/persist.rs
 
@@ -518,7 +518,7 @@ c0e9d9801b08df63b39366eb24fb8d0c69ee329f796c7a8c2c468b088b8785cd  protocol/conve
 
 b73b1db13aacc0392db5c7b8076afab1632fa8a5577c255caeb37b4127486c04  protocol/edit.rs
 
-e643dd2a6de62194e0e5418ef19a03f10051e223ddb9f6b1ee2e472e7f5460f9  protocol/edit_format.rs
+753072fe693836a65b7e8d78ed8f0b4263fa595dc211f1e584f6a811eeb39feb  protocol/edit_format.rs
 
 28e23a7b193acc80c91ac2b1a5914f9cde219847f2c3c04a62f2bbd0457bf02e  protocol/edit_hooks.rs
 
@@ -622,7 +622,7 @@ d02b22e609f97c30ffac2c5152319602bcc017a3a1e65c997264f7541552630e  sidecar/server
 
 246b8b10de904f62e8ecf188aba5861824393b099ccb074a46c7069ebcd85501  stel/controller.rs
 
-82bce907efa5a518b4529f4d8218ee554881898d7a0e170bfface915f119e77d  stel/edit_apply.rs
+26149ca4f3467990544bb3994afa8aa04c8f28cd29cf7321a1040a341f5d073e  stel/edit_apply.rs
 
 4649408ed4a937169c7e71db14a85fa8d339e61f1381d0a817c27247ee6bf5c4  stel/edit_planner.rs
 

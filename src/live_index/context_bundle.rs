@@ -59,6 +59,8 @@ pub struct TypeDependencyView {
     pub depth: u8,
 }
 
+pub(crate) const MAX_TYPE_DEPENDENCIES: usize = 15;
+
 /// Owned definition-and-sections view for bundle-mode `get_symbol_context`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextBundleFoundView {
@@ -443,7 +445,6 @@ impl LiveIndex {
             SymbolKind::Class,
             SymbolKind::Trait,
         ];
-        const MAX_DEPENDENCIES: usize = 15;
 
         let mut resolved: Vec<TypeDependencyView> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
@@ -451,7 +452,7 @@ impl LiveIndex {
             type_names.iter().map(|n| (n.to_string(), 0u8)).collect();
 
         while let Some((name, depth)) = queue.pop() {
-            if seen.contains(&name) || resolved.len() >= MAX_DEPENDENCIES {
+            if seen.contains(&name) || resolved.len() >= MAX_TYPE_DEPENDENCIES {
                 continue;
             }
             seen.insert(name.clone());

@@ -21,6 +21,7 @@ pub(crate) struct SymbolDiffView {
     pub removed_count: usize,
     pub modified_count: usize,
     pub withheld_count: usize,
+    pub name_collision_files: usize,
 }
 
 pub(crate) fn git_comparison_provenance(range: &crate::git::GitComparisonRange) -> String {
@@ -45,6 +46,7 @@ pub(crate) fn capture_symbol_diff(
         removed_count: 0,
         modified_count: 0,
         withheld_count: 0,
+        name_collision_files: 0,
     };
     for path in paths {
         let mut delta = SymbolFileDelta {
@@ -79,6 +81,9 @@ pub(crate) fn capture_symbol_diff(
             .iter()
             .map(|(name, signature)| (name.as_str(), signature.as_str()))
             .collect();
+        if base_names.len() < base_symbols.len() || target_names.len() < target_symbols.len() {
+            view.name_collision_files += 1;
+        }
         for (name, signature) in &target_names {
             match base_names.get(name) {
                 None => delta.added.push((*name).to_string()),

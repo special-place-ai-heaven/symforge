@@ -361,3 +361,41 @@ fn q_keeps_rows_and_reports_completeness_on_json_stdout() {
     assert_eq!(output["value"], json!([]));
     assert_eq!(output["notices"], json!([notice(1, "search_text", 0, 1)]));
 }
+
+#[test]
+#[ignore = "documents a gap: Python references are returned twice when a package re-exports the name; predates 12.3.0"]
+fn python_references_return_one_row_per_reference_line() {
+    let repo = tempfile::tempdir().unwrap();
+    let files = [
+        (
+            "src/pkg/__init__.py",
+            "from .helpers import greet_once as greet_once\n",
+        ),
+        ("src/pkg/helpers.py", "def greet_once():\n    return 1\n"),
+        (
+            "src/pkg/app.py",
+            "from .helpers import greet_once\n\n\ndef main():\n    return greet_once()\n",
+        ),
+        (
+            "tests/test_pkg.py",
+            "import pkg\n\n\ndef test_greet():\n    assert pkg.greet_once() == 1\n",
+        ),
+    ];
+    for (path, source) in files {
+        let path = repo.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+    }
+    let output = run(
+        &repo,
+        r#"
+refs = find_references(name="greet_once", limit=50, max_per_file=50)
+[len(refs), len(set([r["path"] + ":" + str(r["line"]) for r in refs]))]
+"#,
+    );
+    assert_eq!(
+        output["value"],
+        json!([3, 3]),
+        "expected 3 rows, one per distinct path:line (src/pkg/app.py:1 import, src/pkg/app.py:5 and tests/test_pkg.py:5 calls): {output}"
+    );
+}
