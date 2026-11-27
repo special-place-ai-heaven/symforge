@@ -1847,10 +1847,6 @@ pub fn load_gitignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
     }
 }
 
-/// Add `dir/.gitignore` to a matcher rooted at `root`. Git applies a nested
-/// file's patterns relative to the directory holding it; fed to the root
-/// matcher unchanged they would apply at the repository root instead, so each
-/// one is re-anchored beneath `dir` first.
 pub(crate) fn global_excludes_path() -> Option<PathBuf> {
     ignore::gitignore::gitconfig_excludes_path()
 }
@@ -1928,6 +1924,10 @@ pub(crate) fn add_git_excludes(
     }
 }
 
+/// Add `dir/.gitignore` to a matcher rooted at `root`. Git applies a nested
+/// file's patterns relative to the directory holding it; fed to the root
+/// matcher unchanged they would apply at the repository root instead, so each
+/// one is re-anchored beneath `dir` first.
 fn add_gitignore_file(
     builder: &mut ignore::gitignore::GitignoreBuilder,
     root: &Path,
@@ -3716,9 +3716,6 @@ mod tests {
         }
     }
 
-    /// Nested `.gitignore` rules apply relative to their own directory, as git
-    /// applies them. A root-anchored matcher fed the nested file would ignore
-    /// the root `needle.txt` and index `sub/needle.txt` instead.
     #[test]
     fn load_gitignore_honours_the_repository_and_global_exclude_files() {
         let tmp = TempDir::new().unwrap();
@@ -3828,6 +3825,9 @@ mod tests {
         );
     }
 
+    /// Nested `.gitignore` rules apply relative to their own directory, as git
+    /// applies them. A root-anchored matcher fed the nested file would ignore
+    /// the root `needle.txt` and index `sub/needle.txt` instead.
     #[test]
     fn nested_gitignore_matches_like_git_check_ignore() {
         let tmp = TempDir::new().unwrap();

@@ -474,15 +474,6 @@ fn common_leading_whitespace<'a>(lines: &[&'a str]) -> &'a str {
     common.unwrap_or("")
 }
 
-/// Re-column `text` to `indent`: strip the body's uniform base indent, then
-/// prefix each non-empty line with `indent`, using the given line ending.
-///
-/// Stripping the common base indent first means a body the caller pasted at
-/// some other column (e.g. an 8-space chat-context indent) is re-columned to
-/// exactly the symbol's `indent` rather than COMPOUNDING to base+indent. When
-/// the body is already flush-left (its first content line has no leading
-/// whitespace — the normal case) the base is empty and this is a pure prefix,
-/// so existing callers are unaffected.
 pub(crate) fn indent_replacement(
     file_content: &[u8],
     symbol: &SymbolRecord,
@@ -577,6 +568,15 @@ fn carries_file_indentation(
     }
 }
 
+/// Re-column `text` to `indent`: strip the body's uniform base indent, then
+/// prefix each non-empty line with `indent`, using the given line ending.
+///
+/// Stripping the common base indent first means a body the caller pasted at
+/// some other column (e.g. an 8-space chat-context indent) is re-columned to
+/// exactly the symbol's `indent` rather than COMPOUNDING to base+indent. When
+/// the body is already flush-left (its first content line has no leading
+/// whitespace — the normal case) the base is empty and this is a pure prefix,
+/// so existing callers are unaffected.
 pub(crate) fn apply_indentation(text: &str, indent: &[u8], line_ending: LineEnding) -> Vec<u8> {
     let mut result = Vec::new();
     // Use split('\n') instead of lines() so that trailing newlines produce a trailing
