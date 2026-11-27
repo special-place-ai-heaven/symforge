@@ -1804,13 +1804,7 @@ pub fn load_gitignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
     use std::collections::VecDeque;
 
     let mut builder = GitignoreBuilder::new(root);
-    let info_exclude = std::fs::read_to_string(root.join(".git/info/exclude")).ok();
-    add_repository_excludes(
-        &mut builder,
-        root,
-        info_exclude.as_deref(),
-        global_excludes_path().as_deref(),
-    );
+    add_repository_excludes(&mut builder, root);
 
     // BFS to find nested .gitignore files (max depth 6)
     let max_depth: usize = 6;
@@ -1861,7 +1855,56 @@ pub(crate) fn global_excludes_path() -> Option<PathBuf> {
     ignore::gitignore::gitconfig_excludes_path()
 }
 
+const REPOSITORY_EXCLUDE_MAX_BYTES: u64 = 256 * 1024;
+
 pub(crate) fn add_repository_excludes(
+    builder: &mut ignore::gitignore::GitignoreBuilder,
+    root: &Path,
+) {
+    let info_exclude = read_repository_exclude(root);
+    add_git_excludes(
+        builder,
+        root,
+        info_exclude.as_deref(),
+        global_excludes_path().as_deref(),
+    );
+}
+
+fn read_repository_exclude(root: &Path) -> Option<String> {
+    use std::io::Read;
+
+    let marker = root.join(".git");
+    let common = if marker.is_dir() {
+        marker
+    } else {
+        let pointer = std::fs::read_to_string(&marker).ok()?;
+        let git_dir = PathBuf::from(pointer.lines().next()?.strip_prefix("gitdir: ")?.trim_end());
+        let git_dir = if git_dir.is_absolute() {
+            git_dir
+        } else {
+            root.join(git_dir)
+        };
+        let commondir = std::fs::read_to_string(git_dir.join("commondir")).ok()?;
+        let commondir = commondir.lines().next()?.trim_end();
+        if commondir.starts_with('.') {
+            git_dir.join(commondir)
+        } else {
+            PathBuf::from(commondir)
+        }
+    };
+    let mut bytes = Vec::new();
+    std::fs::File::open(common.join("info").join("exclude"))
+        .ok()?
+        .take(REPOSITORY_EXCLUDE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > REPOSITORY_EXCLUDE_MAX_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+pub(crate) fn add_git_excludes(
     builder: &mut ignore::gitignore::GitignoreBuilder,
     root: &Path,
     info_exclude: Option<&str>,
@@ -3707,7 +3750,7 @@ mod tests {
         let global = tmp.path().join("global-ignore");
         std::fs::write(&global, "*.secret\n").unwrap();
         let mut builder = ignore::gitignore::GitignoreBuilder::new(&root);
-        add_repository_excludes(&mut builder, &root, Some("hidden/\n"), Some(&global));
+        add_git_excludes(&mut builder, &root, Some("hidden/\n"), Some(&global));
         let seeded = builder.build().unwrap();
         assert!(
             seeded
@@ -3728,10 +3771,60 @@ mod tests {
         let outside = tmp.path().join("plain");
         std::fs::create_dir_all(&outside).unwrap();
         let mut builder = ignore::gitignore::GitignoreBuilder::new(&outside);
-        add_repository_excludes(&mut builder, &outside, Some("hidden/\n"), Some(&global));
+        add_git_excludes(&mut builder, &outside, Some("hidden/\n"), Some(&global));
         assert!(
             builder.build().unwrap().is_empty(),
             "no repository, no git excludes"
+        );
+    }
+
+    #[test]
+    fn load_gitignore_reads_the_common_exclude_of_a_linked_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = crate::process_util::hidden_command("git")
+                .args([
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&main, &["init", "-q"]);
+        std::fs::write(main.join("README.md"), "main\n").unwrap();
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "init"]);
+        let worktree = tmp.path().join("linked");
+        git(
+            &main,
+            &["worktree", "add", "-q", worktree.to_str().unwrap()],
+        );
+        std::fs::write(main.join(".git/info/exclude"), "hidden/\n").unwrap();
+        let gitignore = load_gitignore(&worktree).expect("the common exclude was loaded");
+        assert!(
+            gitignore
+                .matched_path_or_any_parents("hidden/x.rs", false)
+                .is_ignore()
+        );
+        assert!(
+            !gitignore
+                .matched_path_or_any_parents("src/a.rs", false)
+                .is_ignore()
+        );
+
+        std::fs::write(main.join(".git/info/exclude"), [0xff, 0xfe, b'\n']).unwrap();
+        assert!(
+            load_gitignore(&worktree).is_none_or(|rules| !rules
+                .matched_path_or_any_parents("hidden/x.rs", false)
+                .is_ignore()),
+            "a non-UTF-8 exclude file is skipped"
         );
     }
 

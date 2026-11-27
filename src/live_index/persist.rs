@@ -3212,23 +3212,7 @@ fn discover_files_from_source_anchor_within(
     let mut files = Vec::new();
     let mut observed = HashMap::new();
     let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
-    let info_exclude = authority
-        .with_source_anchor_read(|lease| {
-            crate::index_lifecycle::physical_root::read_regular_beneath(
-                lease,
-                Path::new(".git/info/exclude"),
-                256 * 1024,
-            )
-        })
-        .ok()
-        .flatten()
-        .and_then(|bytes| String::from_utf8(bytes).ok());
-    crate::discovery::add_repository_excludes(
-        &mut builder,
-        root,
-        info_exclude.as_deref(),
-        crate::discovery::global_excludes_path().as_deref(),
-    );
+    crate::discovery::add_repository_excludes(&mut builder, root);
     let mut matcher = builder
         .build()
         .map_err(|_| "admitted ignore rules could not be compiled".to_string())?;

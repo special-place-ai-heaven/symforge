@@ -560,3 +560,108 @@ async fn the_watcher_on_a_restored_index_skips_ignored_directories() {
     );
     watcher.abort();
 }
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = symforge::process_util::hidden_command("git")
+        .args([
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn placement_for(root: &Path) -> StatePlacement {
+    match symforge::discovery::resolve_root_candidate(
+        root,
+        symforge::domain::RootCandidateSource::LaunchCwd,
+        symforge::domain::RootRequestMode::Automatic,
+    ) {
+        symforge::domain::RootResolution::Bound(binding) => {
+            symforge::discovery::resolve_state_placement(&binding)
+        }
+        resolution => panic!("fixture root should bind: {resolution:?}"),
+    }
+}
+
+fn write_fixture(root: &Path, extra: &[(&str, &str)]) {
+    for (name, content) in FIXTURE.iter().chain(extra) {
+        let path = root.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+}
+
+fn file_set(shared: &SharedIndex) -> Vec<String> {
+    let mut paths: Vec<String> = shared
+        .read()
+        .all_files()
+        .map(|(path, _)| path.clone())
+        .collect();
+    paths.sort();
+    paths
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_worktree_restore_honours_the_common_info_exclude() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("main");
+    fs::create_dir_all(&main).unwrap();
+    git(&main, &["init", "-q"]);
+    fs::write(main.join("README.md"), "main\n").unwrap();
+    git(&main, &["add", "-A"]);
+    git(&main, &["commit", "-qm", "init"]);
+    let worktree = tmp.path().join("linked");
+    git(
+        &main,
+        &["worktree", "add", "-q", worktree.to_str().unwrap()],
+    );
+    assert!(
+        worktree.join(".git").is_file(),
+        "a linked worktree has a .git file"
+    );
+    fs::write(main.join(".git/info/exclude"), "hidden/\n").unwrap();
+    write_fixture(
+        &worktree,
+        &[("hidden/b.ts", "export function hidden() {}\n")],
+    );
+
+    let cold = file_set(&LiveIndex::load(&worktree).unwrap());
+    assert!(
+        !cold.iter().any(|path| path.starts_with("hidden/")),
+        "{cold:?}"
+    );
+    let restored = checkpoint_and_restore(&worktree, &placement_for(&worktree)).await;
+    assert_eq!(file_set(&restored), cold);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "documents a gap: restore does not apply parent-directory .gitignore rules or the enclosing repository's info/exclude to a root below the repository top"]
+async fn a_root_below_the_repository_top_restores_the_cold_file_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let root = repo.join("project");
+    fs::create_dir_all(&root).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join(".gitignore"), "parentrule/\n").unwrap();
+    fs::write(repo.join(".git/info/exclude"), "excluded/\n").unwrap();
+    write_fixture(
+        &root,
+        &[
+            ("parentrule/b.ts", "export function parent() {}\n"),
+            ("excluded/c.ts", "export function excluded() {}\n"),
+        ],
+    );
+    let cold = file_set(&LiveIndex::load(&root).unwrap());
+    let restored = checkpoint_and_restore(&root, &placement_for(&root)).await;
+    assert_eq!(file_set(&restored), cold);
+}
