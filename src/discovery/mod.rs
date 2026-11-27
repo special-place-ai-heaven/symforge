@@ -1930,6 +1930,10 @@ fn repository_common_dir(root: &Path) -> Option<(PathBuf, bool)> {
     Some((common, walker_resolves_pointer))
 }
 
+pub(crate) fn inside_repository(root: &Path) -> bool {
+    root.join(".git").exists() || repository_top_above(root).is_some()
+}
+
 fn repository_top_above(root: &Path) -> Option<&Path> {
     if root.join(".git").exists() {
         return None;
@@ -1944,10 +1948,10 @@ fn add_enclosing_repository_rules(
     root: &Path,
     top: &Path,
 ) {
-    if let Some(global) = global_excludes_path().filter(|path| path.is_file())
-        && let Some(err) = builder.add(&global)
+    if let Some(global) = global_excludes_path()
+        && let Some(contents) = read_git_metadata(&global, REPOSITORY_EXCLUDE_MAX_BYTES)
     {
-        tracing::debug!("failed to load {:?}: {}", global, err);
+        add_gitignore_contents(builder, Path::new(""), &global, &contents);
     }
     let mut sources = Vec::new();
     if let Some(contents) = read_repository_exclude(top) {

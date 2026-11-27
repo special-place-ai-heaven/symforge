@@ -815,3 +815,158 @@ async fn a_separate_git_dir_restore_honours_its_own_info_exclude() {
     let restored = checkpoint_and_restore(&root, &placement_for(&root)).await;
     assert_eq!(file_set(&restored), cold);
 }
+
+struct Layout {
+    name: &'static str,
+    _tmp: TempDir,
+    root: std::path::PathBuf,
+    absent: &'static [&'static str],
+    present: &'static [&'static str],
+}
+
+fn layout_fixture(name: &'static str) -> Layout {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let below = repo.join("project");
+    let (root, absent, present): (_, &'static [&'static str], &'static [&'static str]) = match name
+    {
+        "top" => {
+            git(&repo, &["init", "-q"]);
+            fs::write(repo.join(".gitignore"), "built/\n").unwrap();
+            fs::write(repo.join(".git/info/exclude"), "hidden/\n").unwrap();
+            (repo.clone(), &["built/", "hidden/"], &[])
+        }
+        "below-parent-rule" => {
+            git(&repo, &["init", "-q"]);
+            fs::write(repo.join(".gitignore"), "built/\n").unwrap();
+            (below.clone(), &["built/"], &["hidden/x.ts"])
+        }
+        "below-info-exclude" => {
+            git(&repo, &["init", "-q"]);
+            fs::write(repo.join(".git/info/exclude"), "hidden/\n").unwrap();
+            (below.clone(), &["hidden/"], &["built/x.ts"])
+        }
+        "below-nested-reinclude" => {
+            git(&repo, &["init", "-q"]);
+            fs::write(repo.join(".gitignore"), "built/\nhidden/\n").unwrap();
+            fs::create_dir_all(&below).unwrap();
+            fs::write(below.join(".gitignore"), "!built/\n").unwrap();
+            (below.clone(), &["hidden/"], &["built/x.ts"])
+        }
+        "linked-worktree" => {
+            git(&repo, &["init", "-q"]);
+            fs::write(repo.join("README.md"), "main\n").unwrap();
+            git(&repo, &["add", "-A"]);
+            git(&repo, &["commit", "-qm", "init"]);
+            let worktree = tmp.path().join("linked");
+            git(
+                &repo,
+                &["worktree", "add", "-q", worktree.to_str().unwrap()],
+            );
+            fs::write(repo.join(".git/info/exclude"), "hidden/\n").unwrap();
+            fs::write(worktree.join(".gitignore"), "built/\n").unwrap();
+            (worktree, &["built/", "hidden/"], &[])
+        }
+        "no-git" => {
+            fs::write(repo.join(".gitignore"), "built/\n").unwrap();
+            (repo.clone(), &[], &["built/x.ts"])
+        }
+        other => panic!("unknown layout {other}"),
+    };
+    write_fixture(
+        &root,
+        &[
+            ("built/x.ts", "export function built() {}\n"),
+            ("hidden/x.ts", "export function hidden() {}\n"),
+        ],
+    );
+    Layout {
+        name,
+        _tmp: tmp,
+        root,
+        absent,
+        present,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restored_file_set_equals_the_cold_file_set_in_every_layout() {
+    for name in [
+        "top",
+        "below-parent-rule",
+        "below-info-exclude",
+        "below-nested-reinclude",
+        "linked-worktree",
+        "no-git",
+    ] {
+        let layout = layout_fixture(name);
+        let cold = file_set(&LiveIndex::load(&layout.root).unwrap());
+        for prefix in layout.absent {
+            assert!(
+                !cold.iter().any(|path| path.starts_with(prefix)),
+                "{}: {prefix} in {cold:?}",
+                layout.name
+            );
+        }
+        for path in layout.present {
+            assert!(
+                cold.iter().any(|indexed| indexed == path),
+                "{}: {path} missing from {cold:?}",
+                layout.name
+            );
+        }
+        let restored = checkpoint_and_restore(&layout.root, &placement_for(&layout.root)).await;
+        assert_eq!(file_set(&restored), cold, "{}", layout.name);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_snapshot_written_before_the_enclosing_rules_loses_the_files_they_exclude() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let root = repo.join("project");
+    fs::create_dir_all(&root).unwrap();
+    git(&repo, &["init", "-q"]);
+    write_fixture(
+        &root,
+        &[
+            ("built/x.ts", "export function built() {}\n"),
+            ("hidden/x.ts", "export function hidden() {}\n"),
+        ],
+    );
+    let placement = placement_for(&root);
+    let stale = LiveIndex::load(&root).unwrap();
+    assert!(file_set(&stale).iter().any(|path| path == "built/x.ts"));
+    persist::checkpoint_shared_index(&stale, &root, &placement).expect("checkpoint");
+    fs::write(repo.join(".gitignore"), "built/\n").unwrap();
+    fs::write(repo.join(".git/info/exclude"), "hidden/\n").unwrap();
+    let cold = file_set(&LiveIndex::load(&root).unwrap());
+    assert!(
+        !cold
+            .iter()
+            .any(|path| path.starts_with("built/") || path.starts_with("hidden/")),
+        "{cold:?}"
+    );
+
+    let snapshot = persist::load_snapshot(&root, &placement).expect("snapshot restores");
+    assert!(snapshot.files.contains_key("built/x.ts"));
+    let mtimes = snapshot
+        .files
+        .iter()
+        .map(|(path, file)| (path.clone(), file.mtime_secs))
+        .collect();
+    let restored = SharedIndexHandle::shared(persist::snapshot_to_live_index(snapshot, &root));
+    persist::background_verify(
+        Arc::clone(&restored),
+        root.clone(),
+        mtimes,
+        project_source_authority(&root).active_observer(),
+    )
+    .await;
+    assert!(matches!(
+        restored.read().snapshot_verify_state(),
+        SnapshotVerifyState::Completed(_)
+    ));
+    assert_eq!(file_set(&restored), cold);
+}
