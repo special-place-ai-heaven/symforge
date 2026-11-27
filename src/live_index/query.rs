@@ -186,11 +186,199 @@ fn is_pub_use_import(file: &IndexedFile, reference: &ReferenceRecord) -> bool {
     line_prefix.starts_with("pub ") || line_prefix.starts_with("pub(") || line_prefix == "pub"
 }
 
+#[cfg(test)]
+thread_local! {
+    static PER_FILE_DEPENDENTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DEPENDENT_FILES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_per_file_dependents<R>(work: impl FnOnce() -> R) -> R {
+    PER_FILE_DEPENDENTS.with(|flag| flag.set(true));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+    PER_FILE_DEPENDENTS.with(|flag| flag.set(false));
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+#[cfg(test)]
+pub(crate) fn take_dependent_files_scanned() -> usize {
+    DEPENDENT_FILES_SCANNED.with(|count| count.replace(0))
+}
+
+const MAX_IMPORT_TEXT_SEPARATORS: usize = 32;
+
+fn scan_files<'f, 's>(
+    files: &'f HashMap<String, Arc<IndexedFile>>,
+    among: Option<&'s [&'f str]>,
+) -> Box<dyn Iterator<Item = (&'f String, &'f Arc<IndexedFile>)> + 's>
+where
+    'f: 's,
+{
+    match among {
+        None => Box::new(files.iter()),
+        Some(paths) => Box::new(paths.iter().filter_map(|path| files.get_key_value(*path))),
+    }
+}
+
+fn bounded_import_segments(text: &str) -> Option<Vec<&str>> {
+    let separators: Vec<usize> = text
+        .bytes()
+        .enumerate()
+        .filter(|(_, byte)| matches!(byte, b'/' | b':' | b'.'))
+        .map(|(position, _)| position)
+        .collect();
+    if separators.len() > MAX_IMPORT_TEXT_SEPARATORS {
+        return None;
+    }
+    let ends: Vec<usize> = separators
+        .iter()
+        .copied()
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let segments = std::iter::once(0)
+        .chain(separators.iter().map(|position| position + 1))
+        .flat_map(|start| {
+            ends.iter()
+                .filter(move |end| **end >= start)
+                .map(move |end| &text[start..*end])
+        })
+        .collect();
+    Some(segments)
+}
+
+#[derive(Default)]
+struct DependentCandidates<'a> {
+    importers: HashMap<&'a str, HashSet<&'a str>>,
+    wildcard: HashSet<&'a str>,
+    qualified_calls: HashMap<&'a str, HashSet<&'a str>>,
+    type_usages: HashMap<&'a str, HashSet<&'a str>>,
+}
+
+impl<'a> DependentCandidates<'a> {
+    fn build(files: &'a HashMap<String, Arc<IndexedFile>>) -> Self {
+        let mut key_owners: HashMap<String, Vec<&'a str>> = HashMap::new();
+        for (path, file) in files {
+            let stem = std::path::Path::new(path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(path.as_str());
+            key_owners
+                .entry(stem.to_string())
+                .or_default()
+                .push(path.as_str());
+            if let Some(module_path) = resolve_module_path(path, &file.language) {
+                if let Some(tail) = module_path.strip_prefix("crate::") {
+                    key_owners.entry(tail.to_string()).or_default().push(path);
+                }
+                key_owners.entry(module_path).or_default().push(path);
+            }
+        }
+
+        let mut candidates = Self::default();
+        for (path, file) in files {
+            let path = path.as_str();
+            for reference in &file.references {
+                match reference.kind {
+                    ReferenceKind::Import => {
+                        candidates.add_importer(&key_owners, file, path, reference);
+                    }
+                    ReferenceKind::Call if reference.qualified_name.is_some() => {
+                        candidates
+                            .qualified_calls
+                            .entry(reference.name.as_str())
+                            .or_default()
+                            .insert(path);
+                    }
+                    ReferenceKind::TypeUsage => {
+                        candidates
+                            .type_usages
+                            .entry(reference.name.as_str())
+                            .or_default()
+                            .insert(path);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        candidates
+    }
+
+    fn add_importer(
+        &mut self,
+        key_owners: &HashMap<String, Vec<&'a str>>,
+        file: &'a IndexedFile,
+        path: &'a str,
+        reference: &'a ReferenceRecord,
+    ) {
+        let mut owners: Vec<&'a str> = Vec::new();
+        if file.language == LanguageId::Python
+            && let Some(qualified) = reference.qualified_name.as_deref()
+            && qualified.starts_with('.')
+            && let Some(resolved) = resolve_python_relative_import(path, qualified)
+            && let Some(found) = key_owners.get(resolved.as_str())
+        {
+            owners.extend(found);
+        }
+        let texts =
+            std::iter::once(reference.name.as_str()).chain(reference.qualified_name.as_deref());
+        for text in texts {
+            let Some(segments) = bounded_import_segments(text) else {
+                self.wildcard.insert(path);
+                continue;
+            };
+            for segment in segments {
+                if let Some(found) = key_owners.get(segment) {
+                    owners.extend(found);
+                }
+            }
+        }
+        for owner in owners {
+            self.importers.entry(owner).or_default().insert(path);
+        }
+    }
+
+    fn importers_of(&self, target_path: &str) -> Vec<&'a str> {
+        let mut paths: Vec<&'a str> = self
+            .importers
+            .get(target_path)
+            .into_iter()
+            .flatten()
+            .chain(&self.wildcard)
+            .copied()
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        paths
+    }
+
+    fn for_target(
+        &self,
+        target_path: &str,
+        target_language: &LanguageId,
+        exported_names: &HashSet<String>,
+    ) -> Vec<&'a str> {
+        let typed = matches!(target_language, LanguageId::CSharp | LanguageId::Java);
+        let mut paths = self.importers_of(target_path);
+        for name in exported_names {
+            if let Some(found) = self.qualified_calls.get(name.as_str()) {
+                paths.extend(found);
+            }
+            if typed && let Some(found) = self.type_usages.get(name.as_str()) {
+                paths.extend(found);
+            }
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        paths
+    }
+}
+
 /// Find files that re-export symbols from `target_module_path` via `pub use`.
 ///
 /// Returns the file paths of re-exporter files.
 fn find_reexporters<'a>(
     files: &'a std::collections::HashMap<String, Arc<IndexedFile>>,
+    among: Option<&[&'a str]>,
     target_path: &str,
     target_module_path: Option<&str>,
     target_language: &LanguageId,
@@ -201,7 +389,7 @@ fn find_reexporters<'a>(
     }
 
     let mut reexporters = Vec::new();
-    for (file_path, file) in files {
+    for (file_path, file) in scan_files(files, among) {
         if file_path.as_str() == target_path {
             continue;
         }
@@ -4050,6 +4238,31 @@ impl LiveIndex {
     ///
     /// Returns a `Vec` of `(importing_file_path, &import_reference)` tuples.
     pub fn find_dependents_for_file(&self, target_path: &str) -> Vec<(&str, &ReferenceRecord)> {
+        self.dependents_among(target_path, None)
+    }
+
+    pub(crate) fn find_dependents_for_files<'a>(
+        &'a self,
+        target_paths: &[&str],
+    ) -> Vec<Vec<(&'a str, &'a ReferenceRecord)>> {
+        #[cfg(test)]
+        if PER_FILE_DEPENDENTS.with(std::cell::Cell::get) {
+            return target_paths
+                .iter()
+                .map(|path| self.find_dependents_for_file(path))
+                .collect();
+        }
+        let candidates = DependentCandidates::build(&self.files);
+        super::store::ordered_parallel_map(target_paths, |path| {
+            self.dependents_among(path, Some(&candidates))
+        })
+    }
+
+    fn dependents_among<'a>(
+        &'a self,
+        target_path: &str,
+        among: Option<&DependentCandidates<'a>>,
+    ) -> Vec<(&'a str, &'a ReferenceRecord)> {
         let Some(target_file) = self.files.get(target_path) else {
             return vec![];
         };
@@ -4073,10 +4286,16 @@ impl LiveIndex {
             .collect();
         let exported_target_symbol_names =
             Self::exported_symbol_names(target_file, &target_symbol_names);
+        let scan = among.map(|candidates| {
+            candidates.for_target(target_path, &target_language, &exported_target_symbol_names)
+        });
+        let import_scan = |path: &str| among.map(|candidates| candidates.importers_of(path));
 
         let mut results = Vec::new();
 
-        for (file_path, file) in &self.files {
+        for (file_path, file) in scan_files(&self.files, scan.as_deref()) {
+            #[cfg(test)]
+            DEPENDENT_FILES_SCANNED.with(|count| count.set(count.get() + 1));
             // Don't report a file as depending on itself.
             if file_path.as_str() == target_path {
                 continue;
@@ -4151,7 +4370,7 @@ impl LiveIndex {
         if let Some(ref mp) = module_path {
             let already_found: HashSet<&str> = results.iter().map(|(p, _)| *p).collect();
 
-            for (file_path, file) in &self.files {
+            for (file_path, file) in scan_files(&self.files, scan.as_deref()) {
                 if file_path.as_str() == target_path || already_found.contains(file_path.as_str()) {
                     continue;
                 }
@@ -4208,8 +4427,10 @@ impl LiveIndex {
 
             // Seed: find files that pub-use-re-export from target
             let mut queue: VecDeque<(&str, u8)> = VecDeque::new();
+            let target_import_scan = import_scan(target_path);
             let reexporters = find_reexporters(
                 &self.files,
+                target_import_scan.as_deref(),
                 target_path,
                 module_path.as_deref(),
                 &target_language,
@@ -4232,8 +4453,8 @@ impl LiveIndex {
                     .unwrap_or(reexporter_path);
                 let re_module_path = resolve_module_path(reexporter_path, &re_file.language);
 
-                // Find files that import from the re-exporter
-                for (file_path, file) in &self.files {
+                let reexporter_scan = import_scan(reexporter_path);
+                for (file_path, file) in scan_files(&self.files, reexporter_scan.as_deref()) {
                     if file_path.as_str() == target_path
                         || file_path.as_str() == reexporter_path
                         || already_found.contains(file_path.as_str())
@@ -4292,6 +4513,7 @@ impl LiveIndex {
                 if depth < 2 {
                     let next_reexporters = find_reexporters(
                         &self.files,
+                        reexporter_scan.as_deref(),
                         reexporter_path,
                         re_module_path.as_deref(),
                         &target_language,
@@ -10023,6 +10245,236 @@ public class PacketsController {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod batch_dependents_tests {
+    use super::take_dependent_files_scanned;
+    use crate::live_index::store::{LiveIndex, with_serial_oracle};
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    const FIXTURE: &[(&str, &str)] = &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub mod api;\npub mod db;\npub mod facade;\npub mod user;\npub use db::Pool;\n",
+        ),
+        (
+            "src/db.rs",
+            "pub struct Pool;\n\npub fn connect() -> Pool {\n    Pool\n}\n",
+        ),
+        (
+            "src/api/mod.rs",
+            "pub mod handlers;\nuse crate::db::connect;\n\npub fn serve() {\n    connect();\n}\n",
+        ),
+        (
+            "src/api/handlers.rs",
+            "use super::serve;\nuse crate::Pool;\n\npub fn handle(pool: &Pool) {\n    serve();\n    crate::db::connect();\n    self::helper();\n}\n\nfn helper() {}\n",
+        ),
+        ("src/facade.rs", "pub use crate::api::handlers::handle;\n"),
+        (
+            "src/user.rs",
+            "use crate::facade::handle;\nuse crate::db::Pool;\n\npub struct User;\n\npub fn run(pool: &Pool) {\n    handle(pool);\n}\n",
+        ),
+        ("launcher/src/gguf.rs", "pub struct Gguf;\n"),
+        ("py/gguf.py", "class Gguf:\n    pass\n"),
+        ("py/pkg/__init__.py", "from .core import Engine\n"),
+        (
+            "py/pkg/core.py",
+            "class Engine:\n    def run(self):\n        pass\n",
+        ),
+        ("py/pkg/sub/__init__.py", ""),
+        (
+            "py/pkg/sub/consumer.py",
+            "from ..core import Engine\nfrom ....outside import nothing\nimport pkg.core\nimport gguf\n\nengine = Engine()\npkg.core.Engine().run()\n",
+        ),
+        (
+            "web/src/user.service.ts",
+            "export class UserService {\n  find(): string {\n    return '';\n  }\n}\n\nexport interface UserRecord {\n  id: string;\n}\n",
+        ),
+        ("web/src/index.ts", "export * from './user.service';\n"),
+        (
+            "web/src/app.ts",
+            "import { UserService, UserRecord } from './user.service';\nimport * as all from '.';\n\nconst service = new UserService();\nconst record: UserRecord = { id: service.find() };\nexport const keep = [all, record];\n",
+        ),
+        (
+            "web/src/legacy.js",
+            "const { UserService } = require('./user.service');\nmodule.exports = new UserService();\n",
+        ),
+        (
+            "web/src/deep.ts",
+            "import { UserService } from '../../a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t/u/v/w/x/y/z/aa/bb/cc/dd/ee/ff/gg/user.service';\nexport const deep = new UserService();\n",
+        ),
+        (
+            "cs/Core/IStore.cs",
+            "namespace Acme.Core\n{\n    public interface IStore\n    {\n        void Put();\n    }\n}\n",
+        ),
+        (
+            "cs/Core/Store.cs",
+            "namespace Acme.Core\n{\n    public class Store : IStore\n    {\n        public void Put() {}\n    }\n}\n",
+        ),
+        (
+            "cs/App/Program.cs",
+            "using Acme.Core;\n\nnamespace Acme.App\n{\n    class Program\n    {\n        IStore store;\n        void Main() { store.Put(); }\n    }\n}\n",
+        ),
+        (
+            "java/com/acme/storage/MinioService.java",
+            "package com.acme.storage;\n\npublic class MinioService {\n    public void put() {}\n}\n",
+        ),
+        (
+            "java/com/acme/storage/Peer.java",
+            "package com.acme.storage;\n\nclass Peer {\n    MinioService service;\n}\n",
+        ),
+        (
+            "java/com/acme/app/App.java",
+            "package com.acme.app;\n\nimport com.acme.storage.MinioService;\n\npublic class App {\n    MinioService service;\n}\n",
+        ),
+        (
+            "java/com/acme/app/Star.java",
+            "package com.acme.app;\n\nimport com.acme.storage.*;\n\nclass Star {\n    MinioService service;\n}\n",
+        ),
+        ("docs/notes.md", "# Notes\n"),
+    ];
+
+    fn write_fixture(root: &Path, files: &[(&str, &str)]) {
+        for (relative, content) in files {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+    }
+
+    fn assert_batch_matches_per_file(index: &LiveIndex) -> usize {
+        let mut paths: Vec<&str> = index.files.keys().map(String::as_str).collect();
+        paths.sort_unstable();
+        let batch = index.find_dependents_for_files(&paths);
+        assert_eq!(batch.len(), paths.len());
+        let mut targets_with_dependents = 0;
+        for (path, batched) in paths.iter().zip(&batch) {
+            let per_file = index.find_dependents_for_file(path);
+            assert_eq!(batched, &per_file, "dependents of {path}");
+            if !per_file.is_empty() {
+                targets_with_dependents += 1;
+            }
+        }
+        targets_with_dependents
+    }
+
+    #[test]
+    fn batch_dependents_equal_per_file_dependents_on_mixed_fixture() {
+        let root = TempDir::new().unwrap();
+        write_fixture(root.path(), FIXTURE);
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let index = shared.read();
+
+        let parallel = assert_batch_matches_per_file(&index);
+        let serial = with_serial_oracle(|| assert_batch_matches_per_file(&index));
+
+        assert_eq!(parallel, serial);
+        assert!(parallel >= 8, "fixture exercised only {parallel} targets");
+        for (target, importer) in [
+            ("src/db.rs", "src/user.rs"),
+            ("src/api/handlers.rs", "src/user.rs"),
+            ("py/pkg/core.py", "py/pkg/sub/consumer.py"),
+            ("web/src/user.service.ts", "web/src/app.ts"),
+            ("cs/Core/IStore.cs", "cs/App/Program.cs"),
+            (
+                "java/com/acme/storage/MinioService.java",
+                "java/com/acme/app/App.java",
+            ),
+        ] {
+            let dependents = index.find_dependents_for_file(target);
+            assert!(
+                dependents.iter().any(|(path, _)| *path == importer),
+                "{importer} should depend on {target}: {dependents:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_dependents_scan_fewer_files_than_per_file_dependents() {
+        let root = TempDir::new().unwrap();
+        write_fixture(root.path(), FIXTURE);
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let index = shared.read();
+        let mut paths: Vec<&str> = index.files.keys().map(String::as_str).collect();
+        paths.sort_unstable();
+
+        take_dependent_files_scanned();
+        let batch = with_serial_oracle(|| index.find_dependents_for_files(&paths));
+        let batch_scanned = take_dependent_files_scanned();
+        let per_file: Vec<_> = paths
+            .iter()
+            .map(|path| index.find_dependents_for_file(path))
+            .collect();
+        let per_file_scanned = take_dependent_files_scanned();
+
+        assert_eq!(batch, per_file);
+        assert_eq!(per_file_scanned, paths.len() * index.files.len());
+        assert!(
+            batch_scanned * 4 < per_file_scanned,
+            "batch scanned {batch_scanned} of {per_file_scanned}"
+        );
+    }
+
+    #[test]
+    fn batch_dependents_scan_nothing_when_no_file_refers_to_another() {
+        let root = TempDir::new().unwrap();
+        let files: Vec<(String, String)> = (0..20)
+            .map(|index| {
+                (
+                    format!("src/module_{index}.rs"),
+                    format!("pub struct Item{index};\n"),
+                )
+            })
+            .collect();
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str()))
+            .collect();
+        write_fixture(root.path(), &borrowed);
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let index = shared.read();
+        let paths: Vec<&str> = index.files.keys().map(String::as_str).collect();
+
+        take_dependent_files_scanned();
+        let batch = with_serial_oracle(|| index.find_dependents_for_files(&paths));
+
+        assert_eq!(take_dependent_files_scanned(), 0);
+        assert!(batch.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    #[ignore]
+    fn batch_dependents_equal_per_file_dependents_on_this_repository_and_env_repos() {
+        let mut roots = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))];
+        if let Ok(raw) = std::env::var("SYMFORGE_DEPENDENTS_PARITY_REPOS") {
+            roots.extend(
+                raw.split(';')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(std::path::PathBuf::from),
+            );
+        }
+        for root in roots {
+            let shared = LiveIndex::load(&root).unwrap();
+            let index = shared.read();
+            let started = std::time::Instant::now();
+            let with_dependents = assert_batch_matches_per_file(&index);
+            eprintln!(
+                "{}: {} files, {with_dependents} with dependents, parity checked in {:?}",
+                root.display(),
+                index.files.len(),
+                started.elapsed()
+            );
+            assert!(with_dependents > 0, "{}", root.display());
         }
     }
 }
