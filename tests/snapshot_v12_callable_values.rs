@@ -667,6 +667,40 @@ async fn a_root_below_the_repository_top_restores_the_cold_file_set() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_worktree_with_a_relative_gitdir_restores_the_cold_file_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("main");
+    fs::create_dir_all(&main).unwrap();
+    git(&main, &["init", "-q"]);
+    fs::write(main.join("README.md"), "main\n").unwrap();
+    git(&main, &["add", "-A"]);
+    git(&main, &["commit", "-qm", "init"]);
+    let worktree = tmp.path().join("linked");
+    git(
+        &main,
+        &["worktree", "add", "-q", worktree.to_str().unwrap()],
+    );
+    fs::write(
+        worktree.join(".git"),
+        "gitdir: ../main/.git/worktrees/linked\n",
+    )
+    .unwrap();
+    fs::write(main.join(".git/info/exclude"), "hidden/\n").unwrap();
+    write_fixture(
+        &worktree,
+        &[("hidden/b.ts", "export function hidden() {}\n")],
+    );
+
+    let cold = file_set(&LiveIndex::load(&worktree).unwrap());
+    assert!(
+        !cold.iter().any(|path| path.starts_with("hidden/")),
+        "{cold:?}"
+    );
+    let restored = checkpoint_and_restore(&worktree, &placement_for(&worktree)).await;
+    assert_eq!(file_set(&restored), cold);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_separate_git_dir_restore_honours_its_own_info_exclude() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("repo");

@@ -1903,6 +1903,7 @@ fn repository_common_dir(root: &Path) -> Option<(PathBuf, bool)> {
     }
     let pointer = read_git_metadata(&marker, GIT_POINTER_MAX_BYTES)?;
     let git_dir = PathBuf::from(pointer.lines().next()?.strip_prefix("gitdir: ")?.trim_end());
+    let walker_resolves_pointer = git_dir.is_absolute();
     let git_dir = if git_dir.is_absolute() {
         git_dir
     } else {
@@ -1922,7 +1923,7 @@ fn repository_common_dir(root: &Path) -> Option<(PathBuf, bool)> {
     } else {
         PathBuf::from(commondir)
     };
-    Some((common, true))
+    Some((common, walker_resolves_pointer))
 }
 
 fn read_repository_exclude(root: &Path) -> Option<String> {
