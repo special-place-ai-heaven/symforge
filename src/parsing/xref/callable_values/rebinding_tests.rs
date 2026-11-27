@@ -15,9 +15,12 @@ fn check(source: &str, language: LanguageId, blocked: &[&str], exact: &[(&str, &
             1,
             "ambiguous fixture: {usage}"
         );
-        let end = start + usage.rfind(')').expect("callback argument ends in )") as u32;
+        let end = start
+            + usage
+                .rfind([')', '}'])
+                .expect("callback argument ends in ) or }") as u32;
         let leaf = usage[..(end - start) as usize]
-            .rsplit(['.', '('])
+            .rsplit(['.', '(', '{'])
             .next()
             .unwrap();
         (end - leaf.len() as u32, end)
@@ -543,6 +546,34 @@ class Definite {
                 "installDefiniteStable(this.stable)",
                 "stable() { return 10; }",
             ),
+        ],
+    );
+}
+
+#[test]
+fn javascript_jsx_attribute_values_are_value_uses() {
+    check(
+        r#"function handleClick() {}
+class Panel {
+    handle() {}
+    stable() {}
+    swap(fn) { this.handle = fn; }
+    render() {
+        return <div><Button onClick={handleClick} cb={this.stable} other={this.handle} label="x" /></div>;
+    }
+}
+function shadowed(handleClick) { return <Button onPress={handleClick} />; }
+function unknown() { return <Button onHover={missing} />; }
+"#,
+        LanguageId::JavaScript,
+        &[
+            "other={this.handle}",
+            "onPress={handleClick}",
+            "onHover={missing}",
+        ],
+        &[
+            ("onClick={handleClick}", "function handleClick() {}"),
+            ("cb={this.stable}", "stable() {}"),
         ],
     );
 }

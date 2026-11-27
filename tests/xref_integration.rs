@@ -388,6 +388,33 @@ fn class_fields_and_escaped_names_never_leave_a_false_exact_method_callback() {
 }
 
 #[test]
+fn jsx_attribute_callbacks_are_exact_value_uses_in_tsx_and_jsx() {
+    let view = "import { gamma } from \"./handlers\";\nfunction handleClick() {}\nexport function View() {\n    return <Button onClick={handleClick} cb={gamma} />;\n}\n";
+    for (view_path, handlers_path) in [("view.tsx", "handlers.ts"), ("view.jsx", "handlers.js")] {
+        let (_dir, shared) = build_index(&[
+            (view_path, view),
+            (handlers_path, "export function gamma() {}\n"),
+        ]);
+        let index = shared.read();
+        let kind = Some(ReferenceKind::ValueUse);
+        for (path, name) in [(view_path, "handleClick"), (handlers_path, "gamma")] {
+            let site = view.find(&format!("={{{name}}}")).unwrap() as u32 + 2;
+            let hits: Vec<_> = index
+                .find_exact_references_for_symbol(path, name, None, None, kind)
+                .unwrap_or_else(|error| panic!("{path} {name}: {error}"))
+                .into_iter()
+                .map(|(path, reference)| (path, reference.byte_range))
+                .collect();
+            assert_eq!(
+                hits,
+                [(view_path, (site, site + name.len() as u32))],
+                "{view_path} {name}"
+            );
+        }
+    }
+}
+
+#[test]
 fn exact_python_class_value_uses_do_not_require_callback_evidence() {
     let path = "model.py";
     let source = "class Model:\n    pass\n\nisinstance(obj, Model)\n";

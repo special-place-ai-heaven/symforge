@@ -246,6 +246,16 @@ fn walk(
                     );
                 }
                 "shorthand_property_identifier" if !python => candidates.push(node),
+                "jsx_expression"
+                    if !python && node.parent().is_some_and(|p| p.kind() == "jsx_attribute") =>
+                {
+                    candidates.extend(
+                        node.named_children(&mut node.walk())
+                            .find(|n| n.kind() != "comment")
+                            .map(unparen)
+                            .filter(|n| is_candidate(*n)),
+                    );
+                }
                 "import_from_statement" | "import_statement" => {
                     if let Some(scope) = enclosing_scope(node, python) {
                         if python && has_child_kind(node, "wildcard_import") {
