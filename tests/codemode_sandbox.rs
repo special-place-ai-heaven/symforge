@@ -292,6 +292,58 @@ fn oversized_output_spills_losslessly_to_disk_and_caps_inline_preview() {
     );
 }
 
+struct CappedBackend;
+
+impl symforge::codemode::CodeReadBackend for CappedBackend {
+    fn execute_op(
+        &self,
+        op: CodeReadOp,
+        kwargs: Map<String, Value>,
+    ) -> Result<Value, CodeBackendError> {
+        mock_backend(op, kwargs)
+    }
+
+    fn execute_op_with_completeness(
+        &self,
+        op: CodeReadOp,
+        kwargs: Map<String, Value>,
+    ) -> Result<symforge::codemode::CodeReadResult, CodeBackendError> {
+        Ok(symforge::codemode::CodeReadResult {
+            value: mock_backend(op, kwargs)?,
+            completeness: symforge::codemode::CodeReadCompleteness {
+                omitted_rows: 7,
+                ..Default::default()
+            },
+        })
+    }
+}
+
+#[test]
+fn spill_files_carry_the_host_call_notices() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    for code in [
+        "find_references(name='x')\n{'big': 'é' * 4000}",
+        "find_references(name='x')\nprint('é' * 4000)\n1/0",
+    ] {
+        let req = ExecuteRequest {
+            code: code.to_owned(),
+            limits: CodeModeLimits {
+                max_output_chars: 512,
+                ..CodeModeLimits::default()
+            },
+            spill_dir: Some(temp.path().to_path_buf()),
+        };
+        let out = execute_script(&req, &CappedBackend);
+        assert_eq!(out.notices.len(), 1, "{code}");
+        let spill = out.spill_path.expect("spill_path present");
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(&spill).expect("read spill"))
+                .expect("parse spill");
+        assert_eq!(saved["notices"][0]["op"], "find_references", "{code}");
+        assert_eq!(saved["notices"][0]["omitted_rows"], 7, "{code}");
+    }
+}
+
 #[test]
 fn lean_output_inlines_values_whose_lean_text_fits_although_their_json_does_not() {
     let temp = tempfile::tempdir().expect("tempdir");
