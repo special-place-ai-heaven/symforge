@@ -30,13 +30,24 @@ pub(super) fn uses_callable_value_bindings(language: LanguageId) -> bool {
     )
 }
 
-pub(super) fn file_facts(file: &IndexedFile) -> Option<Arc<CallableFacts>> {
+fn facts_eligible(file: &IndexedFile) -> bool {
     // Match the source-evidence lane's bound; never read a file from disk or
     // try to recover callable bindings from damaged syntax.
-    if !uses_callable_value_bindings(file.language)
-        || file.content.len() > 2 * 1024 * 1024
-        || file.parse_status != ParseStatus::Parsed
-    {
+    uses_callable_value_bindings(file.language)
+        && file.content.len() <= 2 * 1024 * 1024
+        && file.parse_status == ParseStatus::Parsed
+}
+
+#[cfg(test)]
+pub(super) static FACTS_PROBE_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(super) fn file_facts(file: &IndexedFile) -> Option<Arc<CallableFacts>> {
+    #[cfg(test)]
+    if file.relative_path.starts_with("facts-probe/") {
+        FACTS_PROBE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if !facts_eligible(file) {
         return None;
     }
     let source = std::str::from_utf8(&file.content).ok()?;
@@ -103,6 +114,55 @@ pub(super) fn build_callable_values(
     .into_iter()
     .flatten()
     .collect()
+}
+
+#[derive(Clone)]
+pub struct PersistedCallableValues(Vec<(String, Arc<CallableFacts>)>);
+
+impl PersistedCallableValues {
+    pub(super) fn capture(table: &CallableValueIndex) -> Self {
+        let mut entries: Vec<_> = table
+            .iter()
+            .map(|(path, facts)| (path.clone(), Arc::clone(facts)))
+            .collect();
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        Self(entries)
+    }
+
+    pub(super) fn adopt(
+        self,
+        files: &HashMap<String, Arc<IndexedFile>>,
+    ) -> Result<CallableValueIndex, String> {
+        if let Some(pair) = self.0.windows(2).find(|pair| pair[0].0 >= pair[1].0) {
+            return Err(pair[1].0.clone());
+        }
+        if let Some((path, _)) = self
+            .0
+            .iter()
+            .find(|(path, _)| !files.get(path).is_some_and(|file| facts_eligible(file)))
+        {
+            return Err(path.clone());
+        }
+        Ok(self.0.into_iter().collect())
+    }
+}
+
+impl serde::Serialize for PersistedCallableValues {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|(path, facts)| (path, facts.as_ref())))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PersistedCallableValues {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let entries = Vec::<(String, CallableFacts)>::deserialize(deserializer)?;
+        Ok(Self(
+            entries
+                .into_iter()
+                .map(|(path, facts)| (path, Arc::new(facts)))
+                .collect(),
+        ))
+    }
 }
 
 impl LiveIndex {

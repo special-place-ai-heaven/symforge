@@ -21,7 +21,7 @@ pub(super) fn extract(
     walk(root, source, language, is_tsx, refs, None);
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ImportedValue {
     pub(crate) module: String,
     pub(crate) exported: String,
@@ -30,15 +30,27 @@ pub(crate) struct ImportedValue {
 
 type ByteRange = (u32, u32);
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CallableFacts {
     pub(crate) uses: Vec<ImportedValue>,
     // Use token range -> lexical declaration's core range in the same file.
+    #[serde(serialize_with = "sorted_map")]
     pub(crate) locals: HashMap<ByteRange, ByteRange>,
     // Exported spelling -> (canonical declaration name, declaration core range).
+    #[serde(serialize_with = "sorted_map")]
     pub(crate) exports: HashMap<String, (String, ByteRange)>,
     // Separate from callbacks: class values are joined only for exact class selectors.
+    #[serde(serialize_with = "sorted_map")]
     pub(crate) class_exports: HashMap<String, (String, ByteRange)>,
+}
+
+fn sorted_map<K: Ord + serde::Serialize, V: serde::Serialize, S: serde::Serializer>(
+    map: &HashMap<K, V>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    serializer.collect_map(entries)
 }
 
 pub(crate) fn facts(root: Node<'_>, source: &str, language: LanguageId) -> CallableFacts {
