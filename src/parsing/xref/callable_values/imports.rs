@@ -6,8 +6,21 @@ use crate::domain::{ReferenceKind, ReferenceRecord};
 use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
-pub(super) type Imports<'tree, 'src> =
-    HashMap<(Node<'tree>, &'src str), (&'src str, &'src str, usize)>;
+#[derive(Clone, Copy)]
+enum ImportName<'src> {
+    Named(&'src str),
+    Module,
+}
+
+type ImportMap<'tree, 'src> =
+    HashMap<(Node<'tree>, &'src str), (&'src str, ImportName<'src>, usize)>;
+
+#[derive(Default)]
+pub(super) struct Imports<'tree, 'src> {
+    bindings: ImportMap<'tree, 'src>,
+    // A visible attribute write makes that name uncertain, even from another scope.
+    pub(super) written_members: HashSet<&'src str>,
+}
 
 pub(super) fn collect_imports<'tree, 'src>(
     node: Node<'tree>,
@@ -17,37 +30,51 @@ pub(super) fn collect_imports<'tree, 'src>(
     bindings: &mut Bindings<'tree, 'src>,
     imports: &mut Imports<'tree, 'src>,
 ) {
-    let mut add = |local: Node<'tree>, module: Option<&'src str>, exported: Option<&'src str>| {
-        let target = module.zip(exported);
-        let binding = if target.is_some() {
-            Binding::Imported
-        } else {
-            Binding::Blocked
+    let mut add =
+        |local: Node<'tree>, module: Option<&'src str>, exported: Option<ImportName<'src>>| {
+            let target = module.zip(exported);
+            let binding = if target.is_some() {
+                Binding::Imported
+            } else {
+                Binding::Blocked
+            };
+            bind_kind(bindings, scope, local, binding, src);
+            if let Some((module, exported)) = target
+                && let Ok(local) = local.utf8_text(src)
+            {
+                imports
+                    .bindings
+                    .insert((scope, local), (module, exported, node.end_byte()));
+            }
         };
-        bind_kind(bindings, scope, local, binding, src);
-        if let Some((module, exported)) = target
-            && let Ok(local) = local.utf8_text(src)
-        {
-            imports.insert((scope, local), (module, exported, node.end_byte()));
-        }
-    };
     if python {
         // Only unconditional imports at the module level or directly in a function body.
+        let unconditional = node.parent() == Some(scope)
+            || node.parent().is_some_and(|p| {
+                p.kind() == "block" && scope.child_by_field_name("body") == Some(p)
+            });
         let module = node
             .child_by_field_name("module_name")
-            .filter(|_| {
-                node.parent() == Some(scope)
-                    || node.parent().is_some_and(|p| {
-                        p.kind() == "block" && scope.child_by_field_name("body") == Some(p)
-                    })
-            })
             .and_then(|n| n.utf8_text(src).ok());
         for item in node.children_by_field_name("name", &mut node.walk()) {
             let name = item.child_by_field_name("name").unwrap_or(item);
             let original = name.named_child(0).unwrap_or(name);
             let local = item.child_by_field_name("alias").unwrap_or(original);
             let exported = name.utf8_text(src).ok().filter(|name| !name.contains('.'));
-            add(local, module, exported);
+            if node.kind() == "import_statement" {
+                // `import model [as m]` binds a module, not a class named `model`.
+                add(
+                    local,
+                    exported.filter(|_| unconditional),
+                    Some(ImportName::Module),
+                );
+            } else {
+                add(
+                    local,
+                    module.filter(|_| unconditional),
+                    exported.map(ImportName::Named),
+                );
+            }
         }
     } else {
         let module = node
@@ -70,7 +97,7 @@ pub(super) fn collect_imports<'tree, 'src>(
         }
         for item in clause.named_children(&mut clause.walk()) {
             match item.kind() {
-                "identifier" => add(item, module, Some("default")),
+                "identifier" => add(item, module, Some(ImportName::Named("default"))),
                 "named_imports" => {
                     for spec in item
                         .named_children(&mut item.walk())
@@ -80,9 +107,12 @@ pub(super) fn collect_imports<'tree, 'src>(
                             add(
                                 spec.child_by_field_name("alias").unwrap_or(name),
                                 module,
-                                name.utf8_text(src).ok().filter(|_| {
-                                    name.kind() == "identifier" && !has_child_kind(spec, "type")
-                                }),
+                                name.utf8_text(src)
+                                    .ok()
+                                    .filter(|_| {
+                                        name.kind() == "identifier" && !has_child_kind(spec, "type")
+                                    })
+                                    .map(ImportName::Named),
                             );
                         }
                     }
@@ -150,10 +180,23 @@ pub(super) fn finish_imports<'tree, 'src>(
 ) {
     let mut seen = HashSet::new();
     for node in candidates {
-        if !matches!(node.kind(), "identifier" | "shorthand_property_identifier") {
-            continue;
-        }
-        let Ok(local) = node.utf8_text(src) else {
+        let (local_node, member) = match node.kind() {
+            "identifier" | "shorthand_property_identifier" => (node, None),
+            "attribute" if python => {
+                let Some(object) = node
+                    .child_by_field_name("object")
+                    .filter(|n| n.kind() == "identifier")
+                else {
+                    continue;
+                };
+                let Some(member) = node.child_by_field_name("attribute") else {
+                    continue;
+                };
+                (object, Some(member))
+            }
+            _ => continue,
+        };
+        let Ok(local) = local_node.utf8_text(src) else {
             continue;
         };
         if python && !python_value_context(node) {
@@ -174,23 +217,36 @@ pub(super) fn finish_imports<'tree, 'src>(
         else {
             continue;
         };
-        let Some(&(module, exported, import_end)) = imports.get(&(scope, local)) else {
+        let Some(&(module, exported, import_end)) = imports.bindings.get(&(scope, local)) else {
             continue;
         };
         if (python && node.start_byte() < import_end) || !seen.insert(node.start_byte()) {
             continue;
         }
+        let (exported, leaf, name, qualified_name) = match (exported, member) {
+            (ImportName::Named(exported), None) => (exported, node, local, None),
+            (ImportName::Module, Some(member)) => {
+                let Ok(name) = member.utf8_text(src) else {
+                    continue;
+                };
+                if imports.written_members.contains(name) {
+                    continue;
+                }
+                (name, member, name, Some(format!("{local}.{name}")))
+            }
+            _ => continue,
+        };
         facts.uses.push(ImportedValue {
             module: module.to_owned(),
             exported: exported.to_owned(),
             reference: ReferenceRecord {
-                name: local.to_owned(),
-                qualified_name: None,
+                name: name.to_owned(),
+                qualified_name,
                 kind: ReferenceKind::ValueUse,
-                byte_range: byte_range(node),
+                byte_range: byte_range(leaf),
                 line_range: (
-                    node.start_position().row as u32,
-                    node.end_position().row as u32,
+                    leaf.start_position().row as u32,
+                    leaf.end_position().row as u32,
                 ),
                 enclosing_symbol_index: None,
             },

@@ -68,7 +68,7 @@ fn walk(
     let mut bindings = Bindings::new();
     let mut methods = Bindings::new();
     let mut candidates = Vec::new();
-    let mut imports = HashMap::new();
+    let mut imports = imports::Imports::default();
     let mut opaque_import_scopes = HashSet::new();
     let mut python_directives = Vec::new();
     let mut js_writes = Vec::new();
@@ -80,6 +80,27 @@ fn walk(
     loop {
         let node = cursor.node();
         if node.is_named() && !node.is_missing() {
+            if python
+                && facts.is_some()
+                && matches!(
+                    node.kind(),
+                    "assignment" | "augmented_assignment" | "delete_statement"
+                )
+            {
+                let target = node
+                    .child_by_field_name("left")
+                    .or_else(|| node.named_child(0));
+                if let Some(target) = target {
+                    visit_pattern(target, true, |member| {
+                        if let Some(name) = member
+                            .child_by_field_name("attribute")
+                            .and_then(|n| n.utf8_text(src).ok())
+                        {
+                            imports.written_members.insert(name);
+                        }
+                    });
+                }
+            }
             match node.kind() {
                 "jsx_opening_element" | "jsx_self_closing_element" if jsx && facts.is_none() => {
                     if let Some((name, qualifier)) = jsx_component(node, src) {
@@ -599,7 +620,9 @@ fn visit_pattern<'tree>(
             "identifier" | "shorthand_property_identifier_pattern" if !include_members => {
                 visit(node);
             }
-            "attribute" | "member_expression" if include_members => visit(node),
+            "attribute" | "member_expression" | "subscript_expression" if include_members => {
+                visit(node)
+            }
             "parenthesized_expression" if include_members => {
                 let inner = unparen(node);
                 if inner != node {
@@ -882,17 +905,22 @@ fn receiver_member<'tree>(
     src: &[u8],
     python: bool,
 ) -> Option<(Node<'tree>, Node<'tree>, Node<'tree>, Node<'tree>)> {
-    if value.kind()
-        != if python {
-            "attribute"
-        } else {
-            "member_expression"
+    let name = match (python, value.kind()) {
+        (true, "attribute") => value.child_by_field_name("attribute")?,
+        (false, "member_expression") => value.child_by_field_name("property")?,
+        (false, "subscript_expression") => {
+            // A literal bracket write can replace the very same method as a dot write.
+            let index = unparen(value.child_by_field_name("index")?);
+            if index.kind() != "string" || index.named_child_count() != 1 {
+                return None;
+            }
+            index
+                .named_child(0)
+                .filter(|n| n.kind() == "string_fragment")?
         }
-    {
-        return None;
-    }
+        _ => return None,
+    };
     let receiver = unparen(value.child_by_field_name("object")?);
-    let name = value.child_by_field_name(if python { "attribute" } else { "property" })?;
     let enclosing = std::iter::successors(value.parent(), |n| n.parent()).find(|n| {
         (is_function(n.kind()) && (python || n.kind() != "arrow_function"))
             || matches!(n.kind(), "class_definition" | "class_body")

@@ -51,6 +51,7 @@ fn javascript_receiver_writes_do_not_become_exact_method_callbacks() {
         r#"function handle() {}
 class Worker {
     handle() {}
+    bracket() {}
     fromConstructor() {}
     stable() {}
     constructor() { this.fromConstructor = () => {}; }
@@ -58,6 +59,8 @@ class Worker {
     bind(other) {
         other.stable = () => {};
         this.handle = () => {};
+        this["bracket"] = () => {};
+        install(this.bracket);
         install(this.handle);
         install(this.fromConstructor);
         install(this.stable);
@@ -73,6 +76,7 @@ class Other {
         &[
             "install(this.handle)",
             "install(this.fromConstructor)",
+            "install(this.bracket)",
             "installAgain(this.handle)",
         ],
         &[
@@ -90,7 +94,7 @@ fn typescript_receiver_writes_in_arrows_and_patterns_block_exact_callbacks() {
     handle(): void {}
     stable(): void {}
     bind(other: Worker, replacement: () => void): void {
-        const replace = () => { [this.handle] = [replacement]; };
+        const replace = () => { [this['handle']] = [replacement]; };
         replace();
         other.stable = replacement;
         install(this.handle);

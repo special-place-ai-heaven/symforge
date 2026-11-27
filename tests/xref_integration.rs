@@ -208,12 +208,28 @@ fn exact_python_class_value_uses_do_not_require_callback_evidence() {
 fn exact_cross_file_python_class_values_require_unique_import_evidence() {
     let model = "class Model:\n    pass\n";
     let direct = "from model import Model\nisinstance(obj, Model)\n";
+    let qualified = "import model\nisinstance(obj, model.Model)\n";
+    let module_alias = "import model as actual\nisinstance(obj, actual.Model)\n";
     let alias = "from model import Model as Imported\ndef check(obj):\n    return isinstance(obj, Imported)\n";
     let wrong = "from other import Model\nisinstance(obj, Model)\n";
     let (_dir, shared) = build_index(&[
         ("model.py", model),
         ("other.py", model),
         ("direct.py", direct),
+        ("qualified.py", qualified),
+        ("module_alias.py", module_alias),
+        (
+            "shadowed_module.py",
+            "import model\ndef check(obj, model):\n    return isinstance(obj, model.Model)\n",
+        ),
+        (
+            "mutated_module.py",
+            "import model\nmodel.Model = object\nisinstance(obj, model.Model)\n",
+        ),
+        (
+            "conditional_module.py",
+            "if flag:\n    import model\nisinstance(obj, model.Model)\n",
+        ),
         ("aliased.py", alias),
         ("wrong.py", wrong),
         ("unimported.py", "isinstance(obj, Model)\n"),
@@ -241,6 +257,8 @@ fn exact_cross_file_python_class_values_require_unique_import_evidence() {
             &[
                 ("aliased.py", alias, "Imported", 2),
                 ("direct.py", direct, "Model", 1),
+                ("module_alias.py", module_alias, "Model", 1),
+                ("qualified.py", qualified, "Model", 1),
             ][..],
         ),
         ("other.py", &[("wrong.py", wrong, "Model", 1)][..]),

@@ -121,6 +121,10 @@ impl LiveIndex {
             .iter()
             .flat_map(move |(path, facts)| {
                 facts.uses.iter().filter_map(move |candidate| {
+                    // A qualified module attribute is evidence for the class query only.
+                    if candidate.reference.qualified_name.is_some() && !python_class {
+                        return None;
+                    }
                     if candidate.exported != "default"
                         && candidate.exported != name
                         && (target_path.is_some() || candidate.reference.name != name)
