@@ -1877,7 +1877,7 @@ fn full_source_set_matches_reviewed_darkness_baseline() {
 // test shards add only nextest's `--partition` selector. Three cargo lines out,
 // three in, none a doctest lane; census still 91/53/2.
 const WORKFLOW_FINGERPRINTS: &[(&str, &str)] = &[
-    ("ci.yml", "f7b866f75b7ae374:47014"),
+    ("ci.yml", "8183f93cd4f3e020:47016"),
     ("release.yml", "78734eda719ef051:118468"),
 ];
 

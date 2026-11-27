@@ -278,7 +278,7 @@ jobs:
         run: bash execution/ensure_rustup.sh
 
       - name: Install nextest (prebuilt)
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
 
@@ -790,7 +790,7 @@ jobs:
         run: bash execution/ensure_rustup.sh
 
       - name: Install dependency advisory checker (prebuilt)
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
         with:
           tool: cargo-deny
 

@@ -15544,10 +15544,13 @@ mod tests {
         };
 
         let lib = repo.path().join("src/lib.rs");
-        let mtime =
-            filetime::FileTime::from_last_modification_time(&fs::metadata(&lib).expect("meta"));
+        let mtime = fs::metadata(&lib).expect("meta").modified().expect("meta");
         fs::write(&lib, IMPACT_LIB_AFTER).expect("edit");
-        filetime::set_file_mtime(&lib, mtime).expect("mtime");
+        std::fs::File::options()
+            .write(true)
+            .open(&lib)
+            .and_then(|f| f.set_modified(mtime))
+            .expect("mtime");
         let edited = impact(serde_json::json!({
             "path": "src/lib.rs",
             "include_co_changes": true,
@@ -15594,7 +15597,10 @@ mod tests {
         assert!(read().await.contains("before_write"));
         fs::write(&file, "pub fn after_write() {}\n").expect("rewrite");
         let later = std::time::SystemTime::now() + Duration::from_secs(5);
-        filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(later))
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|f| f.set_modified(later))
             .expect("mtime");
         let fresh = read().await;
         assert!(fresh.contains("pub fn after_write() {}"), "{fresh}");
