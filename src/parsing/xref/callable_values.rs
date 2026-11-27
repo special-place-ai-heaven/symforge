@@ -5,6 +5,7 @@ use tree_sitter::Node;
 use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord};
 
 mod imports;
+mod member_key;
 #[cfg(test)]
 mod rebinding_tests;
 use imports::{collect_export, collect_imports, finish_imports, python_value_context};
@@ -605,7 +606,25 @@ fn block_method_writes<'tree, 'src>(
         // A constructor or sibling method can change what this receiver sees.
         // Don't infer execution order or a replacement callable; block this
         // member throughout the class without touching lexical namesakes.
-        bind(methods, class, name, None, src);
+        if member.kind() != "subscript_expression" {
+            bind(methods, class, name, None, src);
+            return;
+        }
+        let key = member_key::literal_key(name, src);
+        let Some(body) = class.child_by_field_name("body") else {
+            return;
+        };
+        for method in body
+            .named_children(&mut body.walk())
+            .filter(|n| n.kind() == "method_definition")
+            .filter_map(|n| n.child_by_field_name("name"))
+        {
+            if key.as_deref().is_none_or(|key| {
+                method.kind() == "property_identifier" && method.utf8_text(src) == Ok(key)
+            }) {
+                bind(methods, class, method, None, src);
+            }
+        }
     });
 }
 
@@ -908,16 +927,7 @@ fn receiver_member<'tree>(
     let name = match (python, value.kind()) {
         (true, "attribute") => value.child_by_field_name("attribute")?,
         (false, "member_expression") => value.child_by_field_name("property")?,
-        (false, "subscript_expression") => {
-            // A literal bracket write can replace the very same method as a dot write.
-            let index = unparen(value.child_by_field_name("index")?);
-            if index.kind() != "string" || index.named_child_count() != 1 {
-                return None;
-            }
-            index
-                .named_child(0)
-                .filter(|n| n.kind() == "string_fragment")?
-        }
+        (false, "subscript_expression") => unparen(value.child_by_field_name("index")?),
         _ => return None,
     };
     let receiver = unparen(value.child_by_field_name("object")?);

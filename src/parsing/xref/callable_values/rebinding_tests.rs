@@ -161,3 +161,100 @@ class Other:
         ],
     );
 }
+
+#[test]
+fn javascript_computed_receiver_writes_compare_decoded_keys() {
+    for language in [LanguageId::JavaScript, LanguageId::TypeScript] {
+        check(
+            r#"class Unicode {
+    handle() {}
+    stable() { return 0; }
+    bind(fn) {
+        this["h\u0061ndle"] = fn;
+        installUnicode(this.handle);
+        installUnicodeStable(this.stable);
+    }
+}
+class Hex {
+    handle() {}
+    stable() { return 1; }
+    bind(fn) {
+        this['h\x61ndle'] = fn;
+        installHex(this.handle);
+        installHexStable(this.stable);
+    }
+}
+class Braced {
+    handle() {}
+    stable() { return 2; }
+    bind(fn) {
+        this["h\u{61}ndle"] = fn;
+        installBraced(this.handle);
+        installBracedStable(this.stable);
+    }
+}
+class Template {
+    handle() {}
+    stable() { return 3; }
+    bind(fn) {
+        this[`h\u0061ndle`] = fn;
+        installTemplate(this.handle);
+        installTemplateStable(this.stable);
+    }
+}
+class Plain {
+    handle() {}
+    stable() { return 4; }
+    bind(fn) {
+        this[`handle`] = fn;
+        installPlain(this.handle);
+        installPlainStable(this.stable);
+    }
+}
+class Opaque {
+    handle() {}
+    stable() { return 5; }
+    bind(key, fn) {
+        this[key] = fn;
+        installOpaque(this.handle);
+        installOpaqueStable(this.stable);
+    }
+}
+class Interpolated {
+    handle() {}
+    stable() { return 6; }
+    bind(key, fn) {
+        this[`${key}`] = fn;
+        installInterpolated(this.handle);
+        installInterpolatedStable(this.stable);
+    }
+}
+"#,
+            language,
+            &[
+                "installUnicode(this.handle)",
+                "installHex(this.handle)",
+                "installBraced(this.handle)",
+                "installTemplate(this.handle)",
+                "installPlain(this.handle)",
+                "installOpaque(this.handle)",
+                "installOpaqueStable(this.stable)",
+                "installInterpolated(this.handle)",
+                "installInterpolatedStable(this.stable)",
+            ],
+            &[
+                (
+                    "installUnicodeStable(this.stable)",
+                    "stable() { return 0; }",
+                ),
+                ("installHexStable(this.stable)", "stable() { return 1; }"),
+                ("installBracedStable(this.stable)", "stable() { return 2; }"),
+                (
+                    "installTemplateStable(this.stable)",
+                    "stable() { return 3; }",
+                ),
+                ("installPlainStable(this.stable)", "stable() { return 4; }"),
+            ],
+        );
+    }
+}

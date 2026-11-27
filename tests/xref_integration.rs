@@ -186,6 +186,43 @@ fn exact_same_file_callbacks_follow_the_selected_declaration() {
 }
 
 #[test]
+fn exact_method_callbacks_survive_only_writes_to_other_decoded_keys() {
+    let decoded = "class Worker {\n    handle() {}\n    stable() {}\n    bind(fn) {\n        this[\"h\\u0061ndle\"] = fn;\n        install(this.handle);\n        install(this.stable);\n    }\n}\n";
+    let opaque = "class Worker {\n    handle() {}\n    stable() {}\n    bind(key, fn) {\n        this[key] = fn;\n        install(this.handle);\n        install(this.stable);\n    }\n}\n";
+    let (_dir, shared) = build_index(&[
+        ("decoded.js", decoded),
+        ("decoded.ts", decoded),
+        ("opaque.js", opaque),
+        ("opaque.ts", opaque),
+    ]);
+    let index = shared.read();
+    let kind = Some(ReferenceKind::ValueUse);
+    for (path, source, stable_hits) in [
+        ("decoded.js", decoded, 1),
+        ("decoded.ts", decoded, 1),
+        ("opaque.js", opaque, 0),
+        ("opaque.ts", opaque, 0),
+    ] {
+        let handle = index
+            .find_exact_references_for_symbol(path, "handle", None, None, kind)
+            .unwrap();
+        assert!(handle.is_empty(), "{path}: {handle:?}");
+        let stable = index
+            .find_exact_references_for_symbol(path, "stable", None, None, kind)
+            .unwrap();
+        let site = source.find("this.stable)").unwrap() as u32 + "this.".len() as u32;
+        let expected: Vec<_> = (0..stable_hits)
+            .map(|_| (path, (site, site + "stable".len() as u32)))
+            .collect();
+        let actual: Vec<_> = stable
+            .iter()
+            .map(|(path, reference)| (*path, reference.byte_range))
+            .collect();
+        assert_eq!(actual, expected, "{path}");
+    }
+}
+
+#[test]
 fn exact_python_class_value_uses_do_not_require_callback_evidence() {
     let path = "model.py";
     let source = "class Model:\n    pass\n\nisinstance(obj, Model)\n";
