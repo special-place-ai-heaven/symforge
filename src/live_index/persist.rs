@@ -3323,13 +3323,15 @@ fn discover_files_from_source_anchor_within(
                 .map_err(|_| "admitted ignore rules could not be compiled".to_string())?;
         }
         next_level.retain(|directory| {
-            !matcher
-                .matched_path_or_any_parents(directory.to_string_lossy().replace('\\', "/"), true)
-                .is_ignore()
+            !crate::discovery::ignored_below_root(
+                &matcher,
+                directory.to_string_lossy().replace('\\', "/"),
+                true,
+            )
         });
         level = next_level;
     }
-    files.retain(|path| !matcher.matched_path_or_any_parents(path, false).is_ignore());
+    files.retain(|path| !crate::discovery::ignored_below_root(&matcher, path, false));
     files.sort();
     files.dedup();
     Ok(DiscoveredSource { files, observed })

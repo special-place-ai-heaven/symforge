@@ -1930,6 +1930,22 @@ fn repository_common_dir(root: &Path) -> Option<(PathBuf, bool)> {
     Some((common, walker_resolves_pointer))
 }
 
+pub(crate) fn ignored_below_root(
+    rules: &ignore::gitignore::Gitignore,
+    path: impl AsRef<Path>,
+    is_dir: bool,
+) -> bool {
+    let mut candidate = Some((path.as_ref(), is_dir));
+    while let Some((path, is_dir)) = candidate.filter(|(path, _)| !path.as_os_str().is_empty()) {
+        match rules.matched(path, is_dir) {
+            ignore::Match::Ignore(_) => return true,
+            ignore::Match::Whitelist(_) => return false,
+            ignore::Match::None => candidate = path.parent().map(|parent| (parent, true)),
+        }
+    }
+    false
+}
+
 pub(crate) fn inside_repository(root: &Path) -> bool {
     root.join(".git").exists() || repository_top_above(root).is_some()
 }

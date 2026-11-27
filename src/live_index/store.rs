@@ -8062,9 +8062,7 @@ impl LiveIndex {
         if std::path::Path::new(relative_path).has_root() {
             return false;
         }
-        gitignore
-            .matched_path_or_any_parents(relative_path, false)
-            .is_ignore()
+        crate::discovery::ignored_below_root(gitignore, relative_path, false)
     }
 
     /// Insert a new file into the index (alias for `update_file`).
