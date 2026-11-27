@@ -190,6 +190,7 @@ fn is_pub_use_import(file: &IndexedFile, reference: &ReferenceRecord) -> bool {
 thread_local! {
     static PER_FILE_DEPENDENTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DEPENDENT_FILES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DEPENDENT_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -203,6 +204,11 @@ pub(crate) fn with_per_file_dependents<R>(work: impl FnOnce() -> R) -> R {
 #[cfg(test)]
 pub(crate) fn take_dependent_files_scanned() -> usize {
     DEPENDENT_FILES_SCANNED.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+fn take_dependent_index_builds() -> usize {
+    DEPENDENT_INDEX_BUILDS.with(|count| count.replace(0))
 }
 
 const JS_EXPORT_FORMS: [&str; 8] = [
@@ -4280,13 +4286,17 @@ impl LiveIndex {
         &'a self,
         target_paths: &[&str],
     ) -> Vec<Vec<(&'a str, &'a ReferenceRecord)>> {
+        let per_file = target_paths.len() < 2;
         #[cfg(test)]
-        if PER_FILE_DEPENDENTS.with(std::cell::Cell::get) {
+        let per_file = per_file || PER_FILE_DEPENDENTS.with(std::cell::Cell::get);
+        if per_file {
             return target_paths
                 .iter()
                 .map(|path| self.find_dependents_for_file(path))
                 .collect();
         }
+        #[cfg(test)]
+        DEPENDENT_INDEX_BUILDS.with(|count| count.set(count.get() + 1));
         let candidates = DependentCandidates::build(&self.files);
         super::store::ordered_parallel_map(target_paths, |path| {
             self.dependents_among(path, Some(&candidates))
@@ -10334,7 +10344,7 @@ public class PacketsController {
 
 #[cfg(test)]
 mod batch_dependents_tests {
-    use super::take_dependent_files_scanned;
+    use super::{take_dependent_files_scanned, take_dependent_index_builds};
     use crate::live_index::store::{LiveIndex, with_serial_oracle};
     use std::fs;
     use std::path::Path;
@@ -10423,6 +10433,22 @@ mod batch_dependents_tests {
             "java/com/acme/app/Star.java",
             "package com.acme.app;\n\nimport com.acme.storage.*;\n\nclass Star {\n    MinioService service;\n}\n",
         ),
+        (
+            "go/store/store.go",
+            "package store\n\ntype Store struct{}\n\nfunc Open() *Store {\n    return &Store{}\n}\n",
+        ),
+        (
+            "go/app/main.go",
+            "package main\n\nimport \"example.com/fixture/go/store\"\n\nfunc main() {\n    s := store.Open()\n    _ = s\n}\n",
+        ),
+        (
+            "php/Models/User.php",
+            "<?php\nnamespace App\\Models;\n\nclass User\n{\n}\n",
+        ),
+        (
+            "php/Http/Controller.php",
+            "<?php\nnamespace App\\Http;\n\nuse App\\Models\\User;\n\nclass Controller\n{\n    public function show(): User\n    {\n        return new User();\n    }\n}\n",
+        ),
         ("docs/notes.md", "# Notes\n"),
     ];
 
@@ -10472,6 +10498,7 @@ mod batch_dependents_tests {
                 "java/com/acme/storage/MinioService.java",
                 "java/com/acme/app/App.java",
             ),
+            ("go/store/store.go", "go/app/main.go"),
         ] {
             let dependents = index.find_dependents_for_file(target);
             assert!(
@@ -10505,6 +10532,32 @@ mod batch_dependents_tests {
             batch_scanned * 4 < per_file_scanned,
             "batch scanned {batch_scanned} of {per_file_scanned}"
         );
+    }
+
+    #[test]
+    fn batch_dependents_build_no_index_for_fewer_than_two_targets() {
+        let root = TempDir::new().unwrap();
+        write_fixture(root.path(), FIXTURE);
+        let shared = LiveIndex::load(root.path()).unwrap();
+        let index = shared.read();
+        take_dependent_index_builds();
+        take_dependent_files_scanned();
+
+        let none = with_serial_oracle(|| index.find_dependents_for_files(&[]));
+        assert!(none.is_empty());
+        assert_eq!(take_dependent_index_builds(), 0);
+        assert_eq!(take_dependent_files_scanned(), 0);
+
+        let one = with_serial_oracle(|| index.find_dependents_for_files(&["src/db.rs"]));
+        assert_eq!(one, vec![index.find_dependents_for_file("src/db.rs")]);
+        assert!(!one[0].is_empty());
+        assert_eq!(take_dependent_index_builds(), 0);
+
+        let two = with_serial_oracle(|| {
+            index.find_dependents_for_files(&["src/db.rs", "web/src/user.service.ts"])
+        });
+        assert_eq!(two.len(), 2);
+        assert_eq!(take_dependent_index_builds(), 1);
     }
 
     #[test]
