@@ -220,23 +220,35 @@ fn a_format_11_snapshot_is_preserved_and_never_restored() {
     persist::checkpoint_shared_index(&fresh, dir.path(), &placement).expect("checkpoint");
     let snapshot_path = dir.path().join(".symforge").join("index.bin");
     let current = fs::read(&snapshot_path).unwrap();
-    let mut snapshot: IndexSnapshot =
-        postcard::from_bytes(&current[..current.len() - 32]).expect("current payload decodes");
-    assert_eq!(snapshot.version, 12);
-    snapshot.version = 11;
-    let mut bytes = postcard::to_stdvec(&snapshot).unwrap();
-    use sha2::Digest;
-    let checksum = sha2::Sha256::digest(&bytes);
-    bytes.extend_from_slice(&checksum);
-    fs::write(&snapshot_path, &bytes).unwrap();
+    let decode = || -> IndexSnapshot {
+        postcard::from_bytes(&current[..current.len() - 32]).expect("current payload decodes")
+    };
+    assert_eq!(decode().version, 12);
+    let labelled = |version: u32| {
+        let mut snapshot = decode();
+        snapshot.version = version;
+        let mut bytes = postcard::to_stdvec(&snapshot).unwrap();
+        use sha2::Digest;
+        let checksum = sha2::Sha256::digest(&bytes);
+        bytes.extend_from_slice(&checksum);
+        bytes
+    };
 
+    let current_label = labelled(12);
+    fs::write(&snapshot_path, &current_label).unwrap();
+    let restored = persist::load_snapshot(dir.path(), &placement)
+        .expect("the same payload labelled 12 restores");
+    assert_eq!(restored.files.len(), FIXTURE.len());
+
+    let prior_label = labelled(11);
+    fs::write(&snapshot_path, &prior_label).unwrap();
     assert!(
         persist::load_snapshot(dir.path(), &placement).is_none(),
         "a format-11 snapshot must not restore under format 12"
     );
     assert_eq!(
         fs::read(&snapshot_path).ok().as_deref(),
-        Some(bytes.as_slice()),
+        Some(prior_label.as_slice()),
         "the format-11 original stays in place for rollback"
     );
 }
