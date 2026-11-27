@@ -724,3 +724,93 @@ async fn a_separate_git_dir_restore_honours_its_own_info_exclude() {
     let restored = checkpoint_and_restore(&root, &placement_for(&root)).await;
     assert_eq!(file_set(&restored), cold);
 }
+
+const NESTED_GEN: &str = "libs/foo/build/gen.ts";
+
+fn nested_repository_fixture() -> (TempDir, std::path::PathBuf, StatePlacement) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    fs::create_dir_all(root.join("libs/foo/build")).unwrap();
+    git(&root, &["init", "-q"]);
+    git(&root.join("libs/foo"), &["init", "-q"]);
+    fs::write(root.join(".gitignore"), "build/\n").unwrap();
+    write_fixture(&root, &[(NESTED_GEN, "export function gen() {}\n")]);
+    let placement = placement_for(&root);
+    (tmp, root, placement)
+}
+
+fn nested_content(shared: &SharedIndex) -> Option<Vec<u8>> {
+    shared
+        .read()
+        .get_file(NESTED_GEN)
+        .map(|file| file.content.clone())
+}
+
+const NESTED_EDIT: &str = "export function gen() {}\nexport function edited() {}\n";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "documents a gap: the watcher applies outer .gitignore rules inside a nested repository, so an edit to a file the cold walk indexes is never re-read"]
+async fn the_watcher_updates_a_file_inside_a_nested_repository_that_outer_rules_name() {
+    let (_tmp, root, _placement) = nested_repository_fixture();
+    let shared = LiveIndex::load(&root).unwrap();
+    assert!(
+        nested_content(&shared).is_some(),
+        "the cold load indexes the nested repository's file"
+    );
+    let info = Arc::new(Mutex::new(WatcherInfo::default()));
+    let watcher = tokio::spawn(run_watcher(
+        root.clone(),
+        Arc::clone(&shared),
+        Arc::clone(&info),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while info.lock().state != WatcherState::Active {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("watcher becomes active");
+    fs::write(root.join(NESTED_GEN), NESTED_EDIT).unwrap();
+    let updated = tokio::time::timeout(Duration::from_secs(10), async {
+        while nested_content(&shared).as_deref() != Some(NESTED_EDIT.as_bytes()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    watcher.abort();
+    assert!(
+        updated.is_ok(),
+        "the index still serves {:?}",
+        nested_content(&shared).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "documents a gap: the restore verify applies outer .gitignore rules inside a nested repository, so a file the cold walk indexes is dropped when it changed while the server was down"]
+async fn a_restore_refreshes_a_file_inside_a_nested_repository_edited_while_down() {
+    let (_tmp, root, placement) = nested_repository_fixture();
+    let fresh = LiveIndex::load(&root).unwrap();
+    assert!(nested_content(&fresh).is_some());
+    persist::checkpoint_shared_index(&fresh, &root, &placement).expect("checkpoint");
+    drop(fresh);
+    fs::write(root.join(NESTED_GEN), NESTED_EDIT).unwrap();
+    let snapshot = persist::load_snapshot(&root, &placement).expect("snapshot restores");
+    let mtimes = snapshot
+        .files
+        .iter()
+        .map(|(path, file)| (path.clone(), file.mtime_secs))
+        .collect();
+    let restored = SharedIndexHandle::shared(persist::snapshot_to_live_index(snapshot, &root));
+    persist::background_verify(
+        Arc::clone(&restored),
+        root.clone(),
+        mtimes,
+        project_source_authority(&root).active_observer(),
+    )
+    .await;
+    assert_eq!(
+        nested_content(&restored).as_deref(),
+        Some(NESTED_EDIT.as_bytes()),
+        "the restored index must hold the edited file"
+    );
+}
