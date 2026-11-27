@@ -62,7 +62,7 @@ b7b9b4ea16da0fdd49b62e73b38bb6f2e0e01249884ab6d4a34349a9d1b62820  codemode/value
 
 c21ffa0e7745eae3dbd8369929faec2ed4c3376b0f090530da328e4d6b02ac4e  daemon.rs
 
-b78bfb2acb35d25b8023ea0ec194ef3e0a24c935ace3abbd77b5d0eabd73acb5  discovery/mod.rs
+8e0831a82e16641c4874536370e28cd9fed6f8a8ad5fcd7853ca66d945078de7  discovery/mod.rs
 
 20281b9543c2297f9b22ab4a1440d9ac264321cf08c3a9bf4fd8965344d3a133  discovery/os_response.rs
 
