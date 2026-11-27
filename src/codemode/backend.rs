@@ -865,10 +865,7 @@ fn execute_value_on_generation(
             let max_per_file = input.max_per_file.unwrap_or(10).clamp(1, 50) as usize;
             let live = &generation.live;
             let Some(target_file) = live.get_file(&norm_path) else {
-                if live
-                    .metadata_only_skipped_paths()
-                    .any(|(path, _)| path == norm_path)
-                {
+                if live.capture_file_disposition(&norm_path).is_some() {
                     completeness.withheld_files = 1;
                     return Ok(Value::Array(Vec::new()));
                 }
@@ -2417,6 +2414,44 @@ mod refusal_predicate_tests {
             assert!(refuse(refused), "{refused} must be refused");
         }
         assert!(!refuse("src/lib.rs"));
+    }
+
+    #[test]
+    fn find_dependents_reports_a_size_skipped_target_as_withheld_and_a_missing_one_as_not_found() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+        let shared = LiveIndex::load(repo.path()).unwrap();
+        {
+            let mut live = shared.write();
+            let mut entry = live.manifest_entries[0].clone();
+            entry.path.normalized_utf8 = Some("src/huge.rs".to_string());
+            entry.path.public_id = "src/huge.rs".to_string();
+            entry.disposition = FileDisposition::HardSkip {
+                reason: crate::domain::HardSkipReason::PerFileCeiling,
+            };
+            live.manifest_entries.push(entry);
+        }
+        let generation = shared.published_generation();
+        let source_set = shared.published_source_set();
+        let run = |path: &str| {
+            let mut kwargs = Map::new();
+            kwargs.insert("path".to_string(), json!(path));
+            execute_op_on_generation(
+                CodeReadOp::FindDependents,
+                kwargs,
+                &generation,
+                &source_set,
+                None,
+                "fixture",
+                &|_| {},
+            )
+        };
+        let huge = run("src/huge.rs").unwrap();
+        assert_eq!(huge.value, json!([]));
+        assert_eq!(huge.completeness.withheld_files, 1);
+        let missing = run("src/none.rs").unwrap_err();
+        assert_eq!(missing.kind, "not_found");
     }
 
     #[test]

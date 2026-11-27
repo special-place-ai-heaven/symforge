@@ -341,7 +341,7 @@ pub const CODE_READ_OPS: &[CodeOpDescriptor] = &[
                 py_type: "str",
                 required: true,
                 default_repr: "",
-                doc: "Relative file path whose dependents to list.",
+                doc: "Relative file path whose dependents to list. A path the index does not hold raises not_found; a file catalogued without content (for example skipped for size) returns [] with withheld_files=1.",
             },
             ParamSpec {
                 name: "name",
@@ -1065,7 +1065,7 @@ pub fn render_idioms() -> String {
 - **Inspect return fields**: `symforge code stubs <topic>` (e.g. `symforge code stubs references`).\n\
 - **Known source locations**: Return targeted `file_content` windows. Use `symbol_context(bundle=True, ...)` when you also need caller, callee, or type evidence.\n\
 - **Text search**: Use `group_by=\"count\"` only when locations are unnecessary. When returning many hits, group by path in the script to avoid repeating paths.\n\
-- **Partial answers**: Check host-call completeness notices even when the script returns a scalar or empty list. Omitted rows are known matches. `withheld_files` counts files in the call's search scope that were not searched because they are withheld (policy or size); it repeats across calls with the same scope and is not a count of files with more hits, since those files may or may not contain matches.\n\
+- **Partial answers**: search_text, search_symbols, find_references, find_dependents, search_files, get_symbol (token cuts) and symbol_context (callers, callees and type_usages caps) report omissions as host-call completeness notices, even when the script returns a scalar or empty list. Other operations (repo_map max_files, file_context consumers, symbol_context dependencies withheld by policy) can be partial with no notice, so a missing notice proves nothing there. Omitted rows are known matches. `withheld_files` counts files in the call's search scope that were not searched because they are withheld (policy or size); it repeats across calls with the same scope and is not a count of files with more hits, since those files may or may not contain matches.\n\
 - **Edits**: Mutations NEVER run inside Code Mode; perform edits explicitly after narrowing.\n\
 \n\
 ## Sandbox rules & resource caps\n\
