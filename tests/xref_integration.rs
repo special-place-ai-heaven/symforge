@@ -205,6 +205,147 @@ fn exact_python_class_value_uses_do_not_require_callback_evidence() {
 }
 
 #[test]
+fn exact_cross_file_python_class_values_require_unique_import_evidence() {
+    let model = "class Model:\n    pass\n";
+    let direct = "from model import Model\nisinstance(obj, Model)\n";
+    let alias = "from model import Model as Imported\ndef check(obj):\n    return isinstance(obj, Imported)\n";
+    let wrong = "from other import Model\nisinstance(obj, Model)\n";
+    let (_dir, shared) = build_index(&[
+        ("model.py", model),
+        ("other.py", model),
+        ("direct.py", direct),
+        ("aliased.py", alias),
+        ("wrong.py", wrong),
+        ("unimported.py", "isinstance(obj, Model)\n"),
+        (
+            "rebound.py",
+            "from model import Model\nModel = object\nisinstance(obj, Model)\n",
+        ),
+        (
+            "parameter.py",
+            "from model import Model\ndef check(obj, Model):\n    return isinstance(obj, Model)\n",
+        ),
+        (
+            "conflict.py",
+            "from model import Model\nfrom other import Model\nisinstance(obj, Model)\n",
+        ),
+        (
+            "star.py",
+            "from model import Model\nfrom other import *\nisinstance(obj, Model)\n",
+        ),
+    ]);
+    let index = shared.read();
+    for (provider, sites) in [
+        (
+            "model.py",
+            &[
+                ("aliased.py", alias, "Imported", 2),
+                ("direct.py", direct, "Model", 1),
+            ][..],
+        ),
+        ("other.py", &[("wrong.py", wrong, "Model", 1)][..]),
+    ] {
+        let hits = index
+            .find_exact_references_for_symbol(
+                provider,
+                "Model",
+                None,
+                Some(1),
+                Some(ReferenceKind::ValueUse),
+            )
+            .unwrap();
+        let mut actual: Vec<_> = hits
+            .into_iter()
+            .map(|(path, hit)| {
+                assert_eq!(hit.kind, ReferenceKind::ValueUse);
+                (path, hit.name.as_str(), hit.byte_range, hit.line_range)
+            })
+            .collect();
+        actual.sort_unstable();
+        let expected: Vec<_> = sites
+            .iter()
+            .map(|&(path, src, token, line)| {
+                let start = src.rfind(token).unwrap() as u32;
+                (
+                    path,
+                    token,
+                    (start, start + token.len() as u32),
+                    (line, line),
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected, "{provider}");
+    }
+}
+
+#[test]
+fn exact_cross_file_python_class_values_reject_ambiguous_or_rebound_exports() {
+    let model = "class Model:\n    pass\n";
+    for (provider, files) in [
+        (
+            "model.py",
+            &[
+                ("model.py", model),
+                ("model/__init__.py", "Model = object\n"),
+            ][..],
+        ),
+        (
+            "model.py",
+            &[("model.py", "class Model:\n    pass\nModel = object\n")][..],
+        ),
+    ] {
+        let mut files = files.to_vec();
+        files.push((
+            "consumer.py",
+            "from model import Model\nisinstance(obj, Model)\n",
+        ));
+        let (_dir, shared) = build_index(&files);
+        let index = shared.read();
+        let hits = index
+            .find_exact_references_for_symbol(
+                provider,
+                "Model",
+                None,
+                Some(1),
+                Some(ReferenceKind::ValueUse),
+            )
+            .unwrap();
+        assert!(hits.is_empty(), "{files:?}: {hits:?}");
+    }
+}
+
+#[test]
+fn uppercase_tsx_keeps_exact_imported_callback_and_jsx_uses() {
+    let source = "import { callback } from './provider';\nexport function View() { return <Panel onClick={install(callback)} />; }\n";
+    let path = "View.TSX";
+    let (_dir, shared) = build_index(&[
+        ("provider.ts", "export function callback() {}\n"),
+        (path, source),
+    ]);
+    let index = shared.read();
+    let callback = index
+        .find_exact_references_for_symbol(
+            "provider.ts",
+            "callback",
+            None,
+            Some(1),
+            Some(ReferenceKind::ValueUse),
+        )
+        .unwrap();
+    let jsx = index.find_references_for_name("Panel", Some(ReferenceKind::Call), false);
+    for (hits, token, kind) in [
+        (callback, "callback", ReferenceKind::ValueUse),
+        (jsx, "Panel", ReferenceKind::Call),
+    ] {
+        let start = source.rfind(token).unwrap() as u32;
+        assert_eq!(hits.len(), 1, "{token}: {hits:?}");
+        assert_eq!(hits[0].0, path);
+        assert_eq!(hits[0].1.kind, kind);
+        assert_eq!(hits[0].1.byte_range, (start, start + token.len() as u32));
+    }
+}
+
+#[test]
 fn exact_callback_high_fanout_has_one_hit_per_source_site() {
     const IMPORTERS: usize = 8;
     const SITES_PER_IMPORTER: usize = 128;

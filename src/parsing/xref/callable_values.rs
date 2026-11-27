@@ -5,6 +5,8 @@ use tree_sitter::Node;
 use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord};
 
 mod imports;
+#[cfg(test)]
+mod rebinding_tests;
 use imports::{collect_export, collect_imports, finish_imports, python_value_context};
 
 /// Collect JSX invocations and statically recognizable callable values. Using
@@ -35,6 +37,8 @@ pub(crate) struct CallableFacts {
     pub(crate) locals: HashMap<ByteRange, ByteRange>,
     // Exported spelling -> (canonical declaration name, declaration core range).
     pub(crate) exports: HashMap<String, (String, ByteRange)>,
+    // Separate from callbacks: class values are joined only for exact class selectors.
+    pub(crate) class_exports: HashMap<String, (String, ByteRange)>,
 }
 
 pub(crate) fn facts(root: Node<'_>, source: &str, language: LanguageId) -> CallableFacts {
@@ -144,6 +148,9 @@ fn walk(
                     let rhs = node
                         .child_by_field_name(if var_decl { "value" } else { "right" })
                         .map(unparen);
+                    if !var_decl && rhs.is_some() {
+                        block_method_writes(&mut methods, lhs, src, python);
+                    }
                     let hoisted = !python
                         && var_decl
                         && node
@@ -243,8 +250,25 @@ fn walk(
                         }
                     }
                 }
-                "class_definition"
-                | "class_declaration"
+                "class_definition" if python => {
+                    if let Some(name) = node.child_by_field_name("name")
+                        && let Some(scope) = enclosing_scope(node, true)
+                    {
+                        if facts.is_some() && node.parent() == Some(root) {
+                            bind_kind(
+                                &mut bindings,
+                                scope,
+                                name,
+                                Binding::Class(byte_range(node)),
+                                src,
+                            );
+                            collect_export(root, node, name, true, src, &mut exports);
+                        } else {
+                            bind(&mut bindings, scope, name, None, src);
+                        }
+                    }
+                }
+                "class_declaration"
                 | "abstract_class_declaration"
                 | "enum_declaration"
                 | "internal_module"
@@ -256,9 +280,9 @@ fn walk(
                     }
                 }
                 "for_statement" if python => {
-                    if let Some(target) = node.child_by_field_name("left")
-                        && let Some(scope) = enclosing_scope(node, python)
-                    {
+                    let target = node.child_by_field_name("left");
+                    block_method_writes(&mut methods, target, src, python);
+                    if let (Some(target), Some(scope)) = (target, enclosing_scope(node, python)) {
                         block_pattern(&mut bindings, scope, target, src);
                     }
                     if let Some(iterable) = node.child_by_field_name("right").map(unparen)
@@ -275,8 +299,12 @@ fn walk(
                 "for_in_statement" if !python => {
                     // for-in/of stores the declaration keyword on the loop itself.
                     let keyword = node.child_by_field_name("kind");
+                    let target = node.child_by_field_name("left");
+                    if keyword.is_none() {
+                        block_method_writes(&mut methods, target, src, python);
+                    }
                     if keyword.is_none() && facts.is_some() {
-                        js_writes.extend(node.child_by_field_name("left"));
+                        js_writes.extend(target);
                     } else {
                         let hoisted = keyword.is_some_and(|n| n.kind() == "var");
                         let scope = if hoisted {
@@ -284,8 +312,7 @@ fn walk(
                         } else {
                             Some(node)
                         };
-                        if let (Some(lhs), Some(scope)) = (node.child_by_field_name("left"), scope)
-                        {
+                        if let (Some(lhs), Some(scope)) = (target, scope) {
                             block_pattern(&mut bindings, scope, lhs, src);
                         }
                     }
@@ -296,6 +323,7 @@ fn walk(
                     let lhs = node
                         .child_by_field_name("left")
                         .or_else(|| node.child_by_field_name("argument"));
+                    block_method_writes(&mut methods, lhs, src, python);
                     if !python && facts.is_some() {
                         js_writes.extend(lhs);
                     } else if let Some(lhs) = lhs
@@ -313,7 +341,9 @@ fn walk(
                                 }
                             }
                             "as_pattern" => {
-                                if let Some(target) = node.child_by_field_name("alias") {
+                                let target = node.child_by_field_name("alias");
+                                block_method_writes(&mut methods, target, src, python);
+                                if let Some(target) = target {
                                     block_pattern(&mut bindings, scope, target, src);
                                 }
                             }
@@ -345,6 +375,7 @@ fn walk(
                 "delete_statement" if python => {
                     if let Some(scope) = enclosing_scope(node, python) {
                         for name in node.named_children(&mut node.walk()) {
+                            block_method_writes(&mut methods, Some(name), src, python);
                             block_pattern(&mut bindings, scope, name, src);
                         }
                     }
@@ -365,7 +396,7 @@ fn walk(
                 apply_python_directives(root, &python_directives, &mut bindings, src);
                 if let Some(facts) = facts {
                     for pattern in js_writes {
-                        visit_pattern(pattern, |name| {
+                        visit_pattern(pattern, false, |name| {
                             let Ok(text) = name.utf8_text(src) else {
                                 return;
                             };
@@ -404,14 +435,19 @@ fn walk(
                         facts,
                     );
                     for (exported, name, definition) in exports {
-                        if !opaque_import_scopes.contains(&root)
-                            && bindings.get(&root).and_then(|map| map.get(name))
-                                == Some(&Binding::Callable(definition))
-                        {
-                            facts
-                                .exports
-                                .insert(exported.to_owned(), (name.to_owned(), definition));
+                        if opaque_import_scopes.contains(&root) {
+                            continue;
                         }
+                        let exports = match bindings.get(&root).and_then(|map| map.get(name)) {
+                            Some(Binding::Callable(range)) if *range == definition => {
+                                &mut facts.exports
+                            }
+                            Some(Binding::Class(range)) if *range == definition => {
+                                &mut facts.class_exports
+                            }
+                            _ => continue,
+                        };
+                        exports.insert(exported.to_owned(), (name.to_owned(), definition));
                     }
                 } else {
                     let mut seen: HashSet<_> = refs.iter().map(|r| r.byte_range).collect();
@@ -457,6 +493,7 @@ fn jsx_component<'tree, 'src>(
 #[derive(PartialEq, Eq)]
 enum Binding {
     Callable(ByteRange),
+    Class(ByteRange),
     Imported,
     Parameter,
     Blocked,
@@ -526,15 +563,48 @@ fn block_pattern<'tree, 'src>(
     pattern: Node<'tree>,
     src: &'src [u8],
 ) {
-    visit_pattern(pattern, |name| bind(bindings, scope, name, None, src));
+    visit_pattern(pattern, false, |name| {
+        bind(bindings, scope, name, None, src)
+    });
 }
 
-fn visit_pattern<'tree>(pattern: Node<'tree>, mut visit: impl FnMut(Node<'tree>)) {
+fn block_method_writes<'tree, 'src>(
+    methods: &mut Bindings<'tree, 'src>,
+    target: Option<Node<'tree>>,
+    src: &'src [u8],
+    python: bool,
+) {
+    let Some(target) = target.filter(|n| n.kind() != "identifier") else {
+        return;
+    };
+    visit_pattern(target, true, |member| {
+        let Some((name, _receiver, class, _method)) = receiver_member(member, src, python) else {
+            return;
+        };
+        // A constructor or sibling method can change what this receiver sees.
+        // Don't infer execution order or a replacement callable; block this
+        // member throughout the class without touching lexical namesakes.
+        bind(methods, class, name, None, src);
+    });
+}
+
+fn visit_pattern<'tree>(
+    pattern: Node<'tree>,
+    include_members: bool,
+    mut visit: impl FnMut(Node<'tree>),
+) {
     let mut todo = vec![pattern];
     while let Some(node) = todo.pop() {
         match node.kind() {
-            "identifier" | "shorthand_property_identifier_pattern" => {
+            "identifier" | "shorthand_property_identifier_pattern" if !include_members => {
                 visit(node);
+            }
+            "attribute" | "member_expression" if include_members => visit(node),
+            "parenthesized_expression" if include_members => {
+                let inner = unparen(node);
+                if inner != node {
+                    todo.push(inner);
+                }
             }
             "tuple_pattern"
             | "list_pattern"
@@ -807,17 +877,26 @@ fn finish_values<'tree>(
     }
 }
 
-fn resolve_method<'tree>(
+fn receiver_member<'tree>(
     value: Node<'tree>,
-    bindings: &Bindings<'tree, '_>,
-    methods: &Bindings<'tree, '_>,
     src: &[u8],
     python: bool,
-) -> Option<(Node<'tree>, String, ByteRange)> {
-    let receiver = value.child_by_field_name("object")?;
+) -> Option<(Node<'tree>, Node<'tree>, Node<'tree>, Node<'tree>)> {
+    if value.kind()
+        != if python {
+            "attribute"
+        } else {
+            "member_expression"
+        }
+    {
+        return None;
+    }
+    let receiver = unparen(value.child_by_field_name("object")?);
     let name = value.child_by_field_name(if python { "attribute" } else { "property" })?;
-    let enclosing = std::iter::successors(value.parent(), |n| n.parent())
-        .find(|n| is_function(n.kind()) && (python || n.kind() != "arrow_function"))?;
+    let enclosing = std::iter::successors(value.parent(), |n| n.parent()).find(|n| {
+        (is_function(n.kind()) && (python || n.kind() != "arrow_function"))
+            || matches!(n.kind(), "class_definition" | "class_body")
+    })?;
     let class = enclosing_method_class(enclosing, python)?;
     if python {
         let receiver = receiver.utf8_text(src).ok()?;
@@ -831,11 +910,26 @@ fn resolve_method<'tree>(
         if receiver != if classmethod { "cls" } else { "self" }
             || python_decorated(enclosing, src, &["staticmethod"])
             || parameter_name(first)?.utf8_text(src).ok()? != receiver
-            || bindings.get(&enclosing)?.get(receiver) != Some(&Binding::Parameter)
         {
             return None;
         }
     } else if receiver.kind() != "this" || has_child_kind(enclosing, "static") {
+        return None;
+    }
+    Some((name, receiver, class, enclosing))
+}
+
+fn resolve_method<'tree>(
+    value: Node<'tree>,
+    bindings: &Bindings<'tree, '_>,
+    methods: &Bindings<'tree, '_>,
+    src: &[u8],
+    python: bool,
+) -> Option<(Node<'tree>, String, ByteRange)> {
+    let (name, receiver, class, enclosing) = receiver_member(value, src, python)?;
+    if python
+        && bindings.get(&enclosing)?.get(receiver.utf8_text(src).ok()?) != Some(&Binding::Parameter)
+    {
         return None;
     }
     let method = name.utf8_text(src).ok()?;

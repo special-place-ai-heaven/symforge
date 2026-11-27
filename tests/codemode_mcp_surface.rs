@@ -100,7 +100,7 @@ async fn code_execute_renders_search_references_and_symbol_reads_as_lean_text() 
             r#"get_symbol(path="src/math.rs", name="add_pair")"#
         )
         .await,
-        "@ end_line=3\tkind=fn\tname=add_pair\tpath=src/math.rs\tstart_line=1\nsource:\npub fn add_pair(a: i32, b: i32) -> i32 {\n    a + b\n}"
+        "@ end_line=3\tkind=fn\tname=add_pair\tpath=src/math.rs\tstart_line=1\tsymbol_line=1\nsource:\npub fn add_pair(a: i32, b: i32) -> i32 {\n    a + b\n}"
     );
     assert_eq!(
         code_execute_text(&server, r#"find_references(name="add_pair", context=1)"#).await,

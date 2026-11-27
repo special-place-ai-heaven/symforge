@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord};
+use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolKind};
 use crate::parsing::xref::callable_values::{self, CallableFacts};
 
 use super::query::import_languages_compatible;
@@ -47,6 +47,11 @@ pub(super) fn file_facts(file: &IndexedFile) -> Option<Arc<CallableFacts>> {
     };
     let useful = source.contains("import")
         || source.contains(export_marker)
+        || (file.language == LanguageId::Python
+            && file
+                .symbols
+                .iter()
+                .any(|symbol| symbol.kind == SymbolKind::Class))
         || file
             .references
             .iter()
@@ -57,7 +62,7 @@ pub(super) fn file_facts(file: &IndexedFile) -> Option<Arc<CallableFacts>> {
     let tree = crate::parsing::parse_source_tree(
         source,
         &file.language,
-        file.relative_path.ends_with(".tsx"),
+        LanguageId::is_tsx_path(&file.relative_path),
     )
     .ok()?;
     let root = tree.root_node();
@@ -65,7 +70,11 @@ pub(super) fn file_facts(file: &IndexedFile) -> Option<Arc<CallableFacts>> {
         return None;
     }
     let mut facts = callable_values::facts(root, source, file.language);
-    if facts.uses.is_empty() && facts.exports.is_empty() && facts.locals.is_empty() {
+    if facts.uses.is_empty()
+        && facts.exports.is_empty()
+        && facts.class_exports.is_empty()
+        && facts.locals.is_empty()
+    {
         return None;
     }
     let lines: Vec<_> = facts
@@ -93,11 +102,20 @@ impl LiveIndex {
             .copied()
     }
 
-    /// Resolve candidates to a unique declaration in the current generation.
     pub(super) fn imported_callable_values<'a>(
         &'a self,
         name: &str,
         target_path: Option<&str>,
+    ) -> Vec<ResolvedValue<'a>> {
+        self.imported_bound_values(name, target_path, false)
+    }
+
+    /// Resolve candidates to a unique declaration in the current generation.
+    pub(super) fn imported_bound_values<'a>(
+        &'a self,
+        name: &str,
+        target_path: Option<&str>,
+        python_class: bool,
     ) -> Vec<ResolvedValue<'a>> {
         self.callable_values
             .iter()
@@ -112,14 +130,18 @@ impl LiveIndex {
                     let importer = self.get_file(path)?;
                     let (definition_path, definition) =
                         self.callable_import_target(importer, &candidate.module)?;
-                    if target_path.is_some_and(|target| target != definition_path) {
+                    if target_path.is_some_and(|path| path != definition_path) {
                         return None;
                     }
-                    let (canonical, definition_range) = self
-                        .callable_values
-                        .get(definition_path)?
-                        .exports
-                        .get(&candidate.exported)?;
+                    let definition_facts = self.callable_values.get(definition_path)?;
+                    // Class values require an exact class selector. Do not
+                    // widen callback discovery or the raw name-search lane.
+                    let exports = if python_class {
+                        &definition_facts.class_exports
+                    } else {
+                        &definition_facts.exports
+                    };
+                    let (canonical, definition_range) = exports.get(&candidate.exported)?;
                     if !import_languages_compatible(&importer.language, &definition.language)
                         || (canonical != name
                             && (target_path.is_some() || candidate.reference.name != name))
@@ -147,8 +169,7 @@ impl LiveIndex {
         } else {
             js_paths(&importer.relative_path, module)?
         };
-        // Count all competing modules, not just callable exporters. Ambiguous
-        // resolution must not fall through to the one that has a function.
+        // Count all competing modules, including ones without binding facts.
         let mut found = candidates
             .iter()
             .filter_map(|path| self.files.get_key_value(path))

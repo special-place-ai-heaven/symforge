@@ -2989,7 +2989,11 @@ impl LiveIndex {
             .map(|(ref_path, reference, _)| (*ref_path, reference.byte_range))
             .collect();
         if uses_callable_bindings && matches!(kind_filter, None | Some(ReferenceKind::ValueUse)) {
-            for value in self.imported_callable_values(target_name, Some(path)) {
+            for value in self.imported_bound_values(
+                target_name,
+                Some(path),
+                file.language == LanguageId::Python && target_symbol.kind == SymbolKind::Class,
+            ) {
                 if target_symbol.byte_range == value.definition_range
                     && seen.insert((value.path, value.reference.byte_range))
                 {
