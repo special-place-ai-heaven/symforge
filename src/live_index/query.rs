@@ -205,6 +205,24 @@ pub(crate) fn take_dependent_files_scanned() -> usize {
     DEPENDENT_FILES_SCANNED.with(|count| count.replace(0))
 }
 
+const JS_EXPORT_FORMS: [&str; 8] = [
+    "{ ",
+    "",
+    "default ",
+    "function ",
+    "class ",
+    "const ",
+    "interface ",
+    "type ",
+];
+
+fn starts_with_whole_word(text: &[u8], word: &str) -> bool {
+    text.starts_with(word.as_bytes())
+        && text
+            .get(word.len())
+            .is_none_or(|next| !(next.is_ascii_alphanumeric() || *next == b'_'))
+}
+
 const MAX_IMPORT_TEXT_SEPARATORS: usize = 32;
 
 fn scan_files<'f, 's>(
@@ -4131,6 +4149,7 @@ impl LiveIndex {
 
     /// Check whether a file exports a public symbol with the given name.
     /// Uses a text scan of file content since SymbolRecord has no visibility field.
+    #[cfg(test)]
     pub(crate) fn has_pub_symbol(file: &IndexedFile, name: &str) -> bool {
         let is_word_match = |content: &str, pattern: &str| -> bool {
             let mut start = 0;
@@ -4212,12 +4231,28 @@ impl LiveIndex {
                 }
                 exported
             }
-            LanguageId::JavaScript | LanguageId::TypeScript => target_symbol_names
-                .iter()
-                .copied()
-                .filter(|name| Self::has_pub_symbol(file, name))
-                .map(str::to_string)
-                .collect(),
+            LanguageId::JavaScript | LanguageId::TypeScript => {
+                let content = String::from_utf8_lossy(&file.content);
+                let export_tails: Vec<&[u8]> = content
+                    .match_indices("export ")
+                    .flat_map(|(position, keyword)| {
+                        let rest = &content.as_bytes()[position + keyword.len()..];
+                        JS_EXPORT_FORMS
+                            .iter()
+                            .filter_map(move |form| rest.strip_prefix(form.as_bytes()))
+                    })
+                    .collect();
+                target_symbol_names
+                    .iter()
+                    .copied()
+                    .filter(|name| {
+                        export_tails
+                            .iter()
+                            .any(|tail| starts_with_whole_word(tail, name))
+                    })
+                    .map(str::to_string)
+                    .collect()
+            }
             _ => target_symbol_names
                 .iter()
                 .copied()
@@ -8162,6 +8197,54 @@ impl Actor for MyActor {
         assert!(error.contains("10"), "got: {error}");
     }
 
+    #[test]
+    fn js_exported_names_match_per_name_export_check() {
+        use std::collections::HashSet;
+        let content = "export class Foo2 {}\nexport {Bar}\nexport { Baz, Qux }\nexport default Main\nexport const answer = 1;\nexport interface Shape {}\nexport type Alias = Shape;\nexport function run() {}\nexport function runner() {}\nconst hidden = 2;\nexport \u{e9}t\u{e9}\nexport enum Mode {}\nexport Tail";
+        let mut bytes = content.as_bytes().to_vec();
+        bytes.extend_from_slice(b"\nexport \xff\xfe broken\nexport last_");
+        let names: HashSet<&str> = [
+            "Foo",
+            "Foo2",
+            "Bar",
+            "Baz",
+            "Qux",
+            "Main",
+            "answer",
+            "Shape",
+            "Alias",
+            "run",
+            "runner",
+            "hidden",
+            "\u{e9}t",
+            "\u{e9}t\u{e9}",
+            "Mode",
+            "enum",
+            "Tail",
+            "last",
+            "last_",
+            "\u{fffd}",
+            "class Foo2",
+            "default",
+            "x y",
+        ]
+        .into_iter()
+        .collect();
+        for language in [LanguageId::TypeScript, LanguageId::JavaScript] {
+            let mut file =
+                make_file_with_refs_and_content("web/a.ts", language, "", vec![], vec![]);
+            file.content = bytes.clone();
+            let batch = LiveIndex::exported_symbol_names(&file, &names);
+            let per_name: HashSet<String> = names
+                .iter()
+                .filter(|name| LiveIndex::has_pub_symbol(&file, name))
+                .map(|name| name.to_string())
+                .collect();
+            assert_eq!(batch, per_name);
+            assert!(batch.contains("Foo2") && !batch.contains("Foo") && batch.contains("Tail"));
+        }
+    }
+
     // --- find_dependents_for_file ---
 
     #[test]
@@ -10466,6 +10549,29 @@ mod batch_dependents_tests {
         for root in roots {
             let shared = LiveIndex::load(&root).unwrap();
             let index = shared.read();
+            for file in index.files.values() {
+                let names: std::collections::HashSet<&str> = file
+                    .symbols
+                    .iter()
+                    .map(|symbol| symbol.name.as_str())
+                    .collect();
+                let per_name: std::collections::HashSet<String> = names
+                    .iter()
+                    .filter(|name| LiveIndex::has_pub_symbol(file, name))
+                    .map(|name| name.to_string())
+                    .collect();
+                if matches!(
+                    file.language,
+                    crate::domain::LanguageId::JavaScript | crate::domain::LanguageId::TypeScript
+                ) {
+                    assert_eq!(
+                        LiveIndex::exported_symbol_names(file, &names),
+                        per_name,
+                        "{}",
+                        file.relative_path
+                    );
+                }
+            }
             let started = std::time::Instant::now();
             let with_dependents = assert_batch_matches_per_file(&index);
             eprintln!(
