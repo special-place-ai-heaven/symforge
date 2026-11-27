@@ -303,6 +303,11 @@ fn calls_that_drop_nothing_raise_no_notice() {
             "pub fn real() {}\nmod tests {\n    fn t() {}\n}\n".to_owned(),
         ),
         ("d1/same.rs", "fn f() {}\n".to_owned()),
+        ("src/mid.rs", "use crate::T0;\npub fn mid() {}\n".to_owned()),
+        (
+            "src/top.rs",
+            "use crate::mid::mid;\npub fn top() { mid(); }\n".to_owned(),
+        ),
     ]);
     fs::write(
         repo.path().join("src/lib.rs"),
@@ -311,7 +316,7 @@ fn calls_that_drop_nothing_raise_no_notice() {
     .unwrap();
     let output = run(
         &repo,
-        r#"
+        r##"
 ctx = file_context(path="src/lib.rs")
 outline = file_context(path="src/with_tests.rs")
 found = inspect_match(path="src/lib.rs", line=2)
@@ -320,9 +325,38 @@ resolved = search_files(query="same.rs", resolve=True)
 impact = detect_impact()
 diff = diff_symbols()
 bundle = symbol_context(path="src/lib.rs", name="small", bundle=True)
-[len(found["siblings"]), full["shown_files"], len(resolved), len(impact["changed_symbols"]), len(bundle["dependencies"])]
+linked = file_context(path="src/mid.rs")
+compact = repo_map()
+plain = symbol_context(path="src/lib.rs", name="small")
+[len(found["siblings"]), full["shown_files"], len(resolved), len(impact["changed_symbols"]), len(bundle["dependencies"]),
+ "Imports" in linked["rendered"], "Consumers" in linked["rendered"], compact["shown_files"], len(plain["callers"])]
+"##,
+    );
+    assert_eq!(
+        output["value"],
+        json!([4, 6, 2, 2, 1, true, true, 6, 1]),
+        "{output}"
+    );
+    assert_eq!(output.get("notices"), None, "{output}");
+}
+
+#[test]
+fn compact_repo_map_counts_key_type_rows_cut_inside_their_section() {
+    let types = lines(40, |i| format!("pub struct K{i:02}{};\n", "x".repeat(300)));
+    let repo = repo_with(&[("src/lib.rs", types)]);
+    let output = run(
+        &repo,
+        r#"
+rows = repo_map()["rendered"].split("\n")
+[len([r for r in rows if r.startswith("  src")]), len([r for r in rows if r.startswith("  struct ")])]
 "#,
     );
-    assert_eq!(output["value"], json!([4, 4, 2, 2, 1]), "{output}");
-    assert_eq!(output.get("notices"), None, "{output}");
+    assert_eq!(output["value"][0], 1, "{output}");
+    let shown_types = output["value"][1].as_u64().unwrap();
+    assert!(shown_types > 0 && shown_types < 15, "{output}");
+    assert_eq!(
+        only_notice(&output, "repo_map")["omitted_rows"],
+        40 - shown_types,
+        "{output}"
+    );
 }
