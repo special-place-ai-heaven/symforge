@@ -22,7 +22,7 @@ pub(crate) fn prepare_replace(
     let indented = if member.is_some() {
         normalized
     } else {
-        apply_indentation(normalized_str, &indent, line_ending)
+        indent_replacement(file_content, symbol, normalized_str, &indent, line_ending)
     };
     let new_content = apply_splice(file_content, (splice_start, end), &indented);
     Ok(PreparedReplace {
@@ -483,6 +483,55 @@ fn common_leading_whitespace<'a>(lines: &[&'a str]) -> &'a str {
 /// the body is already flush-left (its first content line has no leading
 /// whitespace — the normal case) the base is empty and this is a pure prefix,
 /// so existing callers are unaffected.
+pub(crate) fn indent_replacement(
+    file_content: &[u8],
+    symbol: &SymbolRecord,
+    body: &str,
+    indent: &[u8],
+    line_ending: LineEnding,
+) -> Vec<u8> {
+    if !carries_file_indentation(file_content, symbol, body, indent) {
+        return apply_indentation(body, indent, line_ending);
+    }
+    let mut indented = indent.to_vec();
+    indented.extend_from_slice(&normalize_line_endings(body.as_bytes(), line_ending));
+    indented
+}
+
+fn continuation_indent(text: &[u8]) -> Vec<(&[u8], usize)> {
+    text.split(|&byte| byte == b'\n')
+        .skip(1)
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter(|line| !line.trim_ascii().is_empty())
+        .map(|line| (line, line.len() - line.trim_ascii_start().len()))
+        .collect()
+}
+
+fn carries_file_indentation(
+    file_content: &[u8],
+    symbol: &SymbolRecord,
+    body: &str,
+    indent: &[u8],
+) -> bool {
+    let (start, end) = (
+        symbol.effective_start() as usize,
+        symbol.byte_range.1 as usize,
+    );
+    let Some(current) = file_content.get(start..end) else {
+        return false;
+    };
+    let new_lines = continuation_indent(body.as_bytes());
+    let new_min = new_lines.iter().map(|(_, width)| *width).min();
+    let current_min = continuation_indent(current)
+        .iter()
+        .map(|(_, width)| *width)
+        .min();
+    !indent.is_empty()
+        && new_min.is_some()
+        && new_min == current_min
+        && new_lines.iter().all(|(line, _)| line.starts_with(indent))
+}
+
 pub(crate) fn apply_indentation(text: &str, indent: &[u8], line_ending: LineEnding) -> Vec<u8> {
     let mut result = Vec::new();
     // Use split('\n') instead of lines() so that trailing newlines produce a trailing

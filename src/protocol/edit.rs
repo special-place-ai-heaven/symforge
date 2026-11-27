@@ -29,13 +29,12 @@ pub(crate) use crate::index_lifecycle::guidance::read_gate::{
 // Shared structural byte planning for MCP and embedded edits.
 #[cfg(test)]
 use crate::edit_safety::structural::{
-    LineEnding, body_starts_with_doc_comment, collapse_blank_lines,
+    LineEnding, apply_indentation, body_starts_with_doc_comment, collapse_blank_lines,
     docless_replacement_splice_start,
 };
 pub(crate) use crate::edit_safety::structural::{
-    apply_indentation, apply_splice, build_delete, build_edit_within, build_insert_after,
-    build_insert_before, detect_indentation, detect_line_ending, extend_past_orphaned_docs,
-    normalize_line_endings,
+    apply_splice, build_delete, build_edit_within, build_insert_after, build_insert_before,
+    detect_indentation, detect_line_ending, extend_past_orphaned_docs, normalize_line_endings,
 };
 
 // Shared with the embedded edit lane; one admission, lock and write path.
@@ -1062,7 +1061,13 @@ pub(crate) fn execute_batch_edit(
                             extend_past_orphaned_docs(&content, raw_line_start, &r.sym) as u32;
                         let indent = detect_indentation(&content, r.sym.byte_range.0);
                         let normalized_str = std::str::from_utf8(&normalized).unwrap_or(new_body);
-                        let indented = apply_indentation(normalized_str, &indent, line_ending);
+                        let indented = crate::edit_safety::structural::indent_replacement(
+                            &content,
+                            &r.sym,
+                            normalized_str,
+                            &indent,
+                            line_ending,
+                        );
                         content =
                             apply_splice(&content, (line_start, r.sym.byte_range.1), &indented);
                     }

@@ -776,3 +776,133 @@ async fn identity_replace_of_every_fixture_symbol_is_never_refused() {
         refused.join("\n")
     );
 }
+
+#[tokio::test]
+async fn doc_commented_members_paste_back_unchanged_at_any_depth() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "box.ts",
+            "export class Box {\n  /** Size doc. */\n  size(): number {\n    return 1;\n  }\n\n  other(): number {\n    return 2;\n  }\n}\n",
+        ),
+        (
+            "outer.ts",
+            "export namespace Outer {\n  export class Box {\n    /** Size doc. */\n    size(): number {\n      return 1;\n    }\n  }\n}\n",
+        ),
+        (
+            "nodoc.ts",
+            "export class Box {\n  size(): number {\n    return 1;\n  }\n\n  other(): number {\n    return 2;\n  }\n}\n",
+        ),
+        (
+            "line.ts",
+            "export class Box {\n  // Size line comment.\n  size(): number {\n    return 1;\n  }\n\n  other(): number {\n    return 2;\n  }\n}\n",
+        ),
+        (
+            "tabs.ts",
+            "export class Box {\r\n\t/** Size doc. */\r\n\tsize(): number {\r\n\t\treturn 1;\r\n\t}\r\n}\r\n",
+        ),
+        (
+            "box.js",
+            "export class Box {\n  /** Size doc. */\n  size() {\n    return 1;\n  }\n\n  other() {\n    return 2;\n  }\n}\n",
+        ),
+        (
+            "make.js",
+            "export function make() {\n  class Box {\n    /** Size doc. */\n    size() {\n      return 1;\n    }\n  }\n  return Box;\n}\n",
+        ),
+        (
+            "box.rs",
+            "pub struct Boxy;\n\nimpl Boxy {\n    /// Size doc.\n    pub fn size(&self) -> u32 {\n        1\n    }\n\n    pub fn other(&self) -> u32 {\n        2\n    }\n}\n",
+        ),
+        (
+            "inner.rs",
+            "pub mod inner {\n    pub struct Boxy;\n\n    impl Boxy {\n        /// Size doc.\n        pub fn size(&self) -> u32 {\n            1\n        }\n    }\n}\n",
+        ),
+        (
+            "box.kt",
+            "class Box {\n    /** Size doc. */\n    fun size(): Int {\n        return 1\n    }\n}\n",
+        ),
+        (
+            "outer.kt",
+            "class Outer {\n    class Box {\n        /** Size doc. */\n        fun size(): Int {\n            return 1\n        }\n    }\n}\n",
+        ),
+        (
+            "box.py",
+            "class Box:\n    @staticmethod\n    def size():\n        return 1\n\n    def other(self):\n        return 2\n",
+        ),
+        (
+            "outer.py",
+            "class Outer:\n    class Box:\n        @staticmethod\n        def size():\n            return 1\n",
+        ),
+        (
+            "comment.py",
+            "class Box:\n    # Size comment.\n    def size(self):\n        \"\"\"Size doc.\"\"\"\n        return 1\n\n    def other(self):\n        return 2\n",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for &(path, source) in cases {
+        let (root, index) = fixture(path, source);
+        let backend = LocalCodeBackend::new(
+            index.clone(),
+            Some(root.path().into()),
+            "symbol-spans",
+            None,
+        );
+        let rows = read(&backend, json!({"path": path, "name": "size"}));
+        let shown = rows[0]["source"].as_str().unwrap_or_default().to_owned();
+        let server = item_server(&root, &index);
+        let (_, facade) = call(
+            &server,
+            "symforge_edit",
+            json!({"path": path, "symbol": "size", "op": "replace", "body": shown, "apply": true}),
+        )
+        .await;
+        let (_, direct) = call(
+            &server,
+            "replace_symbol_body",
+            json!({"path": path, "name": "size", "new_body": shown}),
+        )
+        .await;
+        let after = std::fs::read_to_string(root.path().join(path)).unwrap();
+        if after != source || !facade.contains("Write mode: already_applied") {
+            wrong.push(format!(
+                "{path}: shown {shown:?}\nfacade: {facade}\ndirect: {direct}\nafter: {after:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+}
+
+#[tokio::test]
+async fn doc_commented_member_bodies_land_with_single_indentation() {
+    let path = "box.ts";
+    let source =
+        "export class Box {\n  /** Size doc. */\n  size(): number {\n    return 1;\n  }\n}\n";
+    for (body, expected) in [
+        (
+            "/** Size doc. */\n  size(): number {\n    return 2;\n  }",
+            "export class Box {\n  /** Size doc. */\n  size(): number {\n    return 2;\n  }\n}\n",
+        ),
+        (
+            "/** Size doc. */\nsize(): number {\n  return 3;\n}",
+            "export class Box {\n  /** Size doc. */\n  size(): number {\n    return 3;\n  }\n}\n",
+        ),
+        (
+            "size(): number {\n  return 4;\n}",
+            "export class Box {\n  /** Size doc. */\n  size(): number {\n    return 4;\n  }\n}\n",
+        ),
+    ] {
+        let (root, index) = fixture(path, source);
+        let server = item_server(&root, &index);
+        let (error, text) = call(
+            &server,
+            "replace_symbol_body",
+            json!({"path": path, "name": "size", "new_body": body}),
+        )
+        .await;
+        assert!(!error, "{body:?}: {text}");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(path)).unwrap(),
+            expected,
+            "{body:?}"
+        );
+    }
+}
