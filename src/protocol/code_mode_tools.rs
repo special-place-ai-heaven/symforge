@@ -313,6 +313,8 @@ impl SymForgeServer {
     }
 }
 
+const WITHHELD_FILES_MEANING: &str = "files in this call's search scope that were not searched because they are withheld; they may or may not contain matches, and the number is not a count of files with more hits";
+
 fn render_execute_call_result(
     mut outcome: crate::codemode::ExecuteOutcome,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
@@ -342,7 +344,15 @@ fn render_execute_call_result(
         if !outcome.notices.is_empty() {
             // Keep notices visible even in clients that display only the first text block.
             text.push_str("\n\nHost-call completeness: ");
-            text.push_str(&serde_json::json!({"notices": outcome.notices}).to_string());
+            let mut suffix = serde_json::json!({"notices": outcome.notices});
+            if outcome
+                .notices
+                .iter()
+                .any(|n| n.completeness.withheld_files > 0)
+            {
+                suffix["withheld_files_meaning"] = serde_json::json!(WITHHELD_FILES_MEANING);
+            }
+            text.push_str(&suffix.to_string());
         }
         text
     } else {

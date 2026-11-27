@@ -1065,7 +1065,7 @@ pub fn render_idioms() -> String {
 - **Inspect return fields**: `symforge code stubs <topic>` (e.g. `symforge code stubs references`).\n\
 - **Known source locations**: Return targeted `file_content` windows. Use `symbol_context(bundle=True, ...)` when you also need caller, callee, or type evidence.\n\
 - **Text search**: Use `group_by=\"count\"` only when locations are unnecessary. When returning many hits, group by path in the script to avoid repeating paths.\n\
-- **Partial answers**: Check host-call completeness notices even when the script returns a scalar or empty list. Omitted rows are known matches; withheld files were not searched and may or may not contain matches.\n\
+- **Partial answers**: Check host-call completeness notices even when the script returns a scalar or empty list. Omitted rows are known matches. `withheld_files` counts files in the call's search scope that were not searched because they are withheld (policy or size); it repeats across calls with the same scope and is not a count of files with more hits, since those files may or may not contain matches.\n\
 - **Edits**: Mutations NEVER run inside Code Mode; perform edits explicitly after narrowing.\n\
 \n\
 ## Sandbox rules & resource caps\n\

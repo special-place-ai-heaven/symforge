@@ -122,6 +122,45 @@ fn assert_bare_count_keeps_notice(text: &str) {
     let notices: Value = serde_json::from_str(notices).expect("notices json");
     assert_eq!(notices["notices"][0]["op"], "find_references");
     assert_eq!(notices["notices"][0]["omitted_rows"], 1);
+    assert!(notices.get("withheld_files_meaning").is_none(), "{text}");
+}
+
+#[tokio::test]
+async fn code_execute_lean_text_explains_withheld_files_when_it_reports_them() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+    std::fs::write(
+        root.join("src/math.rs"),
+        "pub fn add_pair(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .expect("write math");
+    std::fs::write(
+        root.join("src/held.rs"),
+        format!("// -----BEGIN {} KEY-----\n", "PRIVATE"),
+    )
+    .expect("write held");
+    let canonical = root.canonicalize().expect("canon");
+    let server = SymForgeServer::new(
+        LiveIndex::load(&canonical).expect("load index"),
+        "code-surface-withheld-test".to_string(),
+        Arc::new(Mutex::new(WatcherInfo::default())),
+        Some(canonical),
+        None,
+    );
+    let text = code_execute_text(&server, r#"len(find_references(name="add_pair"))"#).await;
+    let (_, notices) = text
+        .split_once("\n\nHost-call completeness: ")
+        .unwrap_or_else(|| panic!("missing completeness suffix: {text}"));
+    let notices: Value = serde_json::from_str(notices).expect("notices json");
+    assert_eq!(notices["notices"][0]["withheld_files"], 1, "{text}");
+    assert!(
+        notices["withheld_files_meaning"].as_str().is_some_and(
+            |m| m.contains("not searched") && m.contains("not a count of files with more hits")
+        ),
+        "{text}"
+    );
 }
 
 #[tokio::test]
