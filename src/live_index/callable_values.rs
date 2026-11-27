@@ -116,8 +116,17 @@ pub(super) fn build_callable_values(
     .collect()
 }
 
+const FACTS_VERSION: u32 = 1;
+
+pub(super) fn facts_writer_stamp() -> String {
+    format!("{}+facts{FACTS_VERSION}", env!("CARGO_PKG_VERSION"))
+}
+
 #[derive(Clone)]
-pub struct PersistedCallableValues(Vec<(String, Arc<CallableFacts>)>);
+pub struct PersistedCallableValues {
+    writer: String,
+    entries: Vec<(String, Arc<CallableFacts>)>,
+}
 
 impl PersistedCallableValues {
     pub(super) fn capture(table: &CallableValueIndex) -> Self {
@@ -126,42 +135,75 @@ impl PersistedCallableValues {
             .map(|(path, facts)| (path.clone(), Arc::clone(facts)))
             .collect();
         entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        Self(entries)
+        Self {
+            writer: facts_writer_stamp(),
+            entries,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_writer(self, writer: &str) -> Self {
+        Self {
+            writer: writer.to_string(),
+            ..self
+        }
     }
 
     pub(super) fn adopt(
         self,
         files: &HashMap<String, Arc<IndexedFile>>,
     ) -> Result<CallableValueIndex, String> {
-        if let Some(pair) = self.0.windows(2).find(|pair| pair[0].0 >= pair[1].0) {
-            return Err(pair[1].0.clone());
+        let running = facts_writer_stamp();
+        if self.writer != running {
+            return Err(format!(
+                "persisted callable values were written by {}, this build is {running}",
+                self.writer
+            ));
+        }
+        if let Some(pair) = self.entries.windows(2).find(|pair| pair[0].0 >= pair[1].0) {
+            return Err(format!(
+                "persisted callable values repeat or misorder {}",
+                pair[1].0
+            ));
         }
         if let Some((path, _)) = self
-            .0
+            .entries
             .iter()
             .find(|(path, _)| !files.get(path).is_some_and(|file| facts_eligible(file)))
         {
-            return Err(path.clone());
+            return Err(format!(
+                "persisted callable values name {path}, which is not a restored parsed Python, JavaScript or TypeScript file"
+            ));
         }
-        Ok(self.0.into_iter().collect())
+        Ok(self.entries.into_iter().collect())
     }
 }
 
-impl serde::Serialize for PersistedCallableValues {
+struct PersistedEntries<'a>(&'a [(String, Arc<CallableFacts>)]);
+
+impl serde::Serialize for PersistedEntries<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(self.0.iter().map(|(path, facts)| (path, facts.as_ref())))
     }
 }
 
+impl serde::Serialize for PersistedCallableValues {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&(&self.writer, PersistedEntries(&self.entries)), serializer)
+    }
+}
+
 impl<'de> serde::Deserialize<'de> for PersistedCallableValues {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let entries = Vec::<(String, CallableFacts)>::deserialize(deserializer)?;
-        Ok(Self(
-            entries
+        let (writer, entries) =
+            <(String, Vec<(String, CallableFacts)>)>::deserialize(deserializer)?;
+        Ok(Self {
+            writer,
+            entries: entries
                 .into_iter()
                 .map(|(path, facts)| (path, Arc::new(facts)))
                 .collect(),
-        ))
+        })
     }
 }
 

@@ -2970,8 +2970,8 @@ fn hydrate_snapshot_with_proof(
         rejected => {
             index.rebuild_reverse_index();
             match rejected {
-                Some(Err(path)) => tracing::warn!(
-                    "warm restore: persisted callable values name {path}, which is not a restored parsed Python, JavaScript or TypeScript file; reverse index and callable values rebuilt from restored files in {:?}",
+                Some(Err(reason)) => tracing::warn!(
+                    "warm restore: {reason}; reverse index and callable values rebuilt from restored files in {:?}",
                     phase.elapsed()
                 ),
                 _ => tracing::info!(
@@ -11606,5 +11606,79 @@ mod tests {
             "the edit changed the exporter's facts"
         );
         assert_eq!(guard.callable_values, expected);
+    }
+    #[test]
+    fn restore_falls_back_when_the_facts_were_written_by_another_build() {
+        let tmp = TempDir::new().unwrap();
+        write_callable_probe_fixture(tmp.path());
+        let fresh = LiveIndex::load(tmp.path()).unwrap();
+        let expected = fresh.read().callable_values.clone();
+        serialize_index(&fresh.read(), tmp.path()).unwrap();
+
+        let mut foreign = load_snapshot(tmp.path()).unwrap();
+        let section = foreign.callable_values.take().unwrap();
+        foreign.callable_values = Some(section.with_writer("0.0.0+facts0"));
+        let (rebuilt, calls) = restore_counting_facts(foreign, tmp.path());
+        assert_eq!(
+            calls,
+            CALLABLE_PROBE_FIXTURE.len(),
+            "another writer's facts are parsed again"
+        );
+        assert_eq!(rebuilt.callable_values, expected);
+
+        let (adopted, calls) =
+            restore_counting_facts(load_snapshot(tmp.path()).unwrap(), tmp.path());
+        assert_eq!(calls, 0, "this build's own facts are adopted");
+        assert_eq!(adopted.callable_values, expected);
+    }
+
+    #[test]
+    fn persisted_callable_values_bytes_carry_the_writer_stamp() {
+        let tmp = TempDir::new().unwrap();
+        write_callable_probe_fixture(tmp.path());
+        let index = LiveIndex::load(tmp.path()).unwrap();
+        let section = crate::live_index::callable_values::PersistedCallableValues::capture(
+            &index.read().callable_values,
+        );
+        let own = postcard::to_stdvec(&section).unwrap();
+        let stamp = crate::live_index::callable_values::facts_writer_stamp();
+        assert!(stamp.starts_with(env!("CARGO_PKG_VERSION")));
+        assert!(
+            own.windows(stamp.len())
+                .any(|window| window == stamp.as_bytes())
+        );
+        let other = postcard::to_stdvec(&section.with_writer("0.0.0+facts0")).unwrap();
+        assert_ne!(own, other);
+    }
+
+    #[test]
+    fn a_format_12_snapshot_without_the_facts_field_is_refused_softly() {
+        let tmp = TempDir::new().unwrap();
+        write_callable_probe_fixture(tmp.path());
+        let fresh = LiveIndex::load(tmp.path()).unwrap();
+        serialize_index(&fresh.read(), tmp.path()).unwrap();
+        let mut snapshot = load_snapshot(tmp.path()).unwrap();
+        snapshot.callable_values = None;
+        let mut payload = postcard::to_stdvec(&snapshot).unwrap();
+        assert_eq!(
+            payload.pop(),
+            Some(0),
+            "the absent section is one trailing None tag"
+        );
+        let checksum = crate::hash::digest(&payload);
+        payload.extend_from_slice(&checksum);
+        let snapshot_path = tmp.path().join(".symforge").join("index.bin");
+        std::fs::write(&snapshot_path, &payload).unwrap();
+
+        assert!(
+            load_snapshot(tmp.path()).is_none(),
+            "the older layout never restores"
+        );
+        let reloaded = LiveIndex::load(tmp.path()).unwrap();
+        assert_eq!(
+            reloaded.read().callable_values,
+            fresh.read().callable_values,
+            "a fresh parse replaces it"
+        );
     }
 }
