@@ -2948,7 +2948,7 @@ fn hydrate_snapshot_with_proof(
         files_by_basename: HashMap::new(),
         files_by_dir_component: HashMap::new(),
         trigram_index,
-        gitignore: None,
+        gitignore: crate::discovery::load_gitignore(project_root),
         manifest_entries,
         coupling_store: None,
         local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),

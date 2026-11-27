@@ -490,3 +490,73 @@ async fn the_watcher_skips_files_created_under_a_git_info_exclude_directory() {
     );
     watcher.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_watcher_on_a_restored_index_skips_ignored_directories() {
+    let (dir, placement) = fixture();
+    let init = symforge::process_util::hidden_command("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git init");
+    assert!(init.status.success(), "git init failed");
+    fs::write(dir.path().join(".git/info/exclude"), "hidden/\n").unwrap();
+    fs::write(dir.path().join(".gitignore"), "built/\n").unwrap();
+    fs::create_dir_all(dir.path().join("hidden")).unwrap();
+    fs::create_dir_all(dir.path().join("built")).unwrap();
+    let shared = checkpoint_and_restore(dir.path(), &placement).await;
+    let info = Arc::new(Mutex::new(WatcherInfo::default()));
+    let watcher = tokio::spawn(run_watcher(
+        dir.path().to_path_buf(),
+        Arc::clone(&shared),
+        Arc::clone(&info),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while info.lock().state != WatcherState::Active {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("watcher becomes active");
+    fs::write(
+        dir.path().join("hidden/late.ts"),
+        "export function late() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("built/late.ts"),
+        "export function built() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src/late.ts"),
+        "export function visible() {}\n",
+    )
+    .unwrap();
+    let indexed = tokio::time::timeout(Duration::from_secs(10), async {
+        while shared
+            .read()
+            .all_files()
+            .all(|(path, _)| path != "src/late.ts")
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        indexed.is_ok(),
+        "the visible control file was never indexed"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let leaked: Vec<String> = shared
+        .read()
+        .all_files()
+        .map(|(path, _)| path.clone())
+        .filter(|path| path.starts_with("hidden/") || path.starts_with("built/"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "ignored files were indexed after a restore: {leaked:?}"
+    );
+    watcher.abort();
+}
