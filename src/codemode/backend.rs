@@ -2131,14 +2131,26 @@ fn path_refused_without_catalog(live: &LiveIndex, path: &str) -> bool {
 fn build_code_mode_withheld(live: &LiveIndex) -> crate::live_index::search::CodeModeWithheld {
     let sensitive = live.capture_sensitive_admission_paths();
     let rule = |path: &str| sensitive.contains(path) || path_refused_without_catalog(live, path);
+    let refused_entries =
+        crate::live_index::store::ordered_parallel_map(&live.manifest_entries, |entry| {
+            entry
+                .path
+                .normalized_utf8
+                .as_deref()
+                .is_some_and(|path| rule(&normalized_path(path)))
+        });
     let mut catalog = crate::live_index::search::CodeModeWithheld::default();
     let mut refused_targets = std::collections::HashMap::new();
-    for (i, entry) in live.manifest_entries.iter().enumerate() {
+    for ((i, entry), refused) in live
+        .manifest_entries
+        .iter()
+        .enumerate()
+        .zip(refused_entries)
+    {
         let Some(path) = entry.path.normalized_utf8.as_deref() else {
             continue;
         };
-        let path = crate::live_index::query::normalize_path_query(path);
-        let refused = rule(&path);
+        let path = normalized_path(path).into_owned();
         if refused || crate::live_index::search::catalog_content_is_withheld(&entry.disposition) {
             catalog.manifest.push(i);
         }
@@ -2151,24 +2163,37 @@ fn build_code_mode_withheld(live: &LiveIndex) -> crate::live_index::search::Code
         catalog.known.insert(path);
     }
     for (key, _) in live.all_files() {
-        let path = crate::live_index::query::normalize_path_query(key);
-        let refused = if catalog.known.contains(&path) {
-            catalog.refused.contains(&path)
+        let path = normalized_path(key);
+        let refused = if catalog.known.contains(path.as_ref()) {
+            catalog.refused.contains(path.as_ref())
         } else {
             let refused = rule(&path);
             if refused {
-                catalog.refused.insert(path.clone());
+                catalog.refused.insert(path.to_string());
             }
-            catalog.known.insert(path.clone());
+            catalog.known.insert(path.to_string());
             refused
         };
         if refused {
             catalog
                 .refused_files
-                .push((key.clone(), refused_targets.get(&path).copied()));
+                .push((key.clone(), refused_targets.get(path.as_ref()).copied()));
         }
     }
     catalog
+}
+
+fn normalized_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if path.contains('\\')
+        || path.starts_with("./")
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path.trim().len() != path.len()
+    {
+        std::borrow::Cow::Owned(crate::live_index::query::normalize_path_query(path))
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
 }
 
 fn code_mode_withheld(
