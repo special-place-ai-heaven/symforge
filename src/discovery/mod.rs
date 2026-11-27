@@ -1903,7 +1903,8 @@ fn repository_common_dir(root: &Path) -> Option<(PathBuf, bool)> {
     }
     let pointer = read_git_metadata(&marker, GIT_POINTER_MAX_BYTES)?;
     let git_dir = PathBuf::from(pointer.lines().next()?.strip_prefix("gitdir: ")?.trim_end());
-    let walker_resolves_pointer = git_dir.is_absolute();
+    let walker_resolves_pointer =
+        walker_resolves_git_pointer(&git_dir, root, std::env::current_dir().ok().as_deref());
     let git_dir = if git_dir.is_absolute() {
         git_dir
     } else {
@@ -1924,6 +1925,22 @@ fn repository_common_dir(root: &Path) -> Option<(PathBuf, bool)> {
         PathBuf::from(commondir)
     };
     Some((common, walker_resolves_pointer))
+}
+
+fn walker_resolves_git_pointer(pointer: &Path, root: &Path, working_dir: Option<&Path>) -> bool {
+    if pointer.is_absolute() {
+        return true;
+    }
+    let Some(working_dir) = working_dir else {
+        return false;
+    };
+    match (
+        std::fs::canonicalize(working_dir.join(pointer)),
+        std::fs::canonicalize(root.join(pointer)),
+    ) {
+        (Ok(walker), Ok(ours)) => walker == ours,
+        _ => false,
+    }
 }
 
 fn read_repository_exclude(root: &Path) -> Option<String> {
@@ -3440,6 +3457,45 @@ fn untracked_generated_output_demotions_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_walker_resolves_a_git_pointer_only_where_it_lands_on_the_same_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("linked");
+        let git_dir = tmp.path().join("main/.git/worktrees/linked");
+        let elsewhere = tmp.path().join("a/b");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(tmp.path().join("a/main/.git/worktrees/linked")).unwrap();
+        let relative = Path::new("../main/.git/worktrees/linked");
+        let decoy = Path::new("../../main/.git/worktrees/linked");
+
+        assert!(walker_resolves_git_pointer(
+            &git_dir,
+            &root,
+            Some(&elsewhere)
+        ));
+        assert!(walker_resolves_git_pointer(&git_dir, &root, None));
+        assert!(walker_resolves_git_pointer(relative, &root, Some(&root)));
+        assert!(!walker_resolves_git_pointer(
+            relative,
+            &root,
+            Some(&elsewhere)
+        ));
+        assert!(!walker_resolves_git_pointer(
+            relative,
+            &root,
+            Some(tmp.path())
+        ));
+        assert!(!walker_resolves_git_pointer(relative, &root, None));
+        assert!(!walker_resolves_git_pointer(decoy, &root, Some(&elsewhere)));
+        assert!(!walker_resolves_git_pointer(
+            Path::new("../missing/.git/worktrees/linked"),
+            &root,
+            Some(&root)
+        ));
+    }
     use std::fs;
     use tempfile::TempDir;
 
