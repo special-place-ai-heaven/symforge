@@ -1866,21 +1866,39 @@ pub(crate) fn add_repository_excludes(
     );
 }
 
-fn read_repository_exclude(root: &Path) -> Option<String> {
+const GIT_POINTER_MAX_BYTES: u64 = 4 * 1024;
+
+fn read_git_metadata(path: &Path, max_bytes: u64) -> Option<String> {
     use std::io::Read;
 
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > max_bytes {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn read_repository_exclude(root: &Path) -> Option<String> {
     let marker = root.join(".git");
-    let common = if marker.is_dir() {
+    let common = if std::fs::metadata(&marker).ok()?.is_dir() {
         marker
     } else {
-        let pointer = std::fs::read_to_string(&marker).ok()?;
+        let pointer = read_git_metadata(&marker, GIT_POINTER_MAX_BYTES)?;
         let git_dir = PathBuf::from(pointer.lines().next()?.strip_prefix("gitdir: ")?.trim_end());
         let git_dir = if git_dir.is_absolute() {
             git_dir
         } else {
             root.join(git_dir)
         };
-        let commondir = std::fs::read_to_string(git_dir.join("commondir")).ok()?;
+        let commondir = read_git_metadata(&git_dir.join("commondir"), GIT_POINTER_MAX_BYTES)?;
         let commondir = commondir.lines().next()?.trim_end();
         if commondir.starts_with('.') {
             git_dir.join(commondir)
@@ -1888,16 +1906,10 @@ fn read_repository_exclude(root: &Path) -> Option<String> {
             PathBuf::from(commondir)
         }
     };
-    let mut bytes = Vec::new();
-    std::fs::File::open(common.join("info").join("exclude"))
-        .ok()?
-        .take(REPOSITORY_EXCLUDE_MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > REPOSITORY_EXCLUDE_MAX_BYTES {
-        return None;
-    }
-    String::from_utf8(bytes).ok()
+    read_git_metadata(
+        &common.join("info").join("exclude"),
+        REPOSITORY_EXCLUDE_MAX_BYTES,
+    )
 }
 
 pub(crate) fn add_git_excludes(
@@ -3773,6 +3785,70 @@ mod tests {
             builder.build().unwrap().is_empty(),
             "no repository, no git excludes"
         );
+    }
+
+    #[test]
+    fn oversized_git_pointer_files_give_no_exclude_rules() {
+        let tmp = TempDir::new().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = crate::process_util::hidden_command("git")
+                .args([
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&main, &["init", "-q"]);
+        std::fs::write(main.join("README.md"), "main\n").unwrap();
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "init"]);
+        let worktree = tmp.path().join("linked");
+        git(
+            &main,
+            &["worktree", "add", "-q", worktree.to_str().unwrap()],
+        );
+        std::fs::write(main.join(".git/info/exclude"), "hidden/\n").unwrap();
+        assert!(read_repository_exclude(&worktree).is_some());
+
+        let pointer_path = worktree.join(".git");
+        let pointer = std::fs::read_to_string(&pointer_path).unwrap();
+        let git_dir = PathBuf::from(pointer.trim().strip_prefix("gitdir: ").unwrap());
+        let padding = "#".repeat(8 * 1024);
+        std::fs::write(&pointer_path, format!("{}\n{padding}\n", pointer.trim())).unwrap();
+        assert_eq!(
+            read_repository_exclude(&worktree),
+            None,
+            "oversized .git pointer"
+        );
+        assert!(load_gitignore(&worktree).is_none_or(|rules| {
+            !rules
+                .matched_path_or_any_parents("hidden/x.rs", false)
+                .is_ignore()
+        }));
+        std::fs::write(&pointer_path, &pointer).unwrap();
+
+        let commondir_path = git_dir.join("commondir");
+        let commondir = std::fs::read_to_string(&commondir_path).unwrap();
+        std::fs::write(
+            &commondir_path,
+            format!("{}\n{padding}\n", commondir.trim()),
+        )
+        .unwrap();
+        assert_eq!(
+            read_repository_exclude(&worktree),
+            None,
+            "oversized commondir"
+        );
+        std::fs::write(&commondir_path, &commondir).unwrap();
+        assert!(read_repository_exclude(&worktree).is_some());
     }
 
     #[test]
