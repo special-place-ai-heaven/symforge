@@ -665,3 +665,28 @@ async fn a_root_below_the_repository_top_restores_the_cold_file_set() {
     let restored = checkpoint_and_restore(&root, &placement_for(&root)).await;
     assert_eq!(file_set(&restored), cold);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_separate_git_dir_restore_honours_its_own_info_exclude() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    let git_dir = tmp.path().join("gitdir");
+    let out = symforge::process_util::hidden_command("git")
+        .arg("init")
+        .arg("-q")
+        .arg("--separate-git-dir")
+        .arg(&git_dir)
+        .arg(&root)
+        .output()
+        .expect("git init");
+    assert!(out.status.success(), "git init --separate-git-dir failed");
+    fs::write(git_dir.join("info/exclude"), "hidden/\n").unwrap();
+    write_fixture(&root, &[("hidden/b.ts", "export function hidden() {}\n")]);
+    let cold = file_set(&LiveIndex::load(&root).unwrap());
+    assert!(
+        !cold.iter().any(|path| path.starts_with("hidden/")),
+        "{cold:?}"
+    );
+    let restored = checkpoint_and_restore(&root, &placement_for(&root)).await;
+    assert_eq!(file_set(&restored), cold);
+}

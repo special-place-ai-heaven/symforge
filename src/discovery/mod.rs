@@ -833,13 +833,23 @@ fn refuse_windows_alias_components(requested: &Path) -> std::result::Result<(), 
 fn repository_walk(root: &Path, exclusions: &SourceExclusions) -> ignore::Walk {
     let filter_root = root.to_path_buf();
     let exclusions = exclusions.clone();
+    let git_dir_exclude = exclude_the_walk_misses(root);
     let mut builder = ignore::WalkBuilder::new(root);
     builder.hidden(false).filter_entry(move |entry| {
         entry
             .path()
             .strip_prefix(&filter_root)
             .is_ok_and(|relative| {
-                !path_is_hard_scope_excluded(relative) && !exclusions.excludes_relative(relative)
+                !path_is_hard_scope_excluded(relative)
+                    && !exclusions.excludes_relative(relative)
+                    && !git_dir_exclude.as_ref().is_some_and(|rules| {
+                        rules
+                            .matched_path_or_any_parents(
+                                relative,
+                                entry.file_type().is_some_and(|kind| kind.is_dir()),
+                            )
+                            .is_ignore()
+                    })
             })
     });
     builder.build()
@@ -1886,30 +1896,60 @@ fn read_git_metadata(path: &Path, max_bytes: u64) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-fn read_repository_exclude(root: &Path) -> Option<String> {
+fn repository_common_dir(root: &Path) -> Option<(PathBuf, bool)> {
     let marker = root.join(".git");
-    let common = if std::fs::metadata(&marker).ok()?.is_dir() {
-        marker
+    if std::fs::metadata(&marker).ok()?.is_dir() {
+        return Some((marker, true));
+    }
+    let pointer = read_git_metadata(&marker, GIT_POINTER_MAX_BYTES)?;
+    let git_dir = PathBuf::from(pointer.lines().next()?.strip_prefix("gitdir: ")?.trim_end());
+    let git_dir = if git_dir.is_absolute() {
+        git_dir
     } else {
-        let pointer = read_git_metadata(&marker, GIT_POINTER_MAX_BYTES)?;
-        let git_dir = PathBuf::from(pointer.lines().next()?.strip_prefix("gitdir: ")?.trim_end());
-        let git_dir = if git_dir.is_absolute() {
-            git_dir
-        } else {
-            root.join(git_dir)
-        };
-        let commondir = read_git_metadata(&git_dir.join("commondir"), GIT_POINTER_MAX_BYTES)?;
-        let commondir = commondir.lines().next()?.trim_end();
-        if commondir.starts_with('.') {
-            git_dir.join(commondir)
-        } else {
-            PathBuf::from(commondir)
-        }
+        root.join(git_dir)
     };
+    let commondir_path = git_dir.join("commondir");
+    match std::fs::symlink_metadata(&commondir_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some((git_dir, false));
+        }
+        _ => {}
+    }
+    let commondir = read_git_metadata(&commondir_path, GIT_POINTER_MAX_BYTES)?;
+    let commondir = commondir.lines().next()?.trim_end();
+    let common = if commondir.starts_with('.') {
+        git_dir.join(commondir)
+    } else {
+        PathBuf::from(commondir)
+    };
+    Some((common, true))
+}
+
+fn read_repository_exclude(root: &Path) -> Option<String> {
+    let (common, _) = repository_common_dir(root)?;
     read_git_metadata(
         &common.join("info").join("exclude"),
         REPOSITORY_EXCLUDE_MAX_BYTES,
     )
+}
+
+fn exclude_the_walk_misses(root: &Path) -> Option<ignore::gitignore::Gitignore> {
+    let (common, walker_reads_it) = repository_common_dir(root)?;
+    if walker_reads_it {
+        return None;
+    }
+    let contents = read_git_metadata(
+        &common.join("info").join("exclude"),
+        REPOSITORY_EXCLUDE_MAX_BYTES,
+    )?;
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    add_gitignore_contents(
+        &mut builder,
+        Path::new(""),
+        &common.join("info").join("exclude"),
+        &contents,
+    );
+    builder.build().ok().filter(|rules| !rules.is_empty())
 }
 
 pub(crate) fn add_git_excludes(
@@ -3785,6 +3825,40 @@ mod tests {
             builder.build().unwrap().is_empty(),
             "no repository, no git excludes"
         );
+    }
+
+    #[test]
+    fn a_separate_git_dir_without_commondir_supplies_its_own_exclude() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        let git_dir = tmp.path().join("gitdir");
+        let out = crate::process_util::hidden_command("git")
+            .arg("init")
+            .arg("-q")
+            .arg("--separate-git-dir")
+            .arg(&git_dir)
+            .arg(&root)
+            .output()
+            .expect("git init");
+        assert!(out.status.success(), "git init --separate-git-dir failed");
+        assert!(root.join(".git").is_file());
+        assert!(!git_dir.join("commondir").exists());
+        std::fs::write(git_dir.join("info/exclude"), "hidden/\n").unwrap();
+        create_file(&root, "src/a.rs", "fn a() {}\n");
+        create_file(&root, "hidden/b.rs", "fn b() {}\n");
+        let rules = load_gitignore(&root).expect("the git dir exclude was loaded");
+        assert!(
+            rules
+                .matched_path_or_any_parents("hidden/b.rs", false)
+                .is_ignore()
+        );
+        let cold: Vec<String> = discover_files(&root)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.relative_path)
+            .filter(|path| path.ends_with(".rs"))
+            .collect();
+        assert_eq!(cold, ["src/a.rs"]);
     }
 
     #[test]
