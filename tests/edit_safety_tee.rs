@@ -162,7 +162,10 @@ fn set_mtime_days_ago(path: &std::path::Path, days: u64) {
     let target = std::time::SystemTime::now()
         .checked_sub(Duration::from_secs(days * 86_400))
         .unwrap();
-    filetime::set_file_mtime(path, filetime::FileTime::from_system_time(target))
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_modified(target))
         .expect("backdate mtime");
 }
 

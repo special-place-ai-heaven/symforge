@@ -128,9 +128,13 @@ fn analyze_file_impact_renders_the_mcp_answer_for_every_option() {
     let handle = open(&runtime, root.path());
 
     let lib = root.path().join("src/lib.rs");
-    let mtime = filetime::FileTime::from_last_modification_time(&fs::metadata(&lib).unwrap());
+    let mtime = fs::metadata(&lib).unwrap().modified().unwrap();
     fs::write(&lib, LIB_AFTER).unwrap();
-    filetime::set_file_mtime(&lib, mtime).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&lib)
+        .and_then(|f| f.set_modified(mtime))
+        .unwrap();
     let edited = impact(
         &handle,
         FileImpactRequest {

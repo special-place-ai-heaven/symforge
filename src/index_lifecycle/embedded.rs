@@ -3680,11 +3680,11 @@ mod refresh_lifecycle_tests {
         let mtime = shared.read().get_file("lib.rs").unwrap().mtime_secs;
         let final_bytes = b"pub fn freshened_after_reload() {}\n";
         std::fs::write(root.path().join("lib.rs"), final_bytes).unwrap();
-        filetime::set_file_mtime(
-            root.path().join("lib.rs"),
-            filetime::FileTime::from_unix_time(mtime as i64 + 2, 0),
-        )
-        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(root.path().join("lib.rs"))
+            .and_then(|f| f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(mtime + 2)))
+            .unwrap();
 
         let publishing = Arc::clone(&binding);
         BEFORE_OBSERVED_STATE.with(|hook| {
