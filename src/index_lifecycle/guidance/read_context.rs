@@ -442,14 +442,6 @@ pub(crate) fn repo_map_text_scoped(
     path_scope: Option<&str>,
     depth: Option<u32>,
 ) -> String {
-    repo_map_text_scoped_counted(generation, path_scope, depth).0
-}
-
-pub(crate) fn repo_map_text_scoped_counted(
-    generation: &crate::live_index::PublishedGeneration,
-    path_scope: Option<&str>,
-    depth: Option<u32>,
-) -> (String, usize) {
     let scope = path_scope
         .map(|p| p.replace('\\', "/"))
         .map(|p| {
@@ -504,11 +496,8 @@ pub(crate) fn repo_map_text_scoped_counted(
     if let Some(scope) = scope
         && dir_file_counts.is_empty()
     {
-        return (
-            format!(
-                "No entries under {scope} (paths are relative to the project root and case-sensitive); get_repo_map(detail=\"tree\", depth=1) lists the top-level directories."
-            ),
-            0,
+        return format!(
+            "No entries under {scope} (paths are relative to the project root and case-sensitive); get_repo_map(detail=\"tree\", depth=1) lists the top-level directories."
         );
     }
     let (total_files, total_symbols) = match scope {
@@ -550,8 +539,6 @@ pub(crate) fn repo_map_text_scoped_counted(
     }
     // Rows from here on belong to the key-types section.
     let dir_rows_end = lines.len();
-    let mut omitted_key_types = 0;
-    let mut key_type_rows = dir_rows_end..dir_rows_end;
 
     // Key entry points: top-level structs/traits/interfaces/enums in src/ (depth 0, limit 10).
     {
@@ -681,11 +668,9 @@ pub(crate) fn repo_map_text_scoped_counted(
                     // but keeps the order total either way).
                     .then_with(|| a_kind.cmp(b_kind))
             });
-            omitted_key_types = entry_points.len().saturating_sub(15);
             entry_points.truncate(15);
             lines.push(String::new());
             lines.push("Key types:".to_string());
-            let first_key_type_row = lines.len();
             for (kind, name, path) in &entry_points {
                 // Annotate high-fan-in files: `(→N)` iff distinct dependents N>=2.
                 let dep_count = dep_counts.get(path.as_str()).copied().unwrap_or(0);
@@ -695,7 +680,6 @@ pub(crate) fn repo_map_text_scoped_counted(
                     lines.push(format!("  {kind} {name}  ({path})"));
                 }
             }
-            key_type_rows = first_key_type_row..lines.len();
             if entry_points.len() == 15 {
                 lines.push("  ...".to_string());
             }
@@ -731,12 +715,7 @@ pub(crate) fn repo_map_text_scoped_counted(
         }
     }
 
-    let kept = lines.len() - remaining;
-    let cut_rows = dir_rows_end.saturating_sub(kept)
-        + key_type_rows
-            .end
-            .saturating_sub(kept.max(key_type_rows.start));
-    (text, cut_rows + omitted_key_types)
+    text
 }
 
 #[derive(Clone, Copy)]

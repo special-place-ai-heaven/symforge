@@ -1357,13 +1357,11 @@ fn execute_value_on_generation(
                     (text, total, total)
                 }
                 _ => {
-                    let (text, omitted) =
-                        crate::index_lifecycle::guidance::read_context::repo_map_text_scoped_counted(
-                            generation,
-                            input.path.as_deref(),
-                            input.depth,
-                        );
-                    completeness.omitted_rows = omitted;
+                    let text = crate::index_lifecycle::guidance::read_context::repo_map_text_scoped(
+                        generation,
+                        input.path.as_deref(),
+                        input.depth,
+                    );
                     let total = scoped_count as u64;
                     (text, total, total)
                 }

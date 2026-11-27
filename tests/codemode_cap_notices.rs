@@ -152,7 +152,7 @@ fn inspect_match_reports_siblings_past_the_limit() {
 }
 
 #[test]
-fn repo_map_reports_a_budget_cut_compact_map_and_a_capped_full_map() {
+fn repo_map_reports_a_capped_full_map_but_not_a_budget_cut_compact_map() {
     let files: Vec<(String, String)> = (0..200)
         .map(|i| (format!("d{i:03}/f.rs"), format!("pub struct S{i};\n")))
         .collect();
@@ -166,24 +166,16 @@ fn repo_map_reports_a_budget_cut_compact_map_and_a_capped_full_map() {
         r#"
 compact = repo_map()
 full = repo_map(detail="full", max_files=3)
-rows = compact["rendered"].split("\n")
-dirs = len([r for r in rows if r.startswith("  d")])
-types = len([r for r in rows if r.startswith("  struct ")])
-[compact["total_files"], compact["shown_files"], full["total_files"], full["shown_files"], dirs, types]
+[full["total_files"], full["shown_files"], "Omitted at the 1000-token limit" in compact["rendered"]]
 "#,
     );
-    let value = &output["value"];
+    assert_eq!(output["value"], json!([200, 3, true]), "{output}");
     assert_eq!(
-        json!([value[0], value[1], value[2], value[3]]),
-        json!([200, 200, 200, 3]),
+        output["notices"],
+        json!([{"call": 2, "op": "repo_map", "omitted_rows": 197,
+                "withheld_files": 0, "unparsed_files": 0}]),
         "{output}"
     );
-    let shown_rows = value[4].as_u64().unwrap() + value[5].as_u64().unwrap();
-    assert!(value[4].as_u64().unwrap() < 200, "{output}");
-    let notices = output["notices"].as_array().unwrap();
-    assert_eq!(notices.len(), 2, "{output}");
-    assert_eq!(notices[0]["omitted_rows"], 400 - shown_rows, "{output}");
-    assert_eq!(notices[1]["omitted_rows"], 197, "{output}");
 }
 
 #[test]
@@ -338,25 +330,4 @@ plain = symbol_context(path="src/lib.rs", name="small")
         "{output}"
     );
     assert_eq!(output.get("notices"), None, "{output}");
-}
-
-#[test]
-fn compact_repo_map_counts_key_type_rows_cut_inside_their_section() {
-    let types = lines(40, |i| format!("pub struct K{i:02}{};\n", "x".repeat(300)));
-    let repo = repo_with(&[("src/lib.rs", types)]);
-    let output = run(
-        &repo,
-        r#"
-rows = repo_map()["rendered"].split("\n")
-[len([r for r in rows if r.startswith("  src")]), len([r for r in rows if r.startswith("  struct ")])]
-"#,
-    );
-    assert_eq!(output["value"][0], 1, "{output}");
-    let shown_types = output["value"][1].as_u64().unwrap();
-    assert!(shown_types > 0 && shown_types < 15, "{output}");
-    assert_eq!(
-        only_notice(&output, "repo_map")["omitted_rows"],
-        40 - shown_types,
-        "{output}"
-    );
 }
