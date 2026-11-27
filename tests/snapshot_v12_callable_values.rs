@@ -1063,3 +1063,43 @@ async fn parent_rules_restore_exactly_the_cold_file_set() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_nested_repository_keeps_files_the_outer_rules_would_ignore_after_a_restore() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    fs::create_dir_all(root.join("libs/foo/build")).unwrap();
+    git(&root, &["init", "-q"]);
+    git(&root.join("libs/foo"), &["init", "-q"]);
+    fs::write(root.join(".gitignore"), "build/\n").unwrap();
+    write_fixture(
+        &root,
+        &[
+            ("libs/foo/build/gen.ts", "export function gen() {}\n"),
+            ("build/out.ts", "export function out() {}\n"),
+        ],
+    );
+    let cold = file_set(&LiveIndex::load(&root).unwrap());
+    let restored = checkpoint_and_restore(&root, &placement_for(&root)).await;
+    assert_eq!(file_set(&restored), cold);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dot_ignore_re_include_survives_a_restore() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q"]);
+    fs::write(root.join(".gitignore"), "*.gen.ts\n").unwrap();
+    fs::write(root.join(".ignore"), "!keep.gen.ts\n").unwrap();
+    write_fixture(
+        &root,
+        &[
+            ("src/keep.gen.ts", "export function keep() {}\n"),
+            ("src/drop.gen.ts", "export function drop() {}\n"),
+        ],
+    );
+    let cold = file_set(&LiveIndex::load(&root).unwrap());
+    let restored = checkpoint_and_restore(&root, &placement_for(&root)).await;
+    assert_eq!(file_set(&restored), cold);
+}
