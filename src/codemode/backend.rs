@@ -76,9 +76,13 @@ pub struct CodeReadCompleteness {
     pub unparsed_files: usize,
     #[serde(default, skip_serializing_if = "is_false")]
     pub omitted_rows_inexact: bool,
-    /// Subset of `unparsed_files` whose grammar rejected the query or is unsupported.
+    /// Files whose grammar cannot express the query. Informational: they cannot
+    /// hold a match, so they never count as unparsed and never raise a notice alone.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub incompatible_grammar_files: usize,
+    /// Returned rows whose source was cut by a token budget.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub truncated_rows: usize,
 }
 
 fn is_false(flag: &bool) -> bool {
@@ -91,7 +95,10 @@ fn is_zero(count: &usize) -> bool {
 
 impl CodeReadCompleteness {
     pub fn is_empty(&self) -> bool {
-        *self == Self::default()
+        Self {
+            incompatible_grammar_files: 0,
+            ..*self
+        } == Self::default()
     }
 }
 
@@ -665,6 +672,10 @@ fn execute_value_on_generation(
                     ));
                 }
             }
+            completeness.truncated_rows = results
+                .iter()
+                .filter(|row| row.get("truncated") == Some(&Value::Bool(true)))
+                .count();
             Ok(Value::Array(results))
         }
 
@@ -852,7 +863,17 @@ fn execute_value_on_generation(
             let max_per_file = input.max_per_file.unwrap_or(10).clamp(1, 50) as usize;
             let live = &generation.live;
             let Some(target_file) = live.get_file(&norm_path) else {
-                return Ok(Value::Array(Vec::new()));
+                if live
+                    .metadata_only_skipped_paths()
+                    .any(|(path, _)| path == norm_path)
+                {
+                    completeness.withheld_files = 1;
+                    return Ok(Value::Array(Vec::new()));
+                }
+                return Err(CodeBackendError::refusal(
+                    "not_found",
+                    format!("File not in the index: {norm_path}"),
+                ));
             };
             let refuse = search_refusal_predicate(live);
             let mut withheld = withheld_reference_corpus(
@@ -1217,25 +1238,35 @@ fn execute_value_on_generation(
                 &scope,
             );
             let out = match view {
-                SearchFilesView::Found { hits, .. } => hits
-                    .into_iter()
-                    .map(|h| {
-                        let tier = match h.tier {
-                            crate::live_index::query::SearchFilesTier::CoChange => "co_change",
-                            crate::live_index::query::SearchFilesTier::StrongPath => "strong_path",
-                            crate::live_index::query::SearchFilesTier::Basename => "basename",
-                            crate::live_index::query::SearchFilesTier::LoosePath => "loose_path",
-                            crate::live_index::query::SearchFilesTier::MetadataOnly => {
-                                "metadata_only"
-                            }
-                        };
-                        json!({
-                            "path": h.path,
-                            "tier": tier,
-                            "coupling_score": h.coupling_score,
+                SearchFilesView::Found {
+                    hits,
+                    overflow_count,
+                    ..
+                } => {
+                    completeness.omitted_rows = overflow_count;
+                    hits.into_iter()
+                        .map(|h| {
+                            let tier = match h.tier {
+                                crate::live_index::query::SearchFilesTier::CoChange => "co_change",
+                                crate::live_index::query::SearchFilesTier::StrongPath => {
+                                    "strong_path"
+                                }
+                                crate::live_index::query::SearchFilesTier::Basename => "basename",
+                                crate::live_index::query::SearchFilesTier::LoosePath => {
+                                    "loose_path"
+                                }
+                                crate::live_index::query::SearchFilesTier::MetadataOnly => {
+                                    "metadata_only"
+                                }
+                            };
+                            json!({
+                                "path": h.path,
+                                "tier": tier,
+                                "coupling_score": h.coupling_score,
+                            })
                         })
-                    })
-                    .collect(),
+                        .collect()
+                }
                 _ => Vec::new(),
             };
             Ok(Value::Array(out))
@@ -1403,6 +1434,19 @@ fn execute_value_on_generation(
                             .filter(|e| include_tests_flag || !is_test_entry(&e.file_path))
                             .collect();
                     let total_callers = filtered_callers.len();
+                    let section_omitted =
+                        |sec: &crate::live_index::ContextBundleSectionView| -> usize {
+                            sec.overflow_count
+                                + sec
+                                    .entries
+                                    .iter()
+                                    .filter(|e| include_tests_flag || !is_test_entry(&e.file_path))
+                                    .count()
+                                    .saturating_sub(CODE_MODE_SECTION_CAP)
+                        };
+                    completeness.omitted_rows = total_callers.saturating_sub(CODE_MODE_CALLERS_CAP)
+                        + section_omitted(&found.callees)
+                        + section_omitted(&found.type_usages);
                     let callers_json: Vec<Value> = filtered_callers
                         .into_iter()
                         .take(CODE_MODE_CALLERS_CAP)

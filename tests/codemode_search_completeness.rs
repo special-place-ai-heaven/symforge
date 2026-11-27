@@ -205,6 +205,100 @@ empty_counts = search_text(query="absent_target()", structural=True, language="r
     assert!(!output.to_string().contains("unfinished"));
 }
 
+fn notices_for<'a>(output: &'a Value, op: &str) -> Vec<&'a Value> {
+    output["notices"]
+        .as_array()
+        .map(|items| items.iter().filter(|item| item["op"] == op).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn get_symbol_token_cut_is_reported_after_projection() {
+    let repo = fixture();
+    let output = run(
+        &repo,
+        r#"[b["source"] for b in get_symbol(path="src/a.rs", name="witness_a", max_tokens=5)]"#,
+    );
+    assert_eq!(output["value"].as_array().unwrap().len(), 1);
+    let mut expected = notice(1, "get_symbol", 0, 0);
+    expected["truncated_rows"] = json!(1);
+    assert_eq!(output["notices"], json!([expected]));
+}
+
+#[test]
+fn symbol_context_and_search_files_caps_raise_notices() {
+    let repo = fixture();
+    let callers: String = (0..101)
+        .map(|i| format!("pub fn c{i}() {{ crate::target::witness_target(); }}\n"))
+        .collect();
+    fs::write(repo.path().join("src/many.rs"), callers).unwrap();
+    let helpers: String = (0..21).map(|i| format!("fn h{i}() {{}}\n")).collect();
+    let calls: String = (0..21).map(|i| format!("    h{i}();\n")).collect();
+    fs::write(
+        repo.path().join("src/hub.rs"),
+        format!("{helpers}pub fn hub() {{\n{calls}}}\n"),
+    )
+    .unwrap();
+    fs::write(repo.path().join("src/pick_one.rs"), "fn one() {}\n").unwrap();
+    fs::write(repo.path().join("src/pick_two.rs"), "fn two() {}\n").unwrap();
+    let output = run(
+        &repo,
+        r#"
+ctx = symbol_context(path="src/target.rs", name="witness_target")
+hub = symbol_context(path="src/hub.rs", name="hub")
+picks = search_files(query="pick", limit=1)
+{"callers": len(ctx["callers"]), "total": ctx["total_callers"], "callees": len(hub["callees"]), "picks": len(picks)}
+"#,
+    );
+    let value = &output["value"];
+    assert_eq!(value["callers"], 100);
+    assert_eq!(value["callees"], 20);
+    assert_eq!(value["picks"], 1);
+    let contexts = notices_for(&output, "symbol_context");
+    assert_eq!(contexts.len(), 2, "{output}");
+    assert_eq!(
+        contexts[0]["omitted_rows"].as_u64().unwrap(),
+        value["total"].as_u64().unwrap() - 100
+    );
+    assert!(
+        contexts[1]["omitted_rows"].as_u64().unwrap() >= 1,
+        "{output}"
+    );
+    let files = notices_for(&output, "search_files");
+    assert_eq!(files.len(), 1, "{output}");
+    assert_eq!(files[0]["omitted_rows"], 1);
+}
+
+#[test]
+fn find_dependents_never_answers_an_unindexed_target_with_a_bare_empty_list() {
+    let repo = fixture();
+    let big = "// filler line for an oversized data file\n".repeat(30_000);
+    fs::write(repo.path().join("src/big.json"), format!("{{}}\n{big}")).unwrap();
+    let output = run(
+        &repo,
+        r#"
+try:
+    find_dependents(path="src/no_such_file.rs")
+    missing = "returned"
+except Exception as error:
+    missing = str(error)
+big = find_dependents(path="src/big.json")
+{"missing": missing, "big": big}
+"#,
+    );
+    assert!(
+        output["value"]["missing"]
+            .as_str()
+            .unwrap()
+            .contains("not_found"),
+        "{output}"
+    );
+    assert_eq!(output["value"]["big"], json!([]));
+    let deps = notices_for(&output, "find_dependents");
+    assert_eq!(deps.len(), 1, "{output}");
+    assert_eq!(deps[0]["withheld_files"], 1);
+}
+
 #[test]
 fn scalar_and_bare_empty_list_both_keep_notices() {
     let repo = fixture();

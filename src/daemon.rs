@@ -1176,7 +1176,7 @@ fn default_project_freshness() -> FreshnessStatus {
 // Bump when Code Mode read semantics change incompatibly, even at the same
 // package version. Never use this marker to authorize process replacement.
 const CODE_QUERY_REVISION_HEADER: &str = "x-symforge-code-query-revision";
-const CODE_QUERY_REVISION: &str = "2";
+const CODE_QUERY_REVISION: &str = "3";
 
 fn check_code_query_revision(headers: &HeaderMap) -> anyhow::Result<()> {
     let revisions = headers.get_all(CODE_QUERY_REVISION_HEADER);
@@ -8574,8 +8574,8 @@ mod code_query_revision_tests {
             (None, None, Some("missing (legacy peer)"), 0, 0),
             (Some("99"), Some("99"), Some("got 99"), 0, 0),
             (Some("1"), Some("1"), Some("got 1"), 0, 0),
-            (Some("2"), None, Some("missing (legacy peer)"), 2, 2),
-            (Some("2"), Some("2"), None, 2, 2),
+            (Some("3"), None, Some("missing (legacy peer)"), 2, 2),
+            (Some("3"), Some("3"), None, 2, 2),
         ] {
             let home = TempDir::new().unwrap();
             let control = ControlStateDir::new(home.path().to_path_buf());
@@ -8693,9 +8693,9 @@ mod code_query_revision_tests {
             (None, None, None),
             (Some("99"), None, None),
             (Some("1"), None, None),
-            (Some("2"), None, Some(0)),
+            (Some("3"), None, Some(0)),
             (
-                Some("2"),
+                Some("3"),
                 Some(json!({
                     "omitted_rows": 3, "withheld_files": 1, "unparsed_files": 2,
                     "omitted_rows_inexact": true, "incompatible_grammar_files": 1
@@ -8708,7 +8708,7 @@ mod code_query_revision_tests {
                 post(move |headers: HeaderMap| {
                     let completeness = completeness.clone();
                     async move {
-                        assert_eq!(headers.get(REVISION_HEADER).unwrap(), "2");
+                        assert_eq!(headers.get(REVISION_HEADER).unwrap(), "3");
                         let mut body = json!({"status": "ok", "value": [{"line": 5}]});
                         if let Some(completeness) = completeness {
                             body["completeness"] = completeness;
@@ -8740,6 +8740,7 @@ mod code_query_revision_tests {
                         unparsed_files: 2,
                         omitted_rows_inexact: true,
                         incompatible_grammar_files: 1,
+                        truncated_rows: 0,
                     }
                 };
                 assert_eq!(result.completeness, expected);
@@ -8772,8 +8773,8 @@ mod code_query_revision_tests {
             .unwrap();
         let base = format!("http://127.0.0.1:{port}");
         let health = client.get(format!("{base}/health")).send().await.unwrap();
-        assert_eq!(health.headers().get(REVISION_HEADER).unwrap(), "2");
-        for revision in [None, Some("1"), Some("99"), Some("2")] {
+        assert_eq!(health.headers().get(REVISION_HEADER).unwrap(), "3");
+        for revision in [None, Some("1"), Some("99"), Some("3")] {
             let request = client
                 .post(format!("{base}/v1/sessions/not-a-session/code-query"))
                 .bearer_auth(token)
@@ -8784,12 +8785,12 @@ mod code_query_revision_tests {
                 request
             };
             let response = request.send().await.unwrap();
-            if revision == Some("2") {
+            if revision == Some("3") {
                 assert_eq!(response.status(), StatusCode::NOT_FOUND);
                 assert!(response.text().await.unwrap().contains("unknown session"));
             } else {
                 assert_eq!(response.status(), StatusCode::CONFLICT);
-                assert_eq!(response.headers().get(REVISION_HEADER).unwrap(), "2");
+                assert_eq!(response.headers().get(REVISION_HEADER).unwrap(), "3");
                 let message = response.text().await.unwrap();
                 assert!(
                     message.contains("Code Mode daemon protocol mismatch"),
