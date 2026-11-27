@@ -1644,8 +1644,6 @@ pub(crate) fn search_structural_with_admission(
 
 const STRUCTURAL_SEARCH_ROUND: usize = 64;
 const STRUCTURAL_SEARCH_MAX_PATTERN_BYTES: usize = 4 * 1024;
-const STRUCTURAL_SEARCH_MAX_BYTES: usize = 16 * 1024 * 1024;
-const STRUCTURAL_SEARCH_MAX_FILE_BYTES: usize = 1024 * 1024;
 const STRUCTURAL_SEARCH_MAX_FILE_MATCHES: usize = 1024;
 const STRUCTURAL_SEARCH_FILE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
 const STRUCTURAL_SEARCH_ROUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -1749,21 +1747,8 @@ fn search_structural_impl(
         }
     }
 
-    let mut scheduled_bytes = 0;
-    candidates.retain(|&(_, _, bytes)| {
-        if bytes > STRUCTURAL_SEARCH_MAX_FILE_BYTES
-            || bytes > STRUCTURAL_SEARCH_MAX_BYTES - scheduled_bytes
-        {
-            unparsed_files += 1;
-            false
-        } else {
-            scheduled_bytes += bytes;
-            true
-        }
-    });
-
-    // File, byte and match limits are hard; the wall-time budget only controls
-    // starting new rounds. Matcher traversal already in flight can finish.
+    // Per-file parse and match budgets are hard; the wall-time budget only
+    // controls starting new rounds. Matcher traversal already in flight can finish.
     let started = std::time::Instant::now();
     for (round_idx, round) in candidates.chunks(STRUCTURAL_SEARCH_ROUND).enumerate() {
         if total_matches >= options.total_limit
@@ -4727,6 +4712,72 @@ mod tests {
         assert_eq!(result.total_matches, 1);
         assert_eq!(result.files[0].path, "src/zz.rs");
         assert_eq!(result.unparsed_files, 0);
+    }
+
+    #[test]
+    fn structural_matches_ending_on_a_missing_node_are_dropped() {
+        let index = make_index(vec![
+            make_file(
+                "src/partial.rs",
+                "fn intact() { g(); }\nfn unfinished() {\n",
+                vec![],
+            ),
+            make_file(
+                "src/call.rs",
+                "fn ok() { foo(1); }\nfn bad() { foo(a, b\n",
+                vec![],
+            ),
+        ]);
+        let options = TextSearchOptions::default();
+        let fns = search_structural(&index, "fn $N() { $$$ }", &options).unwrap();
+        let fn_rows: Vec<(&str, usize)> = fns
+            .files
+            .iter()
+            .flat_map(|f| f.matches.iter().map(|m| (f.path.as_str(), m.line_number)))
+            .collect();
+        assert_eq!(fn_rows, [("src/call.rs", 1), ("src/partial.rs", 1)]);
+        let calls = search_structural(&index, "foo($$$)", &options).unwrap();
+        let call_rows: Vec<(&str, usize)> = calls
+            .files
+            .iter()
+            .flat_map(|f| f.matches.iter().map(|m| (f.path.as_str(), m.line_number)))
+            .collect();
+        assert_eq!(call_rows, [("src/call.rs", 1)]);
+    }
+
+    #[test]
+    fn structural_search_reaches_files_past_the_old_byte_bounds() {
+        let filler =
+            |bytes: usize| "// filler line for a large source file\n".repeat(bytes / 40 + 1);
+        let mut files = vec![make_file(
+            "src/a_big.rs",
+            &format!("{}fn big() {{ big_witness(); }}\n", filler(1_200_000)),
+            vec![],
+        )];
+        for i in 0..16 {
+            files.push(make_file(
+                &format!("src/b{i:02}.rs"),
+                &filler(1_100_000),
+                vec![],
+            ));
+        }
+        files.push(make_file(
+            "src/c_late.rs",
+            "fn late() { late_witness(); }\n",
+            vec![],
+        ));
+        let index = make_index(files);
+        let options = TextSearchOptions::default();
+        for (pattern, path) in [
+            ("big_witness()", "src/a_big.rs"),
+            ("late_witness()", "src/c_late.rs"),
+        ] {
+            let started = std::time::Instant::now();
+            let result = search_structural(&index, pattern, &options).unwrap();
+            let paths: Vec<&str> = result.files.iter().map(|f| f.path.as_str()).collect();
+            assert_eq!(paths, [path], "{pattern} after {:?}", started.elapsed());
+            assert_eq!(result.unparsed_files, 0, "{pattern}");
+        }
     }
 
     #[test]

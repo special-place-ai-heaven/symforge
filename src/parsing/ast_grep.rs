@@ -205,10 +205,7 @@ fn damaged_byte_ranges(root: tree_sitter::Node<'_>) -> Vec<(usize, usize)> {
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
         if node.is_error() || node.is_missing() {
-            damaged.push((
-                node.start_byte(),
-                node.end_byte().max(node.start_byte() + 1),
-            ));
+            damaged.push((node.start_byte(), node.end_byte()));
         } else if node.has_error() {
             let mut cursor = node.walk();
             pending.extend(node.children(&mut cursor));
@@ -252,9 +249,13 @@ fn structural_search_impl(
         .find_all(&compiled.pattern)
         .filter(|node_match| {
             let range = node_match.range();
-            !damaged
-                .iter()
-                .any(|&(start, end)| start < range.end && range.start < end)
+            !damaged.iter().any(|&(start, end)| {
+                if start == end {
+                    range.start <= start && start <= range.end
+                } else {
+                    start < range.end && range.start < end
+                }
+            })
         })
         .enumerate()
         .map(|(i, node_match)| {
