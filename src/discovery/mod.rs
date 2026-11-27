@@ -1993,19 +1993,28 @@ fn add_enclosing_repository_rules(
             })
             .collect();
         let contents = contents.strip_prefix('\u{feff}').unwrap_or(&contents);
-        for line in contents.lines() {
-            for pattern in descend_gitignore_line(&prefix, line) {
-                if let Err(err) = builder.add_line(Some(file.clone()), &pattern) {
-                    tracing::debug!("failed to load {:?}: {}", file, err);
-                }
+        let Some(patterns) = contents
+            .lines()
+            .map(|line| descend_gitignore_line(&prefix, line))
+            .collect::<Option<Vec<_>>>()
+        else {
+            tracing::debug!(
+                "skipping {:?}: a rule cannot be applied below its directory exactly",
+                file
+            );
+            continue;
+        };
+        for pattern in patterns.into_iter().flatten() {
+            if let Err(err) = builder.add_line(Some(file.clone()), &pattern) {
+                tracing::debug!("failed to load {:?}: {}", file, err);
             }
         }
     }
 }
 
-fn descend_gitignore_line(prefix: &[String], line: &str) -> Vec<String> {
+fn descend_gitignore_line(prefix: &[String], line: &str) -> Option<Vec<String>> {
     if line.starts_with('#') {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let line = if line.ends_with("\\ ") {
         line
@@ -2013,7 +2022,7 @@ fn descend_gitignore_line(prefix: &[String], line: &str) -> Vec<String> {
         line.trim_end()
     };
     if line.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let (negation, pattern) = match line.strip_prefix('!') {
         Some(rest) => ("!", rest),
@@ -2024,7 +2033,7 @@ fn descend_gitignore_line(prefix: &[String], line: &str) -> Vec<String> {
         None => (pattern, ""),
     };
     if !body.contains('/') {
-        return vec![line.to_string()];
+        return Some(vec![line.to_string()]);
     }
     let segments: Vec<&str> = body.strip_prefix('/').unwrap_or(body).split('/').collect();
     let mut seen = std::collections::HashSet::new();
@@ -2049,21 +2058,26 @@ fn descend_gitignore_line(prefix: &[String], line: &str) -> Vec<String> {
                 pending.push((segment + 1, depth));
                 pending.push((segment, depth + 1));
             }
-            Some(glob) if glob_segment_matches(glob, &prefix[depth]) => {
-                pending.push((segment + 1, depth + 1));
+            Some(glob) => {
+                if glob_segment_matches(glob, &prefix[depth])? {
+                    pending.push((segment + 1, depth + 1));
+                }
             }
-            Some(_) => {}
         }
     }
-    descended
+    Some(descended)
 }
 
-fn glob_segment_matches(glob: &str, name: &str) -> bool {
-    globset::GlobBuilder::new(glob)
+fn glob_segment_matches(glob: &str, name: &str) -> Option<bool> {
+    if glob.contains("**") {
+        return None;
+    }
+    let glob = globset::GlobBuilder::new(glob)
         .literal_separator(true)
         .backslash_escape(true)
         .build()
-        .is_ok_and(|glob| glob.compile_matcher().is_match(name))
+        .ok()?;
+    Some(glob.compile_matcher().is_match(name))
 }
 
 fn read_repository_exclude(root: &Path) -> Option<String> {
@@ -3918,23 +3932,56 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let project = prefix(&["project"]);
-        assert_eq!(descend_gitignore_line(&project, "built/"), ["built/"]);
-        assert_eq!(descend_gitignore_line(&project, "/project/a/"), ["/a/"]);
-        assert_eq!(
-            descend_gitignore_line(&project, "!/project/keep.ts"),
-            ["!/keep.ts"]
-        );
-        assert_eq!(descend_gitignore_line(&project, "p*/x"), ["/x"]);
-        assert_eq!(descend_gitignore_line(&project, "**/foo"), ["/**/foo"]);
-        assert!(descend_gitignore_line(&project, "/other/x").is_empty());
-        assert!(descend_gitignore_line(&project, "/project/").is_empty());
-        assert!(descend_gitignore_line(&project, "# /project/a").is_empty());
-        let mut deep = descend_gitignore_line(&prefix(&["a", "b"]), "a/**/b/c");
+        let descend = |prefix: &[String], line: &str| {
+            descend_gitignore_line(prefix, line).expect("translatable")
+        };
+        assert_eq!(descend(&project, "built/"), ["built/"]);
+        assert_eq!(descend(&project, "/project/a/"), ["/a/"]);
+        assert_eq!(descend(&project, "!/project/keep.ts"), ["!/keep.ts"]);
+        assert_eq!(descend(&project, "p*/x"), ["/x"]);
+        assert_eq!(descend(&project, "**/foo"), ["/**/foo"]);
+        assert!(descend(&project, "/other/x").is_empty());
+        assert!(descend(&project, "/project/").is_empty());
+        assert!(descend(&project, "# /project/a").is_empty());
+        let mut deep = descend(&prefix(&["a", "b"]), "a/**/b/c");
         deep.sort();
         assert_eq!(deep, ["/**/b/c", "/c"]);
+        assert_eq!(descend(&prefix(&["a", "c"]), "a/**/b"), ["/**/b"]);
+        assert_eq!(descend_gitignore_line(&project, "pro**ct/x"), None);
+        assert_eq!(descend_gitignore_line(&project, "[proj/x"), None);
         assert_eq!(
-            descend_gitignore_line(&prefix(&["a", "c"]), "a/**/b"),
-            ["/**/b"]
+            descend_gitignore_line(&project, "build/**/x"),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn an_ancestor_rule_file_with_an_untranslatable_line_contributes_no_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let root = repo.join("project");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".gitignore"), "local/\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), "gen/\n").unwrap();
+        let rules = load_gitignore(&root).expect("rules were loaded");
+        assert!(
+            rules
+                .matched_path_or_any_parents("gen/a.ts", false)
+                .is_ignore()
+        );
+
+        std::fs::write(repo.join(".gitignore"), "gen/\n[proj/x\n").unwrap();
+        let rules = load_gitignore(&root).expect("the root's own rules remain");
+        assert!(
+            !rules
+                .matched_path_or_any_parents("gen/a.ts", false)
+                .is_ignore()
+        );
+        assert!(
+            rules
+                .matched_path_or_any_parents("local/a.ts", false)
+                .is_ignore()
         );
     }
 
