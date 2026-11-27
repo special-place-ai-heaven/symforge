@@ -206,7 +206,13 @@ fn prepare(
     ) {
         return Err(EditErrorKind::InvalidReplacement);
     }
-    let prepared = prepare_replace(&file.content, symbol, &request.new_body)
+    let member = crate::edit_safety::structural::list_member(
+        &file.content,
+        &file.language,
+        &file.relative_path,
+        symbol,
+    );
+    let prepared = prepare_replace(&file.content, symbol, &request.new_body, member)
         .map_err(|_| EditErrorKind::StaleContent)?;
     let targets = crate::domain::IndexTargets::for_path(&file.relative_path, Some(&file.language));
     if !matches!(
@@ -253,6 +259,16 @@ fn prepare_structural(
     {
         return Err(EditErrorKind::InvalidReplacement);
     }
+    let member = crate::edit_safety::structural::list_member(
+        &file.content,
+        &file.language,
+        &file.relative_path,
+        symbol,
+    );
+    if matches!(operation, StructuralOperation::Insert(_, _)) {
+        crate::edit_safety::structural::refuse_list_member(member, symbol)
+            .map_err(|_| EditErrorKind::InvalidReplacement)?;
+    }
     let new_content = match operation {
         StructuralOperation::Insert(InsertPosition::Before, content) => {
             crate::edit_safety::structural::build_insert_before(
@@ -265,8 +281,6 @@ fn prepare_structural(
             .map_err(|_| EditErrorKind::InvalidReplacement)?
         }
         StructuralOperation::Insert(InsertPosition::After, content) => {
-            crate::edit_safety::structural::refuse_inline_list_member(&file.content, symbol)
-                .map_err(|_| EditErrorKind::InvalidReplacement)?;
             crate::edit_safety::structural::build_insert_after(
                 &file.content,
                 symbol,
@@ -278,6 +292,7 @@ fn prepare_structural(
             &file.content,
             symbol,
             crate::edit_safety::structural::detect_line_ending(&file.content),
+            member,
         ),
     };
     let targets = crate::domain::IndexTargets::for_path(&file.relative_path, Some(&file.language));

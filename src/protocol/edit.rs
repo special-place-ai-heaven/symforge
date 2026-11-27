@@ -877,8 +877,15 @@ pub(crate) fn execute_batch_edit(
             .iter()
             .map(|&index| {
                 let symbol = &resolved[index].sym;
+                let member = crate::edit_safety::structural::list_member(
+                    &file.content,
+                    &file.language,
+                    path,
+                    symbol,
+                );
                 Ok(match &edits[resolved[index].operation].operation {
                     EditOperation::InsertBefore { .. } => {
+                        crate::edit_safety::structural::refuse_list_member(member, symbol)?;
                         let position = crate::edit_safety::structural::insert_before_position(
                             &file.content,
                             symbol,
@@ -894,6 +901,7 @@ pub(crate) fn execute_batch_edit(
                         crate::edit_safety::structural::SpliceFootprint::Insert(position)
                     }
                     EditOperation::InsertAfter { .. } => {
+                        crate::edit_safety::structural::refuse_list_member(member, symbol)?;
                         crate::edit_safety::structural::SpliceFootprint::Insert(
                             crate::edit_safety::structural::insert_after_position(
                                 &file.content,
@@ -906,6 +914,7 @@ pub(crate) fn execute_batch_edit(
                             &file.content,
                             symbol,
                             line_ending,
+                            member,
                         );
                         crate::edit_safety::structural::SpliceFootprint::Bytes(start, end)
                     }
@@ -915,6 +924,7 @@ pub(crate) fn execute_batch_edit(
                                 &file.content,
                                 symbol,
                                 new_body,
+                                member,
                             )
                             .unwrap_or((symbol.effective_start(), symbol.byte_range.1));
                         crate::edit_safety::structural::SpliceFootprint::Bytes(start, end)
@@ -952,6 +962,12 @@ pub(crate) fn execute_batch_edit(
                 &file.content,
                 &resolved[index].sym,
                 line_ending,
+                crate::edit_safety::structural::list_member(
+                    &file.content,
+                    &file.language,
+                    path,
+                    &resolved[index].sym,
+                ),
             );
             if footprints.iter().enumerate().any(|(other, footprint)| {
                 other != position
@@ -1030,6 +1046,8 @@ pub(crate) fn execute_batch_edit(
         for &ri in indices {
             let r = &resolved[ri];
             let edit = &edits[r.operation];
+            let member =
+                crate::edit_safety::structural::list_member(&content, &language, path, &r.sym);
             match &edit.operation {
                 EditOperation::Replace { new_body } => {
                     let old_bytes = (r.sym.byte_range.1 - r.sym.byte_range.0) as usize;
@@ -1040,8 +1058,12 @@ pub(crate) fn execute_batch_edit(
                         .map(|p| p + 1)
                         .unwrap_or(0);
                     let normalized = normalize_line_endings(new_body.as_bytes(), line_ending);
-                    if crate::edit_safety::structural::inline_list_member(&content, &r.sym) {
-                        content = apply_splice(&content, r.sym.byte_range, &normalized);
+                    if member.is_some() {
+                        content = apply_splice(
+                            &content,
+                            (r.sym.effective_start(), r.sym.byte_range.1),
+                            &normalized,
+                        );
                     } else {
                         let line_start =
                             extend_past_orphaned_docs(&content, raw_line_start, &r.sym) as u32;
@@ -1080,7 +1102,7 @@ pub(crate) fn execute_batch_edit(
                     ));
                 }
                 EditOperation::InsertAfter { content: code } => {
-                    crate::edit_safety::structural::refuse_inline_list_member(&content, &r.sym)?;
+                    crate::edit_safety::structural::refuse_list_member(member, &r.sym)?;
                     content = build_insert_after(&content, &r.sym, code, line_ending);
                     file_summaries.push(super::edit_format::format_insert(
                         path,
@@ -1091,7 +1113,7 @@ pub(crate) fn execute_batch_edit(
                 }
                 EditOperation::Delete => {
                     let deleted = (r.sym.byte_range.1 - r.sym.byte_range.0) as usize;
-                    content = build_delete(&content, &r.sym, line_ending);
+                    content = build_delete(&content, &r.sym, line_ending, member);
                     file_summaries.push(super::edit_format::format_delete(
                         path,
                         &r.sym.name,
@@ -1852,6 +1874,15 @@ pub(crate) fn execute_batch_insert(
             .iter()
             .map(|&ri| {
                 let symbol = &resolved[ri].sym;
+                crate::edit_safety::structural::refuse_list_member(
+                    crate::edit_safety::structural::list_member(
+                        &file.content,
+                        &file.language,
+                        &path,
+                        symbol,
+                    ),
+                    symbol,
+                )?;
                 match input.position {
                     InsertPosition::Before => {
                         let position = crate::edit_safety::structural::insert_before_position(
@@ -1884,10 +1915,6 @@ pub(crate) fn execute_batch_insert(
                     )
                 }
                 InsertPosition::After => {
-                    crate::edit_safety::structural::refuse_inline_list_member(
-                        &content,
-                        &target.sym,
-                    )?;
                     build_insert_after(&content, &target.sym, &input.content, line_ending)
                 }
             };
@@ -2814,7 +2841,7 @@ mod tests {
     fn test_build_delete_removes_symbol_and_trailing_newline() {
         let content = b"fn keep() {}\n\nfn remove() {}\n\nfn also_keep() {}\n";
         let sym = make_test_symbol("remove", SymbolKind::Function, (14, 28), 3);
-        let result = build_delete(content, &sym, LineEnding::Lf);
+        let result = build_delete(content, &sym, LineEnding::Lf, None);
         let text = std::str::from_utf8(&result).unwrap();
         assert!(!text.contains("remove"), "got: {text}");
         assert!(text.contains("keep"), "got: {text}");
@@ -2828,7 +2855,7 @@ mod tests {
         // onto the next one (which would be a compile error).
         let content = b"fn keep() {}\n\n#[test]\nfn remove() {}\n";
         let sym = make_test_symbol("remove", SymbolKind::Function, (22, 36), 4);
-        let result = build_delete(content, &sym, LineEnding::Lf);
+        let result = build_delete(content, &sym, LineEnding::Lf, None);
         let text = std::str::from_utf8(&result).unwrap();
         assert!(
             !text.contains("#[test]"),
@@ -2845,7 +2872,7 @@ mod tests {
     fn test_build_delete_removes_multiple_leading_attributes() {
         let content = b"fn keep() {}\n\n#[cfg(test)]\n#[tokio::test]\nasync fn remove() {}\n";
         let sym = make_test_symbol("remove", SymbolKind::Function, (42, 62), 5);
-        let result = build_delete(content, &sym, LineEnding::Lf);
+        let result = build_delete(content, &sym, LineEnding::Lf, None);
         let text = std::str::from_utf8(&result).unwrap();
         assert!(
             !text.contains("#[cfg(test)]"),
@@ -4225,7 +4252,7 @@ mod tests {
             doc_byte_range: Some((0, 30)),
             item_byte_range: None,
         };
-        let result = build_delete(content, &sym, LineEnding::Lf);
+        let result = build_delete(content, &sym, LineEnding::Lf, None);
         let result_str = String::from_utf8(result).unwrap();
         assert!(
             !result_str.contains("/// Doc line 1"),
@@ -4263,7 +4290,7 @@ mod tests {
             doc_byte_range: None, // blank line prevents attachment
             item_byte_range: None,
         };
-        let result = build_delete(content, &sym, LineEnding::Lf);
+        let result = build_delete(content, &sym, LineEnding::Lf, None);
         let result_str = String::from_utf8(result).unwrap();
         assert!(
             !result_str.contains("/// Batch-inserted marker"),
@@ -4826,7 +4853,7 @@ fn uses_it() { Widget::default(); }
         let content = b"fn keep1() {}\r\n\r\nfn remove() {}\r\n\r\nfn keep2() {}\r\n";
         // "fn remove() {}" occupies bytes 17..31 (exclusive)
         let sym = make_test_symbol("remove", SymbolKind::Function, (17, 31), 3);
-        let result = build_delete(content, &sym, LineEnding::CrLf);
+        let result = build_delete(content, &sym, LineEnding::CrLf, None);
         // No orphan \r (every \r must be followed by \n)
         for (i, &byte) in result.iter().enumerate() {
             if byte == b'\r' {

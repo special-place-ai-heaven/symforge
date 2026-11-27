@@ -414,10 +414,203 @@ async fn an_edit_that_breaks_the_syntax_is_refused_and_not_written() {
                 "{path} {tool}: {text}"
             );
             assert!(
-                text.contains("syntax error; nothing was written")
+                text.contains("syntax error at line ")
+                    && text.contains("nothing was written")
                     && !text.contains("Write mode: committed"),
                 "{path} {tool}: {text}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn declarator_siblings_come_from_the_parse_in_every_mcp_path() {
+    let comma_first = "const a = 1\n  , b = 2;\n";
+    let commented = "const a = 1 /* x */, b = 2;\n";
+    let doc_second = "const a = 1, /** d */ b = 2;\n";
+    let split = "export const a = 1,\n    b = 2;\n";
+    let replace = |name: &str, body: &str| json!({"name": name, "op": "replace", "body": body});
+    let cases: Vec<(&str, &str, Value, String)> = vec![
+        (
+            comma_first,
+            "symforge_edit",
+            replace("a", "a = 9"),
+            "const a = 9\n  , b = 2;\n".into(),
+        ),
+        (
+            comma_first,
+            "delete_symbol",
+            json!({"name": "a"}),
+            "const b = 2;\n".into(),
+        ),
+        (
+            comma_first,
+            "delete_symbol",
+            json!({"name": "b"}),
+            "const a = 1;\n".into(),
+        ),
+        (
+            comma_first,
+            "insert_symbol",
+            json!({"name": "a", "position": "after", "content": "let z = 0;"}),
+            comma_first.into(),
+        ),
+        (
+            commented,
+            "symforge_edit",
+            replace("a", "a = 9"),
+            "const a = 9 /* x */, b = 2;\n".into(),
+        ),
+        (
+            commented,
+            "delete_symbol",
+            json!({"name": "a"}),
+            "const b = 2;\n".into(),
+        ),
+        (
+            commented,
+            "delete_symbol",
+            json!({"name": "b"}),
+            "const a = 1 /* x */;\n".into(),
+        ),
+        (
+            doc_second,
+            "delete_symbol",
+            json!({"name": "b"}),
+            "const a = 1;\n".into(),
+        ),
+        (
+            doc_second,
+            "symforge_edit",
+            replace("b", "/** d */ b = 3"),
+            "const a = 1, /** d */ b = 3;\n".into(),
+        ),
+        (
+            split,
+            "delete_symbol",
+            json!({"name": "b"}),
+            "export const a = 1;\n".into(),
+        ),
+        (
+            split,
+            "delete_symbol",
+            json!({"name": "a"}),
+            "export const b = 2;\n".into(),
+        ),
+        (
+            split,
+            "insert_symbol",
+            json!({"name": "b", "position": "before", "content": "let z = 0;"}),
+            split.into(),
+        ),
+        (
+            split,
+            "batch_edit",
+            json!({"edits": [{"name": "b", "operation": {"type": "delete"}}]}),
+            "export const a = 1;\n".into(),
+        ),
+        (
+            comma_first,
+            "batch_edit",
+            json!({"edits": [{"name": "a", "operation": {"type": "replace", "new_body": "a = 9"}}]}),
+            "const a = 9\n  , b = 2;\n".into(),
+        ),
+        (
+            split,
+            "batch_insert",
+            json!({"position": "before", "content": "let z = 0;", "targets": [{"name": "b"}]}),
+            split.into(),
+        ),
+    ];
+    for path in ["shapes.ts", "shapes.js"] {
+        for (source, tool, args, expected) in &cases {
+            let mut args = args.clone();
+            if tool == &"symforge_edit" {
+                args["path"] = json!(path);
+                args["symbol"] = args["name"].take();
+                args.as_object_mut().unwrap().remove("name");
+                args["apply"] = json!(true);
+            } else if tool == &"batch_edit" {
+                args["edits"][0]["path"] = json!(path);
+            } else if tool == &"batch_insert" {
+                args["targets"][0]["path"] = json!(path);
+            } else {
+                args["path"] = json!(path);
+            }
+            let (root, index) = fixture(path, source);
+            let server = item_server(&root, &index);
+            let (_, text) = call(&server, tool, args.clone()).await;
+            assert_eq!(
+                &std::fs::read_to_string(root.path().join(path)).unwrap(),
+                expected,
+                "{path} {tool} {args}: {text}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_syntax_check_names_the_error_and_spares_broken_files() {
+    let cases = [
+        (
+            "lib.rs",
+            "fn alpha() -> u32 {\n    1\n}\n\nfn beta() {}\n",
+            "fn alpha() -> u32 {\n    (1\n}",
+            "fn alpha() -> u32 {\n    2\n}",
+            "fn beta() {}",
+            "fn beta( {}",
+        ),
+        (
+            "lib.py",
+            "def alpha():\n    return 1\n\n\ndef beta():\n    return 2\n",
+            "def alpha():\n    return (1",
+            "def alpha():\n    return 3",
+            "def beta():\n    return 2\n",
+            "def beta(:\n    return 2\n",
+        ),
+    ];
+    for (path, source, broken, fixed, from, to) in cases {
+        let (root, index) = fixture(path, source);
+        let server = item_server(&root, &index);
+        let replace = |body: &str, dry_run: bool| json!({"path": path, "name": "alpha", "new_body": body, "dry_run": dry_run});
+        let (_, preview) = call(&server, "replace_symbol_body", replace(broken, true)).await;
+        let (_, refused) = call(&server, "replace_symbol_body", replace(broken, false)).await;
+        for text in [&preview, &refused] {
+            assert!(
+                text.contains("syntax error at line ")
+                    && text.contains("nothing was written")
+                    && text.contains("plain text edit"),
+                "{path}: {text}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(path)).unwrap(),
+            source
+        );
+        let (_, preview) = call(&server, "replace_symbol_body", replace(fixed, true)).await;
+        assert!(
+            preview.contains("[DRY RUN] Would replace"),
+            "{path}: {preview}"
+        );
+        let (error, applied) = call(&server, "replace_symbol_body", replace(fixed, false)).await;
+        assert!(!error, "{path}: {applied}");
+        assert!(
+            std::fs::read_to_string(root.path().join(path))
+                .unwrap()
+                .contains(fixed),
+            "{path}: {applied}"
+        );
+
+        let broken_source = source.replacen(from, to, 1);
+        let (root, index) = fixture(path, &broken_source);
+        let server = item_server(&root, &index);
+        let (error, applied) = call(&server, "replace_symbol_body", replace(fixed, false)).await;
+        assert!(!error, "{path}: {applied}");
+        assert!(
+            std::fs::read_to_string(root.path().join(path))
+                .unwrap()
+                .contains(fixed),
+            "{path}: {applied}"
+        );
     }
 }

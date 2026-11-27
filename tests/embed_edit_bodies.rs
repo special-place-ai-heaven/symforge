@@ -587,3 +587,59 @@ fn project_config_trust_mode_is_the_hosts_choice() {
     );
     handle.close().unwrap();
 }
+
+#[test]
+fn embedded_edits_keep_a_split_declaration_intact() {
+    let original = "export const a = 1,\n    b = 2;\n";
+    for path in ["src/a.ts", "src/a.js"] {
+        let files = serde_json::json!({ path: original });
+        let repo = fixture_repo(files.as_object().unwrap());
+        let runtime = ProcessIndexRuntime::acquire().unwrap();
+        let handle = open(&runtime, repo.path());
+        let authority = EditApplyAuthority::for_source_root(
+            fs::canonicalize(repo.path()).unwrap(),
+            "split-declaration-regression".to_string(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let insert = InsertRequest {
+            guard: guard(&handle, path, "b"),
+            position: InsertPosition::Before,
+            content: "let z = 0;".to_string(),
+        };
+        assert!(matches!(
+            handle.apply_insert(&insert, &authority, "split-insert"),
+            Err(EditError::Edit(EditErrorKind::InvalidReplacement))
+        ));
+        let batch = BatchInsertRequest {
+            targets: vec![insert.guard.clone()],
+            position: InsertPosition::Before,
+            content: insert.content.clone(),
+        };
+        assert!(matches!(
+            handle.apply_batch_insert(&batch, &authority, "split-batch-insert"),
+            Err(EditError::Edit(EditErrorKind::InvalidReplacement))
+        ));
+        assert_eq!(
+            fs::read_to_string(repo.path().join(path)).unwrap(),
+            original
+        );
+        let delete = DeleteRequest {
+            guard: guard(&handle, path, "b"),
+        };
+        handle
+            .apply_batch_edit(
+                &BatchEditRequest {
+                    actions: vec![BatchEditAction::Delete(delete)],
+                },
+                &authority,
+                "split-batch-delete",
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(repo.path().join(path)).unwrap(),
+            "export const a = 1;\n"
+        );
+        handle.close().unwrap();
+    }
+}
