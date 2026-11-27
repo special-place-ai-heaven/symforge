@@ -1650,6 +1650,12 @@ const STRUCTURAL_SEARCH_FILE_DEADLINE: std::time::Duration = std::time::Duration
 const STRUCTURAL_SEARCH_ROUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(test)]
+thread_local! {
+    static STRUCTURAL_FILE_DELAY: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+#[cfg(test)]
 fn search_structural_with_compiler(
     index: &LiveIndex,
     pattern: &str,
@@ -1769,6 +1775,8 @@ fn search_structural_impl(
             if started.elapsed() >= round_deadline {
                 return None;
             }
+            #[cfg(test)]
+            std::thread::sleep(STRUCTURAL_FILE_DELAY.with(std::cell::Cell::get));
             let file = index.get_file(path)?;
             let key = (lang, LanguageId::is_tsx_path(path));
             let compiled_pattern = compiled_patterns.get(&key)?.as_ref().ok()?;
@@ -4713,14 +4721,11 @@ mod tests {
 
     #[test]
     fn structural_round_deadline_stops_files_inside_a_round() {
-        let body: String = (0..4000)
-            .map(|i| format!("fn g{i}() {{ let a = b{i} + c; }}\n"))
-            .collect();
         let files = (0..STRUCTURAL_SEARCH_ROUND)
             .map(|i| {
                 make_file(
                     &format!("src/{i:03}.rs"),
-                    &format!("fn f() {{ slow_witness(); }}\n{body}"),
+                    "fn f() { slow_witness(); }\n",
                     vec![],
                 )
             })
@@ -4732,18 +4737,26 @@ mod tests {
             ..Default::default()
         };
         let deadline = std::time::Duration::from_millis(30);
+        STRUCTURAL_FILE_DELAY.with(|delay| delay.set(deadline + deadline / 3));
         let started = std::time::Instant::now();
-        let (result, _) = search_structural_impl(
-            &index,
-            "slow_witness()",
-            &options,
-            None,
-            deadline,
-            crate::parsing::ast_grep::compile_structural_pattern,
-        )
+        let (result, _) = crate::live_index::store::with_serial_oracle(|| {
+            search_structural_impl(
+                &index,
+                "slow_witness()",
+                &options,
+                None,
+                deadline,
+                crate::parsing::ast_grep::compile_structural_pattern,
+            )
+        })
         .unwrap();
         let elapsed = started.elapsed();
-        assert!(result.unparsed_files > 0, "every file ran in {elapsed:?}");
+        STRUCTURAL_FILE_DELAY.with(|delay| delay.set(std::time::Duration::ZERO));
+        assert_eq!(
+            result.total_matches, 1,
+            "only the first file starts in {elapsed:?}"
+        );
+        assert_eq!(result.unparsed_files, STRUCTURAL_SEARCH_ROUND - 1);
         assert_eq!(
             result.total_matches + result.unparsed_files,
             STRUCTURAL_SEARCH_ROUND
