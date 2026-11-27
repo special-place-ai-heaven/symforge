@@ -577,3 +577,159 @@ function unknown() { return <Button onHover={missing} />; }
         ],
     );
 }
+
+#[test]
+fn later_method_names_and_outer_this_never_give_an_exact_method_callback() {
+    check(
+        r#"const key = "x";
+function register() { return () => {}; }
+class StringName {
+    handle() { return 1; }
+    stable() { return 1; }
+    "handle"() { return 0; }
+    bind() {
+        installStringName(this.handle);
+        installStringNameStable(this.stable);
+    }
+}
+class EscapedName {
+    handle() { return 2; }
+    stable() { return 2; }
+    h\u0061ndle() { return 0; }
+    bind() {
+        installEscapedName(this.handle);
+        installEscapedNameStable(this.stable);
+    }
+}
+class ComputedLiteral {
+    handle() { return 3; }
+    stable() { return 3; }
+    ["handle"]() { return 0; }
+    bind() {
+        installComputedLiteral(this.handle);
+        installComputedLiteralStable(this.stable);
+    }
+}
+class ComputedName {
+    handle() { return 4; }
+    stable() { return 4; }
+    [key]() { return 0; }
+    bind() {
+        installComputedName(this.handle);
+        installComputedNameStable(this.stable);
+    }
+}
+class Decorated {
+    handle() { return 5; }
+    stable() { return 5; }
+    @register(this.handle) other() { return 0; }
+    bind() {
+        installDecoratedStable(this.stable);
+    }
+}
+"#,
+        LanguageId::JavaScript,
+        &[
+            "installStringName(this.handle)",
+            "installEscapedName(this.handle)",
+            "installComputedLiteral(this.handle)",
+            "installComputedName(this.handle)",
+            "installComputedNameStable(this.stable)",
+            "register(this.handle)",
+        ],
+        &[
+            (
+                "installStringNameStable(this.stable)",
+                "stable() { return 1; }",
+            ),
+            (
+                "installEscapedNameStable(this.stable)",
+                "stable() { return 2; }",
+            ),
+            (
+                "installComputedLiteralStable(this.stable)",
+                "stable() { return 3; }",
+            ),
+            (
+                "installDecoratedStable(this.stable)",
+                "stable() { return 5; }",
+            ),
+        ],
+    );
+    check(
+        r#"const key = "x";
+function register() { return () => {}; }
+class StringName {
+    handle() { return 1; }
+    stable() { return 1; }
+    "handle"() { return 0; }
+    bind() {
+        installStringName(this.handle);
+        installStringNameStable(this.stable);
+    }
+}
+class EscapedName {
+    handle() { return 2; }
+    stable() { return 2; }
+    h\u0061ndle() { return 0; }
+    bind() {
+        installEscapedName(this.handle);
+        installEscapedNameStable(this.stable);
+    }
+}
+class ComputedLiteral {
+    handle() { return 3; }
+    stable() { return 3; }
+    ["handle"]() { return 0; }
+    bind() {
+        installComputedLiteral(this.handle);
+        installComputedLiteralStable(this.stable);
+    }
+}
+class ComputedName {
+    handle() { return 4; }
+    stable() { return 4; }
+    [key]() { return 0; }
+    bind() {
+        installComputedName(this.handle);
+        installComputedNameStable(this.stable);
+    }
+}
+class Decorated {
+    handle() { return 5; }
+    stable() { return 5; }
+    @register(this.handle) other() { return 0; }
+    bind() {
+        installDecoratedStable(this.stable);
+    }
+}
+"#,
+        LanguageId::TypeScript,
+        &[
+            "installStringName(this.handle)",
+            "installEscapedName(this.handle)",
+            "installComputedLiteral(this.handle)",
+            "installComputedName(this.handle)",
+            "installComputedNameStable(this.stable)",
+            "register(this.handle)",
+        ],
+        &[
+            (
+                "installStringNameStable(this.stable)",
+                "stable() { return 1; }",
+            ),
+            (
+                "installEscapedNameStable(this.stable)",
+                "stable() { return 2; }",
+            ),
+            (
+                "installComputedLiteralStable(this.stable)",
+                "stable() { return 3; }",
+            ),
+            (
+                "installDecoratedStable(this.stable)",
+                "stable() { return 5; }",
+            ),
+        ],
+    );
+}

@@ -415,6 +415,81 @@ fn jsx_attribute_callbacks_are_exact_value_uses_in_tsx_and_jsx() {
 }
 
 #[test]
+fn later_method_names_and_outer_this_never_give_an_exact_method_callback_in_js_and_ts() {
+    let cases: &[(&str, &str, usize)] = &[
+        (
+            "StringName.js",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass StringName {\n    handle() { return 1; }\n    stable() { return 1; }\n    \"handle\"() { return 0; }\n    bind() {\n        installStringName(this.handle);\n        installStringNameStable(this.stable);\n    }\n}\n",
+            1,
+        ),
+        (
+            "StringName.ts",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass StringName {\n    handle() { return 1; }\n    stable() { return 1; }\n    \"handle\"() { return 0; }\n    bind() {\n        installStringName(this.handle);\n        installStringNameStable(this.stable);\n    }\n}\n",
+            1,
+        ),
+        (
+            "EscapedName.js",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass EscapedName {\n    handle() { return 2; }\n    stable() { return 2; }\n    h\\u0061ndle() { return 0; }\n    bind() {\n        installEscapedName(this.handle);\n        installEscapedNameStable(this.stable);\n    }\n}\n",
+            1,
+        ),
+        (
+            "EscapedName.ts",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass EscapedName {\n    handle() { return 2; }\n    stable() { return 2; }\n    h\\u0061ndle() { return 0; }\n    bind() {\n        installEscapedName(this.handle);\n        installEscapedNameStable(this.stable);\n    }\n}\n",
+            1,
+        ),
+        (
+            "ComputedLiteral.js",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass ComputedLiteral {\n    handle() { return 3; }\n    stable() { return 3; }\n    [\"handle\"]() { return 0; }\n    bind() {\n        installComputedLiteral(this.handle);\n        installComputedLiteralStable(this.stable);\n    }\n}\n",
+            1,
+        ),
+        (
+            "ComputedLiteral.ts",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass ComputedLiteral {\n    handle() { return 3; }\n    stable() { return 3; }\n    [\"handle\"]() { return 0; }\n    bind() {\n        installComputedLiteral(this.handle);\n        installComputedLiteralStable(this.stable);\n    }\n}\n",
+            1,
+        ),
+        (
+            "ComputedName.js",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass ComputedName {\n    handle() { return 4; }\n    stable() { return 4; }\n    [key]() { return 0; }\n    bind() {\n        installComputedName(this.handle);\n        installComputedNameStable(this.stable);\n    }\n}\n",
+            0,
+        ),
+        (
+            "ComputedName.ts",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass ComputedName {\n    handle() { return 4; }\n    stable() { return 4; }\n    [key]() { return 0; }\n    bind() {\n        installComputedName(this.handle);\n        installComputedNameStable(this.stable);\n    }\n}\n",
+            0,
+        ),
+        (
+            "Decorated.js",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass Decorated {\n    handle() { return 5; }\n    stable() { return 5; }\n    @register(this.handle) other() { return 0; }\n    bind() {\n        installDecoratedStable(this.stable);\n    }\n}\n",
+            1,
+        ),
+        (
+            "Decorated.ts",
+            "const key = \"x\";\nfunction register() { return () => {}; }\nclass Decorated {\n    handle() { return 5; }\n    stable() { return 5; }\n    @register(this.handle) other() { return 0; }\n    bind() {\n        installDecoratedStable(this.stable);\n    }\n}\n",
+            1,
+        ),
+    ];
+    let files: Vec<_> = cases
+        .iter()
+        .map(|(path, source, _)| (*path, *source))
+        .collect();
+    let (_dir, shared) = build_index(&files);
+    let index = shared.read();
+    let kind = Some(ReferenceKind::ValueUse);
+    let mut wrong = Vec::new();
+    for &(path, _, stable_hits) in cases {
+        for (name, line, expected) in [("handle", 4, 0), ("stable", 5, stable_hits)] {
+            let hits = index
+                .find_exact_references_for_symbol(path, name, None, Some(line), kind)
+                .unwrap_or_else(|error| panic!("{path} {name}: {error}"));
+            if hits.len() != expected {
+                wrong.push(format!("{path} {name}: expected {expected}, got {hits:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
 fn exact_python_class_value_uses_do_not_require_callback_evidence() {
     let path = "model.py";
     let source = "class Model:\n    pass\n\nisinstance(obj, Model)\n";

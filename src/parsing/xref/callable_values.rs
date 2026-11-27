@@ -140,6 +140,12 @@ fn walk(
                                     callable.then_some(definition),
                                     src,
                                 );
+                                let plain = name.kind() == "property_identifier"
+                                    && name.utf8_text(src).is_ok_and(|text| !text.contains('\\'));
+                                if !python && !plain && name.kind() != "private_property_identifier"
+                                {
+                                    block_member_name(&mut methods, class, name, src);
+                                }
                             }
                             if python {
                                 bind(&mut bindings, class, name, None, src);
@@ -1023,6 +1029,13 @@ fn receiver_member<'tree>(
             || matches!(n.kind(), "class_definition" | "class_body")
             || (!python && is_class_field(*n))
     })?;
+    if enclosing.kind() == "method_definition"
+        && enclosing
+            .child_by_field_name("parameters")
+            .is_none_or(|params| value.start_byte() < params.start_byte())
+    {
+        return None;
+    }
     if is_class_field(enclosing)
         && enclosing.child_by_field_name("value").is_none_or(|init| {
             init.start_byte() > value.start_byte() || init.end_byte() < value.end_byte()
