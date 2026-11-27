@@ -906,3 +906,110 @@ async fn doc_commented_member_bodies_land_with_single_indentation() {
         );
     }
 }
+
+#[tokio::test]
+async fn bodies_outside_the_shown_style_keep_the_previous_indentation() {
+    let ts = "export class Box {\n  size(): number {\n    return 1;\n  }\n}\n";
+    let rs =
+        "pub struct Boxy;\n\nimpl Boxy {\n    pub fn size(&self) -> u32 {\n        1\n    }\n}\n";
+    let py = "class Box:\n    def size(self):\n        return 1\n";
+    let decorated = "class Box:\n    @staticmethod\n    def size():\n        return 1\n";
+    let data_class = "class Outer:\n    @dataclass\n    class Point:\n        x: int = 0\n";
+    let cases: &[(&str, &str, &str, &str, &str)] = &[
+        (
+            "box.ts",
+            ts,
+            "size",
+            "  size(): number {\n    return 2;\n  }",
+            "export class Box {\n  size(): number {\n    return 2;\n  }\n}\n",
+        ),
+        (
+            "box.rs",
+            rs,
+            "size",
+            "    pub fn size(&self) -> u32 {\n        2\n    }",
+            "pub struct Boxy;\n\nimpl Boxy {\n    pub fn size(&self) -> u32 {\n        2\n    }\n}\n",
+        ),
+        (
+            "box.py",
+            py,
+            "size",
+            "    def size(self):\n        return 2",
+            "class Box:\n    def size(self):\n        return 2\n",
+        ),
+        (
+            "deco.py",
+            decorated,
+            "size",
+            "@staticmethod\ndef size():\n    return 2",
+            "class Box:\n    @staticmethod\n    def size():\n        return 2\n",
+        ),
+        (
+            "deco2.py",
+            decorated,
+            "size",
+            "def size():\n    return 3",
+            "class Box:\n    def size():\n        return 3\n",
+        ),
+        (
+            "point.py",
+            data_class,
+            "Point",
+            "@dataclass\nclass Point:\n    x: int = 1",
+            "class Outer:\n    @dataclass\n    class Point:\n        x: int = 1\n",
+        ),
+        (
+            "point2.py",
+            data_class,
+            "Point",
+            "class Point:\n    x: int = 2",
+            "class Outer:\n    class Point:\n        x: int = 2\n",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for &(path, source, name, body, expected) in cases {
+        let (root, index) = fixture(path, source);
+        let server = item_server(&root, &index);
+        let (_, text) = call(
+            &server,
+            "replace_symbol_body",
+            json!({"path": path, "name": name, "new_body": body}),
+        )
+        .await;
+        let after = std::fs::read_to_string(root.path().join(path)).unwrap();
+        if after != expected {
+            wrong.push(format!(
+                "{path}: {body:?}\nafter {after:?}\nexpected {expected:?}\n{text}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+}
+
+#[tokio::test]
+async fn a_sole_exported_declarator_pasted_as_shown_is_already_applied() {
+    let path = "alpha.js";
+    let source = "export const alpha = () => {\n  return 1;\n};\n";
+    let (root, index) = fixture(path, source);
+    let backend = LocalCodeBackend::new(
+        index.clone(),
+        Some(root.path().into()),
+        "symbol-spans",
+        None,
+    );
+    let rows = read(&backend, json!({"path": path, "name": "alpha"}));
+    let shown = rows[0]["source"].as_str().unwrap().to_owned();
+    assert_eq!(shown, source.trim_end());
+    let server = item_server(&root, &index);
+    let (_, text) = call(
+        &server,
+        "symforge_edit",
+        json!({"path": path, "symbol": "alpha", "op": "replace", "body": shown, "apply": true}),
+    )
+    .await;
+    assert!(text.contains("Write mode: already_applied"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join(path)).unwrap(),
+        source
+    );
+}

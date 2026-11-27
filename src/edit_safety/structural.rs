@@ -498,13 +498,21 @@ pub(crate) fn indent_replacement(
     indented
 }
 
-fn continuation_indent(text: &[u8]) -> Vec<(&[u8], usize)> {
+fn leads_with_marker(line: &[u8]) -> bool {
+    let line = line.trim_ascii_start();
+    [&b"@"[..], b"///", b"//!", b"/*", b"*", b"#["]
+        .iter()
+        .any(|marker| line.starts_with(marker))
+}
+
+fn nonblank_lines(text: &[u8]) -> impl Iterator<Item = &[u8]> {
     text.split(|&byte| byte == b'\n')
-        .skip(1)
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
         .filter(|line| !line.trim_ascii().is_empty())
-        .map(|line| (line, line.len() - line.trim_ascii_start().len()))
-        .collect()
+}
+
+fn leading_width(line: &[u8]) -> usize {
+    line.len() - line.trim_ascii_start().len()
 }
 
 fn carries_file_indentation(
@@ -513,23 +521,60 @@ fn carries_file_indentation(
     body: &str,
     indent: &[u8],
 ) -> bool {
-    let (start, end) = (
-        symbol.effective_start() as usize,
-        symbol.byte_range.1 as usize,
-    );
+    let mut body_lines = nonblank_lines(body.as_bytes());
+    let Some(first) = body_lines.next() else {
+        return false;
+    };
+    let rest: Vec<&[u8]> = body_lines.collect();
+    let Some(second) = rest.first() else {
+        return false;
+    };
+    if indent.is_empty()
+        || leading_width(first) != 0
+        || !rest.iter().all(|line| line.starts_with(indent))
+    {
+        return false;
+    }
+    let brings_marker = leads_with_marker(first);
+    let start = if brings_marker {
+        symbol.effective_start()
+    } else {
+        symbol.byte_range.0
+    } as usize;
+    let end = symbol.byte_range.1 as usize;
     let Some(current) = file_content.get(start..end) else {
         return false;
     };
-    let new_lines = continuation_indent(body.as_bytes());
-    let new_min = new_lines.iter().map(|(_, width)| *width).min();
-    let current_min = continuation_indent(current)
+    let line_start = file_content[..start]
         .iter()
-        .map(|(_, width)| *width)
-        .min();
-    !indent.is_empty()
-        && new_min.is_some()
-        && new_min == current_min
-        && new_lines.iter().all(|(line, _)| line.starts_with(indent))
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |position| position + 1);
+    let lead = &file_content[line_start..start];
+    if !lead.trim_ascii().is_empty() {
+        return false;
+    }
+    let mut current_lines: Vec<(usize, &[u8])> = Vec::new();
+    for (index, line) in nonblank_lines(current).enumerate() {
+        let width = if index == 0 {
+            lead.len()
+        } else {
+            leading_width(line)
+        };
+        current_lines.push((width, line));
+    }
+    if !brings_marker {
+        let skip = current_lines
+            .iter()
+            .take_while(|(_, line)| leads_with_marker(line))
+            .count();
+        current_lines.drain(..skip);
+    }
+    match current_lines.as_slice() {
+        [(first_width, _), (second_width, _), ..] => {
+            *first_width > 0 && leading_width(second) == *second_width
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn apply_indentation(text: &str, indent: &[u8], line_ending: LineEnding) -> Vec<u8> {
