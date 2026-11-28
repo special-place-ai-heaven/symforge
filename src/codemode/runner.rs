@@ -311,12 +311,16 @@ fn execute_script_inner(
                     Ok(kwargs) => {
                         host_calls += 1;
                         match backend.execute_op_with_completeness(op, kwargs) {
-                            Ok(result) => {
-                                if !result.completeness.is_empty() {
+                            Ok(mut result) => {
+                                result.withheld.retain(|meta| {
+                                    !notices.iter().any(|notice| notice.withheld.contains(meta))
+                                });
+                                if !result.completeness.is_empty() || !result.withheld.is_empty() {
                                     notices.push(super::CodeReadNotice {
                                         call: host_calls,
                                         op,
                                         completeness: result.completeness,
+                                        withheld: result.withheld,
                                     });
                                 }
                                 let val = result.value;
@@ -329,10 +333,23 @@ fn execute_script_inner(
                                     }
                                 }
                             }
-                            Err(backend_err) => ExtFunctionResult::Error(MontyException::new(
-                                ExcType::RuntimeError,
-                                Some(backend_err.to_string()),
-                            )),
+                            Err(mut backend_err) => {
+                                backend_err.withheld.retain(|meta| {
+                                    !notices.iter().any(|notice| notice.withheld.contains(meta))
+                                });
+                                if !backend_err.withheld.is_empty() {
+                                    notices.push(super::CodeReadNotice {
+                                        call: host_calls,
+                                        op,
+                                        completeness: super::CodeReadCompleteness::default(),
+                                        withheld: std::mem::take(&mut backend_err.withheld),
+                                    });
+                                }
+                                ExtFunctionResult::Error(MontyException::new(
+                                    ExcType::RuntimeError,
+                                    Some(backend_err.to_string()),
+                                ))
+                            }
                         }
                     }
                 };

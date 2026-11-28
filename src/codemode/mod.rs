@@ -131,13 +131,15 @@ pub struct ExecuteErrorInfo {
     pub traceback: Option<String>,
 }
 
-/// One incomplete host call. The index is one-based in host-call order.
+/// One incomplete or refused host call. The index is one-based in host-call order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeReadNotice {
     pub call: usize,
     pub op: CodeReadOp,
     #[serde(flatten)]
     pub completeness: CodeReadCompleteness,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld: Vec<crate::protocol::withheld::WithheldMeta>,
 }
 
 /// Structured JSON outcome of one `CodeModeRunner` execution.

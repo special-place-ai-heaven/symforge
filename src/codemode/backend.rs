@@ -21,12 +21,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::catalog::CodeReadOp;
+use crate::index_lifecycle::guidance::withheld::WithheldMeta;
 
 /// Error returned by a [`CodeReadBackend`] when a query is refused or invalid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeBackendError {
     pub kind: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld: Vec<WithheldMeta>,
 }
 
 impl CodeBackendError {
@@ -35,6 +38,7 @@ impl CodeBackendError {
         Self {
             kind: "invalid_request".to_owned(),
             message: message.into(),
+            withheld: Vec::new(),
         }
     }
 
@@ -43,6 +47,7 @@ impl CodeBackendError {
         Self {
             kind: kind.into(),
             message: message.into(),
+            withheld: Vec::new(),
         }
     }
 }
@@ -106,6 +111,7 @@ impl CodeReadCompleteness {
 pub struct CodeReadResult {
     pub value: Value,
     pub completeness: CodeReadCompleteness,
+    pub withheld: Vec<WithheldMeta>,
 }
 
 /// Wire reply returned by `POST /v1/sessions/{session_id}/code-query`.
@@ -116,6 +122,8 @@ pub enum DaemonCodeQueryResponse {
         value: Value,
         #[serde(default, skip_serializing_if = "CodeReadCompleteness::is_empty")]
         completeness: CodeReadCompleteness,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        withheld: Vec<WithheldMeta>,
     },
     Error {
         error: CodeBackendError,
@@ -138,6 +146,7 @@ pub trait CodeReadBackend: Send + Sync {
         self.execute_op(op, kwargs).map(|value| CodeReadResult {
             value,
             completeness: CodeReadCompleteness::default(),
+            withheld: Vec::new(),
         })
     }
 }
@@ -335,6 +344,7 @@ pub fn execute_op_on_generation(
     on_commitment_read: &dyn Fn(&str),
 ) -> Result<CodeReadResult, CodeBackendError> {
     let mut completeness = CodeReadCompleteness::default();
+    let mut withheld = Vec::new();
     let value = execute_value_on_generation(
         op,
         kwargs,
@@ -344,10 +354,20 @@ pub fn execute_op_on_generation(
         project_name,
         on_commitment_read,
         &mut completeness,
-    )?;
+        &mut withheld,
+    )
+    .map_err(|mut error| {
+        for meta in std::mem::take(&mut withheld) {
+            if !error.withheld.contains(&meta) {
+                error.withheld.push(meta);
+            }
+        }
+        error
+    })?;
     Ok(CodeReadResult {
         value,
         completeness,
+        withheld,
     })
 }
 
@@ -361,6 +381,7 @@ fn execute_value_on_generation(
     project_name: &str,
     on_commitment_read: &dyn Fn(&str),
     completeness: &mut CodeReadCompleteness,
+    withheld: &mut Vec<WithheldMeta>,
 ) -> Result<Value, CodeBackendError> {
     // Strip optional caller `project` if present after routing.
     kwargs.remove("project");
@@ -572,7 +593,12 @@ fn execute_value_on_generation(
                     crate::index_lifecycle::guidance::read_gate::normalize_requested_path(
                         &target.path,
                     );
-                if let Some(refusal) = check_secret_or_scope_refusal(&generation.live, &norm_path) {
+                if let Some(refusal) = direct_read_refusal(&generation.live, &norm_path) {
+                    for meta in refusal.withheld {
+                        if !withheld.contains(&meta) {
+                            withheld.push(meta);
+                        }
+                    }
                     results.push(json!({
                         "path": norm_path,
                         "name": target.name.unwrap_or_default(),
@@ -581,7 +607,7 @@ fn execute_value_on_generation(
                         "end_line": 0,
                         "source": Value::Null,
                         "refusal": "policy_withheld",
-                        "withheld_reason": refusal,
+                        "withheld_reason": refusal.message,
                     }));
                     continue;
                 }
@@ -598,21 +624,6 @@ fn execute_value_on_generation(
                     }));
                     continue;
                 };
-                if let Some(refusal) =
-                    check_bytes_admission(&generation.live, &norm_path, &file.content)
-                {
-                    results.push(json!({
-                        "path": norm_path,
-                        "name": target.name.unwrap_or_default(),
-                        "kind": target.kind.unwrap_or_default(),
-                        "start_line": 0,
-                        "end_line": 0,
-                        "source": Value::Null,
-                        "refusal": "policy_withheld",
-                        "withheld_reason": refusal,
-                    }));
-                    continue;
-                }
                 if let Some(sym_name) = target.name.as_deref() {
                     match resolve_symbol_selector(
                         file,
@@ -852,14 +863,8 @@ fn execute_value_on_generation(
             let input: crate::protocol::tools::FindDependentsInput = decode_op_args(op, kwargs)?;
             let norm_path =
                 crate::index_lifecycle::guidance::read_gate::normalize_requested_path(&input.path);
-            if let Some(refusal) = check_secret_or_scope_refusal(&generation.live, &norm_path) {
-                return Err(CodeBackendError::refusal("policy_withheld", refusal));
-            }
-            if let Some(target_file) = generation.live.get_file(&norm_path)
-                && let Some(refusal) =
-                    check_bytes_admission(&generation.live, &norm_path, &target_file.content)
-            {
-                return Err(CodeBackendError::refusal("policy_withheld", refusal));
+            if let Some(refusal) = direct_read_refusal(&generation.live, &norm_path) {
+                return Err(refusal);
             }
             let max_files = input.limit.unwrap_or(20).clamp(1, 100) as usize;
             let max_per_file = input.max_per_file.unwrap_or(10).clamp(1, 50) as usize;
@@ -945,8 +950,8 @@ fn execute_value_on_generation(
             }
             let norm_path =
                 crate::index_lifecycle::guidance::read_gate::normalize_requested_path(&input.path);
-            if let Some(refusal) = check_secret_or_scope_refusal(&generation.live, &norm_path) {
-                return Err(CodeBackendError::refusal("policy_withheld", refusal));
+            if let Some(refusal) = direct_read_refusal(&generation.live, &norm_path) {
+                return Err(refusal);
             }
             let Some(file) = generation.live.get_file(&norm_path) else {
                 return Err(CodeBackendError::refusal(
@@ -954,11 +959,6 @@ fn execute_value_on_generation(
                     format!("File not found: {norm_path}"),
                 ));
             };
-            if let Some(refusal) =
-                check_bytes_admission(&generation.live, &norm_path, &file.content)
-            {
-                return Err(CodeBackendError::refusal("policy_withheld", refusal));
-            }
             let raw_tokens =
                 crate::stel::handler::estimate_tokens_from_bytes(file.content.len() as u64);
             // Build structured outline + imports + consumers directly from IndexedFile & LiveIndex
@@ -1053,28 +1053,29 @@ fn execute_value_on_generation(
             crate::protocol::read_tools::normalize_file_content_aliases(&mut input)
                 .map_err(CodeBackendError::invalid_args)?;
 
-            if let Some(refusal) = check_secret_or_scope_refusal(&generation.live, &input.path) {
-                return Err(CodeBackendError::refusal("policy_withheld", refusal));
+            if let Some(refusal) = direct_read_refusal(&generation.live, &input.path) {
+                return Err(refusal);
             }
             let options = crate::protocol::read_tools::file_content_options_from_input(&input)
                 .map_err(CodeBackendError::invalid_args)?;
 
             let bytes: Vec<u8> = if let Some(file) = generation.live.get_file(&input.path) {
-                if let Some(refusal) =
-                    check_bytes_admission(&generation.live, &input.path, &file.content)
-                {
-                    return Err(CodeBackendError::refusal("policy_withheld", refusal));
-                }
                 file.content.clone()
             } else if let Some(root) = repo_root {
                 let _canon = crate::protocol::edit::safe_repo_path(root, &input.path)
                     .map_err(|msg| CodeBackendError::refusal("invalid_path", msg))?;
-                crate::protocol::read_gate::observe_disk_beneath(
+                let mut metadata = Vec::new();
+                crate::protocol::read_gate::observe_disk_beneath_recording(
                     generation.live.as_ref(),
                     root,
                     &input.path,
+                    &mut |meta| metadata.push(meta),
                 )
-                .map_err(|refusal| CodeBackendError::refusal("policy_withheld", refusal))?
+                .map_err(|message| CodeBackendError {
+                    kind: "policy_withheld".to_string(),
+                    message,
+                    withheld: metadata,
+                })?
             } else {
                 return Err(CodeBackendError::refusal(
                     "not_found",
@@ -1411,14 +1412,8 @@ fn execute_value_on_generation(
                     }
                 }
             };
-            if let Some(refusal) = check_secret_or_scope_refusal(&generation.live, &target_path) {
-                return Err(CodeBackendError::refusal("policy_withheld", refusal));
-            }
-            if let Some(target_file) = generation.live.get_file(&target_path)
-                && let Some(refusal) =
-                    check_bytes_admission(&generation.live, &target_path, &target_file.content)
-            {
-                return Err(CodeBackendError::refusal("policy_withheld", refusal));
+            if let Some(refusal) = direct_read_refusal(&generation.live, &target_path) {
+                return Err(refusal);
             }
             const CODE_MODE_CALLERS_CAP: usize = 100;
             const CODE_MODE_SECTION_CAP: usize = 20;
@@ -1580,14 +1575,8 @@ fn execute_value_on_generation(
             let input: crate::protocol::tools::InspectMatchInput = decode_op_args(op, kwargs)?;
             let norm_path =
                 crate::index_lifecycle::guidance::read_gate::normalize_requested_path(&input.path);
-            if let Some(refusal) = check_secret_or_scope_refusal(&generation.live, &norm_path) {
-                return Err(CodeBackendError::refusal("policy_withheld", refusal));
-            }
-            if let Some(file) = generation.live.get_file(&norm_path)
-                && let Some(refusal) =
-                    check_bytes_admission(&generation.live, &norm_path, &file.content)
-            {
-                return Err(CodeBackendError::refusal("policy_withheld", refusal));
+            if let Some(refusal) = direct_read_refusal(&generation.live, &norm_path) {
+                return Err(refusal);
             }
             match generation.live.capture_inspect_match_view(
                 &norm_path,
@@ -2283,6 +2272,27 @@ fn check_secret_or_scope_refusal(live: &LiveIndex, norm_path: &str) -> Option<St
     crate::index_lifecycle::guidance::read_gate::refuse_by_policy_with(live, norm_path, &mut noop)
 }
 
+/// Direct refusals may gather bounded evidence, but never release refused bytes.
+fn direct_read_refusal(live: &LiveIndex, path: &str) -> Option<CodeBackendError> {
+    use crate::index_lifecycle::guidance::read_gate;
+
+    if let Some(message) = read_gate::hard_scope_refusal(path) {
+        return Some(CodeBackendError::refusal("policy_withheld", message));
+    }
+    let mut withheld = Vec::new();
+    let mut record = |meta| withheld.push(meta);
+    let refusal =
+        read_gate::refuse_by_policy_naming_lines_with(live, path, &mut record).or_else(|| {
+            let file = live.get_file(path)?;
+            read_gate::classify_admitted_bytes_with(live, path, &file.content, &mut record)
+        });
+    refusal.map(|message| CodeBackendError {
+        kind: "policy_withheld".to_string(),
+        message,
+        withheld,
+    })
+}
+
 fn check_bytes_admission(live: &LiveIndex, norm_path: &str, bytes: &[u8]) -> Option<String> {
     let mut noop = |_meta| {};
     crate::index_lifecycle::guidance::read_gate::classify_admitted_bytes_with(
@@ -2416,6 +2426,39 @@ mod refusal_predicate_tests {
     use super::*;
     use crate::domain::{FileDisposition, MetadataOnlyReason};
     use crate::live_index::store::{SnapshotVerifyReport, SnapshotVerifyState};
+
+    #[test]
+    fn direct_refusals_do_not_invent_content_findings_for_path_rules_or_unscanned_files() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join(".env"), "NAME=placeholder\n").unwrap();
+        std::fs::write(repo.path().join("plain.rs"), "fn plain() {}\n").unwrap();
+        let shared = LiveIndex::load(repo.path()).unwrap();
+        let mut live = shared.write();
+        for entry in &mut live.manifest_entries {
+            if entry.path.normalized_utf8.as_deref() == Some("plain.rs") {
+                entry.disposition = FileDisposition::MetadataOnly {
+                    reason: MetadataOnlyReason::SensitiveContent {
+                        rule_ids: vec![crate::knowledge::INDETERMINATE_RULE_ID.to_string()],
+                        finding_count: 0,
+                    },
+                };
+            }
+        }
+        let path = direct_read_refusal(&live, ".env").unwrap();
+        let finding = &path.withheld[0].findings[0];
+        assert!(finding.id.starts_with("path_rule:"));
+        assert_eq!((finding.line_start, finding.line_end), (0, 0));
+        assert!(finding.actions.iter().all(|action| !action.available));
+        let unscanned = direct_read_refusal(&live, "plain.rs").unwrap();
+        assert_eq!(unscanned.withheld.len(), 1);
+        assert!(unscanned.withheld[0].findings.is_empty());
+        assert!(
+            direct_read_refusal(&live, ".git/config")
+                .unwrap()
+                .withheld
+                .is_empty()
+        );
+    }
 
     #[test]
     fn bulk_search_refusal_agrees_with_the_read_gate_for_every_refusal_reason() {

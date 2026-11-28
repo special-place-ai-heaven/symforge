@@ -310,6 +310,7 @@ impl symforge::codemode::CodeReadBackend for CappedBackend {
     ) -> Result<symforge::codemode::CodeReadResult, CodeBackendError> {
         Ok(symforge::codemode::CodeReadResult {
             value: mock_backend(op, kwargs)?,
+            withheld: Vec::new(),
             completeness: symforge::codemode::CodeReadCompleteness {
                 omitted_rows: 7,
                 ..Default::default()

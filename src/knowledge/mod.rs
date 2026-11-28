@@ -7,13 +7,17 @@ pub(crate) mod curation;
 pub(crate) mod curation_contract;
 #[cfg(test)]
 mod f3_admission_tests;
+mod markdown_boundary;
+mod python_lookup;
 pub(crate) mod review;
 pub(crate) mod review_contract;
+mod script_assignment;
 pub(crate) mod search;
 pub(crate) mod search_contract;
 pub mod secret_dismissals;
 pub(crate) mod secret_remediation;
 pub(crate) mod source_scope;
+mod yaml_placeholder;
 
 /// UTF-8 byte-order mark accepted by the v1 searchable-text contract.
 pub const UTF8_BOM: &[u8; 3] = b"\xEF\xBB\xBF";
@@ -68,7 +72,11 @@ pub fn decode_searchable_text(bytes: &[u8]) -> Result<DecodedText<'_>, std::str:
 /// credential keys, so a v6 manifest admits files v7 withholds.
 /// Bumped to 10: invalidate admissions from the candidate v9 Python lookup
 /// exception, which did not establish receiver provenance.
-pub const SECRET_POLICY_VERSION: u32 = 10;
+/// Bumped to 11: syntax-proven Rust boundaries and provenance-checked Python
+/// lookups admit previously withheld code, requiring admissions to be re-scouted.
+/// Bumped to 12: parser-owned YAML flow values and punctuation outside complete
+/// Markdown code spans admit markers that policy 11 mistook for credential text.
+pub const SECRET_POLICY_VERSION: u32 = 12;
 pub const SECRET_SCAN_MAX_BYTES: usize = crate::domain::index::METADATA_ONLY_CODE_BYTES as usize;
 /// The one reserved rule id every [`DetectorFailure`] collapses onto. Public so
 /// the disclosure gate can tell an indeterminate verdict — which a reindex
@@ -229,6 +237,9 @@ pub fn scan_secret_spans(path: &str, bytes: &[u8]) -> SecretSpansScan {
     };
     let scan_path = classify_scan_path(path);
     let (relaxed, rust) = (scan_path.relaxed, scan_path.rust);
+    let source_syntax = std::cell::OnceCell::new();
+    let markdown_boundaries = std::cell::OnceCell::new();
+    let yaml_boundaries = std::cell::OnceCell::new();
     let mut spans = Vec::new();
     for rule in rules {
         if !rule
@@ -256,9 +267,35 @@ pub fn scan_secret_spans(path: &str, bytes: &[u8]) -> SecretSpansScan {
                     .get(0)
                     .map_or(secret.start(), |whole| whole.start()),
             );
+            if rule.id == CONTEXT_ASSIGNMENT_RULE_ID
+                && (yaml_placeholder::placeholder_ends_at_mapping_value(
+                    path,
+                    bytes,
+                    secret.start(),
+                    secret.end(),
+                    &yaml_boundaries,
+                ) || markdown_boundary::placeholder_ends_at_boundary(
+                    path,
+                    bytes,
+                    match_start,
+                    secret.start(),
+                    secret.end(),
+                    &markdown_boundaries,
+                ))
+            {
+                continue;
+            }
             if rule.placeholders_allowed
-                && (is_placeholder(secret.as_bytes())
-                    || is_angle_placeholder(bytes, secret.start(), relaxed.then_some(secret.end())))
+                && (is_placeholder_capture(
+                    bytes,
+                    secret.start()..secret.end(),
+                    scan_path,
+                    &source_syntax,
+                ) || is_angle_placeholder(
+                    bytes,
+                    secret.start(),
+                    relaxed.then_some(secret.end()),
+                ))
             {
                 if right_hand_side_continuation(
                     bytes,
@@ -273,16 +310,19 @@ pub fn scan_secret_spans(path: &str, bytes: &[u8]) -> SecretSpansScan {
                 }
             } else if (rule.id == CONTEXT_ASSIGNMENT_RULE_ID
                 && (assignment_is_code_expression(
+                    path,
                     scan_path,
                     bytes,
                     match_start,
-                    secret.start(),
+                    secret.start()..secret.end(),
                     secret.as_bytes(),
+                    &source_syntax,
                 ) || !assignment_value_looks_like_credential(
                     bytes,
                     match_start,
                     secret.start(),
                     secret.as_bytes(),
+                    scan_path,
                 )))
                 || (rule.id == URI_CREDENTIALS_RULE_ID
                     && uri_credentials_are_placeholder(bytes, secret.start(), secret.end()))
@@ -400,6 +440,19 @@ fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
+fn is_placeholder_name(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn has_placeholder_prefix(value: &[u8]) -> bool {
+    value.get(..5).is_some_and(|prefix| {
+        prefix.eq_ignore_ascii_case(b"your_") || prefix.eq_ignore_ascii_case(b"your-")
+    })
+}
+
 fn is_placeholder(value: &[u8]) -> bool {
     let Ok(value) = std::str::from_utf8(value) else {
         return false;
@@ -423,9 +476,59 @@ fn is_placeholder(value: &[u8]) -> bool {
             | "dummy"
             | "fake"
             | "test-value"
-    ) || normalized.starts_with("your_")
-        || normalized.starts_with("your-")
+    ) || (has_placeholder_prefix(normalized.as_bytes())
+        && is_placeholder_name(normalized.as_bytes()))
         || is_placeholder_only_expression(&normalized)
+}
+
+fn is_placeholder_capture(
+    bytes: &[u8],
+    value_span: std::ops::Range<usize>,
+    scan_path: ScanPath,
+    syntax: &std::cell::OnceCell<AssignmentSyntax>,
+) -> bool {
+    let value = &bytes[value_span.clone()];
+    if is_placeholder(value) {
+        return true;
+    }
+    if !scan_path.rust {
+        return false;
+    }
+    let Some(marker) = value.strip_suffix(b"\\n") else {
+        return false;
+    };
+    if !has_placeholder_prefix(marker) || !is_placeholder_name(marker) {
+        return false;
+    }
+    // A real Rust newline escape ends the marker; literal slash text does not.
+    let AssignmentSyntax::Rust(Some(tree)) =
+        syntax.get_or_init(|| AssignmentSyntax::Rust(parse_rust_assignment_tree(bytes)))
+    else {
+        return false;
+    };
+    let Some(escape) = tree
+        .root_node()
+        .descendant_for_byte_range(value_span.end - 2, value_span.end)
+    else {
+        return false;
+    };
+    if escape.kind() != "escape_sequence"
+        || escape.start_byte() != value_span.end - 2
+        || escape.end_byte() != value_span.end
+    {
+        return false;
+    }
+    let mut node = escape.parent();
+    while let Some(current) = node {
+        if current.kind() == "string_literal"
+            && current.start_byte() < value_span.start
+            && current.end_byte() > value_span.end
+        {
+            return true;
+        }
+        node = current.parent();
+    }
+    false
 }
 
 /// A capture built ONLY of interpolation placeholder groups — one or more, back
@@ -571,6 +674,7 @@ fn assignment_value_looks_like_credential(
     match_start: usize,
     value_start: usize,
     value: &[u8],
+    scan_path: ScanPath,
 ) -> bool {
     if value.is_empty() {
         return false;
@@ -580,7 +684,14 @@ fn assignment_value_looks_like_credential(
         return false;
     }
     if is_natural_language_label(value) {
-        return false;
+        return has_placeholder_prefix(value)
+            && right_hand_side_continuation(
+                bytes,
+                value_start,
+                value_start + value.len(),
+                scan_path.relaxed.then_some(scan_path.rust),
+            )
+            .is_none_or(|from| expression_carries_quoted_payload(bytes, from, false, scan_path));
     }
     true
 }
@@ -780,7 +891,8 @@ fn uri_credentials_are_placeholder(
 /// prose rather than shown: an inline example would itself be a keyword adjacent
 /// to `=` ahead of a payload run, which this rule rightly flags.)
 ///
-/// Config, data, markup and every unrecognized extension stay STRICT:
+/// Config, data, markup and every unrecognized extension stay STRICT except
+/// for exact reference-only assignments in parsed inline JavaScript:
 /// [`crate::domain::LanguageId::is_code_language`] is false for Json, Toml,
 /// Yaml, Markdown, Text, Env, Html, Css and Scss, and `from_path` yields `None`
 /// for anything unknown — including the synthetic labels the visible-field
@@ -801,14 +913,24 @@ fn uri_credentials_are_placeholder(
 /// CLOSING quote as an opening one and inverts quote parity for the whole
 /// window.
 fn assignment_is_code_expression(
+    path: &str,
     scan_path: ScanPath,
     bytes: &[u8],
     match_start: usize,
-    value_start: usize,
+    value_span: std::ops::Range<usize>,
     value: &[u8],
+    source_syntax: &std::cell::OnceCell<AssignmentSyntax>,
 ) -> bool {
+    let (value_start, value_end) = (value_span.start, value_span.end);
     if !scan_path.code {
-        return false;
+        return syntax_proves_no_payload(
+            path,
+            bytes,
+            match_start,
+            value_start,
+            value_end,
+            source_syntax,
+        );
     }
     if separator_is_path_not_assignment(bytes, match_start, value_start, scan_path.relaxed) {
         return true;
@@ -848,6 +970,360 @@ fn assignment_is_code_expression(
             || (relaxed && fixture_and_rest_are_clean(bytes, value_start, value, scan_path));
     }
     !expression_carries_quoted_payload(bytes, value_start, false, scan_path)
+        || (relaxed
+            && syntax_proves_no_payload(
+                path,
+                bytes,
+                match_start,
+                value_start,
+                value_end,
+                source_syntax,
+            ))
+}
+
+enum AssignmentSyntax {
+    Rust(Option<tree_sitter::Tree>),
+    Python(python_lookup::ProvenLookups),
+    Script(script_assignment::ProvenAssignments),
+    Unsupported,
+}
+
+fn parse_rust_assignment_tree(bytes: &[u8]) -> Option<tree_sitter::Tree> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|source| {
+            crate::parsing::parse_source_tree(source, &crate::domain::LanguageId::Rust, false).ok()
+        })
+        .filter(|tree| !tree.root_node().has_error())
+}
+
+fn syntax_proves_no_payload(
+    path: &str,
+    bytes: &[u8],
+    match_start: usize,
+    value_start: usize,
+    value_end: usize,
+    syntax: &std::cell::OnceCell<AssignmentSyntax>,
+) -> bool {
+    use crate::domain::LanguageId;
+    match syntax.get_or_init(|| match LanguageId::from_path(path) {
+        Some(LanguageId::Rust) => AssignmentSyntax::Rust(parse_rust_assignment_tree(bytes)),
+        Some(LanguageId::Python) => {
+            AssignmentSyntax::Python(python_lookup::ProvenLookups::new(path, bytes))
+        }
+        Some(LanguageId::Html) => {
+            AssignmentSyntax::Script(script_assignment::ProvenAssignments::new(bytes))
+        }
+        _ => AssignmentSyntax::Unsupported,
+    }) {
+        AssignmentSyntax::Rust(Some(tree)) => {
+            rust_syntax_proves_no_payload(bytes, tree, match_start, value_start, value_end)
+        }
+        AssignmentSyntax::Python(proof) => proof.contains(match_start, value_start),
+        AssignmentSyntax::Script(proof) => proof.contains(match_start, value_start, value_end),
+        _ => false,
+    }
+}
+
+fn rust_syntax_proves_no_payload(
+    bytes: &[u8],
+    tree: &tree_sitter::Tree,
+    match_start: usize,
+    value_start: usize,
+    value_end: usize,
+) -> bool {
+    let Some(mut node) = tree
+        .root_node()
+        .descendant_for_byte_range(match_start, value_start)
+    else {
+        return false;
+    };
+    // Bound each candidate's work even when many names share one match arm.
+    let mut remaining_nodes = 512_usize;
+    loop {
+        if remaining_nodes == 0 {
+            return false;
+        }
+        remaining_nodes -= 1;
+        let field = match node.kind() {
+            "let_declaration" => "pattern",
+            "field_declaration" => "name",
+            "match_arm" => "pattern",
+            "call_expression"
+                if node
+                    .child_by_field_name("function")
+                    .is_some_and(|function| function.kind() == "scoped_identifier") =>
+            {
+                "function"
+            }
+            _ => {
+                let Some(parent) = node.parent() else {
+                    return false;
+                };
+                node = parent;
+                continue;
+            }
+        };
+        let Some(owner) = node.child_by_field_name(field) else {
+            return false;
+        };
+        if !(owner.start_byte() <= match_start && match_start < owner.end_byte()) {
+            return false;
+        }
+        let boundary = match node.kind() {
+            "match_arm" => owner.end_byte(),
+            "let_declaration" => node
+                .child_by_field_name("value")
+                .map(|value| value.end_byte())
+                .unwrap_or(0),
+            "field_declaration" => node
+                .child_by_field_name("type")
+                .map(|value| value.end_byte())
+                .unwrap_or(0),
+            _ => node.end_byte(),
+        };
+        if !capture_ends_within(bytes, value_start, value_end, boundary) {
+            return false;
+        }
+        let scoped_pattern = node.kind() == "match_arm"
+            && bytes.get(value_start.wrapping_sub(1)) == Some(&b':')
+            && bytes.get(value_start) == Some(&b':');
+        let scoped_call = node.kind() == "call_expression";
+        if scoped_call {
+            let Some(parent) = node.parent() else {
+                return false;
+            };
+            if parent.kind() != "expression_statement"
+                && !(parent.kind() == "let_declaration"
+                    && parent.child_by_field_name("value") == Some(node))
+            {
+                return false;
+            }
+            node = parent;
+        }
+        if !scoped_call
+            && node.kind() == "let_declaration"
+            && !node.child_by_field_name("value").is_some_and(|value| {
+                matches!(
+                    value.kind(),
+                    "identifier" | "scoped_identifier" | "field_expression"
+                )
+            })
+        {
+            return false;
+        }
+        // Grammar boundaries isolate declarations/arms; any payload or opaque tokens fail closed.
+        let mut cursor = node.walk();
+        loop {
+            if remaining_nodes == 0 {
+                return false;
+            }
+            remaining_nodes -= 1;
+            let current = cursor.node();
+            let kind = current.kind();
+            let literal_or_comment = kind.ends_with("_literal") || kind.contains("comment");
+            let proven_macro = kind == "macro_invocation"
+                && scoped_pattern
+                && rust_pattern_macro_is_benign(bytes, current, &mut remaining_nodes);
+            if matches!(kind, "array_expression" | "token_tree")
+                || (kind == "macro_invocation" && !proven_macro)
+            {
+                return false;
+            }
+            if literal_or_comment {
+                let text = &bytes[current.byte_range()];
+                if !scoped_pattern
+                    || if kind.contains("comment") {
+                        !rust_pattern_comment_is_benign(text)
+                    } else {
+                        !rust_pattern_literal_is_benign_fragment(text)
+                    }
+                {
+                    return false;
+                }
+            }
+            if !proven_macro && cursor.goto_first_child() {
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    return true;
+                }
+            }
+        }
+    }
+}
+
+fn capture_ends_within(bytes: &[u8], start: usize, end: usize, boundary: usize) -> bool {
+    start <= end
+        && start < boundary
+        && end <= bytes.len()
+        && (end <= boundary
+            || bytes.get(boundary..end).is_some_and(|tail| {
+                tail.len() <= CONTEXT_ASSIGNMENT_SCAN_BOUND
+                    && tail
+                        .iter()
+                        .all(|byte| matches!(byte, b')' | b']' | b'}' | b',' | b';'))
+            }))
+}
+
+fn rust_pattern_macro_is_benign(
+    bytes: &[u8],
+    node: tree_sitter::Node<'_>,
+    remaining_nodes: &mut usize,
+) -> bool {
+    let mut children = node.walk();
+    let Some(tokens) = node
+        .named_children(&mut children)
+        .find(|child| child.kind() == "token_tree")
+    else {
+        return false;
+    };
+    if tokens.end_byte() - tokens.start_byte() > CONTEXT_ASSIGNMENT_SCAN_BOUND {
+        return false;
+    }
+    let mut material = 0;
+    let mut cursor = tokens.walk();
+    loop {
+        if *remaining_nodes == 0 {
+            return false;
+        }
+        *remaining_nodes -= 1;
+        let current = cursor.node();
+        let kind = current.kind();
+        let text = &bytes[current.byte_range()];
+        let empty_group = kind == "token_tree"
+            && text.len() >= 2
+            && matches!(
+                (text.first(), text.last()),
+                (Some(b'('), Some(b')')) | (Some(b'['), Some(b']')) | (Some(b'{'), Some(b'}'))
+            )
+            && text[1..text.len() - 1].iter().all(u8::is_ascii_whitespace);
+        if kind.contains("comment") || kind == "macro_invocation" {
+            return false;
+        }
+        if kind == "identifier" || kind.ends_with("_literal") {
+            if kind != "identifier" && !rust_pattern_literal_is_benign_fragment(text) {
+                return false;
+            }
+            material += text.len();
+            if material >= CONTEXT_ASSIGNMENT_MIN_PAYLOAD {
+                return false;
+            }
+        } else if current.child_count() == 0
+            && !empty_group
+            && !text.iter().all(|byte| {
+                (byte.is_ascii_punctuation() || byte.is_ascii_whitespace())
+                    && !matches!(byte, b'[' | b']')
+            })
+        {
+            return false;
+        }
+        if !empty_group && cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return true;
+            }
+        }
+    }
+}
+
+fn rust_pattern_literal_is_benign_fragment(text: &[u8]) -> bool {
+    if text.len() > CONTEXT_ASSIGNMENT_SCAN_BOUND {
+        return false;
+    }
+    let text = text.strip_prefix(b"b").unwrap_or(text);
+    let text = text.strip_prefix(b"r").unwrap_or(text);
+    let hashes = text.iter().take_while(|byte| **byte == b'#').count();
+    let text = &text[hashes..];
+    let Some(quote @ (b'"' | b'\'')) = text.first().copied() else {
+        return false;
+    };
+    let Some(end) = text.len().checked_sub(hashes + 1) else {
+        return false;
+    };
+    if end < 1 || text.get(end) != Some(&quote) || !text[end + 1..].iter().all(|byte| *byte == b'#')
+    {
+        return false;
+    }
+    let content = &text[1..end];
+    content.iter().all(u8::is_ascii_punctuation)
+        && (content.len() < CONTEXT_ASSIGNMENT_MIN_PAYLOAD
+            || structural_path_regex_fragment(content))
+}
+
+fn structural_path_regex_fragment(content: &[u8]) -> bool {
+    let (mut index, mut depth) = (0, 0_u32);
+    let (mut group, mut wildcard, mut needs_atom, mut quantifiable) = (false, false, true, false);
+    while index < content.len() {
+        match content[index] {
+            b'(' if content[index..].starts_with(b"(?:") => {
+                depth += 1;
+                group = true;
+                needs_atom = true;
+                quantifiable = false;
+                index += 2;
+            }
+            b')' if depth > 0 && !needs_atom => {
+                depth -= 1;
+                quantifiable = true;
+            }
+            b'|' if depth > 0 && !needs_atom => {
+                needs_atom = true;
+                quantifiable = false;
+            }
+            byte @ (b'.' | b'/') => {
+                wildcard |= byte == b'.';
+                needs_atom = false;
+                quantifiable = true;
+            }
+            b'*' | b'?' if quantifiable => quantifiable = false,
+            _ => return false,
+        }
+        index += 1;
+    }
+    depth == 0 && group && wildcard && !needs_atom
+}
+
+fn rust_pattern_comment_is_benign(text: &[u8]) -> bool {
+    if text.len() > CONTEXT_ASSIGNMENT_SCAN_BOUND
+        || !text.is_ascii()
+        || span_fences_payload(text)
+        || text
+            .split(|byte| !byte.is_ascii_alphanumeric())
+            .any(|word| {
+                word.len() >= CONTEXT_ASSIGNMENT_MIN_PAYLOAD && !comparand_reads_as_word(word)
+            })
+    {
+        return false;
+    }
+    let mut index = 0;
+    while index < text.len() {
+        let quote = text[index];
+        if !matches!(quote, b'"' | b'\'' | b'`') {
+            index += 1;
+            continue;
+        }
+        let Some(close) = unescaped_delimiter_after(text, index + 1, quote) else {
+            if quote == b'\'' {
+                index += 1;
+                continue;
+            }
+            return false;
+        };
+        let content = &text[index + 1..close];
+        if content.len() >= CONTEXT_ASSIGNMENT_MIN_PAYLOAD
+            && content
+                .iter()
+                .any(|byte| !byte.is_ascii_punctuation() && !byte.is_ascii_whitespace())
+        {
+            return false;
+        }
+        index = close + 1;
+    }
+    true
 }
 
 fn fixture_and_rest_are_clean(
@@ -1479,6 +1955,9 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
     let mut findings: Vec<SecretFindingDescriptor> = Vec::new();
     let scan_path = classify_scan_path(path);
     let (relaxed, rust) = (scan_path.relaxed, scan_path.rust);
+    let source_syntax = std::cell::OnceCell::new();
+    let markdown_boundaries = std::cell::OnceCell::new();
+    let yaml_boundaries = std::cell::OnceCell::new();
     for rule in rules {
         if !rule
             .keywords
@@ -1512,9 +1991,35 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
                     .get(0)
                     .map_or(secret.start(), |whole| whole.start()),
             );
+            if rule.id == CONTEXT_ASSIGNMENT_RULE_ID
+                && (yaml_placeholder::placeholder_ends_at_mapping_value(
+                    path,
+                    bytes,
+                    secret.start(),
+                    secret.end(),
+                    &yaml_boundaries,
+                ) || markdown_boundary::placeholder_ends_at_boundary(
+                    path,
+                    bytes,
+                    match_start,
+                    secret.start(),
+                    secret.end(),
+                    &markdown_boundaries,
+                ))
+            {
+                continue;
+            }
             if rule.placeholders_allowed
-                && (is_placeholder(secret.as_bytes())
-                    || is_angle_placeholder(bytes, secret.start(), relaxed.then_some(secret.end())))
+                && (is_placeholder_capture(
+                    bytes,
+                    secret.start()..secret.end(),
+                    scan_path,
+                    &source_syntax,
+                ) || is_angle_placeholder(
+                    bytes,
+                    secret.start(),
+                    relaxed.then_some(secret.end()),
+                ))
             {
                 // The CAPTURE is a placeholder — but that exempts the capture,
                 // not the expression it sits in. A placeholder in one operand
@@ -1536,16 +2041,19 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
                 }
             } else if (rule.id == CONTEXT_ASSIGNMENT_RULE_ID
                 && (assignment_is_code_expression(
+                    path,
                     scan_path,
                     bytes,
                     match_start,
-                    secret.start(),
+                    secret.start()..secret.end(),
                     secret.as_bytes(),
+                    &source_syntax,
                 ) || !assignment_value_looks_like_credential(
                     bytes,
                     match_start,
                     secret.start(),
                     secret.as_bytes(),
+                    scan_path,
                 )))
                 || (rule.id == URI_CREDENTIALS_RULE_ID
                     && uri_credentials_are_placeholder(bytes, secret.start(), secret.end()))

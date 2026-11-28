@@ -186,6 +186,130 @@ fn exact_same_file_callbacks_follow_the_selected_declaration() {
 }
 
 #[test]
+fn collection_callbacks_are_exact_reads_in_python_javascript_and_typescript() {
+    let python = r#"def callback(): pass
+items = [callback]  # hit
+items2 = (callback,)  # hit
+items3 = {callback}  # hit
+implicit_tuple = callback,  # hit
+items4 = [{"event": (callback,)}]  # hit
+consume([callback])  # hit
+def shadowed(callback):
+    return [callback]
+def unpacked(values):
+    [callback] = values
+    return [callback]
+def rebound():
+    callback = None
+    return [callback]
+def loop(values):
+    for callback in values:
+        consume([callback])
+comprehension = [[callback] for callback in values]
+set_comprehension = {tuple([callback]) for callback in values}
+dict_comprehension = {key: [callback] for callback in values}
+generator = ([callback] for callback in values)
+unknown = [missing]
+"#;
+    let js = r#"export function callback() {}
+const items = [callback]; // hit
+const nested = [{event: [callback]}]; // hit
+consume([callback]); // hit
+function defaulted([value] = [callback]) { return value; } // hit
+function shadowed(callback) { return [callback]; }
+function unpacked([callback]) { return [callback]; }
+function rebound() { let callback = () => {}; callback = null; return [callback]; }
+const unknown = [missing];
+"#;
+    let imported_python =
+        python.replacen("def callback(): pass", "from .provider import callback", 1);
+    let imported_js = js.replacen(
+        "export function callback() {}",
+        "import { callback } from './provider.js';",
+        1,
+    );
+    let files = [
+        ("local.py", python),
+        ("pkg/provider.py", "def callback(): pass\n"),
+        ("pkg/consumer.py", imported_python.as_str()),
+        ("local.js", js),
+        ("local.ts", js),
+        ("web/provider.js", "export function callback() {}\n"),
+        ("web/consumer.js", imported_js.as_str()),
+        ("web/consumer.ts", imported_js.as_str()),
+    ];
+    let (_dir, shared) = build_index(&files);
+    let index = shared.read();
+    for (provider, consumers) in [
+        ("local.py", vec![files[0]]),
+        ("pkg/provider.py", vec![files[2]]),
+        ("local.js", vec![files[3]]),
+        ("local.ts", vec![files[4]]),
+        ("web/provider.js", vec![files[6], files[7]]),
+    ] {
+        let mut expected = Vec::new();
+        for (path, source) in consumers {
+            let mut offset = 0;
+            for (line, text) in source.split_inclusive('\n').enumerate() {
+                if text.contains("# hit") || text.contains("// hit") {
+                    let start = (offset + text.find("callback").unwrap()) as u32;
+                    expected.push((path, (start, start + 8), (line as u32, line as u32)));
+                }
+                offset += text.len();
+            }
+        }
+        let hits = index
+            .find_exact_references_for_symbol(
+                provider,
+                "callback",
+                None,
+                Some(1),
+                Some(ReferenceKind::ValueUse),
+            )
+            .unwrap();
+        let mut actual: Vec<_> = hits
+            .iter()
+            .map(|(path, reference)| (*path, reference.byte_range, reference.line_range))
+            .collect();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected, "{provider}");
+    }
+}
+
+#[test]
+fn collection_method_callbacks_keep_receiver_resolution() {
+    let python = "class Worker:\n    def handle(self): pass\n    def bind(self):\n        return [self.handle, other.handle]\n";
+    let js = "class Worker { handle() {} bind() { return [this.handle, other.handle]; } }";
+    let (_dir, shared) =
+        build_index(&[("worker.py", python), ("worker.js", js), ("worker.ts", js)]);
+    let index = shared.read();
+    for path in ["worker.py", "worker.js", "worker.ts"] {
+        let hits = index
+            .find_exact_references_for_symbol(
+                path,
+                "handle",
+                None,
+                None,
+                Some(ReferenceKind::ValueUse),
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{path}: {hits:?}");
+        assert_eq!(hits[0].1.qualified_name.as_deref(), Some("Worker.handle"));
+    }
+}
+
+#[test]
+fn collection_candidates_preserve_existing_free_comprehension_arguments() {
+    let source = "def callback(): pass\n[consume(callback) for item in items]\n[[callback] for callback in values]\n";
+    let (_dir, shared) = build_index(&[("sample.py", source)]);
+    let index = shared.read();
+    let hits = index.find_references_for_name("callback", Some(ReferenceKind::ValueUse), false);
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].1.line_range, (1, 1));
+}
+
+#[test]
 fn exact_method_callbacks_survive_only_writes_to_other_decoded_keys() {
     let decoded = "class Worker {\n    handle() {}\n    stable() {}\n    bind(fn) {\n        this[\"h\\u0061ndle\"] = fn;\n        install(this.handle);\n        install(this.stable);\n    }\n}\n";
     let opaque = "class Worker {\n    handle() {}\n    stable() {}\n    bind(key, fn) {\n        this[key] = fn;\n        install(this.handle);\n        install(this.stable);\n    }\n}\n";
