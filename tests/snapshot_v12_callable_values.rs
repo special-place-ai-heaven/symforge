@@ -27,6 +27,7 @@ export function makeId(prefix: string): string {
 
 /** Trims a label. */
 export const formatLabel = (value: string): string => value.trim();
+export const handlers = [makeId];
 "#,
     ),
     (
@@ -37,6 +38,7 @@ export function wire(register: (fn: unknown) => void): void {
     register(formatLabel);
     register(makeId);
 }
+export const handlers = [formatLabel, makeId];
 "#,
     ),
     (
@@ -65,6 +67,7 @@ export function View() {
         this["h\u0061ndle"] = fn;
         install(this.handle);
         install(this.stable);
+        const handlers = [this.stable];
     }
 }
 
@@ -74,6 +77,14 @@ function install(callback) {
 
 export { Worker, install };
 "#,
+    ),
+    (
+        "pkg/provider.py",
+        "def callback(): pass\nhandlers = [callback]\n",
+    ),
+    (
+        "pkg/consumer.py",
+        "from .provider import callback\nhandlers = [callback]\n",
     ),
 ];
 
@@ -198,6 +209,7 @@ fn answers(index: &LiveIndex) -> Answers {
             ("src/widgets.tsx", "Panel"),
             ("src/worker.js", "handle"),
             ("src/worker.js", "stable"),
+            ("pkg/provider.py", "callback"),
         ]
         .into_iter()
         .map(|(path, name)| (path, name, exact(index, path, name)))
@@ -214,7 +226,7 @@ fn value_use_from(sites: &[Site], path: &str, line: u32) -> bool {
 }
 
 #[test]
-fn a_format_11_snapshot_is_preserved_and_never_restored() {
+fn prior_callback_snapshots_are_preserved_and_never_restored() {
     let (dir, placement) = fixture();
     let fresh = LiveIndex::load(dir.path()).unwrap();
     persist::checkpoint_shared_index(&fresh, dir.path(), &placement).expect("checkpoint");
@@ -223,7 +235,7 @@ fn a_format_11_snapshot_is_preserved_and_never_restored() {
     let decode = || -> IndexSnapshot {
         postcard::from_bytes(&current[..current.len() - 32]).expect("current payload decodes")
     };
-    assert_eq!(decode().version, 12);
+    assert_eq!(decode().version, 13);
     let labelled = |version: u32| {
         let mut snapshot = decode();
         snapshot.version = version;
@@ -234,23 +246,25 @@ fn a_format_11_snapshot_is_preserved_and_never_restored() {
         bytes
     };
 
-    let current_label = labelled(12);
+    let current_label = labelled(13);
     fs::write(&snapshot_path, &current_label).unwrap();
     let restored = persist::load_snapshot(dir.path(), &placement)
-        .expect("the same payload labelled 12 restores");
+        .expect("the same payload labelled 13 restores");
     assert_eq!(restored.files.len(), FIXTURE.len());
 
-    let prior_label = labelled(11);
-    fs::write(&snapshot_path, &prior_label).unwrap();
-    assert!(
-        persist::load_snapshot(dir.path(), &placement).is_none(),
-        "a format-11 snapshot must not restore under format 12"
-    );
-    assert_eq!(
-        fs::read(&snapshot_path).ok().as_deref(),
-        Some(prior_label.as_slice()),
-        "the format-11 original stays in place for rollback"
-    );
+    for version in [11, 12] {
+        let prior_label = labelled(version);
+        fs::write(&snapshot_path, &prior_label).unwrap();
+        assert!(
+            persist::load_snapshot(dir.path(), &placement).is_none(),
+            "a format-{version} snapshot must not restore under format 13"
+        );
+        assert_eq!(
+            fs::read(&snapshot_path).ok().as_deref(),
+            Some(prior_label.as_slice()),
+            "the format-{version} original stays in place for rollback"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -285,6 +299,18 @@ async fn a_restored_snapshot_answers_like_a_fresh_parse() {
         value_use_from(&expected.exact[4].2, "src/worker.js", 6),
         "{expected:?}"
     );
+    for (query, path, line) in [
+        (0, "src/handlers.ts", 6),
+        (1, "src/handlers.ts", 6),
+        (4, "src/worker.js", 7),
+        (5, "pkg/provider.py", 1),
+        (5, "pkg/consumer.py", 1),
+    ] {
+        assert!(
+            value_use_from(&expected.exact[query].2, path, line),
+            "{expected:?}"
+        );
+    }
     assert!(
         expected.dependents.iter().any(|s| s.0 == "src/handlers.ts"),
         "{expected:?}"

@@ -53,7 +53,8 @@ use crate::domain::ParseDiagnostic;
 // Format 11 appends a SHA-256 checksum covering every serialized snapshot field.
 // Format 12 requires a fresh parse: serialized JSX/callable xrefs and JS/TS
 // symbol item ranges changed even though the postcard field layout did not.
-const CURRENT_VERSION: u32 = 12;
+// Format 13 reparses collection callback references absent from format 12.
+const CURRENT_VERSION: u32 = 13;
 
 /// The on-disk snapshot format version this engine writes and restores
 /// (embed `engine_info` reporting; a mismatched snapshot fails soft to a
@@ -8799,7 +8800,7 @@ mod tests {
     #[test]
     fn test_persist_format_version_is_pinned() {
         assert_eq!(
-            CURRENT_VERSION, 12,
+            CURRENT_VERSION, 13,
             "persist format version changed — a format bump breaks every existing \
              user's .symforge/index.bin and requires orchestrator approval"
         );
@@ -11466,24 +11467,24 @@ mod tests {
     const CALLABLE_PROBE_FIXTURE: &[(&str, &str)] = &[
         (
             "facts-probe/util.ts",
-            "export function makeId(p: string): string { return p; }\nexport const label = (v: string) => v.trim();\n",
+            "export function makeId(p: string): string { return p; }\nexport const label = (v: string) => v.trim();\nexport const handlers = [makeId];\n",
         ),
         (
             "facts-probe/handlers.ts",
-            "import { label, makeId } from \"./util\";\nexport function wire(r: (f: unknown) => void) { r(label); r(makeId); }\n",
+            "import { label, makeId } from \"./util\";\nexport function wire(r: (f: unknown) => void) { r(label); r(makeId); }\nconst handlers = [label, makeId];\n",
         ),
         ("facts-probe/pkg/__init__.py", ""),
         (
             "facts-probe/pkg/a.py",
-            "def handler():\n    pass\n\n\nclass Thing:\n    pass\n",
+            "def handler():\n    pass\n\n\nclass Thing:\n    pass\n\nhandlers = [handler]\n",
         ),
         (
             "facts-probe/pkg/b.py",
-            "from .a import handler, Thing\n\n\ndef run():\n    register(handler)\n    make(Thing)\n",
+            "from .a import handler, Thing\n\n\ndef run():\n    register(handler)\n    make(Thing)\n\nhandlers = [handler]\n",
         ),
         (
             "facts-probe/w.js",
-            "import { makeId } from \"./util\";\nexport function go() { install(makeId); }\n",
+            "import { makeId } from \"./util\";\nexport function go() { install(makeId); }\nconst handlers = [makeId];\n",
         ),
     ];
 
@@ -11564,6 +11565,36 @@ mod tests {
         assert!(first.len() > 64);
         for _ in 0..4 {
             assert_eq!(encode(), first);
+        }
+    }
+
+    #[test]
+    fn format_12_collection_references_force_a_cold_reparse() {
+        let tmp = TempDir::new().unwrap();
+        write_callable_probe_fixture(tmp.path());
+        let fresh = LiveIndex::load(tmp.path()).unwrap();
+        serialize_index(&fresh.read(), tmp.path()).unwrap();
+        let mut legacy = load_snapshot(tmp.path()).unwrap();
+        legacy.version = 12;
+        for file in legacy.files.values_mut() {
+            file.references
+                .retain(|reference| reference.kind != crate::domain::ReferenceKind::ValueUse);
+        }
+        legacy.callable_values = Some(
+            crate::live_index::callable_values::PersistedCallableValues::capture(&HashMap::new()),
+        );
+        let bytes = encode_snapshot(&legacy).unwrap();
+        let snapshot_path = tmp.path().join(".symforge").join("index.bin");
+        std::fs::write(&snapshot_path, &bytes).unwrap();
+
+        assert!(load_snapshot(tmp.path()).is_none(), "format 12 is stale");
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), bytes);
+        let rebuilt = LiveIndex::load(tmp.path()).unwrap();
+        let fresh = fresh.read();
+        let rebuilt = rebuilt.read();
+        assert_eq!(rebuilt.callable_values, fresh.callable_values);
+        for (path, file) in &fresh.files {
+            assert_eq!(rebuilt.files[path].references, file.references, "{path}");
         }
     }
 
@@ -11652,7 +11683,7 @@ mod tests {
     }
 
     #[test]
-    fn a_format_12_snapshot_without_the_facts_field_is_refused_softly() {
+    fn a_current_snapshot_without_the_facts_field_is_refused_softly() {
         let tmp = TempDir::new().unwrap();
         write_callable_probe_fixture(tmp.path());
         let fresh = LiveIndex::load(tmp.path()).unwrap();

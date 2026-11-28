@@ -396,7 +396,7 @@ f273b4114c254d900814a55d00beb2003a2621e70e56df3ae98d824dc0045ba6  live_index/kno
 
 31c8bdec782769fd3ac350aff34a56a62f015c05abcdda9da4ba40eca26622b1  live_index/mod.rs
 
-ade7f504f0c56acfa592b3cc0cca0c6ab8a1aae27acaa68b07ccfffc70ea88f2  live_index/persist.rs
+4820ed85be479233903fcbafab8b435819506069969cdfc0ab5cdabc8f28d949  live_index/persist.rs
 
 e9bded0e817f58d773b483af7d58856c956096eb8f4ff71130bd3e47d7b3208f  live_index/qualified_usages.rs
 
@@ -490,7 +490,7 @@ e91318cd37319b48c3c87f95f6a6025069fdf301968e2c8fcee096c55c604091  parsing/resolv
 
 cc5911789c2b61f9fa5574b62f84f6653574d2cd109eeb891c20a30c0630f74b  parsing/xref.rs
 
-f439bc35f05d365ecc5493058da3dc5b41d2717e10ef803d495a7910ae1cb749  parsing/xref/callable_values.rs
+374f930b5a2ee2847ac89db23adc8097048881d32e7f431b7f891feaacf233ed  parsing/xref/callable_values.rs
 
 8625ff408aec036c039ca01727a2c2a5cc6a87d802248ea77046ecdb5b0ee0bf  parsing/xref/callable_values/imports.rs
 

@@ -262,6 +262,13 @@ fn walk(
                             .filter(|n| is_candidate(*n)),
                     );
                 }
+                "list" | "tuple" | "set" | "expression_list" | "array" => {
+                    candidates.extend(
+                        node.named_children(&mut node.walk())
+                            .map(unparen)
+                            .filter(|n| is_candidate(*n) && (!python || python_value_context(*n))),
+                    );
+                }
                 "pair" => {
                     candidates.extend(
                         node.child_by_field_name("value")
@@ -352,16 +359,6 @@ fn walk(
                     block_method_writes(&mut methods, target, src, python);
                     if let (Some(target), Some(scope)) = (target, enclosing_scope(node, python)) {
                         block_pattern(&mut bindings, scope, target, src);
-                    }
-                    if let Some(iterable) = node.child_by_field_name("right").map(unparen)
-                        && matches!(iterable.kind(), "tuple" | "list" | "expression_list")
-                    {
-                        candidates.extend(
-                            iterable
-                                .named_children(&mut iterable.walk())
-                                .map(unparen)
-                                .filter(|n| is_candidate(*n)),
-                        );
                     }
                 }
                 "for_in_statement" if !python => {

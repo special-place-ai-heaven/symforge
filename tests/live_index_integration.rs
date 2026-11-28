@@ -1176,8 +1176,8 @@ fn test_persist_round_trip() {
         .expect("snapshot should be loadable after serialize");
 
     assert_eq!(
-        snapshot.version, 12,
-        "checkpoint must write format 12 with the refreshed xrefs and symbol ranges"
+        snapshot.version, 13,
+        "checkpoint must write format 13 with collection callback references"
     );
     assert_eq!(snapshot.files.len(), 2, "snapshot should contain 2 files");
     assert!(
