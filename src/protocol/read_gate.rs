@@ -75,7 +75,22 @@ pub fn observe_disk_beneath(
     workspace_root: &Path,
     relative_path: &str,
 ) -> Result<Vec<u8>, String> {
-    observe_beneath(live, workspace_root, relative_path, true)
+    observe_disk_beneath_recording(
+        live,
+        workspace_root,
+        relative_path,
+        &mut crate::protocol::withheld::record_pending_withheld,
+    )
+}
+
+/// The same confined read with an explicit metadata sink for synchronous callers.
+pub(crate) fn observe_disk_beneath_recording(
+    live: &LiveIndex,
+    workspace_root: &Path,
+    relative_path: &str,
+    record: &mut dyn FnMut(crate::protocol::withheld::WithheldMeta),
+) -> Result<Vec<u8>, String> {
+    observe_beneath(live, workspace_root, relative_path, true, record)
 }
 
 /// [`observe_disk_beneath`] for a sweep that drops the refusal: a recorded
@@ -85,7 +100,13 @@ pub(crate) fn observe_disk_beneath_without_lines(
     workspace_root: &Path,
     relative_path: &str,
 ) -> Result<Vec<u8>, String> {
-    observe_beneath(live, workspace_root, relative_path, false)
+    observe_beneath(
+        live,
+        workspace_root,
+        relative_path,
+        false,
+        &mut crate::protocol::withheld::record_pending_withheld,
+    )
 }
 
 fn observe_beneath(
@@ -93,6 +114,7 @@ fn observe_beneath(
     workspace_root: &Path,
     relative_path: &str,
     name_lines: bool,
+    record: &mut dyn FnMut(crate::protocol::withheld::WithheldMeta),
 ) -> Result<Vec<u8>, String> {
     let candidate = Path::new(relative_path);
     let escapes = candidate.components().any(|component| {
@@ -111,7 +133,7 @@ fn observe_beneath(
     // stays syscall-free; the spelling is judged on the resolved path here.
     refuse_disk_spelling(workspace_root, relative_path)?;
     let full_path = workspace_root.join(candidate);
-    disk_read(live, relative_path, &full_path, name_lines)
+    disk_read_recording(live, relative_path, &full_path, name_lines, record)
 }
 
 /// The refusal for a path under VCS or runtime-state internals (`.git`,
@@ -231,11 +253,15 @@ pub(crate) use crate::index_lifecycle::guidance::read_gate::unverified_notice;
 /// `None` when that refusal is not a recorded content match (the path rule and
 /// a detector failure take precedence exactly as in [`refuse_by_policy`]) or no
 /// lines were recovered; the caller then renders the policy refusal unchanged.
-fn recorded_refusal_naming_lines(live: &LiveIndex, relative_path: &str) -> Option<String> {
+fn recorded_refusal_naming_lines(
+    live: &LiveIndex,
+    relative_path: &str,
+    record: &mut dyn FnMut(crate::protocol::withheld::WithheldMeta),
+) -> Option<String> {
     crate::index_lifecycle::guidance::read_gate::recorded_refusal_naming_lines_with(
         live,
         relative_path,
-        &mut crate::protocol::withheld::record_pending_withheld,
+        record,
     )
 }
 
@@ -292,6 +318,22 @@ fn disk_read(
     canon_path: &Path,
     name_lines: bool,
 ) -> Result<Vec<u8>, String> {
+    disk_read_recording(
+        live,
+        relative_path,
+        canon_path,
+        name_lines,
+        &mut crate::protocol::withheld::record_pending_withheld,
+    )
+}
+
+fn disk_read_recording(
+    live: &LiveIndex,
+    relative_path: &str,
+    canon_path: &Path,
+    name_lines: bool,
+    record: &mut dyn FnMut(crate::protocol::withheld::WithheldMeta),
+) -> Result<Vec<u8>, String> {
     // Policy refusals need no bytes, so they run BEFORE the read: a demoted
     // file is never opened for disclosure. Only once refusing, and only for a
     // caller that renders the refusal, does the gate re-read a recorded content
@@ -301,19 +343,26 @@ fn disk_read(
     // Secret dismissals need no override here: every publication route
     // classifies with them applied, so a fully dismissed file is recorded
     // admitted, not demoted, and never reaches this refusal.
-    crate::index_lifecycle::guidance::read_gate::disk_read_with(
+    let mut evidence_meta = Vec::new();
+    let result = crate::index_lifecycle::guidance::read_gate::disk_read_with(
         live,
         relative_path,
         canon_path,
         &mut || {
             if name_lines {
-                recorded_refusal_naming_lines(live, relative_path)
+                recorded_refusal_naming_lines(live, relative_path, &mut |meta| {
+                    evidence_meta.push(meta)
+                })
             } else {
                 None
             }
         },
-        &mut crate::protocol::withheld::record_pending_withheld,
-    )
+        record,
+    );
+    for meta in evidence_meta {
+        record(meta);
+    }
+    result
 }
 
 // ── Frozen seam anchor (C5) ────────────────────────────────────────────────
@@ -384,7 +433,10 @@ mod tests {
         }
         assert_eq!(
             callers,
-            vec![("protocol/read_gate.rs".to_string(), "disk_read".to_string())],
+            vec![(
+                "protocol/read_gate.rs".to_string(),
+                "disk_read_recording".to_string()
+            )],
             "the line re-read must be reached only through the disk-read lane"
         );
     }

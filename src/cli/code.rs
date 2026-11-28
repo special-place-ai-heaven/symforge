@@ -396,11 +396,12 @@ pub fn run_query_cli(args: QueryCliArgs) -> anyhow::Result<MainExit> {
                 "value": result.value,
                 "duration_ms": duration_ms,
             });
-            if !result.completeness.is_empty() {
+            if !result.completeness.is_empty() || !result.withheld.is_empty() {
                 payload["notices"] = json!([crate::codemode::CodeReadNotice {
                     call: 1,
                     op,
                     completeness: result.completeness,
+                    withheld: result.withheld,
                 }]);
             }
             (payload, MainExit::Success)
@@ -410,10 +411,7 @@ pub fn run_query_cli(args: QueryCliArgs) -> anyhow::Result<MainExit> {
                 "status": "error",
                 "op": op.as_str(),
                 "duration_ms": duration_ms,
-                "error": {
-                    "kind": err.kind,
-                    "message": err.message,
-                }
+                "error": err,
             }),
             MainExit::JsonCommandError,
         ),
