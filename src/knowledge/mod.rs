@@ -17,6 +17,7 @@ pub(crate) mod search_contract;
 pub mod secret_dismissals;
 pub(crate) mod secret_remediation;
 pub(crate) mod source_scope;
+mod yaml_placeholder;
 
 /// UTF-8 byte-order mark accepted by the v1 searchable-text contract.
 pub const UTF8_BOM: &[u8; 3] = b"\xEF\xBB\xBF";
@@ -73,7 +74,9 @@ pub fn decode_searchable_text(bytes: &[u8]) -> Result<DecodedText<'_>, std::str:
 /// exception, which did not establish receiver provenance.
 /// Bumped to 11: syntax-proven Rust boundaries and provenance-checked Python
 /// lookups admit previously withheld code, requiring admissions to be re-scouted.
-pub const SECRET_POLICY_VERSION: u32 = 11;
+/// Bumped to 12: parser-owned YAML flow values and punctuation outside complete
+/// Markdown code spans admit markers that policy 11 mistook for credential text.
+pub const SECRET_POLICY_VERSION: u32 = 12;
 pub const SECRET_SCAN_MAX_BYTES: usize = crate::domain::index::METADATA_ONLY_CODE_BYTES as usize;
 /// The one reserved rule id every [`DetectorFailure`] collapses onto. Public so
 /// the disclosure gate can tell an indeterminate verdict — which a reindex
@@ -236,6 +239,7 @@ pub fn scan_secret_spans(path: &str, bytes: &[u8]) -> SecretSpansScan {
     let (relaxed, rust) = (scan_path.relaxed, scan_path.rust);
     let source_syntax = std::cell::OnceCell::new();
     let markdown_boundaries = std::cell::OnceCell::new();
+    let yaml_boundaries = std::cell::OnceCell::new();
     let mut spans = Vec::new();
     for rule in rules {
         if !rule
@@ -264,14 +268,20 @@ pub fn scan_secret_spans(path: &str, bytes: &[u8]) -> SecretSpansScan {
                     .map_or(secret.start(), |whole| whole.start()),
             );
             if rule.id == CONTEXT_ASSIGNMENT_RULE_ID
-                && markdown_boundary::placeholder_ends_at_boundary(
+                && (yaml_placeholder::placeholder_ends_at_mapping_value(
+                    path,
+                    bytes,
+                    secret.start(),
+                    secret.end(),
+                    &yaml_boundaries,
+                ) || markdown_boundary::placeholder_ends_at_boundary(
                     path,
                     bytes,
                     match_start,
                     secret.start(),
                     secret.end(),
                     &markdown_boundaries,
-                )
+                ))
             {
                 continue;
             }
@@ -491,21 +501,9 @@ fn is_placeholder_capture(
         return false;
     }
     // A real Rust newline escape ends the marker; literal slash text does not.
-    let AssignmentSyntax::Rust(Some(tree)) = syntax.get_or_init(|| {
-        AssignmentSyntax::Rust(
-            std::str::from_utf8(bytes)
-                .ok()
-                .and_then(|source| {
-                    crate::parsing::parse_source_tree(
-                        source,
-                        &crate::domain::LanguageId::Rust,
-                        false,
-                    )
-                    .ok()
-                })
-                .filter(|tree| !tree.root_node().has_error()),
-        )
-    }) else {
+    let AssignmentSyntax::Rust(Some(tree)) =
+        syntax.get_or_init(|| AssignmentSyntax::Rust(parse_rust_assignment_tree(bytes)))
+    else {
         return false;
     };
     let Some(escape) = tree
@@ -990,6 +988,15 @@ enum AssignmentSyntax {
     Unsupported,
 }
 
+fn parse_rust_assignment_tree(bytes: &[u8]) -> Option<tree_sitter::Tree> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|source| {
+            crate::parsing::parse_source_tree(source, &crate::domain::LanguageId::Rust, false).ok()
+        })
+        .filter(|tree| !tree.root_node().has_error())
+}
+
 fn syntax_proves_no_payload(
     path: &str,
     bytes: &[u8],
@@ -1000,14 +1007,7 @@ fn syntax_proves_no_payload(
 ) -> bool {
     use crate::domain::LanguageId;
     match syntax.get_or_init(|| match LanguageId::from_path(path) {
-        Some(LanguageId::Rust) => AssignmentSyntax::Rust(
-            std::str::from_utf8(bytes)
-                .ok()
-                .and_then(|source| {
-                    crate::parsing::parse_source_tree(source, &LanguageId::Rust, false).ok()
-                })
-                .filter(|tree| !tree.root_node().has_error()),
-        ),
+        Some(LanguageId::Rust) => AssignmentSyntax::Rust(parse_rust_assignment_tree(bytes)),
         Some(LanguageId::Python) => {
             AssignmentSyntax::Python(python_lookup::ProvenLookups::new(path, bytes))
         }
@@ -1957,6 +1957,7 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
     let (relaxed, rust) = (scan_path.relaxed, scan_path.rust);
     let source_syntax = std::cell::OnceCell::new();
     let markdown_boundaries = std::cell::OnceCell::new();
+    let yaml_boundaries = std::cell::OnceCell::new();
     for rule in rules {
         if !rule
             .keywords
@@ -1991,14 +1992,20 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
                     .map_or(secret.start(), |whole| whole.start()),
             );
             if rule.id == CONTEXT_ASSIGNMENT_RULE_ID
-                && markdown_boundary::placeholder_ends_at_boundary(
+                && (yaml_placeholder::placeholder_ends_at_mapping_value(
+                    path,
+                    bytes,
+                    secret.start(),
+                    secret.end(),
+                    &yaml_boundaries,
+                ) || markdown_boundary::placeholder_ends_at_boundary(
                     path,
                     bytes,
                     match_start,
                     secret.start(),
                     secret.end(),
                     &markdown_boundaries,
-                )
+                ))
             {
                 continue;
             }

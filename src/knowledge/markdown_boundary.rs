@@ -7,6 +7,20 @@ pub(super) struct Boundary {
     cell: bool,
 }
 
+fn prose_punctuation(byte: &u8) -> bool {
+    matches!(byte, b'.' | b',' | b';' | b':' | b'!')
+}
+
+fn expression_continues(text: &[u8]) -> bool {
+    text.first()
+        .is_some_and(|byte| b"+-*/%=.?:&|^([{\\".contains(byte))
+        || [b"or".as_slice(), b"and", b"if", b"else"]
+            .iter()
+            .any(|word| {
+                text.starts_with(word) && text.get(word.len()).is_some_and(u8::is_ascii_whitespace)
+            })
+}
+
 fn complete_placeholder(mut value: &[u8]) -> bool {
     while value.len() >= 2
         && matches!(
@@ -36,11 +50,15 @@ pub(super) fn placeholder_ends_at_boundary(
     let Some(value) = bytes.get(value_start..value_end) else {
         return false;
     };
-    let marker = if let Some(marker) = value.strip_suffix(b":") {
-        if !marker.ends_with(b"`") {
+    let punctuation_start = value
+        .iter()
+        .rposition(|byte| !prose_punctuation(byte))
+        .map_or(0, |at| at + 1);
+    let marker = if punctuation_start < value.len() {
+        if !value[..punctuation_start].ends_with(b"`") {
             return false;
         }
-        marker
+        &value[..punctuation_start]
     } else {
         value
     };
@@ -78,9 +96,11 @@ pub(super) fn placeholder_ends_at_boundary(
             } else if !tail.is_empty() {
                 return false;
             }
-            let prose_colon_capture = value_end == boundary.after.saturating_add(1)
-                && bytes.get(boundary.after) == Some(&b':');
-            if value_end > range.end && value_end != boundary.after && !prose_colon_capture {
+            let prose_capture = value_end >= boundary.after
+                && bytes[boundary.after..value_end]
+                    .iter()
+                    .all(prose_punctuation);
+            if value_end > range.end && !prose_capture {
                 return false;
             }
             if boundary.cell {
@@ -91,25 +111,39 @@ pub(super) fn placeholder_ends_at_boundary(
                 .position(|byte| *byte == b'\n')
                 .map_or(bytes.len(), |offset| boundary.after + offset);
             let rest = bytes[boundary.after..line_end].trim_ascii();
-            let prose_colon = rest.strip_prefix(b":").is_none_or(|tail| {
-                tail.trim_ascii_start()
-                    .first()
-                    .is_some_and(|byte| !b"+-*/%=?:&|^([{\\".contains(byte))
-            });
             // A closed code span ends prose, but an explicit continuation remains ambiguous.
-            prose_colon
-                && !rest
-                    .first()
-                    .is_some_and(|byte| b"'\"`+-*/%=?&|^([{\\".contains(byte))
-                && ![b"or".as_slice(), b"and", b"if", b"else"]
-                    .iter()
-                    .any(|word| {
-                        rest.starts_with(word)
-                            && rest.get(word.len()).is_some_and(u8::is_ascii_whitespace)
-                    })
-                && (!rest.is_empty()
+            let punctuation_end = rest
+                .iter()
+                .position(|byte| !prose_punctuation(byte))
+                .unwrap_or(rest.len());
+            let following = if punctuation_end > 0 {
+                if &rest[..punctuation_end] != b":"
+                    && rest
+                        .get(punctuation_end)
+                        .is_some_and(|byte| !byte.is_ascii_whitespace())
+                {
+                    return false;
+                }
+                let following = rest[punctuation_end..].trim_ascii_start();
+                if rest[punctuation_end - 1] == b':' && following.is_empty() {
+                    return false;
+                }
+                if &rest[..punctuation_end] != b":"
+                    && following.first().is_some_and(|byte| b"'\"`".contains(byte))
+                {
+                    return false;
+                }
+                following
+            } else {
+                if rest.first().is_some_and(|byte| b"'\"`".contains(byte)) {
+                    return false;
+                }
+                rest
+            };
+            !expression_continues(following)
+                && (!following.is_empty()
                     || line_end == bytes.len()
-                    || !super::line_break_continues_expression(bytes, line_end, false))
+                    || !super::line_break_continues_expression(&bytes[line_end..], 0, false))
         })
 }
 
@@ -347,6 +381,30 @@ mod tests {
             clean(&format!("Use `{assignment}`: \"OrdinaryLabel\".\n"));
         }
         clean(&format!("Use ``{key}=REDACTED`` with \"OrdinaryLabel\".\n"));
+    }
+
+    #[test]
+    fn sentence_punctuation_belongs_to_the_closed_code_span_host() {
+        let key = "api_key";
+        for value in ["your_marker", "\"your_marker\""] {
+            for punctuation in [".", ",", ";", "!", ":"] {
+                clean(&format!(
+                    "Use `{key}={value}`{punctuation} Ordinary prose.\n"
+                ));
+            }
+        }
+        clean(&format!("Use `{key}=your_marker`.\n"));
+        let canary = ["Opaque", "Fixture", "Canary"].concat();
+        for punctuation in [".", ",", ";", "!"] {
+            sensitive(&format!(
+                "Use `{key}=your_marker`{punctuation} \"{canary}\"\n"
+            ));
+        }
+        sensitive(&format!("Use `{key}=your_marker`.method(\"{canary}\")\n"));
+        sensitive(&format!("Use `{key}=your_marker`. + \"{canary}\"\n"));
+        sensitive(&format!("Use `{key}=your_marker`.\n + \"{canary}\"\n"));
+        sensitive(&format!("Use `{key}=your_marker.` Ordinary prose.\n"));
+        sensitive(&format!("Use {key}=your_marker.\n"));
     }
 
     #[test]
